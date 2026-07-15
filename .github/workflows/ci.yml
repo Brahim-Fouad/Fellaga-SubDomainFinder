@@ -1,0 +1,62 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y zstd libssl-dev pkg-config
+      - name: Verify embedded corpus
+        run: |
+          test "$(zstd -dc data/candidates-1m.txt.zst | wc -l)" -eq 1000000
+          echo "cde7d80ff87e21ef2c6d3021b09931a469e4ca965f2bc7816e4c143682681d9b  data/candidates-1m.txt.zst" | sha256sum -c -
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets --all-features --locked -- -D warnings
+      - run: cargo test --all-targets --all-features --locked
+      - run: cargo build --release --locked
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.85.0"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+      - run: cargo check --all-targets --locked
+
+  fuzz-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: fuzz
+      - run: cargo install cargo-fuzz --locked
+      - run: cargo fuzz run normalize_name -- -max_total_time=20
+        working-directory: fuzz
+
+  dns-lab:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: tests/dns-lab/verify.sh

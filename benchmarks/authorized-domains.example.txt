@@ -1,0 +1,3 @@
+# Copiez ce fichier, puis ne conservez que des domaines explicitement autorisés.
+example.com
+example.org

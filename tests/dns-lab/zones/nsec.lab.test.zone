@@ -1,0 +1,7 @@
+$ORIGIN nsec.lab.test.
+$TTL 60
+@ IN SOA ns.nsec.lab.test. hostmaster.nsec.lab.test. 1 60 60 600 60
+  IN NS ns.nsec.lab.test.
+ns IN A 127.0.0.1
+www IN A 192.0.2.50
+api IN A 192.0.2.51

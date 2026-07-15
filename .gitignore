@@ -1,0 +1,11 @@
+/target/
+/results/
+/benchmarks/results/
+/=
+*.db
+*.db-shm
+*.db-wal
+*.jsonl
+__pycache__/
+.idea/
+.vscode/

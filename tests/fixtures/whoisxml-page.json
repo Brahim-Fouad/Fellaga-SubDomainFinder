@@ -1,0 +1,10 @@
+{
+  "result": {
+    "records": [
+      {"domain": "api.example.com"},
+      {"domain": "deep.api.example.com"},
+      {"domain": "outside.example.net"}
+    ],
+    "nextPageSearchAfter": "cursor-2"
+  }
+}

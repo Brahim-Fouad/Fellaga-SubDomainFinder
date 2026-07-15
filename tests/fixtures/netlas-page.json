@@ -1,0 +1,6 @@
+{
+  "items": [
+    {"data": {"domain": "edge.example.com"}},
+    {"data": {"domain": "outside.example.net"}}
+  ]
+}

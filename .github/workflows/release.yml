@@ -1,0 +1,77 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  binaries:
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            archive: fellaga-kali-x86_64
+          - target: aarch64-unknown-linux-gnu
+            archive: fellaga-kali-arm64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@cross
+      - run: cross build --release --locked --features vendored-openssl --target ${{ matrix.target }}
+      - name: Assemble archive
+        run: |
+          mkdir -p dist/${{ matrix.archive }}
+          cp target/${{ matrix.target }}/release/fellaga dist/${{ matrix.archive }}/
+          cp README.md LICENSE data/CORPUS_LICENSE.md dist/${{ matrix.archive }}/
+          tar -C dist -czf dist/${{ matrix.archive }}.tar.gz ${{ matrix.archive }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.archive }}
+          path: dist/${{ matrix.archive }}.tar.gz
+
+  publish:
+    needs: binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: taiki-e/install-action@cargo-deb
+      - run: cargo build --release --locked && cargo deb --no-build
+      - run: cp target/debian/*.deb dist/
+      - uses: anchore/sbom-action@v0
+        with:
+          path: target/release/fellaga
+          format: cyclonedx-json
+          output-file: dist/fellaga-sbom.cdx.json
+      - name: Checksums
+        run: cd dist && sha256sum *.tar.gz *.deb fellaga-sbom.cdx.json > SHA256SUMS
+      - uses: sigstore/cosign-installer@v3
+      - name: Keyless signature
+        run: cosign sign-blob --yes --bundle dist/SHA256SUMS.sigstore.json dist/SHA256SUMS
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/*.deb
+            dist/fellaga-sbom.cdx.json
+            dist/SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/*.tar.gz
+            dist/*.deb
+            dist/fellaga-sbom.cdx.json
+            dist/SHA256SUMS
+            dist/SHA256SUMS.sigstore.json

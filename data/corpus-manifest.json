@@ -1,0 +1,15 @@
+{
+  "name": "fellaga-candidates-1m",
+  "version": 1,
+  "entries": 1000000,
+  "compression": "zstd",
+  "sha256": "cde7d80ff87e21ef2c6d3021b09931a469e4ca965f2bc7816e4c143682681d9b",
+  "license": "MIT",
+  "source_project": "https://github.com/danielmiessler/SecLists",
+  "sources": [
+    "Discovery/DNS/subdomains-top1million-110000.txt",
+    "Discovery/DNS/bitquark-subdomains-top100000.txt"
+  ],
+  "generator": "scripts/build-corpus.sh",
+  "contains_target_data": false
+}

@@ -1,0 +1,6 @@
+$ORIGIN hijack.test.
+$TTL 60
+@ IN SOA ns.hijack.test. hostmaster.hijack.test. 1 60 60 600 60
+  IN NS ns.hijack.test.
+ns IN A 127.0.0.1
+* IN A 198.51.100.66

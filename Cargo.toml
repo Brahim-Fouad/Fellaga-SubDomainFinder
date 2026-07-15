@@ -1,0 +1,63 @@
+[package]
+name = "fellaga-subdomainfinder"
+version = "0.8.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Fast, learning subdomain enumerator for Kali Linux"
+license = "MIT"
+readme = "README.md"
+keywords = ["dns", "subdomain", "reconnaissance", "kali", "sqlite"]
+categories = ["command-line-utilities", "network-programming"]
+
+[lib]
+name = "fellaga_core"
+path = "src/lib.rs"
+
+[features]
+default = []
+vendored-openssl = ["openssl/vendored"]
+
+[[bin]]
+name = "fellaga"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+base64 = "0.22"
+clap = { version = "4.6", features = ["derive", "env"] }
+futures-util = "0.3"
+hickory-client = { version = "0.25.2", features = ["dnssec-ring"] }
+hickory-resolver = "0.25.2"
+httpdate = "1.0"
+openssl = "0.10.81"
+psl = "2.1"
+reqwest = { version = "0.13.4", features = ["json", "query"] }
+rusqlite = { version = "0.40.1", features = ["bundled"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+socket2 = "0.6"
+tokio = { version = "1.52", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+url = "2.5"
+zstd = "0.13"
+
+[dev-dependencies]
+proptest = "1.8"
+tempfile = "3.20"
+
+[package.metadata.deb]
+name = "fellaga"
+maintainer = "Fellaga Project"
+section = "net"
+priority = "optional"
+assets = [
+  ["target/release/fellaga", "usr/bin/fellaga", "755"],
+  ["README.md", "usr/share/doc/fellaga/README.md", "644"],
+  ["LICENSE", "usr/share/doc/fellaga/LICENSE", "644"],
+  ["data/CORPUS_LICENSE.md", "usr/share/doc/fellaga/CORPUS_LICENSE.md", "644"],
+]
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
