@@ -139,10 +139,17 @@ jobs:
 
   dns-lab:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
-      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends dnsutils
-      - run: tests/dns-lab/verify.sh
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # verified master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: dns-lab-cli
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends dnsutils libssl-dev pkg-config
+      - run: cargo build --locked --bin fellaga
+      - run: FELLAGA_BIN=target/debug/fellaga tests/dns-lab/verify.sh

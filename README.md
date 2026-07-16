@@ -14,10 +14,11 @@ Fellaga is a fast, adaptive subdomain enumerator written in Rust for Kali Linux 
 
 - Native asynchronous DNS engine with correlated UDP queries, EDNS0, TCP fallback, resolver balancing, retries, and global rate limiting.
 - Adaptive `deep` scan by default: passive sources, Certificate Transparency, a one-million-candidate corpus, recursive DNS, AXFR, DNSSEC/NSEC, Web and JavaScript discovery, TLS/STARTTLS, and bounded PTR pivots.
-- Hierarchical wildcard detection, rotating-answer recognition, trusted-resolver consensus, and optional authoritative validation.
+- Persistent, lazy candidate scheduling: passive/authoritative seeds and active word generators are consumed in bounded SQLite-backed waves instead of being materialized in memory before DNS starts.
+- Hierarchical wildcard detection, rotating-answer recognition, exact-signature filtering, trusted-resolver consensus, and optional authoritative validation.
 - Permanent SQLite inventory with `live`, `historical`, and `unverified` states; positive evidence is retained while weak wildcard-only false positives are purged automatically.
 - Evidence-family scoring so multiple providers backed by the same underlying dataset are not counted as independent proof.
-- Checkpoints every 30 seconds and `--resume latest` for interrupted or time-limited scans.
+- Checkpoints every 30 seconds and `--resume latest` for interrupted or time-limited scans; queued work, retry counts, source provenance, and learning counters survive a restart.
 - Text, JSON, per-domain JSONL, streaming JSONL, CSV export, and import support for common enumeration tools.
 - No telemetry, no remote cache synchronization, and no automatic sharing of targets, findings, or learned patterns.
 
@@ -30,8 +31,8 @@ Fellaga does not claim market leadership without reproducible evidence. The repo
 Download the release package and install it with APT. Checksums, a Sigstore-signed manifest, and GitHub attestations are available for independent verification:
 
 ```bash
-curl -fLO https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/download/v0.8.1/fellaga_0.8.1-1_amd64.deb
-sudo apt install ./fellaga_0.8.1-1_amd64.deb
+curl -fLO https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/download/v0.8.2/fellaga_0.8.2-1_amd64.deb
+sudo apt install ./fellaga_0.8.2-1_amd64.deb
 fellaga --version
 ```
 
@@ -68,7 +69,9 @@ fellaga scan your-domain.example --stream-jsonl > findings.jsonl
 fellaga scan your-domain.example --resume latest
 ```
 
-The default scan processes one domain at a time, caps DNS traffic at 100 queries per second, uses at most 128 concurrent DNS requests, and stops after 1,800 seconds per domain. Adaptive waves stop low-yield candidate generation early. These safeguards can be changed explicitly, but disabling them may saturate the local connection, public resolvers, or the target.
+The default scan processes one domain at a time, caps DNS traffic at 100 queries per second, uses at most 128 concurrent DNS requests, and stops after 1,800 seconds per domain. Adaptive waves stop low-yield generated candidates early, but do not silently abandon an unfinished user wordlist or the bounded passive seed queue. Transient candidate-resolution failures receive at most three total attempts. These safeguards can be changed explicitly, but disabling them may saturate the local connection, public resolvers, or the target.
+
+Long-running phases emit periodic progress on standard error. Initial passive collection, direct CT monitoring, and AXFR run concurrently, while passive work has a separate profile-specific active-time budget so waiting in unrelated phases does not consume it. Names returned on completed connector pages are retained even if a later page times out; the affected source is reported as partial rather than silently discarded.
 
 Fellaga displays all retained states by default:
 

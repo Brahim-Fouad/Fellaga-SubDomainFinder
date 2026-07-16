@@ -839,41 +839,113 @@ const MAX_EXTERNAL_BODY_BYTES: usize = 16 * 1024 * 1024;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SourcePolicy {
     pub timeout: Duration,
+    /// Maximum wall-clock time for the entire connector, including pagination,
+    /// throttling and retries. This prevents one degraded provider from holding
+    /// the whole passive phase indefinitely.
+    pub total_timeout: Duration,
     pub attempts: usize,
     pub base_backoff: Duration,
+}
+
+#[derive(Debug)]
+struct SourceBudgetExceeded {
+    source: String,
+    budget: Duration,
+}
+
+impl fmt::Display for SourceBudgetExceeded {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{}: budget total de {}s dépassé; résultat en cache conservé",
+            self.source,
+            self.budget.as_secs_f64()
+        )
+    }
+}
+
+impl std::error::Error for SourceBudgetExceeded {}
+
+#[derive(Debug)]
+pub struct PassiveFetchResult {
+    pub names: BTreeSet<String>,
+    pub partial_warning: Option<String>,
+}
+
+#[derive(Clone, Default)]
+struct PartialResultCheckpoint {
+    names: Arc<StdMutex<BTreeSet<String>>>,
+}
+
+impl PartialResultCheckpoint {
+    fn merge(&self, names: &BTreeSet<String>) {
+        let mut checkpoint = self
+            .names
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        checkpoint.extend(names.iter().cloned());
+    }
+
+    fn snapshot(&self) -> BTreeSet<String> {
+        self.names
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+}
+
+tokio::task_local! {
+    static PARTIAL_RESULT_CHECKPOINT: PartialResultCheckpoint;
+}
+
+/// Commits one fully decoded provider page both to the connector accumulator
+/// and to a task-local checkpoint. If the total connector budget expires while
+/// the next page is in flight, `fetch` can still return every committed page.
+pub(super) fn commit_result_page(accumulated: &mut BTreeSet<String>, page: BTreeSet<String>) {
+    if page.is_empty() {
+        return;
+    }
+    let _ = PARTIAL_RESULT_CHECKPOINT.try_with(|checkpoint| checkpoint.merge(&page));
+    accumulated.extend(page);
 }
 
 pub fn source_policy(source: &str) -> SourcePolicy {
     match source {
         "crtsh" => SourcePolicy {
             timeout: Duration::from_secs(25),
+            total_timeout: Duration::from_secs(35),
             attempts: 3,
             base_backoff: Duration::from_millis(750),
         },
         "commoncrawl" => SourcePolicy {
             timeout: Duration::from_secs(30),
+            total_timeout: Duration::from_secs(45),
             attempts: 3,
             base_backoff: Duration::from_secs(1),
         },
         "wayback" => SourcePolicy {
             timeout: Duration::from_secs(45),
+            total_timeout: Duration::from_secs(45),
             attempts: 1,
             base_backoff: Duration::from_secs(1),
         },
         "otx" => SourcePolicy {
             timeout: Duration::from_secs(20),
+            total_timeout: Duration::from_secs(25),
             attempts: 2,
             base_backoff: Duration::from_secs(1),
         },
         "certspotter" | "urlscan" | "virustotal" | "shodan" | "censys" | "github" | "gitlab" => {
             SourcePolicy {
                 timeout: Duration::from_secs(30),
+                total_timeout: Duration::from_secs(45),
                 attempts: 2,
                 base_backoff: Duration::from_secs(1),
             }
         }
         _ => SourcePolicy {
             timeout: Duration::from_secs(20),
+            total_timeout: Duration::from_secs(30),
             attempts: 2,
             base_backoff: Duration::from_millis(500),
         },
@@ -1253,43 +1325,103 @@ pub(super) async fn send_with_retry(
     unreachable!("au moins une tentative HTTP est toujours exécutée")
 }
 
+async fn enforce_source_budget<T, F>(source: &str, budget: Duration, request: F) -> Result<T>
+where
+    F: std::future::Future<Output = Result<T>>,
+{
+    tokio::time::timeout(budget, request).await.map_err(|_| {
+        anyhow::Error::new(SourceBudgetExceeded {
+            source: source.to_owned(),
+            budget,
+        })
+    })?
+}
+
+async fn enforce_source_budget_preserving_partial<F>(
+    source: &str,
+    budget: Duration,
+    request: F,
+) -> Result<PassiveFetchResult>
+where
+    F: std::future::Future<Output = Result<BTreeSet<String>>>,
+{
+    let checkpoint = PartialResultCheckpoint::default();
+    let result = PARTIAL_RESULT_CHECKPOINT
+        .scope(
+            checkpoint.clone(),
+            enforce_source_budget(source, budget, request),
+        )
+        .await;
+    match result {
+        Err(error) if error.downcast_ref::<SourceBudgetExceeded>().is_some() => {
+            let partial = checkpoint.snapshot();
+            if partial.is_empty() {
+                Err(error)
+            } else {
+                Ok(PassiveFetchResult {
+                    names: partial,
+                    partial_warning: Some(error.to_string()),
+                })
+            }
+        }
+        Ok(names) => Ok(PassiveFetchResult {
+            names,
+            partial_warning: None,
+        }),
+        Err(error) => Err(error),
+    }
+}
+
+pub async fn fetch_detailed(
+    source: &str,
+    domain: &str,
+    timeout: Duration,
+    keys: &ApiKeyStore,
+) -> Result<PassiveFetchResult> {
+    let budget = source_policy(source).total_timeout;
+    let request = async {
+        match source {
+            "crtsh" => crtsh(domain, timeout).await,
+            "certspotter" => certspotter(domain, timeout, keys).await,
+            "hackertarget" => hackertarget(domain, timeout).await,
+            "commoncrawl" => commoncrawl(domain, timeout).await,
+            "wayback" => wayback(domain, timeout).await,
+            "urlscan" => urlscan(domain, timeout, keys).await,
+            "anubisdb" => anubisdb(domain, timeout).await,
+            "subdomainapp" => subdomainapp(domain, timeout).await,
+            "virustotal" => virustotal(domain, timeout, keys).await,
+            "whoisxml" => whoisxml(domain, timeout, keys).await,
+            "securitytrails" => securitytrails(domain, timeout, keys).await,
+            "bevigil" => extra::bevigil(domain, timeout, keys).await,
+            "builtwith" => extra::builtwith(domain, timeout, keys).await,
+            "censys" => extra::censys(domain, timeout, keys).await,
+            "circl" => extra::circl(domain, timeout, keys).await,
+            "certificatedetails" => extra::certificate_details(domain, timeout).await,
+            "chaos" => extra::chaos(domain, timeout, keys).await,
+            "driftnet" => extra::driftnet(domain, timeout).await,
+            "fullhunt" => extra::fullhunt(domain, timeout, keys).await,
+            "github" => extra::github(domain, timeout, keys).await,
+            "gitlab" => extra::gitlab(domain, timeout, keys).await,
+            "intelx" => extra::intelx(domain, timeout, keys).await,
+            "leakix" => extra::leakix(domain, timeout, keys).await,
+            "netlas" => netlas(domain, timeout, keys).await,
+            "otx" => extra::otx(domain, timeout, keys).await,
+            "shodan" => extra::shodan(domain, timeout, keys).await,
+            "subdomaincenter" => extra::subdomain_center(domain, timeout).await,
+            _ => Err(anyhow::anyhow!("source passive inconnue: {source}")),
+        }
+    };
+    let result = enforce_source_budget_preserving_partial(source, budget, request).await;
+    result.map_err(|error| anyhow::Error::msg(sanitize_external_error(&format!("{error:#}"), keys)))
+}
+
 pub async fn fetch(
     source: &str,
     domain: &str,
     timeout: Duration,
     keys: &ApiKeyStore,
 ) -> Result<BTreeSet<String>> {
-    let result = match source {
-        "crtsh" => crtsh(domain, timeout).await,
-        "certspotter" => certspotter(domain, timeout, keys).await,
-        "hackertarget" => hackertarget(domain, timeout).await,
-        "commoncrawl" => commoncrawl(domain, timeout).await,
-        "wayback" => wayback(domain, timeout).await,
-        "urlscan" => urlscan(domain, timeout, keys).await,
-        "anubisdb" => anubisdb(domain, timeout).await,
-        "subdomainapp" => subdomainapp(domain, timeout).await,
-        "virustotal" => virustotal(domain, timeout, keys).await,
-        "whoisxml" => whoisxml(domain, timeout, keys).await,
-        "securitytrails" => securitytrails(domain, timeout, keys).await,
-        "bevigil" => extra::bevigil(domain, timeout, keys).await,
-        "builtwith" => extra::builtwith(domain, timeout, keys).await,
-        "censys" => extra::censys(domain, timeout, keys).await,
-        "circl" => extra::circl(domain, timeout, keys).await,
-        "certificatedetails" => extra::certificate_details(domain, timeout).await,
-        "chaos" => extra::chaos(domain, timeout, keys).await,
-        "driftnet" => extra::driftnet(domain, timeout).await,
-        "fullhunt" => extra::fullhunt(domain, timeout, keys).await,
-        "github" => extra::github(domain, timeout, keys).await,
-        "gitlab" => extra::gitlab(domain, timeout, keys).await,
-        "intelx" => extra::intelx(domain, timeout, keys).await,
-        "leakix" => extra::leakix(domain, timeout, keys).await,
-        "netlas" => netlas(domain, timeout, keys).await,
-        "otx" => extra::otx(domain, timeout, keys).await,
-        "shodan" => extra::shodan(domain, timeout, keys).await,
-        "subdomaincenter" => extra::subdomain_center(domain, timeout).await,
-        _ => Err(anyhow::anyhow!("source passive inconnue: {source}")),
-    };
-    result.map_err(|error| anyhow::Error::msg(sanitize_external_error(&format!("{error:#}"), keys)))
+    Ok(fetch_detailed(source, domain, timeout, keys).await?.names)
 }
 
 async fn crtsh(domain: &str, timeout: Duration) -> Result<BTreeSet<String>> {
@@ -1359,13 +1491,15 @@ async fn certspotter(
             break;
         }
         after = next_after;
+        let mut page_names = BTreeSet::new();
         for issuance in page {
             for dns_name in issuance.dns_names {
                 if let Some(name) = normalize_observed_name(&dns_name, domain) {
-                    names.insert(name);
+                    page_names.insert(name);
                 }
             }
         }
+        commit_result_page(&mut names, page_names);
     }
     Ok(names)
 }
@@ -1492,12 +1626,13 @@ async fn commoncrawl(domain: &str, timeout: Duration) -> Result<BTreeSet<String>
                         break;
                     }
                     successful_requests += 1;
-                    names.extend(
-                        body.lines()
-                            .take(50_000)
-                            .filter_map(|line| serde_json::from_str::<CommonCrawlRow>(line).ok())
-                            .filter_map(|row| hostname_from_url(&row.url, domain)),
-                    );
+                    let page_names = body
+                        .lines()
+                        .take(50_000)
+                        .filter_map(|line| serde_json::from_str::<CommonCrawlRow>(line).ok())
+                        .filter_map(|row| hostname_from_url(&row.url, domain))
+                        .collect();
+                    commit_result_page(&mut names, page_names);
                 }
                 Err(error) => {
                     errors.push(format!("{endpoint} page {page}: {error:#}"));
@@ -1586,7 +1721,7 @@ async fn wayback(domain: &str, timeout: Duration) -> Result<BTreeSet<String>> {
         match result {
             Ok(window_names) => {
                 completed += 1;
-                names.extend(window_names);
+                commit_result_page(&mut names, window_names);
             }
             Err(error) => errors.push(format!("{error:#}")),
         }
@@ -1633,6 +1768,7 @@ async fn urlscan(domain: &str, timeout: Duration, keys: &ApiKeyStore) -> Result<
         };
         let page_len = response.results.len();
         let next = response.results.last().and_then(urlscan_search_after);
+        let mut page_names = BTreeSet::new();
         for result in response.results {
             for host in [result.page, result.task].into_iter().flatten() {
                 if let Some(name) = host
@@ -1645,10 +1781,11 @@ async fn urlscan(domain: &str, timeout: Duration, keys: &ApiKeyStore) -> Result<
                             .and_then(|url| hostname_from_url(url, domain))
                     })
                 {
-                    names.insert(name);
+                    page_names.insert(name);
                 }
             }
         }
+        commit_result_page(&mut names, page_names);
         if page_len < 1_000 || next.is_none() || next == search_after {
             break;
         }
@@ -1738,11 +1875,12 @@ async fn virustotal(
             Err(_) if !names.is_empty() => break,
             Err(error) => return Err(error).context("connexion à VirusTotal"),
         };
-        for item in response.data {
-            if let Some(name) = normalize_observed_name(&item.id, domain) {
-                names.insert(name);
-            }
-        }
+        let page_names = response
+            .data
+            .into_iter()
+            .filter_map(|item| normalize_observed_name(&item.id, domain))
+            .collect();
+        commit_result_page(&mut names, page_names);
         next = response.links.and_then(|links| links.next);
     }
     Ok(names)
@@ -1785,11 +1923,12 @@ async fn whoisxml(domain: &str, timeout: Duration, keys: &ApiKeyStore) -> Result
         let Some(result) = page.result else {
             break;
         };
-        for record in result.records {
-            if let Some(name) = normalize_observed_name(&record.domain, domain) {
-                names.insert(name);
-            }
-        }
+        let page_names = result
+            .records
+            .into_iter()
+            .filter_map(|record| normalize_observed_name(&record.domain, domain))
+            .collect();
+        commit_result_page(&mut names, page_names);
         if result.next_page_search_after.is_empty() || result.next_page_search_after == search_after
         {
             break;
@@ -1822,11 +1961,12 @@ async fn netlas(domain: &str, timeout: Duration, keys: &ApiKeyStore) -> Result<B
         if page.items.is_empty() {
             break;
         }
-        for item in page.items {
-            if let Some(name) = normalize_observed_name(&item.data.domain, domain) {
-                names.insert(name);
-            }
-        }
+        let page_names = page
+            .items
+            .into_iter()
+            .filter_map(|item| normalize_observed_name(&item.data.domain, domain))
+            .collect();
+        commit_result_page(&mut names, page_names);
     }
     Ok(names)
 }
@@ -2040,6 +2180,12 @@ mod tests {
     #[test]
     fn unstable_sources_have_bounded_individual_policies() {
         assert_eq!(source_policy("wayback").timeout, Duration::from_secs(45));
+        assert_eq!(
+            source_policy("wayback").total_timeout,
+            Duration::from_secs(45)
+        );
+        assert!(source_policy("commoncrawl").total_timeout <= Duration::from_secs(45));
+        assert!(source_policy("subdomaincenter").total_timeout <= Duration::from_secs(30));
         assert_eq!(source_policy("crtsh").attempts, 3);
         assert_eq!(source_policy("commoncrawl").attempts, 3);
         assert!(retryable_status(reqwest::StatusCode::REQUEST_TIMEOUT));
@@ -2054,6 +2200,88 @@ mod tests {
             backoff_delay("example.com", 1, Duration::from_millis(750))
                 > backoff_delay("example.com", 0, Duration::from_millis(750))
         );
+    }
+
+    #[tokio::test]
+    async fn connector_wall_clock_budget_cancels_a_slow_tail() {
+        let started = Instant::now();
+        let result = enforce_source_budget("slow-test", Duration::from_millis(10), async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("slow-test"));
+        assert!(started.elapsed() < Duration::from_millis(250));
+    }
+
+    #[tokio::test]
+    async fn connector_budget_returns_pages_committed_before_a_slow_tail() {
+        let result = enforce_source_budget_preserving_partial(
+            "paginated-test",
+            Duration::from_millis(10),
+            async {
+                let mut accumulated = BTreeSet::new();
+                commit_result_page(
+                    &mut accumulated,
+                    BTreeSet::from(["api.example.com".to_owned(), "mail.example.com".to_owned()]),
+                );
+                std::future::pending::<Result<BTreeSet<String>>>().await
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            result.names,
+            BTreeSet::from(["api.example.com".to_owned(), "mail.example.com".to_owned(),])
+        );
+        assert!(result.partial_warning.is_some());
+    }
+
+    #[tokio::test]
+    async fn partial_page_checkpoints_are_isolated_between_concurrent_sources() {
+        async fn one_slow_page(name: &'static str) -> Result<BTreeSet<String>> {
+            let mut accumulated = BTreeSet::new();
+            commit_result_page(&mut accumulated, BTreeSet::from([name.to_owned()]));
+            std::future::pending::<Result<BTreeSet<String>>>().await
+        }
+
+        let (first, second) = tokio::join!(
+            enforce_source_budget_preserving_partial(
+                "first-test",
+                Duration::from_millis(10),
+                one_slow_page("one.example.com"),
+            ),
+            enforce_source_budget_preserving_partial(
+                "second-test",
+                Duration::from_millis(10),
+                one_slow_page("two.example.com"),
+            ),
+        );
+
+        assert_eq!(
+            first.unwrap().names,
+            BTreeSet::from(["one.example.com".to_owned()])
+        );
+        assert_eq!(
+            second.unwrap().names,
+            BTreeSet::from(["two.example.com".to_owned()])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_budget_timeout_without_a_committed_page_remains_an_error() {
+        let result = enforce_source_budget_preserving_partial(
+            "empty-test",
+            Duration::from_millis(10),
+            std::future::pending::<Result<BTreeSet<String>>>(),
+        )
+        .await;
+
+        let error = result.unwrap_err();
+        assert!(error.downcast_ref::<SourceBudgetExceeded>().is_some());
+        assert!(error.to_string().contains("empty-test"));
     }
 
     #[test]

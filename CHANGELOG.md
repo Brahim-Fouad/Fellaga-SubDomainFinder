@@ -6,6 +6,35 @@ A version is available only when its artifacts appear on [GitHub Releases](https
 
 ## [Unreleased]
 
+## [0.8.2] - 2026-07-16
+
+### Added
+
+- added separate persistent SQLite queues for high-value discovery seeds and active generated candidates, including durable priorities, merged provenance, feed cursors, retry counters, and resume-safe learning counters;
+- added bounded, resumable wordlist paging with non-UTF-8-tolerant decoding, oversized-line handling, and fixed per-page line and byte limits;
+- added periodic phase heartbeats for passive collection, DNS validation, graph, Web, TLS, recursive, pipeline, and other potentially long-running work;
+- added a real CLI DNS laboratory covering wildcard filtering and complete versus refused AXFR behavior.
+
+### Changed
+
+- start DNS validation from small adaptive waves instead of inserting the complete embedded corpus into SQLite before the first query;
+- interleave high-value passive, CT, AXFR, cached, and learned seeds with active candidates, then continue draining the bounded seed queue after adaptive brute-force generation stops;
+- run initial passive collection, direct CT monitoring, and AXFR concurrently;
+- charge passive time limits only while passive phases are active, share a global passive connector concurrency limit across root and child zones, and retain completed pages from a connector that later times out;
+- retry transient candidate DNS failures up to three total attempts across the original run and resumed runs, while definitive negative responses remain terminal;
+- ensure an unfinished explicit wordlist is processed independently of low-yield adaptive stopping;
+- reuse prepared SQLite statements during atomic scan finalization, add queue-selection indexes, and move superseded-queue cleanup outside the completion-critical transaction;
+- keep the existing conservative defaults: one active target, 100 DNS requests per second, 128 in-flight DNS operations, bounded source work, 30-second checkpoints, and a 1,800-second per-target limit.
+
+### Fixed
+
+- exclude exact wildcard-signature matches from normal scan output even when another discovery source supplied the name; `--include-wildcard` remains the explicit opt-in;
+- preserve legitimate answers whose records differ from a wildcard pool, and purge only weak wildcard-only inventory rows and orphaned positive cache entries;
+- preserve seed provenance, queue position, retry state, and previously validated positive results across interruption and `--resume`;
+- prevent resumed or duplicate queue work from double-counting candidate learning;
+- repair additive v8 columns before creating dependent indexes and wrap same-version schema repair in one rollback-safe transaction;
+- classify an immediate AXFR refusal as `refused` instead of waiting for the transfer timeout.
+
 ## [0.8.1] - 2026-07-16
 
 ### Changed
@@ -51,6 +80,7 @@ Initial public release of Fellaga.
 - public MIT repository with security policy, contribution guide, third-party notices, and verifiable corpus provenance;
 - verifiable v0.8.0 release with x86-64 and ARM64 GNU/Linux archives, an amd64 Debian package, architecture SBOMs, checksums, a keyless Sigstore signature over the checksum manifest, and GitHub attestations.
 
-[Unreleased]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/compare/v0.8.1...HEAD
+[Unreleased]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/compare/v0.8.2...HEAD
+[0.8.2]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/tag/v0.8.2
 [0.8.1]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/tag/v0.8.1
 [0.8.0]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/tag/v0.8.0

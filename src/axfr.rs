@@ -3,6 +3,7 @@ use crate::model::{AxfrAttempt, AxfrStatus, DnsRecord};
 use crate::util::normalize_observed_name;
 use futures_util::{StreamExt, stream};
 use hickory_net::client::{Client, ClientHandle};
+use hickory_net::proto::op::ResponseCode;
 use hickory_net::proto::rr::Name;
 use hickory_net::proto::serialize::binary::BinEncodable;
 use hickory_net::runtime::TokioRuntimeProvider;
@@ -114,6 +115,14 @@ async fn transfer_one(
     'transfer: loop {
         match timeout_at(deadline, transfer.next()).await {
             Ok(Some(Ok(response))) => {
+                let response_code = response.metadata.response_code;
+                if let Some(status) = classify_response_code(response_code) {
+                    attempt.status = status;
+                    attempt.error = Some(format!(
+                        "réponse AXFR DNS {response_code} reçue de {nameserver}"
+                    ));
+                    break 'transfer;
+                }
                 for record in &response.answers {
                     if Instant::now() >= deadline {
                         attempt.status = AxfrStatus::Timeout;
@@ -188,6 +197,14 @@ async fn transfer_one(
         }
     }
     attempt
+}
+
+fn classify_response_code(response_code: ResponseCode) -> Option<AxfrStatus> {
+    match response_code {
+        ResponseCode::NoError => None,
+        ResponseCode::Refused => Some(AxfrStatus::Refused),
+        _ => Some(AxfrStatus::ProtocolError),
+    }
 }
 
 fn classify_protocol_error(error: &str) -> AxfrStatus {
@@ -422,6 +439,15 @@ mod tests {
 
     #[test]
     fn refused_and_timeouts_are_distinct() {
+        assert_eq!(classify_response_code(ResponseCode::NoError), None);
+        assert_eq!(
+            classify_response_code(ResponseCode::Refused),
+            Some(AxfrStatus::Refused)
+        );
+        assert_eq!(
+            classify_response_code(ResponseCode::ServFail),
+            Some(AxfrStatus::ProtocolError)
+        );
         assert_eq!(
             classify_protocol_error("Query Refused"),
             AxfrStatus::Refused

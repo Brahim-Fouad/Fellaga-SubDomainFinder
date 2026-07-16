@@ -1,6 +1,6 @@
 use super::{
-    ApiKeyStore, client, response_bytes_limited, response_json, response_text, send_external,
-    send_with_retry, source_policy,
+    ApiKeyStore, client, commit_result_page, response_bytes_limited, response_json, response_text,
+    send_external, send_with_retry, source_policy,
 };
 use crate::util::normalize_observed_name;
 use anyhow::{Context, Result, bail};
@@ -165,10 +165,11 @@ pub(super) async fn censys(
             Err(_) if !names.is_empty() => break,
             Err(error) => return Err(error).context("connexion à Censys"),
         };
+        let mut page_names = BTreeSet::new();
         if let Some(hits) = response.pointer("/result/hits").and_then(Value::as_array) {
             for hit in hits {
                 if let Some(values) = hit.get("names").and_then(Value::as_array) {
-                    names.extend(
+                    page_names.extend(
                         values
                             .iter()
                             .filter_map(Value::as_str)
@@ -177,6 +178,7 @@ pub(super) async fn censys(
                 }
             }
         }
+        commit_result_page(&mut names, page_names);
         cursor = response
             .pointer("/result/links/next")
             .and_then(Value::as_str)
@@ -334,15 +336,17 @@ pub(super) async fn github(
         if items.is_empty() {
             break;
         }
+        let mut page_names = BTreeSet::new();
         for item in items {
             if let Some(matches) = item.get("text_matches").and_then(Value::as_array) {
                 for text_match in matches {
                     if let Some(fragment) = text_match.get("fragment").and_then(Value::as_str) {
-                        names.extend(extract_from_text(fragment, domain));
+                        page_names.extend(extract_from_text(fragment, domain));
                     }
                 }
             }
         }
+        commit_result_page(&mut names, page_names);
         if items.len() < 100 {
             break;
         }
@@ -384,9 +388,11 @@ pub(super) async fn gitlab(
             Err(_) if !names.is_empty() => break,
             Err(error) => return Err(error),
         };
+        let mut page_names = BTreeSet::new();
         for value in &values {
-            extract_from_json(value, domain, &mut names);
+            extract_from_json(value, domain, &mut page_names);
         }
+        commit_result_page(&mut names, page_names);
         if values.is_empty() || next_page.is_none() {
             break;
         }
@@ -438,15 +444,17 @@ pub(super) async fn intelx(
             Err(_) if !names.is_empty() => break,
             Err(error) => return Err(error).context("lecture des résultats Intelligence X"),
         };
+        let mut page_names = BTreeSet::new();
         if let Some(selectors) = response.get("selectors").and_then(Value::as_array) {
             for selector in selectors {
                 if let Some(name) = selector.get("selectorvalue").and_then(Value::as_str)
                     && let Some(name) = normalize_observed_name(name, domain)
                 {
-                    names.insert(name);
+                    page_names.insert(name);
                 }
             }
         }
+        commit_result_page(&mut names, page_names);
         let status = response.get("status").and_then(Value::as_i64).unwrap_or(2);
         if status != 0 && status != 3 {
             break;
@@ -568,12 +576,12 @@ pub(super) async fn shodan(
             Err(_) if !names.is_empty() => break,
             Err(error) => return Err(error).context("connexion à Shodan"),
         };
-        names.extend(
-            response
-                .subdomains
-                .into_iter()
-                .filter_map(|label| normalize_observed_name(&format!("{label}.{domain}"), domain)),
-        );
+        let page_names = response
+            .subdomains
+            .into_iter()
+            .filter_map(|label| normalize_observed_name(&format!("{label}.{domain}"), domain))
+            .collect();
+        commit_result_page(&mut names, page_names);
         if !response.more {
             break;
         }

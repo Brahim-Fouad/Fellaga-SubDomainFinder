@@ -4,7 +4,7 @@ Treat an artifact as published only when it appears on the GitHub release page a
 
 ## Release contents
 
-Fellaga v0.8.1 contains seven assets:
+Fellaga v0.8.2 contains seven assets:
 
 - x86-64 and ARM64 GNU/Linux archives;
 - an amd64 Debian package;
@@ -36,7 +36,7 @@ Install the GitHub CLI, authenticate if required, and verify the downloaded arti
 
 ```bash
 gh attestation verify \
-  fellaga-v0.8.1-x86_64-unknown-linux-gnu.tar.gz \
+  fellaga-v0.8.2-x86_64-unknown-linux-gnu.tar.gz \
   --repo Brahim-Fouad/Fellaga-SubDomainFinder
 ```
 
@@ -49,12 +49,12 @@ Install Cosign and run:
 ```bash
 cosign verify-blob \
   --bundle SHA256SUMS.sigstore.json \
-  --certificate-identity "https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/.github/workflows/release.yml@refs/tags/v0.8.1" \
+  --certificate-identity "https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/.github/workflows/release.yml@refs/tags/v0.8.2" \
   --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
   SHA256SUMS
 ```
 
-The certificate identity binds the keyless signature to the release workflow at the exact `v0.8.1` tag.
+The certificate identity binds the keyless signature to the release workflow at the exact `v0.8.2` tag.
 
 ## Verify the source identity
 
@@ -62,8 +62,8 @@ For a source checkout:
 
 ```bash
 git fetch --tags origin
-git rev-parse 'v0.8.1^{commit}'
-git show --no-patch --format=fuller v0.8.1
+git rev-parse 'v0.8.2^{commit}'
+git show --no-patch --format=fuller v0.8.2
 ```
 
 The release pipeline also verifies that the tag version matches `Cargo.toml`, that the tagged commit is reachable from `main`, and that it will not overwrite an existing published release.

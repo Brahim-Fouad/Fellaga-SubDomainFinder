@@ -11,8 +11,8 @@ use crate::model::{
     ScanResult, ServiceEndpoint, WebObservation,
 };
 use crate::passive::{
-    ApiKeyStore, current_commoncrawl_endpoint, fetch as fetch_passive, sanitize_external_error,
-    seed_commoncrawl_endpoint, source_metadata, source_policy,
+    ApiKeyStore, current_commoncrawl_endpoint, fetch_detailed as fetch_passive,
+    sanitize_external_error, seed_commoncrawl_endpoint, source_metadata, source_policy,
 };
 use crate::pipeline::DiscoveryPipeline;
 use crate::tls::discover as discover_tls_certificates;
@@ -27,7 +27,7 @@ use serde_json::json;
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone)]
@@ -111,6 +111,9 @@ pub struct ScanOptions {
     pub api_keys: ApiKeyStore,
     pub automatic_source_selection: bool,
     pub passive_refresh: Duration,
+    pub passive_phase_timeout: Duration,
+    pub passive_zone_concurrency: usize,
+    pub passive_concurrency: usize,
     pub max_passive: usize,
     pub passive_only: bool,
     pub axfr: bool,
@@ -167,6 +170,7 @@ pub struct Scanner {
     trusted_dns: Option<DnsEngine>,
     options: ScanOptions,
     progress: Option<ProgressCallback>,
+    passive_request_slots: Arc<tokio::sync::Semaphore>,
 }
 
 /// Persists an interrupted state if the scan future is cancelled by a timeout,
@@ -327,12 +331,13 @@ fn wildcard_signature_is_confirmed(signature: &BTreeSet<String>) -> bool {
 }
 
 fn should_expand_adaptive_wave(
-    root_is_normal: bool,
+    wildcard_classification_is_reliable: bool,
     previous_positive: usize,
     wave_number: usize,
     passive_positive: usize,
 ) -> bool {
-    root_is_normal && (previous_positive >= 2 || (wave_number == 2 && passive_positive >= 5))
+    wildcard_classification_is_reliable
+        && (previous_positive >= 2 || (wave_number == 2 && passive_positive >= 5))
 }
 
 fn should_retry_otx_after_key_added(key_configured: bool, last_error: Option<&str>) -> bool {
@@ -413,14 +418,57 @@ fn discard_failed_candidate_origins(
     }
 }
 
+fn candidate_refill_capacity(
+    queued: usize,
+    total: usize,
+    target_queued: usize,
+    max_words: usize,
+) -> usize {
+    target_queued
+        .saturating_sub(queued)
+        .min(max_words.saturating_sub(total))
+}
+
+fn seed_candidate_priority(sources: &BTreeSet<String>) -> i64 {
+    let families = evidence_families(sources);
+    let authoritative = families.contains(&crate::model::EvidenceFamily::Authoritative);
+    let fresh = sources
+        .iter()
+        .any(|source| !source.contains(":stale") && !source.contains(":cache"));
+    1_000_000_i64
+        .saturating_add(if authoritative { 500_000 } else { 0 })
+        .saturating_add(if fresh { 100_000 } else { 0 })
+        .saturating_add((families.len() as i64).saturating_mul(10_000))
+        .saturating_add((sources.len() as i64).saturating_mul(1_000))
+}
+
+fn seed_share(batch_limit: usize, active_candidates_enabled: bool) -> usize {
+    if !active_candidates_enabled {
+        return batch_limit;
+    }
+    batch_limit.saturating_mul(3).saturating_div(4).max(1)
+}
+
+fn passive_deadline(remaining: Option<Duration>) -> Option<tokio::time::Instant> {
+    remaining.map(|remaining| tokio::time::Instant::now() + remaining)
+}
+
+fn consume_passive_budget(remaining: &mut Option<Duration>, elapsed: Duration) {
+    if let Some(budget) = remaining {
+        *budget = budget.saturating_sub(elapsed);
+    }
+}
+
 impl Scanner {
     pub fn new(database: Database, dns: DnsEngine, options: ScanOptions) -> Self {
+        let passive_concurrency = options.passive_concurrency.clamp(1, 32);
         Self {
             database,
             dns,
             trusted_dns: None,
             options,
             progress: None,
+            passive_request_slots: Arc::new(tokio::sync::Semaphore::new(passive_concurrency)),
         }
     }
 
@@ -437,6 +485,38 @@ impl Scanner {
     fn emit(&self, event: ProgressEvent) {
         if let Some(progress) = &self.progress {
             progress(event);
+        }
+    }
+
+    async fn await_with_phase_heartbeat<F, T>(
+        &self,
+        name: impl Into<String>,
+        detail: impl Into<String>,
+        future: F,
+    ) -> T
+    where
+        F: std::future::Future<Output = T>,
+    {
+        const HEARTBEAT_EVERY: Duration = Duration::from_secs(5);
+
+        let name = name.into();
+        let detail = detail.into();
+        let started = Instant::now();
+        tokio::pin!(future);
+        loop {
+            tokio::select! {
+                biased;
+                output = &mut future => return output,
+                _ = tokio::time::sleep(HEARTBEAT_EVERY) => {
+                    self.emit(ProgressEvent::Phase {
+                        name: name.clone(),
+                        detail: format!(
+                            "{detail}; en cours depuis {:.0}s",
+                            started.elapsed().as_secs_f64()
+                        ),
+                    });
+                }
+            }
         }
     }
 
@@ -477,6 +557,30 @@ impl Scanner {
         root_wildcard
     }
 
+    fn is_strict_enrichment_seed(
+        answer: &ResolvedHost,
+        root_wildcard: &BTreeSet<String>,
+        wildcard_by_parent: &BTreeMap<String, BTreeSet<String>>,
+    ) -> bool {
+        let signature =
+            Self::applicable_wildcard_signature(&answer.fqdn, root_wildcard, wildcard_by_parent);
+        !wildcard_signature_is_indeterminate(signature)
+            && (!wildcard_signature_is_confirmed(signature)
+                || !DnsEngine::matches_wildcard(answer, signature))
+    }
+
+    fn answer_is_wildcard_ambiguous(
+        answer: &ResolvedHost,
+        root_wildcard: &BTreeSet<String>,
+        wildcard_by_parent: &BTreeMap<String, BTreeSet<String>>,
+    ) -> bool {
+        let signature =
+            Self::applicable_wildcard_signature(&answer.fqdn, root_wildcard, wildcard_by_parent);
+        wildcard_signature_is_indeterminate(signature)
+            || (wildcard_signature_is_confirmed(signature)
+                && DnsEngine::matches_wildcard(answer, signature))
+    }
+
     fn reclassify_cached_wildcard_matches(
         &self,
         scan_id: i64,
@@ -485,24 +589,37 @@ impl Scanner {
         wildcard_by_parent: &BTreeMap<String, BTreeSet<String>>,
     ) -> Result<(usize, usize)> {
         let inventory = self.database.inventory(Some(domain), false)?;
+        let inventory_states = inventory
+            .iter()
+            .map(|entry| (entry.fqdn.clone(), entry.state))
+            .collect::<BTreeMap<_, _>>();
+        let names = inventory
+            .iter()
+            .map(|entry| entry.fqdn.clone())
+            .chain(self.database.positive_cache_names(domain)?)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let cached = self.database.fresh_cache(&names)?;
         let mut confirmed = Vec::new();
         let mut uncertain = Vec::new();
-        for entry in inventory {
-            let signature =
-                Self::applicable_wildcard_signature(&entry.fqdn, root_wildcard, wildcard_by_parent);
-            if wildcard_signature_is_confirmed(signature) {
-                confirmed.push(entry.fqdn);
-            } else if wildcard_signature_is_indeterminate(signature)
-                && entry.state != crate::model::ObservationState::Unverified
-            {
-                uncertain.push(entry.fqdn);
-            }
-        }
-        for fqdn in self.database.positive_cache_names(domain)? {
+        for fqdn in names {
             let signature =
                 Self::applicable_wildcard_signature(&fqdn, root_wildcard, wildcard_by_parent);
-            if wildcard_signature_is_confirmed(signature) {
+            let answer = cached.get(&fqdn).and_then(|entry| match entry {
+                CachedAnswer::Positive(answer) => Some(answer),
+                CachedAnswer::Negative => None,
+            });
+            if wildcard_signature_is_confirmed(signature)
+                && answer.is_some_and(|answer| DnsEngine::matches_wildcard(answer, signature))
+            {
                 confirmed.push(fqdn);
+            } else if wildcard_signature_is_indeterminate(signature)
+                && inventory_states
+                    .get(&fqdn)
+                    .is_some_and(|state| *state != crate::model::ObservationState::Unverified)
+            {
+                uncertain.push(fqdn);
             }
         }
         confirmed.sort();
@@ -587,6 +704,8 @@ impl Scanner {
         domain: &str,
         answers: &BTreeMap<String, ResolvedHost>,
         services: &[ServiceEndpoint],
+        root_wildcard: &BTreeSet<String>,
+        wildcard_by_parent: &BTreeMap<String, BTreeSet<String>>,
     ) -> Vec<(String, u16, String)> {
         let hinted = services
             .iter()
@@ -605,9 +724,17 @@ impl Scanner {
             })
             .collect::<BTreeSet<_>>();
         let mut endpoints = answers
-            .keys()
-            .cloned()
-            .map(|host| (host, self.options.tls_port, "tcp-tls".to_owned()))
+            .values()
+            .filter(|answer| {
+                Self::is_strict_enrichment_seed(answer, root_wildcard, wildcard_by_parent)
+            })
+            .map(|answer| {
+                (
+                    answer.fqdn.clone(),
+                    self.options.tls_port,
+                    "tcp-tls".to_owned(),
+                )
+            })
             .collect::<Vec<_>>();
         endpoints.push((
             domain.to_owned(),
@@ -691,6 +818,103 @@ impl Scanner {
         Ok(candidates)
     }
 
+    /// Keep only a small, durable page in SQLite. Expensive corpora are fed on
+    /// demand after the previous DNS wave completes, so DNS starts without a
+    /// one-million-row insertion pause.
+    fn refill_candidate_queue(
+        &self,
+        scan_id: i64,
+        domain: &str,
+        observed_names: &BTreeMap<String, BTreeSet<String>>,
+        target_queued: usize,
+    ) -> Result<usize> {
+        let queued = self.database.pending_scan_candidate_count(scan_id)?.max(0) as usize;
+        let total = self.database.scan_candidate_budget_count(scan_id)?.max(0) as usize;
+        if queued >= target_queued || total >= self.options.max_words {
+            return Ok(queued);
+        }
+
+        let mut capacity =
+            candidate_refill_capacity(queued, total, target_queued, self.options.max_words);
+        let mut inserted = 0_usize;
+
+        if let Some(path) = &self.options.wordlist
+            && capacity > 0
+            && !self
+                .database
+                .scan_candidate_feed_exhausted(scan_id, "wordlist")?
+        {
+            let (added, exhausted) = self
+                .database
+                .refill_wordlist_candidates(scan_id, domain, path, capacity)?;
+            inserted += added;
+            capacity = capacity.saturating_sub(added);
+            // A user-supplied wordlist has priority over the embedded corpus.
+            // If this bounded page contained only duplicates/invalid lines,
+            // keep its remaining budget for the next cursor page instead of
+            // letting built-ins consume `max_words` first.
+            if !exhausted {
+                return Ok(queued.saturating_add(inserted));
+            }
+        }
+
+        const HIGH_VALUE_WINDOW: usize = 5_000;
+        if capacity > 0 {
+            let prioritized =
+                self.ordered_candidates(domain, observed_names.keys().cloned(), HIGH_VALUE_WINDOW)?;
+            let requested = capacity;
+            let payload = prioritized
+                .into_iter()
+                .map(|candidate| {
+                    (
+                        candidate.relative_name,
+                        candidate.generator,
+                        candidate.score,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let added = self
+                .database
+                .persist_scan_candidates_bounded(scan_id, domain, &payload, requested)?;
+            inserted += added;
+            capacity = capacity.saturating_sub(added);
+        }
+
+        if capacity > 0 {
+            inserted += self
+                .database
+                .persist_prior_candidates_to_scan(scan_id, domain, capacity)?;
+        }
+        Ok(queued.saturating_add(inserted))
+    }
+
+    fn candidate_feeds_have_more(&self, scan_id: i64) -> Result<bool> {
+        if self.database.scan_candidate_budget_count(scan_id)?.max(0) as usize
+            >= self.options.max_words
+        {
+            return Ok(false);
+        }
+        if self.options.wordlist.is_some()
+            && !self
+                .database
+                .scan_candidate_feed_exhausted(scan_id, "wordlist")?
+        {
+            return Ok(true);
+        }
+        Ok(!self
+            .database
+            .scan_candidate_feed_exhausted(scan_id, "builtin")?)
+    }
+
+    fn explicit_wordlist_has_more(&self, scan_id: i64) -> Result<bool> {
+        Ok(self.options.wordlist.is_some()
+            && (self.database.scan_candidate_budget_count(scan_id)?.max(0) as usize)
+                < self.options.max_words
+            && !self
+                .database
+                .scan_candidate_feed_exhausted(scan_id, "wordlist")?)
+    }
+
     fn recursive_wordlist(&self) -> Result<Vec<String>> {
         let mut words = Vec::new();
         let mut seen = BTreeSet::new();
@@ -717,12 +941,16 @@ impl Scanner {
     async fn collect_passive(
         &self,
         domain: &str,
+        passive_deadline: Option<tokio::time::Instant>,
         sources: &mut BTreeMap<String, BTreeSet<String>>,
         warnings: &mut Vec<String>,
     ) -> Result<()> {
         let now = now_epoch();
         let freshness = self.options.passive_refresh.as_secs().min(i64::MAX as u64) as i64;
-        let mut cooldowns = if self.options.adaptive && self.options.automatic_source_selection {
+        // Candidate-wave adaptivity and provider health are independent. An
+        // exhaustive brute-force scan must not repeatedly block on a provider
+        // that the automatic source scheduler already knows is unhealthy.
+        let mut cooldowns = if self.options.automatic_source_selection {
             self.database
                 .source_cooldowns(Duration::from_secs(24 * 3_600))?
         } else {
@@ -740,7 +968,7 @@ impl Scanner {
             cooldowns.remove("otx");
         }
         let mut external_pauses = BTreeMap::new();
-        if self.options.adaptive && self.options.automatic_source_selection {
+        if self.options.automatic_source_selection {
             for source in &self.options.passive_sources {
                 let key = format!("source.retry_until.{source}");
                 if let Some(retry_until) = self
@@ -809,21 +1037,101 @@ impl Scanner {
                 source.clone(),
             )
         });
-        let mut results = stream::iter(refresh)
+        let mut stale_fallbacks = BTreeMap::new();
+        let refresh = refresh
+            .into_iter()
             .map(|(source, stale)| {
+                if let Some(stale) = stale {
+                    stale_fallbacks.insert(source.clone(), stale);
+                }
+                source
+            })
+            .collect::<Vec<_>>();
+        let mut unfinished_sources = refresh.iter().cloned().collect::<BTreeSet<_>>();
+        let started_sources = Arc::new(Mutex::new(BTreeSet::<String>::new()));
+        let refresh_total = refresh.len();
+        let mut refresh_finished = 0_usize;
+        let mut phase_timed_out = false;
+        let mut results = stream::iter(refresh)
+            .map(|source| {
                 let keys = keys.clone();
+                let started_sources = started_sources.clone();
+                let passive_request_slots = self.passive_request_slots.clone();
                 async move {
+                    let _permit = passive_request_slots
+                        .acquire_owned()
+                        .await
+                        .expect("le sémaphore passif reste ouvert pendant le scan");
+                    if let Ok(mut started_sources) = started_sources.lock() {
+                        started_sources.insert(source.clone());
+                    }
                     let started = Instant::now();
                     let result =
                         fetch_passive(&source, domain, source_policy(&source).timeout, &keys).await;
-                    (source, stale, started.elapsed().as_millis(), result)
+                    (source, started.elapsed().as_millis(), result)
                 }
             })
-            .buffer_unordered(5);
-        while let Some((source, stale, duration_ms, result)) = results.next().await {
+            // Providers use independent host-specific throttles; a slightly
+            // wider scheduler avoids one slow service holding unrelated fast
+            // sources while keeping the network footprint bounded.
+            .buffer_unordered(8);
+        let deadline_sleep = async move {
+            if let Some(deadline) = passive_deadline {
+                tokio::time::sleep_until(deadline).await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        };
+        tokio::pin!(deadline_sleep);
+        let mut heartbeat = tokio::time::interval_at(
+            tokio::time::Instant::now() + Duration::from_secs(1),
+            Duration::from_secs(1),
+        );
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            let poll = tokio::select! {
+                biased;
+                _ = &mut deadline_sleep => None,
+                _ = heartbeat.tick() => {
+                    let started = started_sources
+                        .lock()
+                        .map(|sources| sources.len())
+                        .unwrap_or_default();
+                    let active = started.saturating_sub(refresh_finished);
+                    let remaining = passive_deadline
+                        .map(|deadline| format!("{}s", deadline.saturating_duration_since(tokio::time::Instant::now()).as_secs()))
+                        .unwrap_or_else(|| "illimité".to_owned());
+                    self.emit(ProgressEvent::Phase {
+                        name: "passif".to_owned(),
+                        detail: format!(
+                            "{refresh_finished}/{refresh_total} source(s), {active} active(s), budget restant {remaining}"
+                        ),
+                    });
+                    continue;
+                }
+                next = results.next() => Some(next),
+            };
+            let Some(next) = poll else {
+                let unfinished = refresh_total.saturating_sub(refresh_finished);
+                let warning = format!(
+                    "budget passif de {:.1}s atteint; {unfinished} source(s) lente(s) annulée(s), mémoire permanente conservée",
+                    self.options.passive_phase_timeout.as_secs_f64()
+                );
+                self.emit(ProgressEvent::Warning(warning.clone()));
+                warnings.push(warning);
+                phase_timed_out = true;
+                break;
+            };
+            let Some((source, duration_ms, result)) = next else {
+                break;
+            };
+            refresh_finished = refresh_finished.saturating_add(1);
+            unfinished_sources.remove(&source);
+            let stale = stale_fallbacks.remove(&source);
             match result {
-                Ok(names) => {
-                    let names = names.into_iter().collect::<Vec<_>>();
+                Ok(fetch) => {
+                    let partial_warning = fetch.partial_warning;
+                    let names = fetch.names.into_iter().collect::<Vec<_>>();
                     let network_names = names.len();
                     let names = self.database.store_passive_cache(domain, &source, &names)?;
                     if source == "commoncrawl"
@@ -836,18 +1144,34 @@ impl Scanner {
                         &source,
                         network_names,
                         duration_ms,
-                        None,
+                        partial_warning.as_deref(),
                     )?;
+                    if let Some(partial_warning) = &partial_warning {
+                        let warning = format!(
+                            "{source}: {partial_warning}; {} nom(s) frais conservé(s)",
+                            network_names
+                        );
+                        self.emit(ProgressEvent::Warning(warning.clone()));
+                        warnings.push(warning);
+                    }
                     self.emit(ProgressEvent::PassiveSource {
                         source: source.clone(),
-                        status: "réseau + mémoire permanente".to_owned(),
+                        status: if partial_warning.is_some() {
+                            "réseau partiel + mémoire permanente".to_owned()
+                        } else {
+                            "réseau + mémoire permanente".to_owned()
+                        },
                         names: names.len(),
                     });
                     for name in names {
                         sources
                             .entry(name)
                             .or_default()
-                            .insert(format!("passive:{source}"));
+                            .insert(if partial_warning.is_some() {
+                                format!("passive:{source}:partial")
+                            } else {
+                                format!("passive:{source}")
+                            });
                     }
                 }
                 Err(error) => {
@@ -884,6 +1208,41 @@ impl Scanner {
                                 .insert(format!("passive:{source}:stale"));
                         }
                     }
+                }
+            }
+        }
+        drop(results);
+        if phase_timed_out {
+            let timeout_ms = self.options.passive_phase_timeout.as_millis();
+            let started_sources = started_sources
+                .lock()
+                .map(|sources| sources.clone())
+                .unwrap_or_default();
+            for source in unfinished_sources {
+                let started = started_sources.contains(&source);
+                if started {
+                    self.database.record_source_result(
+                        &source,
+                        0,
+                        timeout_ms,
+                        Some("budget passif global dépassé"),
+                    )?;
+                }
+                let names = stale_fallbacks.remove(&source).unwrap_or_default();
+                self.emit(ProgressEvent::PassiveSource {
+                    source: source.clone(),
+                    status: if started {
+                        "cache périmé, requête lente annulée".to_owned()
+                    } else {
+                        "cache périmé, source différée par le budget".to_owned()
+                    },
+                    names: names.len(),
+                });
+                for name in names {
+                    sources
+                        .entry(name)
+                        .or_default()
+                        .insert(format!("passive:{source}:stale"));
                 }
             }
         }
@@ -1023,6 +1382,7 @@ impl Scanner {
         &self,
         root_domain: &str,
         zones: impl IntoIterator<Item = String>,
+        passive_deadline: Option<tokio::time::Instant>,
         queried_zones: &mut BTreeSet<String>,
         sources: &mut BTreeMap<String, BTreeSet<String>>,
         warnings: &mut Vec<String>,
@@ -1033,6 +1393,7 @@ impl Scanner {
             _ => 3,
         };
         let before = sources.keys().cloned().collect::<BTreeSet<_>>();
+        let mut tasks = Vec::new();
         for zone in zones
             .into_iter()
             .filter(|zone| zone != root_domain)
@@ -1066,19 +1427,59 @@ impl Scanner {
                 trusted_dns: self.trusted_dns.clone(),
                 options,
                 progress: self.progress.clone(),
+                passive_request_slots: self.passive_request_slots.clone(),
             };
-            self.emit(ProgressEvent::Phase {
-                name: "passif récursif".to_owned(),
-                detail: format!(
-                    "zone {zone} ({})",
-                    if child_query { "fille" } else { "parente" }
-                ),
-            });
-            let mut zone_sources = BTreeMap::new();
-            let mut zone_warnings = Vec::new();
-            recursive_scanner
-                .collect_passive(&zone, &mut zone_sources, &mut zone_warnings)
-                .await?;
+            tasks.push((zone, child_query, recursive_scanner));
+        }
+
+        let zone_total = tasks.len();
+        let mut zone_completed = 0_usize;
+        let recursive_deadline = passive_deadline;
+        let mut pending = stream::iter(tasks)
+            .map(|(zone, child_query, recursive_scanner)| async move {
+                recursive_scanner.emit(ProgressEvent::Phase {
+                    name: "passif récursif".to_owned(),
+                    detail: format!(
+                        "zone {zone} ({})",
+                        if child_query { "fille" } else { "parente" }
+                    ),
+                });
+                let mut zone_sources = BTreeMap::new();
+                let mut zone_warnings = Vec::new();
+                let result = recursive_scanner
+                    .collect_passive(
+                        &zone,
+                        passive_deadline,
+                        &mut zone_sources,
+                        &mut zone_warnings,
+                    )
+                    .await;
+                (zone, zone_sources, zone_warnings, result)
+            })
+            .buffer_unordered(self.options.passive_zone_concurrency.clamp(1, 32));
+        loop {
+            let next = if let Some(deadline) = recursive_deadline {
+                match tokio::time::timeout_at(deadline, pending.next()).await {
+                    Ok(next) => next,
+                    Err(_) => {
+                        let unfinished = zone_total.saturating_sub(zone_completed);
+                        let warning = format!(
+                            "budget passif récursif de {:.1}s atteint; {unfinished} zone(s) restante(s) annulée(s)",
+                            self.options.passive_phase_timeout.as_secs_f64()
+                        );
+                        self.emit(ProgressEvent::Warning(warning.clone()));
+                        warnings.push(warning);
+                        break;
+                    }
+                }
+            } else {
+                pending.next().await
+            };
+            let Some((zone, zone_sources, zone_warnings, result)) = next else {
+                break;
+            };
+            result?;
+            zone_completed = zone_completed.saturating_add(1);
             warnings.extend(
                 zone_warnings
                     .into_iter()
@@ -1148,9 +1549,13 @@ impl Scanner {
         let wildcard_signature =
             Self::applicable_wildcard_signature(&answer.fqdn, root_wildcard, wildcard_by_parent);
         let wildcard_indeterminate = wildcard_signature_is_indeterminate(wildcard_signature);
-        let wildcard = wildcard_signature_is_confirmed(wildcard_signature);
+        let wildcard = wildcard_signature_is_confirmed(wildcard_signature)
+            && DnsEngine::matches_wildcard(answer, wildcard_signature);
         let wildcard_ambiguous = wildcard || wildcard_indeterminate;
-        if wildcard_ambiguous && !self.options.include_wildcard && !strong_observation {
+        if wildcard && !self.options.include_wildcard {
+            return None;
+        }
+        if wildcard_indeterminate && !self.options.include_wildcard && !strong_observation {
             return None;
         }
         let recently_verified = answer.last_verified_at.is_some_and(|checked_at| {
@@ -1187,6 +1592,49 @@ impl Scanner {
         })
     }
 
+    fn finding_for_unresolved_seed(
+        &self,
+        fqdn: String,
+        sources: BTreeSet<String>,
+        fallback_state: crate::model::ObservationState,
+        root_wildcard: &BTreeSet<String>,
+        wildcard_by_parent: &BTreeMap<String, BTreeSet<String>>,
+    ) -> Finding {
+        let families = evidence_families(&sources);
+        let authoritative = families.contains(&crate::model::EvidenceFamily::Authoritative);
+        let signature =
+            Self::applicable_wildcard_signature(&fqdn, root_wildcard, wildcard_by_parent);
+        let wildcard_ambiguous = !authoritative
+            && (wildcard_signature_is_confirmed(signature)
+                || wildcard_signature_is_indeterminate(signature));
+        let state = if authoritative {
+            crate::model::ObservationState::Live
+        } else {
+            fallback_state
+        };
+        let from_cache = sources
+            .iter()
+            .all(|source| source.contains(":cache") || source.contains(":stale"));
+        let confidence = assess_confidence(
+            &sources,
+            wildcard_ambiguous,
+            state,
+            authoritative && !from_cache,
+        );
+        Finding {
+            fqdn,
+            records: Vec::new(),
+            sources,
+            wildcard: wildcard_ambiguous,
+            from_cache,
+            confidence,
+            state,
+            last_verified_at: None,
+            evidence_families: families,
+            authoritative_validation: authoritative,
+        }
+    }
+
     fn append_persistent_inventory(
         &self,
         domain: &str,
@@ -1216,8 +1664,9 @@ impl Scanner {
             });
             let signature =
                 Self::applicable_wildcard_signature(&entry.fqdn, root_wildcard, wildcard_by_parent);
-            let wildcard = wildcard_signature_is_confirmed(signature)
-                || wildcard_signature_is_indeterminate(signature);
+            let wildcard = wildcard_signature_is_indeterminate(signature)
+                || (wildcard_signature_is_confirmed(signature)
+                    && answer.is_some_and(|answer| DnsEngine::matches_wildcard(answer, signature)));
             let state = if wildcard {
                 crate::model::ObservationState::Unverified
             } else {
@@ -1249,6 +1698,7 @@ impl Scanner {
     async fn resolve_batch(
         &self,
         scan_id: i64,
+        domain: &str,
         hosts: &[String],
         phase: &str,
         scan_started: &Instant,
@@ -1367,12 +1817,7 @@ impl Scanner {
         let mut validation_candidates = Vec::new();
         let mut suppressed_wildcard = 0_usize;
         for answer in network_answers {
-            let signature = Self::applicable_wildcard_signature(
-                &answer.fqdn,
-                root_wildcard,
-                wildcard_by_parent,
-            );
-            if signature.is_empty() {
+            if Self::is_strict_enrichment_seed(&answer, root_wildcard, wildcard_by_parent) {
                 validation_candidates.push(answer);
             } else if self
                 .finding_for_answer(
@@ -1398,26 +1843,67 @@ impl Scanner {
             });
         }
         if let Some(trusted_dns) = &self.trusted_dns {
-            let validations = stream::iter(validation_candidates)
+            let validation_total = validation_candidates.len();
+            let validation_started = Instant::now();
+            let mut validations = stream::iter(validation_candidates)
                 .map(|answer| async move {
                     let fqdn = answer.fqdn.clone();
-                    let outcome = trusted_dns.resolve_host_consensus_classified(&fqdn).await;
+                    let outcome = match trusted_dns.resolve_host_consensus_classified(&fqdn).await {
+                        DnsResolutionOutcome::Positive(mut consensus) => {
+                            consensus.authoritative_validation =
+                                trusted_dns.authoritative_confirms(&consensus.fqdn).await;
+                            DnsResolutionOutcome::Positive(consensus)
+                        }
+                        outcome => outcome,
+                    };
                     (fqdn, outcome)
                 })
-                .buffer_unordered(trusted_dns.concurrency().min(64))
-                .collect::<Vec<_>>()
-                .await;
+                .buffer_unordered(trusted_dns.concurrency().clamp(1, 32));
             let mut validated = Vec::new();
-            for (fqdn, outcome) in validations {
-                match outcome {
-                    DnsResolutionOutcome::Positive(mut consensus) => {
-                        consensus.authoritative_validation =
-                            trusted_dns.authoritative_confirms(&consensus.fqdn).await;
-                        validated.push(consensus);
+            let mut validation_processed = 0_usize;
+            let mut validation_heartbeat = tokio::time::interval_at(
+                tokio::time::Instant::now() + Duration::from_millis(250),
+                Duration::from_millis(250),
+            );
+            validation_heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    next = validations.next() => {
+                        let Some((fqdn, outcome)) = next else {
+                            break;
+                        };
+                        validation_processed += 1;
+                        match outcome {
+                            DnsResolutionOutcome::Positive(consensus) => validated.push(consensus),
+                            DnsResolutionOutcome::Negative { .. }
+                            | DnsResolutionOutcome::Indeterminate { .. } => {
+                                indeterminate.push(fqdn);
+                            }
+                        }
+                        if validation_processed == validation_total {
+                            self.emit(ProgressEvent::DnsProgress {
+                                phase: format!("{phase} trusted"),
+                                processed: validation_processed,
+                                total: validation_total,
+                                found: validated.len(),
+                                cache_hits: 0,
+                                rate: validation_processed as f64
+                                    / validation_started.elapsed().as_secs_f64().max(0.001),
+                                elapsed_ms: scan_started.elapsed().as_millis(),
+                            });
+                        }
                     }
-                    DnsResolutionOutcome::Negative { .. }
-                    | DnsResolutionOutcome::Indeterminate { .. } => {
-                        indeterminate.push(fqdn);
+                    _ = validation_heartbeat.tick(), if validation_processed < validation_total => {
+                        self.emit(ProgressEvent::DnsProgress {
+                            phase: format!("{phase} trusted"),
+                            processed: validation_processed,
+                            total: validation_total,
+                            found: validated.len(),
+                            cache_hits: 0,
+                            rate: validation_processed as f64
+                                / validation_started.elapsed().as_secs_f64().max(0.001),
+                            elapsed_ms: scan_started.elapsed().as_millis(),
+                        });
                     }
                 }
             }
@@ -1472,6 +1958,24 @@ impl Scanner {
         )?;
         let resolved_from_network = network_answers.len();
         answers.extend(network_answers);
+        let incremental_findings = answers
+            .iter()
+            .filter_map(|answer| {
+                self.finding_for_answer(
+                    answer,
+                    sources,
+                    root_wildcard,
+                    parent_by_host,
+                    wildcard_by_parent,
+                )
+            })
+            .collect::<Vec<_>>();
+        self.database.persist_findings(
+            scan_id,
+            domain,
+            &incremental_findings,
+            self.options.ttl_cap,
+        )?;
         Ok((answers, cache_hits, resolved_from_network))
     }
 
@@ -1487,6 +1991,9 @@ impl Scanner {
             "pipeline_rounds": self.options.pipeline_rounds,
             "pipeline_budget": self.options.pipeline_budget,
             "passive_refresh_seconds": self.options.passive_refresh.as_secs(),
+            "passive_phase_timeout_seconds": self.options.passive_phase_timeout.as_secs(),
+            "passive_zone_concurrency": self.options.passive_zone_concurrency,
+            "passive_concurrency": self.options.passive_concurrency,
             "max_passive": self.options.max_passive,
             "passive_only": self.options.passive_only,
             "axfr": self.options.axfr,
@@ -1533,6 +2040,7 @@ impl Scanner {
             "mutation_rules": self.options.mutation_rules,
         });
         let options_hash = domain_hash(&serde_json::to_string(&options_json)?);
+        let resuming = self.options.resume.is_some();
         let scan_id = if let Some(selector) = &self.options.resume {
             let checkpoint = self
                 .database
@@ -1553,11 +2061,28 @@ impl Scanner {
         };
         self.database
             .upsert_checkpoint(scan_id, &domain, "running", &options_hash)?;
+        let superseded_candidates = if resuming {
+            0
+        } else {
+            self.database.supersede_incomplete_candidate_queues(
+                &domain,
+                scan_id,
+                Duration::from_secs(120),
+            )?
+        };
         let started = Instant::now();
         self.emit(ProgressEvent::Started {
             scan_id,
             domain: domain.clone(),
         });
+        if superseded_candidates > 0 {
+            self.emit(ProgressEvent::Phase {
+                name: "candidats".to_owned(),
+                detail: format!(
+                    "{superseded_candidates} ancien(s) candidat(s) abandonné(s) remplacé(s)"
+                ),
+            });
+        }
         let checkpoint_heartbeat = CheckpointHeartbeat::start(
             self.database.clone(),
             scan_id,
@@ -1591,83 +2116,108 @@ impl Scanner {
         let mut warnings = Vec::new();
         let mut pipeline_metrics = PipelineMetrics::default();
         let mut sources: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-        let mut passive_zones_queried = BTreeSet::from([domain.to_owned()]);
-        if self.options.passive {
-            self.emit(ProgressEvent::Phase {
-                name: "passif".to_owned(),
-                detail: format!(
-                    "{} source(s), cache {} h",
-                    self.options.passive_sources.len(),
-                    self.options.passive_refresh.as_secs() / 3_600
-                ),
-            });
-            self.collect_passive(domain, &mut sources, &mut warnings)
-                .await?;
-            let mut inferred = self.inferred_passive_zones(
-                domain,
-                sources.keys().cloned(),
-                self.options.recursive_hosts.min(20),
-            );
-            if let Some(parent) = crate::util::registrable_domain(domain)
-                && parent != domain
-            {
-                inferred.insert(0, parent);
-            }
-            self.collect_passive_recursively(
-                domain,
-                inferred,
-                &mut passive_zones_queried,
-                &mut sources,
-                &mut warnings,
-            )
-            .await?;
-        }
+        let mut passive_budget_remaining = (!self.options.passive_phase_timeout.is_zero())
+            .then_some(self.options.passive_phase_timeout);
 
-        let mut ct_monitor = CtMonitorResult::default();
-        if self.options.ct_monitor {
-            self.emit(ProgressEvent::Phase {
-                name: "CT incrémental".to_owned(),
-                detail: format!(
-                    "{} journal(aux), {} entrées maximum par journal",
-                    self.options.ct_max_logs, self.options.ct_entries_per_log
-                ),
-            });
-            match monitor_ct_logs(
-                &self.database,
-                domain,
-                self.options.ct_timeout,
-                self.options.ct_max_logs,
-                self.options.ct_entries_per_log,
-                self.options.ct_initial_backfill,
-            )
-            .await
-            {
-                Ok(result) => ct_monitor = result,
-                Err(error) => {
-                    let warning = format!("CT incrémental: {error:#}");
-                    self.emit(ProgressEvent::Warning(warning.clone()));
-                    warnings.push(warning);
-                    if let Some(cache) = self.database.passive_cache(domain, "ct-direct")? {
-                        ct_monitor.names = cache.names.into_iter().collect();
+        // These discovery families are independent network operations. Running
+        // them together turns their cold-start wall time into the slowest one,
+        // instead of adding three unrelated waits before DNS validation starts.
+        let passive_phase = async {
+            let mut passive_sources = BTreeMap::new();
+            let mut passive_warnings = Vec::new();
+            let mut queried_zones = BTreeSet::from([domain.to_owned()]);
+            let passive_phase_started = Instant::now();
+            let deadline = passive_deadline(passive_budget_remaining);
+            if self.options.passive {
+                self.emit(ProgressEvent::Phase {
+                    name: "passif".to_owned(),
+                    detail: format!(
+                        "{} source(s), cache {} h",
+                        self.options.passive_sources.len(),
+                        self.options.passive_refresh.as_secs() / 3_600
+                    ),
+                });
+                self.collect_passive(
+                    domain,
+                    deadline,
+                    &mut passive_sources,
+                    &mut passive_warnings,
+                )
+                .await?;
+                let mut inferred = self.inferred_passive_zones(
+                    domain,
+                    passive_sources.keys().cloned(),
+                    self.options.recursive_hosts.min(20),
+                );
+                if let Some(parent) = crate::util::registrable_domain(domain)
+                    && parent != domain
+                {
+                    inferred.insert(0, parent);
+                }
+                self.collect_passive_recursively(
+                    domain,
+                    inferred,
+                    deadline,
+                    &mut queried_zones,
+                    &mut passive_sources,
+                    &mut passive_warnings,
+                )
+                .await?;
+            }
+            Ok::<_, anyhow::Error>((
+                passive_sources,
+                passive_warnings,
+                queried_zones,
+                passive_phase_started.elapsed(),
+            ))
+        };
+
+        let ct_phase = async {
+            let mut ct_monitor = CtMonitorResult::default();
+            let mut ct_warnings = Vec::new();
+            if self.options.ct_monitor {
+                self.emit(ProgressEvent::Phase {
+                    name: "CT incrémental".to_owned(),
+                    detail: format!(
+                        "{} journal(aux), {} entrées maximum par journal",
+                        self.options.ct_max_logs, self.options.ct_entries_per_log
+                    ),
+                });
+                match monitor_ct_logs(
+                    &self.database,
+                    domain,
+                    self.options.ct_timeout,
+                    self.options.ct_max_logs,
+                    self.options.ct_entries_per_log,
+                    self.options.ct_initial_backfill,
+                )
+                .await
+                {
+                    Ok(result) => ct_monitor = result,
+                    Err(error) => {
+                        let warning = format!("CT incrémental: {error:#}");
+                        self.emit(ProgressEvent::Warning(warning.clone()));
+                        ct_warnings.push(warning);
+                        if let Some(cache) = self.database.passive_cache(domain, "ct-direct")? {
+                            ct_monitor.names = cache.names.into_iter().collect();
+                        }
                     }
                 }
+                self.emit(ProgressEvent::CtMonitor {
+                    logs: ct_monitor.logs_checked,
+                    entries: ct_monitor.entries_processed,
+                    failures: ct_monitor.failures,
+                    names: ct_monitor.names.len(),
+                    duration_ms: ct_monitor.duration_ms,
+                });
             }
-            for name in &ct_monitor.names {
-                sources
-                    .entry(name.clone())
-                    .or_default()
-                    .insert("passive:ct-direct".to_owned());
-            }
-            self.emit(ProgressEvent::CtMonitor {
-                logs: ct_monitor.logs_checked,
-                entries: ct_monitor.entries_processed,
-                failures: ct_monitor.failures,
-                names: ct_monitor.names.len(),
-                duration_ms: ct_monitor.duration_ms,
-            });
-        }
+            Ok::<_, anyhow::Error>((ct_monitor, ct_warnings))
+        };
 
-        let axfr_attempts = if self.options.axfr {
+        let axfr_phase = async {
+            if !self.options.axfr {
+                return (Vec::new(), Vec::new());
+            }
             self.emit(ProgressEvent::Phase {
                 name: "AXFR".to_owned(),
                 detail: "résolution des NS et transfert TCP".to_owned(),
@@ -1677,22 +2227,42 @@ impl Scanner {
             for warning in &axfr_warnings {
                 self.emit(ProgressEvent::Warning(warning.clone()));
             }
-            warnings.extend(axfr_warnings);
             for attempt in &attempts {
                 self.emit(ProgressEvent::AxfrAttempt(attempt.clone()));
-                if attempt.status == crate::model::AxfrStatus::Success {
-                    for name in &attempt.names {
-                        sources
-                            .entry(name.clone())
-                            .or_default()
-                            .insert(format!("axfr:{}", attempt.nameserver));
-                    }
+            }
+            (attempts, axfr_warnings)
+        };
+
+        let (passive_result, ct_result, (axfr_attempts, axfr_warnings)) =
+            tokio::join!(passive_phase, ct_phase, axfr_phase);
+        let (passive_sources, passive_warnings, mut passive_zones_queried, passive_elapsed) =
+            passive_result?;
+        let (ct_monitor, ct_warnings) = ct_result?;
+        if self.options.passive {
+            consume_passive_budget(&mut passive_budget_remaining, passive_elapsed);
+        }
+        warnings.extend(passive_warnings);
+        warnings.extend(ct_warnings);
+        warnings.extend(axfr_warnings);
+        for (name, origins) in passive_sources {
+            sources.entry(name).or_default().extend(origins);
+        }
+        for name in &ct_monitor.names {
+            sources
+                .entry(name.clone())
+                .or_default()
+                .insert("passive:ct-direct".to_owned());
+        }
+        for attempt in &axfr_attempts {
+            if attempt.status == crate::model::AxfrStatus::Success {
+                for name in &attempt.names {
+                    sources
+                        .entry(name.clone())
+                        .or_default()
+                        .insert(format!("axfr:{}", attempt.nameserver));
                 }
             }
-            attempts
-        } else {
-            Vec::new()
-        };
+        }
         self.database.save_axfr_attempts(scan_id, &axfr_attempts)?;
         self.cap_seed_sources(domain, &mut sources, &mut warnings);
 
@@ -1700,49 +2270,46 @@ impl Scanner {
             name: "candidats".to_owned(),
             detail: "fusion du passif, AXFR, apprentissage et wordlist".to_owned(),
         });
-        let discovered_seed_count = sources.len();
-        let first_batch_limit = if self.options.adaptive { 500 } else { 50_000 };
+        let mut seed_payload = sources
+            .iter()
+            .map(|(fqdn, origins)| {
+                (
+                    fqdn.clone(),
+                    origins.clone(),
+                    seed_candidate_priority(origins),
+                )
+            })
+            .collect::<Vec<_>>();
+        seed_payload.sort_by_key(|(fqdn, _, priority)| (Reverse(*priority), fqdn.clone()));
+        self.database.persist_scan_seed_candidates(
+            scan_id,
+            &seed_payload,
+            self.options.max_passive,
+        )?;
+        let discovered_seed_count =
+            self.database.scan_seed_candidate_count(scan_id)?.max(0) as usize;
+        let first_batch_limit = if self.options.adaptive { 500 } else { 5_000 };
+        let first_seed_limit = seed_share(first_batch_limit, !self.options.passive_only);
+        let first_seed_candidates = self
+            .database
+            .pending_scan_seed_candidates(scan_id, first_seed_limit)?;
+        let first_seed_hosts = first_seed_candidates
+            .iter()
+            .map(|(fqdn, _, _)| fqdn.clone())
+            .collect::<BTreeSet<_>>();
+        for (fqdn, persisted_sources, _) in &first_seed_candidates {
+            sources
+                .entry(fqdn.clone())
+                .or_default()
+                .extend(persisted_sources.iter().cloned());
+        }
+        let first_candidate_limit = first_batch_limit.saturating_sub(first_seed_hosts.len());
         let candidates = if self.options.passive_only {
             Vec::new()
         } else {
-            if self.database.scan_candidate_count(scan_id)? == 0 {
-                if let Some(path) = &self.options.wordlist {
-                    self.database.persist_wordlist_candidates(
-                        scan_id,
-                        domain,
-                        path,
-                        self.options.max_words,
-                    )?;
-                }
-                let queued = self.database.scan_candidate_count(scan_id)?.max(0) as usize;
-                let prioritized = self.ordered_candidates(
-                    domain,
-                    sources.keys().cloned(),
-                    self.options.max_words.saturating_sub(queued),
-                )?;
-                self.database.persist_scan_candidates(
-                    scan_id,
-                    domain,
-                    &prioritized
-                        .iter()
-                        .map(|candidate| {
-                            (
-                                candidate.relative_name.clone(),
-                                candidate.generator.clone(),
-                                candidate.score,
-                            )
-                        })
-                        .collect::<Vec<_>>(),
-                )?;
-                let queued = self.database.scan_candidate_count(scan_id)?.max(0) as usize;
-                self.database.persist_prior_candidates_to_scan(
-                    scan_id,
-                    domain,
-                    self.options.max_words.saturating_sub(queued),
-                )?;
-            }
+            self.refill_candidate_queue(scan_id, domain, &sources, first_candidate_limit)?;
             self.database
-                .pending_scan_candidates(scan_id, first_batch_limit)?
+                .pending_scan_candidates(scan_id, first_candidate_limit)?
                 .into_iter()
                 .map(|(relative_name, generator, score)| CandidateProposal {
                     relative_name,
@@ -1754,14 +2321,12 @@ impl Scanner {
         let mut attempted_words = BTreeSet::new();
         let mut generator_attempts = HashMap::<String, usize>::new();
         let mut generator_successes = HashMap::<String, usize>::new();
-        let first_wave_hosts = {
+        let first_candidate_hosts = {
             let mut add_candidates = |wave: &[CandidateProposal], label: &str| {
                 let mut hosts = Vec::new();
                 for candidate in wave {
                     let fqdn = format!("{}.{domain}", candidate.relative_name);
-                    if !sources.contains_key(&fqdn) {
-                        hosts.push(fqdn.clone());
-                    }
+                    hosts.push(fqdn.clone());
                     sources.entry(fqdn.clone()).or_default().extend([
                         label.to_owned(),
                         format!("candidate:{}", candidate.generator),
@@ -1784,7 +2349,13 @@ impl Scanner {
             add_candidates(&candidates, "dns")
         };
 
-        let initial_hosts = sources.keys().cloned().collect::<Vec<_>>();
+        let initial_hosts = first_seed_hosts
+            .iter()
+            .cloned()
+            .chain(first_candidate_hosts.iter().cloned())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
         self.emit(ProgressEvent::Phase {
             name: "wildcard".to_owned(),
             detail: "sondes aléatoires sur la racine et les sous-zones observées".to_owned(),
@@ -1845,6 +2416,7 @@ impl Scanner {
         let (initial_answers, mut cache_hits, mut network_resolved) = self
             .resolve_batch(
                 scan_id,
+                domain,
                 &initial_hosts,
                 "DNS niveau 1",
                 &started,
@@ -1854,8 +2426,32 @@ impl Scanner {
                 &wildcard_by_parent,
             )
             .await?;
+        let initial_answer_names = initial_answers
+            .iter()
+            .filter(|answer| {
+                Self::is_strict_enrichment_seed(answer, &root_wildcard, &wildcard_by_parent)
+            })
+            .map(|answer| answer.fqdn.clone())
+            .collect::<BTreeSet<_>>();
+        self.database.record_scan_candidate_results(
+            scan_id,
+            &candidates
+                .iter()
+                .map(|candidate| {
+                    let fqdn = format!("{}.{domain}", candidate.relative_name);
+                    (
+                        fqdn.clone(),
+                        candidate.relative_name.clone(),
+                        candidate.generator.clone(),
+                        initial_answer_names.contains(&fqdn),
+                    )
+                })
+                .collect::<Vec<_>>(),
+        )?;
         self.database
             .mark_scan_candidates_done(scan_id, &initial_hosts)?;
+        self.database
+            .mark_scan_seed_candidates_done(scan_id, &initial_hosts)?;
         let mut answers: BTreeMap<String, ResolvedHost> = initial_answers
             .into_iter()
             .map(|answer| (answer.fqdn.clone(), answer))
@@ -1870,17 +2466,28 @@ impl Scanner {
         let mut web_processed = BTreeSet::new();
         let mut tls_processed = BTreeSet::new();
 
-        let mut previous_positive = first_wave_hosts
+        let mut previous_positive = first_candidate_hosts
             .iter()
-            .filter(|host| answers.contains_key(*host))
+            .filter_map(|host| answers.get(host))
+            .filter(|answer| {
+                Self::is_strict_enrichment_seed(answer, &root_wildcard, &wildcard_by_parent)
+            })
             .count();
-        let passive_positive = answers.len().saturating_sub(previous_positive);
+        let passive_positive = first_seed_hosts
+            .iter()
+            .filter_map(|host| answers.get(host))
+            .filter(|answer| {
+                Self::is_strict_enrichment_seed(answer, &root_wildcard, &wildcard_by_parent)
+            })
+            .count();
         let mut wave_number = 2;
-        while !self.options.passive_only && self.database.pending_scan_candidate_count(scan_id)? > 0
-        {
-            if self.options.adaptive
+        let mut active_candidates_enabled = !self.options.passive_only;
+        loop {
+            if active_candidates_enabled
+                && self.options.adaptive
+                && !self.explicit_wordlist_has_more(scan_id)?
                 && !should_expand_adaptive_wave(
-                    root_wildcard.is_empty(),
+                    !wildcard_signature_is_indeterminate(&root_wildcard),
                     previous_positive,
                     wave_number,
                     passive_positive,
@@ -1893,31 +2500,50 @@ impl Scanner {
                         generator_attempts.values().sum::<usize>()
                     ),
                 });
-                break;
+                active_candidates_enabled = false;
             }
-            let wave_limit = if wave_number == 2 { 1_500 } else { 50_000 };
-            let wave_candidates = self
-                .database
-                .pending_scan_candidates(scan_id, wave_limit)?
-                .into_iter()
-                .map(|(relative_name, generator, score)| CandidateProposal {
-                    relative_name,
-                    generator,
-                    score,
-                })
-                .collect::<Vec<_>>();
-            if wave_candidates.is_empty() {
-                break;
+            let wave_limit = if self.options.adaptive && wave_number == 2 {
+                1_500
+            } else {
+                5_000
+            };
+            let wave_seed_candidates = self.database.pending_scan_seed_candidates(
+                scan_id,
+                seed_share(wave_limit, active_candidates_enabled),
+            )?;
+            let wave_seed_hosts = wave_seed_candidates
+                .iter()
+                .map(|(fqdn, _, _)| fqdn.clone())
+                .collect::<BTreeSet<_>>();
+            for (fqdn, persisted_sources, _) in &wave_seed_candidates {
+                sources
+                    .entry(fqdn.clone())
+                    .or_default()
+                    .extend(persisted_sources.iter().cloned());
             }
-            let mut wave_hosts = Vec::new();
-            let mut wave_names = Vec::with_capacity(wave_candidates.len());
+
+            let candidate_limit = wave_limit.saturating_sub(wave_seed_hosts.len());
+            let wave_candidates = if candidate_limit == 0 {
+                Vec::new()
+            } else {
+                if active_candidates_enabled {
+                    self.refill_candidate_queue(scan_id, domain, &sources, candidate_limit)?;
+                }
+                self.database
+                    .pending_scan_candidates(scan_id, candidate_limit)?
+                    .into_iter()
+                    .map(|(relative_name, generator, score)| CandidateProposal {
+                        relative_name,
+                        generator,
+                        score,
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let mut wave_candidate_hosts = BTreeSet::new();
             for candidate in &wave_candidates {
                 let fqdn = format!("{}.{domain}", candidate.relative_name);
-                wave_names.push(fqdn.clone());
-                if !sources.contains_key(&fqdn) {
-                    wave_hosts.push(fqdn.clone());
-                }
-                sources.entry(fqdn).or_default().extend([
+                wave_candidate_hosts.insert(fqdn.clone());
+                sources.entry(fqdn.clone()).or_default().extend([
                     format!("dns-wave-{wave_number}"),
                     format!("candidate:{}", candidate.generator),
                 ]);
@@ -1934,9 +2560,36 @@ impl Scanner {
                     );
                 }
             }
+
+            let wave_hosts = wave_seed_hosts
+                .iter()
+                .cloned()
+                .chain(wave_candidate_hosts.iter().cloned())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            if wave_hosts.is_empty() {
+                if active_candidates_enabled && self.candidate_feeds_have_more(scan_id)? {
+                    self.emit(ProgressEvent::Phase {
+                        name: "candidats".to_owned(),
+                        detail: "page sans nouveau nom; reprise au curseur suivant".to_owned(),
+                    });
+                    continue;
+                }
+                break;
+            }
+            let remaining_seeds = self
+                .database
+                .pending_scan_seed_candidate_count(scan_id)?
+                .max(0) as usize;
             self.emit(ProgressEvent::Phase {
                 name: format!("vague DNS {wave_number}"),
-                detail: format!("{} nouveau(x) candidat(s)", wave_hosts.len()),
+                detail: format!(
+                    "{} passif(s), {} actif(s), {} passif(s) restant(s)",
+                    wave_seed_hosts.len(),
+                    wave_candidate_hosts.len(),
+                    remaining_seeds
+                ),
             });
             self.register_wildcard_parents(
                 &wave_hosts,
@@ -1949,6 +2602,7 @@ impl Scanner {
             let (wave_answers, wave_cache_hits, wave_network_resolved) = self
                 .resolve_batch(
                     scan_id,
+                    domain,
                     &wave_hosts,
                     &format!("DNS vague {wave_number}"),
                     &started,
@@ -1958,11 +2612,41 @@ impl Scanner {
                     &wildcard_by_parent,
                 )
                 .await?;
+            let wave_answer_names = wave_answers
+                .iter()
+                .filter(|answer| {
+                    Self::is_strict_enrichment_seed(answer, &root_wildcard, &wildcard_by_parent)
+                })
+                .map(|answer| answer.fqdn.clone())
+                .collect::<BTreeSet<_>>();
+            self.database.record_scan_candidate_results(
+                scan_id,
+                &wave_candidates
+                    .iter()
+                    .map(|candidate| {
+                        let fqdn = format!("{}.{domain}", candidate.relative_name);
+                        (
+                            fqdn.clone(),
+                            candidate.relative_name.clone(),
+                            candidate.generator.clone(),
+                            wave_answer_names.contains(&fqdn),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            )?;
             self.database
-                .mark_scan_candidates_done(scan_id, &wave_names)?;
+                .mark_scan_candidates_done(scan_id, &wave_hosts)?;
+            self.database
+                .mark_scan_seed_candidates_done(scan_id, &wave_hosts)?;
             cache_hits += wave_cache_hits;
             network_resolved += wave_network_resolved;
-            previous_positive = wave_answers.len();
+            previous_positive = wave_answers
+                .iter()
+                .filter(|answer| wave_candidate_hosts.contains(&answer.fqdn))
+                .filter(|answer| {
+                    Self::is_strict_enrichment_seed(answer, &root_wildcard, &wildcard_by_parent)
+                })
+                .count();
             for answer in wave_answers {
                 answers.insert(answer.fqdn.clone(), answer);
             }
@@ -1985,20 +2669,30 @@ impl Scanner {
                 detail: "MX/NS/SOA/TXT/CAA/SRV/HTTPS/SVCB et zones enfants".to_owned(),
             });
             let graph_input = answers
-                .keys()
+                .values()
+                .filter(|answer| {
+                    Self::is_strict_enrichment_seed(answer, &root_wildcard, &wildcard_by_parent)
+                })
                 .take(self.options.graph_max_hosts)
-                .cloned()
+                .map(|answer| answer.fqdn.clone())
                 .collect::<Vec<_>>();
             graph_processed.extend(graph_input.iter().cloned());
-            let mut graph = discover_dns_graph(
-                &self.dns,
-                domain,
-                graph_input,
-                self.options.graph_max_hosts,
-                self.options.service_discovery,
-            )
-            .await;
-            for answer in answers.values() {
+            let mut graph = self
+                .await_with_phase_heartbeat(
+                    "graphe DNS",
+                    "interrogation des enregistrements et délégations",
+                    discover_dns_graph(
+                        &self.dns,
+                        domain,
+                        graph_input,
+                        self.options.graph_max_hosts,
+                        self.options.service_discovery,
+                    ),
+                )
+                .await;
+            for answer in answers.values().filter(|answer| {
+                Self::is_strict_enrichment_seed(answer, &root_wildcard, &wildcard_by_parent)
+            }) {
                 for record in &answer.records {
                     let target = (record.record_type == "CNAME")
                         .then(|| normalize_observed_name(&record.value, domain))
@@ -2017,6 +2711,9 @@ impl Scanner {
             if self.options.ptr_pivot {
                 let addresses = answers
                     .values()
+                    .filter(|answer| {
+                        Self::is_strict_enrichment_seed(answer, &root_wildcard, &wildcard_by_parent)
+                    })
                     .flat_map(|answer| answer.records.iter())
                     .filter(|record| matches!(record.record_type.as_str(), "A" | "AAAA"))
                     .filter_map(|record| record.value.parse().ok())
@@ -2025,7 +2722,14 @@ impl Scanner {
                     .take(self.options.ptr_max_ips)
                     .collect::<Vec<_>>();
                 graph.queried += addresses.len();
-                for (address, names) in self.dns.reverse_names(addresses).await {
+                let reverse_names = self
+                    .await_with_phase_heartbeat(
+                        "graphe DNS",
+                        "résolution inverse PTR",
+                        self.dns.reverse_names(addresses),
+                    )
+                    .await;
+                for (address, names) in reverse_names {
                     for name in names {
                         if let Some(name) = normalize_observed_name(&name, domain) {
                             graph.names.insert(name.clone());
@@ -2091,6 +2795,7 @@ impl Scanner {
                 let (graph_answers, graph_cache_hits, graph_network_resolved) = self
                     .resolve_batch(
                         scan_id,
+                        domain,
                         &graph_hosts,
                         "DNS graphe",
                         &started,
@@ -2112,15 +2817,22 @@ impl Scanner {
         }
 
         if self.options.passive && !child_zones.is_empty() {
+            let passive_phase_started = Instant::now();
+            let deadline = passive_deadline(passive_budget_remaining);
             let recursive_names = self
                 .collect_passive_recursively(
                     domain,
                     child_zones.iter().cloned(),
+                    deadline,
                     &mut passive_zones_queried,
                     &mut sources,
                     &mut warnings,
                 )
                 .await?;
+            consume_passive_budget(
+                &mut passive_budget_remaining,
+                passive_phase_started.elapsed(),
+            );
             let recursive_names = recursive_names
                 .into_iter()
                 .filter(|name| !answers.contains_key(name))
@@ -2137,6 +2849,7 @@ impl Scanner {
                 let (recursive_answers, recursive_cache_hits, recursive_network_resolved) = self
                     .resolve_batch(
                         scan_id,
+                        domain,
                         &recursive_names,
                         "DNS passif récursif",
                         &started,
@@ -2163,16 +2876,21 @@ impl Scanner {
                 name: "DNSSEC NSEC".to_owned(),
                 detail: format!("{} zone(s), parcours borné et cache permanent", zones.len()),
             });
-            let walks = discover_nsec(
-                &self.database,
-                &self.dns,
-                domain,
-                zones,
-                self.options.nsec_timeout,
-                self.options.nsec_refresh,
-                self.options.nsec_max_names,
-            )
-            .await;
+            let walks = self
+                .await_with_phase_heartbeat(
+                    "DNSSEC NSEC",
+                    "parcours des zones",
+                    discover_nsec(
+                        &self.database,
+                        &self.dns,
+                        domain,
+                        zones,
+                        self.options.nsec_timeout,
+                        self.options.nsec_refresh,
+                        self.options.nsec_max_names,
+                    ),
+                )
+                .await;
             let nsec_names = walks
                 .iter()
                 .flat_map(|walk| walk.names.iter().cloned())
@@ -2227,6 +2945,7 @@ impl Scanner {
                 let (nsec_answers, nsec_cache_hits, nsec_network_resolved) = self
                     .resolve_batch(
                         scan_id,
+                        domain,
                         &nsec_hosts,
                         "DNS NSEC",
                         &started,
@@ -2247,7 +2966,13 @@ impl Scanner {
 
         let mut web_observations = Vec::<WebObservation>::new();
         if self.options.web_discovery {
-            let mut web_hosts = answers.keys().cloned().collect::<Vec<_>>();
+            let mut web_hosts = answers
+                .values()
+                .filter(|answer| {
+                    Self::is_strict_enrichment_seed(answer, &root_wildcard, &wildcard_by_parent)
+                })
+                .map(|answer| answer.fqdn.clone())
+                .collect::<Vec<_>>();
             web_hosts.push(domain.to_owned());
             web_hosts.sort_by_key(|host| {
                 let relative = host
@@ -2274,17 +2999,22 @@ impl Scanner {
                     self.options.web_assets_per_host
                 ),
             });
-            let web = discover_web(
-                &self.database,
-                domain,
-                web_hosts.clone(),
-                self.options.web_timeout,
-                self.options.web_refresh,
-                self.options.web_concurrency,
-                self.options.web_max_bytes,
-                self.options.web_assets_per_host,
-            )
-            .await?;
+            let web = self
+                .await_with_phase_heartbeat(
+                    "web/JavaScript",
+                    "collecte des pages et assets",
+                    discover_web(
+                        &self.database,
+                        domain,
+                        web_hosts.clone(),
+                        self.options.web_timeout,
+                        self.options.web_refresh,
+                        self.options.web_concurrency,
+                        self.options.web_max_bytes,
+                        self.options.web_assets_per_host,
+                    ),
+                )
+                .await?;
             self.emit(ProgressEvent::WebDiscovery {
                 hosts: web_hosts.len(),
                 requests: web.network_requests,
@@ -2325,6 +3055,7 @@ impl Scanner {
                 let (web_answers, web_cache_hits, web_network_resolved) = self
                     .resolve_batch(
                         scan_id,
+                        domain,
                         &web_hosts_to_validate,
                         "DNS web/JS",
                         &started,
@@ -2345,7 +3076,13 @@ impl Scanner {
 
         let mut tls_certificates = Vec::new();
         if self.options.tls_certificates {
-            let endpoints = self.tls_endpoints(domain, &answers, &service_endpoints);
+            let endpoints = self.tls_endpoints(
+                domain,
+                &answers,
+                &service_endpoints,
+                &root_wildcard,
+                &wildcard_by_parent,
+            );
             tls_processed.extend(
                 endpoints
                     .iter()
@@ -2367,15 +3104,20 @@ impl Scanner {
                     ports
                 ),
             });
-            let discovery = discover_tls_certificates(
-                &self.database,
-                domain,
-                endpoints.clone(),
-                self.options.tls_timeout,
-                self.options.tls_refresh,
-                self.options.tls_concurrency,
-            )
-            .await?;
+            let discovery = self
+                .await_with_phase_heartbeat(
+                    "certificats TLS",
+                    "connexions TLS/STARTTLS et extraction SAN/CN",
+                    discover_tls_certificates(
+                        &self.database,
+                        domain,
+                        endpoints.clone(),
+                        self.options.tls_timeout,
+                        self.options.tls_refresh,
+                        self.options.tls_concurrency,
+                    ),
+                )
+                .await?;
             self.emit(ProgressEvent::TlsCertificates {
                 endpoints: endpoints.len(),
                 network: discovery.attempted_network,
@@ -2432,6 +3174,7 @@ impl Scanner {
                 let (tls_answers, tls_cache_hits, tls_network_resolved) = self
                     .resolve_batch(
                         scan_id,
+                        domain,
                         &tls_hosts,
                         "DNS certificats TLS",
                         &started,
@@ -2465,13 +3208,21 @@ impl Scanner {
                     .tls_max_hosts
                     .saturating_sub(tls_processed.len());
                 let graph_hosts = answers
-                    .keys()
+                    .values()
+                    .filter(|answer| {
+                        Self::is_strict_enrichment_seed(answer, &root_wildcard, &wildcard_by_parent)
+                    })
+                    .map(|answer| &answer.fqdn)
                     .filter(|host| !graph_processed.contains(*host))
                     .take(graph_remaining)
                     .cloned()
                     .collect::<Vec<_>>();
                 let web_hosts = answers
-                    .keys()
+                    .values()
+                    .filter(|answer| {
+                        Self::is_strict_enrichment_seed(answer, &root_wildcard, &wildcard_by_parent)
+                    })
+                    .map(|answer| &answer.fqdn)
                     .filter(|host| !web_processed.contains(*host))
                     .take(web_remaining)
                     .cloned()
@@ -2491,9 +3242,19 @@ impl Scanner {
 
                 if self.options.dns_graph && !graph_hosts.is_empty() {
                     graph_processed.extend(graph_hosts.iter().cloned());
-                    let graph =
-                        discover_dns_graph(&self.dns, domain, graph_hosts, graph_remaining, false)
-                            .await;
+                    let graph = self
+                        .await_with_phase_heartbeat(
+                            format!("pipeline événementiel {round}"),
+                            "enrichissement du graphe DNS",
+                            discover_dns_graph(
+                                &self.dns,
+                                domain,
+                                graph_hosts,
+                                graph_remaining,
+                                false,
+                            ),
+                        )
+                        .await;
                     self.database.store_discovery_graph(
                         domain,
                         &graph.edges,
@@ -2531,17 +3292,22 @@ impl Scanner {
 
                 if self.options.web_discovery && !web_hosts.is_empty() {
                     web_processed.extend(web_hosts.iter().cloned());
-                    let web = discover_web(
-                        &self.database,
-                        domain,
-                        web_hosts.clone(),
-                        self.options.web_timeout,
-                        self.options.web_refresh,
-                        self.options.web_concurrency,
-                        self.options.web_max_bytes,
-                        self.options.web_assets_per_host,
-                    )
-                    .await?;
+                    let web = self
+                        .await_with_phase_heartbeat(
+                            format!("pipeline événementiel {round}"),
+                            "collecte web/JavaScript",
+                            discover_web(
+                                &self.database,
+                                domain,
+                                web_hosts.clone(),
+                                self.options.web_timeout,
+                                self.options.web_refresh,
+                                self.options.web_concurrency,
+                                self.options.web_max_bytes,
+                                self.options.web_assets_per_host,
+                            ),
+                        )
+                        .await?;
                     self.emit(ProgressEvent::WebDiscovery {
                         hosts: web_hosts.len(),
                         requests: web.network_requests,
@@ -2568,7 +3334,13 @@ impl Scanner {
 
                 if self.options.tls_certificates && tls_remaining > 0 {
                     let endpoints = self
-                        .tls_endpoints(domain, &answers, &service_endpoints)
+                        .tls_endpoints(
+                            domain,
+                            &answers,
+                            &service_endpoints,
+                            &root_wildcard,
+                            &wildcard_by_parent,
+                        )
                         .into_iter()
                         .filter(|(host, port, transport)| {
                             !tls_processed.contains(&format!("{host}:{port}:{transport}"))
@@ -2581,15 +3353,20 @@ impl Scanner {
                             .map(|(host, port, transport)| format!("{host}:{port}:{transport}")),
                     );
                     if !endpoints.is_empty() {
-                        let discovery = discover_tls_certificates(
-                            &self.database,
-                            domain,
-                            endpoints.clone(),
-                            self.options.tls_timeout,
-                            self.options.tls_refresh,
-                            self.options.tls_concurrency,
-                        )
-                        .await?;
+                        let discovery = self
+                            .await_with_phase_heartbeat(
+                                format!("pipeline événementiel {round}"),
+                                "collecte des certificats TLS/STARTTLS",
+                                discover_tls_certificates(
+                                    &self.database,
+                                    domain,
+                                    endpoints.clone(),
+                                    self.options.tls_timeout,
+                                    self.options.tls_refresh,
+                                    self.options.tls_concurrency,
+                                ),
+                            )
+                            .await?;
                         self.emit(ProgressEvent::TlsCertificates {
                             endpoints: endpoints.len(),
                             network: discovery.attempted_network,
@@ -2637,6 +3414,7 @@ impl Scanner {
                 let (new_answers, new_cache_hits, new_network_resolved) = self
                     .resolve_batch(
                         scan_id,
+                        domain,
                         &new_hosts,
                         &format!("DNS pipeline {round}"),
                         &started,
@@ -2665,16 +3443,21 @@ impl Scanner {
                 .cloned()
                 .collect::<BTreeSet<_>>();
             if !late_zones.is_empty() {
-                let walks = discover_nsec(
-                    &self.database,
-                    &self.dns,
-                    domain,
-                    late_zones,
-                    self.options.nsec_timeout,
-                    self.options.nsec_refresh,
-                    self.options.nsec_max_names,
-                )
-                .await;
+                let walks = self
+                    .await_with_phase_heartbeat(
+                        "DNSSEC NSEC zones filles",
+                        "parcours des nouvelles zones déléguées",
+                        discover_nsec(
+                            &self.database,
+                            &self.dns,
+                            domain,
+                            late_zones,
+                            self.options.nsec_timeout,
+                            self.options.nsec_refresh,
+                            self.options.nsec_max_names,
+                        ),
+                    )
+                    .await;
                 for walk in &walks {
                     for name in &walk.names {
                         sources
@@ -2701,6 +3484,7 @@ impl Scanner {
                     let (resolved, extra_cache_hits, extra_network) = self
                         .resolve_batch(
                             scan_id,
+                            domain,
                             &hosts,
                             "DNS NSEC zones filles",
                             &started,
@@ -2734,12 +3518,7 @@ impl Scanner {
                             .is_some_and(|relative| relative.split('.').count() == depth - 1)
                     })
                     .filter(|answer| {
-                        let signature = Self::applicable_wildcard_signature(
-                            &answer.fqdn,
-                            &root_wildcard,
-                            &wildcard_by_parent,
-                        );
-                        signature.is_empty()
+                        Self::is_strict_enrichment_seed(answer, &root_wildcard, &wildcard_by_parent)
                     })
                     .map(|answer| answer.fqdn.clone())
                     .collect::<Vec<_>>();
@@ -2782,6 +3561,7 @@ impl Scanner {
                 let (round_answers, round_cache_hits, round_network_resolved) = self
                     .resolve_batch(
                         scan_id,
+                        domain,
                         &recursive_hosts,
                         &phase,
                         &started,
@@ -2839,13 +3619,72 @@ impl Scanner {
                 findings.push(finding);
             }
         }
+        let mut known_findings = findings
+            .iter()
+            .map(|finding| finding.fqdn.clone())
+            .collect::<BTreeSet<_>>();
+        let seed_candidates = self.database.scan_seed_candidates_for_output(scan_id)?;
+        let seed_cache = self.database.fresh_cache(
+            &seed_candidates
+                .iter()
+                .map(|(fqdn, _)| fqdn.clone())
+                .collect::<Vec<_>>(),
+        )?;
+        for (fqdn, seed_sources) in seed_candidates {
+            if !known_findings.insert(fqdn.clone()) {
+                continue;
+            }
+            match seed_cache.get(&fqdn) {
+                Some(CachedAnswer::Positive(answer)) => {
+                    let signature = Self::applicable_wildcard_signature(
+                        &fqdn,
+                        &root_wildcard,
+                        &wildcard_by_parent,
+                    );
+                    if wildcard_signature_is_confirmed(signature)
+                        && DnsEngine::matches_wildcard(answer, signature)
+                        && !self.options.include_wildcard
+                    {
+                        continue;
+                    }
+                    let persisted_sources = BTreeMap::from([(fqdn.clone(), seed_sources.clone())]);
+                    if let Some(finding) = self.finding_for_answer(
+                        answer,
+                        &persisted_sources,
+                        &root_wildcard,
+                        &parent_by_host,
+                        &wildcard_by_parent,
+                    ) {
+                        findings.push(finding);
+                    }
+                }
+                Some(CachedAnswer::Negative) => {
+                    findings.push(self.finding_for_unresolved_seed(
+                        fqdn,
+                        seed_sources,
+                        crate::model::ObservationState::Historical,
+                        &root_wildcard,
+                        &wildcard_by_parent,
+                    ));
+                }
+                None => {
+                    findings.push(self.finding_for_unresolved_seed(
+                        fqdn,
+                        seed_sources,
+                        crate::model::ObservationState::Unverified,
+                        &root_wildcard,
+                        &wildcard_by_parent,
+                    ));
+                }
+            }
+        }
         findings.sort_by(|left, right| left.fqdn.cmp(&right.fqdn));
 
-        self.database.record_generator_results(
-            domain,
-            &generator_attempts,
-            &generator_successes,
-        )?;
+        let durable_learning = self.database.scan_candidate_learning(scan_id)?;
+        generator_attempts = durable_learning.generator_attempts;
+        generator_successes = durable_learning.generator_successes;
+        attempted_words.extend(durable_learning.attempted_words);
+        let durable_candidate_attempts = durable_learning.total_attempts;
 
         self.emit(ProgressEvent::Phase {
             name: "SQLite".to_owned(),
@@ -2853,25 +3692,27 @@ impl Scanner {
         });
         let mut successful_words = BTreeSet::new();
         let mut successful_patterns = BTreeSet::new();
-        for finding in &findings {
-            if finding.wildcard {
-                continue;
-            }
+        let mut successful_names = self.database.live_scan_finding_names(scan_id)?;
+        successful_names.extend(
+            findings
+                .iter()
+                .filter(|finding| {
+                    !finding.wildcard && finding.state == crate::model::ObservationState::Live
+                })
+                .map(|finding| finding.fqdn.clone()),
+        );
+        for fqdn in successful_names {
             successful_words.extend(
-                labels_from_name(&finding.fqdn, domain)
+                labels_from_name(&fqdn, domain)
                     .into_iter()
                     .filter(|label| learnable_label(label)),
             );
-            if let Some(relative) = finding.fqdn.strip_suffix(&format!(".{domain}"))
+            if let Some(relative) = fqdn.strip_suffix(&format!(".{domain}"))
                 && learnable_relative_name(relative)
             {
                 successful_patterns.insert(relative.to_owned());
             }
         }
-        self.database
-            .record_word_results(domain, &attempted_words, &successful_words)?;
-        self.database
-            .record_patterns(domain, &successful_patterns)?;
         pipeline_metrics.rounds = validation_rounds;
         pipeline_metrics.events_enqueued = pipeline.enqueued;
         pipeline_metrics.duplicates_suppressed = pipeline.duplicates;
@@ -2908,10 +3749,15 @@ impl Scanner {
         self.database
             .store_pipeline_metrics(scan_id, &pipeline_metrics)?;
         let duration_ms = started.elapsed().as_millis();
-        let candidate_count =
-            discovered_seed_count.saturating_add(generator_attempts.values().sum::<usize>());
-        self.database.finalize_scan(
+        let candidate_count = discovered_seed_count.saturating_add(durable_candidate_attempts);
+        self.database.finalize_scan_with_learning(
             scan_id,
+            domain,
+            &generator_attempts,
+            &generator_successes,
+            &attempted_words,
+            &successful_words,
+            &successful_patterns,
             candidate_count,
             findings.len(),
             cache_hits,
@@ -3028,14 +3874,20 @@ pub async fn refresh_inventory_with_trusted(
         .collect::<BTreeMap<_, _>>()
         .await;
     wildcard_by_parent.extend(profiles);
+    let classification_names = classification_hosts.iter().cloned().collect::<Vec<_>>();
+    let classification_cache = database.fresh_cache(&classification_names)?;
     let wildcard_hosts = classification_hosts
         .iter()
         .filter(|host| {
-            wildcard_signature_is_confirmed(Scanner::applicable_wildcard_signature(
+            let signature = Scanner::applicable_wildcard_signature(
                 host,
                 &root_wildcard,
                 &wildcard_by_parent,
-            ))
+            );
+            wildcard_signature_is_confirmed(signature)
+                && classification_cache.get(*host).is_some_and(|cached| {
+                    matches!(cached, CachedAnswer::Positive(answer) if DnsEngine::matches_wildcard(answer, signature))
+                })
         })
         .cloned()
         .collect::<BTreeSet<_>>();
@@ -3076,10 +3928,12 @@ pub async fn refresh_inventory_with_trusted(
     let mut indeterminate = Vec::new();
     for outcome in outcomes {
         match outcome {
-            DnsResolutionOutcome::Positive(answer) if purged_wildcards.contains(&answer.fqdn) => {}
             DnsResolutionOutcome::Positive(answer)
-                if retained_wildcard_hosts.contains(&answer.fqdn)
-                    || uncertain_wildcard_hosts.contains(&answer.fqdn) =>
+                if Scanner::answer_is_wildcard_ambiguous(
+                    &answer,
+                    &root_wildcard,
+                    &wildcard_by_parent,
+                ) =>
             {
                 wildcard_resolved.push(answer);
             }
@@ -3100,22 +3954,23 @@ pub async fn refresh_inventory_with_trusted(
         let validations = stream::iter(resolved)
             .map(|answer| async move {
                 let fqdn = answer.fqdn.clone();
-                (
-                    fqdn.clone(),
-                    trusted_dns.resolve_host_consensus_classified(&fqdn).await,
-                )
+                let outcome = match trusted_dns.resolve_host_consensus_classified(&fqdn).await {
+                    DnsResolutionOutcome::Positive(mut consensus) => {
+                        consensus.authoritative_validation =
+                            trusted_dns.authoritative_confirms(&consensus.fqdn).await;
+                        DnsResolutionOutcome::Positive(consensus)
+                    }
+                    outcome => outcome,
+                };
+                (fqdn, outcome)
             })
-            .buffer_unordered(32)
+            .buffer_unordered(trusted_dns.concurrency().clamp(1, 32))
             .collect::<Vec<_>>()
             .await;
         resolved = Vec::new();
         for (fqdn, outcome) in validations {
             match outcome {
-                DnsResolutionOutcome::Positive(mut answer) => {
-                    answer.authoritative_validation =
-                        trusted_dns.authoritative_confirms(&answer.fqdn).await;
-                    resolved.push(answer);
-                }
+                DnsResolutionOutcome::Positive(answer) => resolved.push(answer),
                 DnsResolutionOutcome::Negative { .. }
                 | DnsResolutionOutcome::Indeterminate { .. } => indeterminate.push(fqdn),
             }
@@ -3220,8 +4075,8 @@ pub async fn refresh_inventory_with_trusted(
 #[cfg(test)]
 mod tests {
     use super::{
-        ScanRunGuard, Scanner, cache_requires_revalidation, external_pause_status,
-        external_retry_after_seconds, should_expand_adaptive_wave,
+        ScanRunGuard, Scanner, cache_requires_revalidation, candidate_refill_capacity,
+        external_pause_status, external_retry_after_seconds, should_expand_adaptive_wave,
         should_retry_otx_after_key_added,
     };
     use crate::db::Database;
@@ -3257,6 +4112,15 @@ mod tests {
             Duration::from_secs(3_600),
             1_100,
         ));
+    }
+
+    #[test]
+    fn lazy_refills_are_batch_bounded_and_honor_the_total_word_budget() {
+        assert_eq!(candidate_refill_capacity(0, 0, 500, 1_000_000), 500);
+        assert_eq!(candidate_refill_capacity(0, 500, 1_500, 1_000), 500);
+        assert_eq!(candidate_refill_capacity(1_200, 1_200, 1_500, 10_000), 300);
+        assert_eq!(candidate_refill_capacity(500, 500, 500, 10_000), 0);
+        assert_eq!(candidate_refill_capacity(0, 10_000, 5_000, 10_000), 0);
     }
 
     #[test]
@@ -3298,6 +4162,54 @@ mod tests {
             Scanner::applicable_wildcard_signature("a.b.c.prod.example.com", &root, &by_parent)
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn only_matching_or_indeterminate_wildcard_answers_are_terminal_seeds() {
+        let normal_root = BTreeSet::new();
+        let wildcard = BTreeSet::from(["A:192.0.2.29".to_owned()]);
+        let indeterminate = super::indeterminate_wildcard_signature();
+        let by_parent = BTreeMap::from([
+            ("example.com".to_owned(), normal_root.clone()),
+            ("prod.example.com".to_owned(), wildcard),
+            ("unknown.example.com".to_owned(), indeterminate),
+        ]);
+        let answer = |fqdn: &str, address: &str| ResolvedHost {
+            fqdn: fqdn.to_owned(),
+            records: vec![crate::model::DnsRecord {
+                record_type: "A".to_owned(),
+                value: address.to_owned(),
+                ttl: 60,
+            }],
+            from_cache: false,
+            last_verified_at: None,
+            authoritative_validation: false,
+            resolver_count: 1,
+        };
+
+        assert!(Scanner::is_strict_enrichment_seed(
+            &answer("api.example.com", "192.0.2.10"),
+            &normal_root,
+            &by_parent
+        ));
+        assert!(!Scanner::is_strict_enrichment_seed(
+            &answer("random.prod.example.com", "192.0.2.29"),
+            &normal_root,
+            &by_parent
+        ));
+        assert!(
+            Scanner::is_strict_enrichment_seed(
+                &answer("mail.prod.example.com", "192.0.2.10"),
+                &normal_root,
+                &by_parent
+            ),
+            "a legitimate answer with records distinct from the wildcard must remain usable"
+        );
+        assert!(!Scanner::is_strict_enrichment_seed(
+            &answer("api.unknown.example.com", "192.0.2.10"),
+            &normal_root,
+            &by_parent
+        ));
     }
 
     #[test]

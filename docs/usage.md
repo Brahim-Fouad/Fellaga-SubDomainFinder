@@ -29,6 +29,10 @@ fellaga scan your-domain.example --profile deep
 
 These are ceilings, not promised request counts. Adaptive mode ranks candidates and stops low-yield waves early.
 
+Fellaga does not pre-insert the full embedded corpus before DNS validation. It keeps separate persistent queues for high-value seeds (passive, CT, AXFR, cached, and learned observations) and active candidates (wordlists, mutations, learned patterns, and the embedded corpus). The queues are consumed in bounded waves and interleaved so useful passive names do not wait behind a large brute-force corpus. On the first adaptive wave, approximately three quarters of the available slots are reserved for seeds when both queues have work.
+
+Low-yield adaptive stopping applies to generated active candidates. Fellaga still drains the bounded seed queue, retries transiently failed queued names, and continues an explicit `--wordlist` until its durable cursor reaches the end or another configured hard limit stops the scan.
+
 `--passive-only` is different from `--profile passive`: it skips brute-force candidate generation but does not disable every active enrichment method. Use `--profile passive` when AXFR and the active Web, TLS, graph, NSEC, PTR, and pipeline stages must be disabled. Even the passive profile performs provider HTTP requests, Certificate Transparency collection, wildcard probes, and DNS validation, so it is not a zero-network mode.
 
 ## Custom mutation rules
@@ -59,12 +63,24 @@ fellaga scan your-domain.example --mutations custom-mutations.txt
 | `--checkpoint-every` | `30` | Persists resumable progress every 30 seconds. |
 | `--verification-max-age` | `24` | Treats a cached DNS validation as live for 24 hours. |
 
+Passive collection also has profile-specific safeguards: an active-time budget, a global connector concurrency limit, and a child-zone concurrency limit. The default active-time budgets are 75 seconds for `deep`, 45 for `balanced`, 90 for `passive`, and 30 for `turbo`; the global connector concurrency default is 8. Use `--passive-max-runtime`, `--passive-concurrency`, and `--passive-zone-concurrency` to override them. A value of `0` for `--passive-max-runtime` disables only the passive-time safeguard; the per-connector request limits still apply.
+
 `--dns-rate-limit 0` disables the DNS rate cap, and `--max-runtime 0` disables the global time limit. `--no-adaptive` asks Fellaga to exhaust configured candidate waves. These expert controls can create very high traffic and should be used only in an isolated laboratory or an explicitly authorized environment with suitable resolvers.
 
 If a scan reaches its time limit or is interrupted with Ctrl+C, the latest checkpoint remains available:
 
 ```bash
 fellaga scan your-domain.example --resume latest
+```
+
+Resume restores the two candidate queues, feed cursors, merged seed provenance, attempt counts, and durable learning counters. Transient DNS failures are attempted no more than three times in total, including attempts made before an interruption. A definitive negative answer is terminal for that queue item. Previously validated positive cache entries are reclassified through the normal wildcard and freshness rules instead of being downgraded merely because the scan restarted.
+
+### Large wordlists
+
+User wordlists are read lazily, without holding the SQLite write lock during file I/O. Each read page examines at most 1,024 lines or 4 MiB, whichever comes first. Invalid names are skipped, non-UTF-8 bytes are decoded safely, and an oversized line is discarded in bounded chunks. The byte cursor and oversized-line state are stored in SQLite, so `--resume` continues from the committed position rather than rereading the file from the beginning.
+
+```bash
+fellaga scan your-domain.example --wordlist candidates.txt --resume latest
 ```
 
 ## Freshness and output states
@@ -110,6 +126,8 @@ fellaga scan your-domain.example --stream-jsonl --only-live > live-findings.json
 
 Progress is written to standard error. Machine-readable output stays on standard output. `--quiet` disables progress messages, and `--output` or `--output-dir` writes scan results to files.
 
+Long operations emit periodic heartbeats rather than leaving the terminal apparently frozen. Passive heartbeats report completed, active, and remaining sources plus the active-time budget. DNS-validation heartbeats report completed work, and the enrichment phases periodically report how long their current bounded operation has been running.
+
 Normally, `--stream-jsonl` emits an event immediately and does not add a final domain record. With `--only-live`, Fellaga defers those events until each domain has completed its final wildcard classification, ensuring that the stream contains only final `live` non-wildcard findings.
 
 The public `Finding` object includes `fqdn`, DNS `records`, `sources`, `wildcard`, `from_cache`, `confidence`, `state`, `last_verified_at`, `evidence_families`, and `authoritative_validation`.
@@ -125,6 +143,8 @@ fellaga sources --check --target your-domain.example
 ```
 
 Use `--passive-sources` for an explicit comma-separated allowlist and `--exclude-sources` to remove providers. `--all-sources` also attempts connectors whose required credentials are missing and therefore normally creates predictable configuration errors; it is mainly a connector-diagnostic option.
+
+The initial passive phase, direct CT-log monitor, and AXFR checks run concurrently. The passive budget is charged only for elapsed passive phases, not for CT, AXFR, DNS validation, or other unrelated work. If a paginated connector returns valid pages and then times out, Fellaga saves the names already collected, marks the source result as partial/degraded, and reports the condition in progress output and scan warnings.
 
 Test resolver behavior before intensive work:
 

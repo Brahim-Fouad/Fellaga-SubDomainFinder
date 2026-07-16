@@ -57,6 +57,16 @@ Fellaga records the yield of words, relative patterns, generators, and resolver 
 
 The learning database stays on the local machine. Domain inventories are necessarily stored locally so that `list`, `refresh`, `explain`, and resume operations work, but Fellaga does not upload them.
 
+## Resumable work queues
+
+Each running scan stores two bounded work queues in SQLite. The seed queue contains full names and merged provenance from passive, CT, AXFR, cached, and learned discovery. The active queue contains generated relative names, priorities, and generator identities. Separate feed rows store cursors for the embedded corpus and optional user wordlist, so Fellaga does not need to insert or retain the entire candidate space in memory.
+
+Queue claims are atomic and include an attempt counter. Rows left in the processing state are requeued when the same checkpoint is resumed. Transient DNS failures receive at most three total attempts across runs, while definitive answers become terminal. Durable per-scan generator totals and attempted-word rows preserve learning accuracy even after terminal candidate rows are cleaned up.
+
+The final scan status, checkpoint completion, generator learning, successful words and patterns, and cleanup of temporary learning rows are committed in one transaction. The transaction is guarded against applying the same scan's learning twice. Prepared statements and queue-selection indexes keep finalization and bounded claims predictable on large databases. Physical deletion of completed or superseded queue rows is maintenance work performed after the completion commit; its failure does not reopen or fail the scan.
+
+Compatible v8 schema additions are also transactional. Fellaga adds required columns before their dependent indexes and rolls back the complete repair if any statement fails, preventing a partially upgraded database from being accepted on the next launch.
+
 ## Backup
 
 Create a consistent SQLite backup while no scan is writing to the database:
