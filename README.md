@@ -22,8 +22,6 @@ Fellaga is a fast, adaptive subdomain enumerator written in Rust for Kali Linux 
 - Text, JSON, per-domain JSONL, streaming JSONL, CSV export, and import support for common enumeration tools.
 - No telemetry, no remote cache synchronization, and no automatic sharing of targets, findings, or learned patterns.
 
-Fellaga does not claim market leadership without reproducible evidence. The repository includes a controlled DNS laboratory and a benchmark harness so coverage, false positives, throughput, and resource use can be measured transparently.
-
 ## Install
 
 ### Kali or Debian on x86-64
