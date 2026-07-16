@@ -1,6 +1,6 @@
 [package]
 name = "fellaga-subdomainfinder"
-version = "0.8.3"
+version = "0.8.4"
 edition = "2024"
 rust-version = "1.95"
 description = "Fast, learning subdomain enumerator for Kali Linux"
@@ -49,30 +49,6 @@ zstd = "0.13"
 [dev-dependencies]
 proptest = "1.8"
 tempfile = "3.20"
-
-[package.metadata.deb]
-name = "fellaga"
-maintainer = "Brahim-Fouad GUIA <170998597+Brahim-Fouad@users.noreply.github.com>"
-section = "net"
-priority = "optional"
-assets = [
-  ["target/release/fellaga", "usr/bin/fellaga", "755"],
-  ["README.md", "usr/share/doc/fellaga/README.md", "644"],
-  ["CHANGELOG.md", "usr/share/doc/fellaga/CHANGELOG.md", "644"],
-  ["CONTRIBUTING.md", "usr/share/doc/fellaga/CONTRIBUTING.md", "644"],
-  ["SECURITY.md", "usr/share/doc/fellaga/SECURITY.md", "644"],
-  ["LICENSE", "usr/share/doc/fellaga/LICENSE", "644"],
-  ["THIRD_PARTY_NOTICES.md", "usr/share/doc/fellaga/THIRD_PARTY_NOTICES.md", "644"],
-  ["docs/README.md", "usr/share/doc/fellaga/docs/README.md", "644"],
-  ["docs/installation.md", "usr/share/doc/fellaga/docs/installation.md", "644"],
-  ["docs/usage.md", "usr/share/doc/fellaga/docs/usage.md", "644"],
-  ["docs/discovery-engine.md", "usr/share/doc/fellaga/docs/discovery-engine.md", "644"],
-  ["docs/sources.md", "usr/share/doc/fellaga/docs/sources.md", "644"],
-  ["docs/local-data.md", "usr/share/doc/fellaga/docs/local-data.md", "644"],
-  ["docs/release-verification.md", "usr/share/doc/fellaga/docs/release-verification.md", "644"],
-  ["data/CORPUS_LICENSE.md", "usr/share/doc/fellaga/data/CORPUS_LICENSE.md", "644"],
-  ["data/corpus-manifest.json", "usr/share/doc/fellaga/data/corpus-manifest.json", "644"],
-]
 
 [profile.release]
 lto = "thin"

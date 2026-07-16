@@ -8,7 +8,8 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 OUT="${BENCH_OUT:-$ROOT/benchmarks/results/$STAMP-$MODE}"
 BENCH_MAX_RUNTIME="${FELLAGA_BENCH_MAX_RUNTIME:-1800}"
-BENCH_DNS_RATE="${FELLAGA_BENCH_DNS_RATE:-100}"
+BENCH_ACTIVE_MAX_RUNTIME="${FELLAGA_BENCH_ACTIVE_MAX_RUNTIME:-$BENCH_MAX_RUNTIME}"
+BENCH_DNS_RATE="${FELLAGA_BENCH_DNS_RATE:-1000}"
 BENCH_DNS_CONCURRENCY="${FELLAGA_BENCH_DNS_CONCURRENCY:-100}"
 BENCH_RESOLVER_QUERIES="${FELLAGA_BENCH_RESOLVER_QUERIES:-100000}"
 BENCH_RESOLVER_CONCURRENCY="${FELLAGA_BENCH_RESOLVER_CONCURRENCY:-128}"
@@ -18,6 +19,11 @@ BENCH_PIPELINE_CONCURRENCY="${FELLAGA_BENCH_PIPELINE_CONCURRENCY:-128}"
 BENCH_REPETITIONS="${FELLAGA_BENCH_REPETITIONS:-3}"
 BENCH_TIMEOUT_GRACE="${FELLAGA_BENCH_TIMEOUT_GRACE:-5}"
 BENCH_REQUIRE_PASS="${FELLAGA_BENCH_REQUIRE_PASS:-1}"
+BENCH_PIPELINE_BYTES_PER_CANDIDATE="${FELLAGA_BENCH_PIPELINE_BYTES_PER_CANDIDATE:-2048}"
+BENCH_PIPELINE_FIXED_BYTES="${FELLAGA_BENCH_PIPELINE_FIXED_BYTES:-2147483648}"
+BENCH_PIPELINE_DISK_MARGIN_PERCENT="${FELLAGA_BENCH_PIPELINE_DISK_MARGIN_PERCENT:-125}"
+BENCH_PUREDNS_HEADROOM_PERCENT="${FELLAGA_BENCH_PUREDNS_HEADROOM_PERCENT:-125}"
+BENCH_PROFILE_BASELINES_SPEC="${FELLAGA_BENCH_PROFILE_BASELINES:-none}"
 RESOLVERS_SOURCE="${FELLAGA_BENCH_RESOLVERS_FILE:-}"
 
 if [[ "$MODE" != "no-key" && "$MODE" != "equal-keys" ]]; then
@@ -30,11 +36,14 @@ fi
 }
 [[ -f "$DOMAINS_FILE" ]] || { echo "domains file not found" >&2; exit 2; }
 
-for value in "$BENCH_MAX_RUNTIME" "$BENCH_DNS_RATE" "$BENCH_DNS_CONCURRENCY" \
+for value in "$BENCH_MAX_RUNTIME" "$BENCH_ACTIVE_MAX_RUNTIME" \
+  "$BENCH_DNS_RATE" "$BENCH_DNS_CONCURRENCY" \
   "$BENCH_RESOLVER_QUERIES" "$BENCH_RESOLVER_CONCURRENCY" \
   "$BENCH_PIPELINE_CANDIDATES" "$BENCH_PIPELINE_BATCH" \
   "$BENCH_PIPELINE_CONCURRENCY" "$BENCH_REPETITIONS" "$BENCH_TIMEOUT_GRACE" \
-  "$BENCH_REQUIRE_PASS"; do
+  "$BENCH_REQUIRE_PASS" "$BENCH_PIPELINE_BYTES_PER_CANDIDATE" \
+  "$BENCH_PIPELINE_FIXED_BYTES" "$BENCH_PIPELINE_DISK_MARGIN_PERCENT" \
+  "$BENCH_PUREDNS_HEADROOM_PERCENT"; do
   [[ "$value" =~ ^[0-9]+$ ]] || {
     echo "benchmark numeric settings must be non-negative integers" >&2
     exit 2
@@ -58,6 +67,37 @@ done
   echo "candidate pipeline requires exactly 10000000 candidates and positive batch/concurrency" >&2
   exit 2
 }
+(( BENCH_PIPELINE_BYTES_PER_CANDIDATE > 0 \
+  && BENCH_PIPELINE_DISK_MARGIN_PERCENT >= 100 \
+  && BENCH_PUREDNS_HEADROOM_PERCENT >= 100 )) || {
+  echo "pipeline bytes per candidate must be positive; disk and PureDNS margins must be at least 100 percent" >&2
+  exit 2
+}
+
+BENCH_PROFILE_BASELINES=()
+case "${BENCH_PROFILE_BASELINES_SPEC,,}" in
+  ""|none)
+    ;;
+  all)
+    BENCH_PROFILE_BASELINES=(deep balanced passive turbo)
+    ;;
+  *)
+    IFS=',' read -r -a requested_profiles <<< "${BENCH_PROFILE_BASELINES_SPEC,,}"
+    for profile in "${requested_profiles[@]}"; do
+      case "$profile" in
+        deep|balanced|passive|turbo)
+          if [[ " ${BENCH_PROFILE_BASELINES[*]} " != *" $profile "* ]]; then
+            BENCH_PROFILE_BASELINES+=("$profile")
+          fi
+          ;;
+        *)
+          echo "FELLAGA_BENCH_PROFILE_BASELINES accepts none, all, or a comma-separated subset of deep,balanced,passive,turbo" >&2
+          exit 2
+          ;;
+      esac
+    done
+    ;;
+esac
 
 BENCH_DISCOVERY_TIMEOUT="${FELLAGA_BENCH_DISCOVERY_TIMEOUT:-$((BENCH_MAX_RUNTIME + 60))}"
 BENCH_VALIDATION_TIMEOUT="${FELLAGA_BENCH_VALIDATION_TIMEOUT:-300}"
@@ -89,6 +129,21 @@ done
   exit 6
 }
 mkdir -p "$OUT/raw" "$OUT/live" "$OUT/logs" "$OUT/state" "$OUT/config"
+
+DISK_PREFLIGHT="$OUT/disk-preflight.json"
+if ! python3 "$ROOT/benchmarks/preflight.py" disk \
+  --path "$OUT" \
+  --candidates "$BENCH_PIPELINE_CANDIDATES" \
+  --bytes-per-candidate "$BENCH_PIPELINE_BYTES_PER_CANDIDATE" \
+  --fixed-bytes "$BENCH_PIPELINE_FIXED_BYTES" \
+  --margin-percent "$BENCH_PIPELINE_DISK_MARGIN_PERCENT" \
+  --output "$DISK_PREFLIGHT" > "$OUT/logs/disk-preflight.stdout"; then
+  disk_status="$(jq -r '.status // "error"' "$DISK_PREFLIGHT" 2>/dev/null || echo error)"
+  disk_required="$(jq -r '.required_free_bytes // "unknown"' "$DISK_PREFLIGHT" 2>/dev/null || echo unknown)"
+  disk_available="$(jq -r '.available_free_bytes // "unknown"' "$DISK_PREFLIGHT" 2>/dev/null || echo unknown)"
+  echo "candidate pipeline disk preflight failed: status=$disk_status required_bytes=$disk_required available_bytes=$disk_available" >&2
+  exit 6
+fi
 
 ACTIVE_CAPTURE_PID=""
 BENCH_ISOLATED_HOME=""
@@ -243,6 +298,42 @@ if (( ${#authorized_domains[@]} == 0 )); then
   exit 2
 fi
 
+corpus="$OUT/raw/candidates-1m.txt"
+corpus_timing="$OUT/logs/corpus.time.json"
+python3 "$ROOT/benchmarks/timed.py" \
+  --timeout "$BENCH_VALIDATION_TIMEOUT" --grace "$BENCH_TIMEOUT_GRACE" \
+  "$corpus_timing" -- zstd -dc "$ROOT/data/candidates-1m.txt.zst" \
+  > "$corpus" 2> "$OUT/logs/corpus.stderr" || true
+if [[ "$(jq -r '.status' "$corpus_timing")" != "success" ]]; then
+  echo "unable to prepare the active benchmark corpus within its deadline" >&2
+  exit 6
+fi
+python3 "$ROOT/benchmarks/redact.py" "$OUT/logs/corpus.stderr"
+ACTIVE_CORPUS_CANDIDATES="$(awk 'NF { candidates++ } END { print candidates + 0 }' "$corpus")"
+(( ACTIVE_CORPUS_CANDIDATES > 0 )) || {
+  echo "active benchmark corpus contains no candidates" >&2
+  exit 6
+}
+
+PUREDNS_PREFLIGHT="$OUT/puredns-preflight.json"
+if ! python3 "$ROOT/benchmarks/preflight.py" puredns \
+  --corpus "$corpus" \
+  --rate-qps "$BENCH_DNS_RATE" \
+  --timeout-seconds "$BENCH_DISCOVERY_TIMEOUT" \
+  --headroom-percent "$BENCH_PUREDNS_HEADROOM_PERCENT" \
+  --output "$PUREDNS_PREFLIGHT" > "$OUT/logs/puredns-preflight.stdout"; then
+  puredns_status="$(jq -r '.status // "error"' "$PUREDNS_PREFLIGHT" 2>/dev/null || echo error)"
+  puredns_minimum_rate="$(jq -r '.minimum_coherent_rate_qps // "unknown"' "$PUREDNS_PREFLIGHT" 2>/dev/null || echo unknown)"
+  puredns_estimated_seconds="$(jq -r '.estimated_minimum_seconds // "unknown"' "$PUREDNS_PREFLIGHT" 2>/dev/null || echo unknown)"
+  echo "PureDNS capacity preflight failed: status=$puredns_status estimated_seconds=$puredns_estimated_seconds timeout_seconds=$BENCH_DISCOVERY_TIMEOUT minimum_rate_qps=$puredns_minimum_rate" >&2
+  exit 8
+fi
+if ! jq -e --argjson candidates "$ACTIVE_CORPUS_CANDIDATES" \
+  '.corpus_candidates == $candidates' "$PUREDNS_PREFLIGHT" >/dev/null; then
+  echo "PureDNS preflight corpus count does not match the active corpus" >&2
+  exit 8
+fi
+
 versions='{}'
 executables='{}'
 for tool in fellaga subfinder amass bbot puredns massdns dnsx; do
@@ -267,18 +358,6 @@ for tool in fellaga subfinder amass bbot puredns massdns dnsx; do
       '. + {($tool): {version: $version, sha256: $sha256}}' <<< "$executables"
   )"
 done
-
-corpus="$OUT/raw/candidates-1m.txt"
-corpus_timing="$OUT/logs/corpus.time.json"
-python3 "$ROOT/benchmarks/timed.py" \
-  --timeout "$BENCH_VALIDATION_TIMEOUT" --grace "$BENCH_TIMEOUT_GRACE" \
-  "$corpus_timing" -- zstd -dc "$ROOT/data/candidates-1m.txt.zst" \
-  > "$corpus" 2> "$OUT/logs/corpus.stderr" || true
-if [[ "$(jq -r '.status' "$corpus_timing")" != "success" ]]; then
-  echo "unable to prepare the active benchmark corpus within its deadline" >&2
-  exit 6
-fi
-python3 "$ROOT/benchmarks/redact.py" "$OUT/logs/corpus.stderr"
 
 pipeline_corpus="$OUT/raw/candidates-10m.txt"
 CAMPAIGN_ID="$STAMP-$(python3 -c 'import secrets; print(secrets.token_hex(8))')"
@@ -322,6 +401,9 @@ if [[ "$MODE" == "equal-keys" ]]; then
   keys_manifest_sha256="\"$(sha256sum "$manifest" | awk '{print $1}')\""
 fi
 domains_json="$(jq -Rsc 'split("\n") | map(select(length > 0))' "$OUT/authorized-domains.txt")"
+baseline_profiles_json="$(printf '%s\n' "${BENCH_PROFILE_BASELINES[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))')"
+disk_preflight_json="$(jq -c . "$DISK_PREFLIGHT")"
+puredns_preflight_json="$(jq -c . "$PUREDNS_PREFLIGHT")"
 jq -n \
   --arg campaign_id "$CAMPAIGN_ID" \
   --arg mode "$MODE" \
@@ -332,6 +414,7 @@ jq -n \
   --argjson repository_dirty "$repository_dirty" \
   --argjson authorized_domains "$domains_json" \
   --argjson repetitions "$BENCH_REPETITIONS" \
+  --argjson active_max_runtime "$BENCH_ACTIVE_MAX_RUNTIME" \
   --argjson discovery_timeout "$BENCH_DISCOVERY_TIMEOUT" \
   --argjson validation_timeout "$BENCH_VALIDATION_TIMEOUT" \
   --argjson transport_timeout "$BENCH_DNS_ENGINE_TIMEOUT" \
@@ -344,16 +427,24 @@ jq -n \
   --argjson pipeline_candidates "$BENCH_PIPELINE_CANDIDATES" \
   --argjson pipeline_batch "$BENCH_PIPELINE_BATCH" \
   --argjson pipeline_concurrency "$BENCH_PIPELINE_CONCURRENCY" \
+  --argjson pipeline_bytes_per_candidate "$BENCH_PIPELINE_BYTES_PER_CANDIDATE" \
+  --argjson pipeline_fixed_bytes "$BENCH_PIPELINE_FIXED_BYTES" \
+  --argjson pipeline_disk_margin "$BENCH_PIPELINE_DISK_MARGIN_PERCENT" \
+  --argjson puredns_headroom "$BENCH_PUREDNS_HEADROOM_PERCENT" \
+  --argjson baseline_profiles "$baseline_profiles_json" \
+  --argjson disk_preflight "$disk_preflight_json" \
+  --argjson puredns_preflight "$puredns_preflight_json" \
   --argjson resolver_count "$RESOLVER_COUNT" \
   --arg resolvers_sha256 "$RESOLVERS_SHA256" \
   --arg domains_sha256 "$domains_sha256" \
   --arg corpus_archive_sha256 "$corpus_archive_sha256" \
   --arg corpus_sha256 "$corpus_sha256" \
+  --argjson active_corpus_candidates "$ACTIVE_CORPUS_CANDIDATES" \
   --arg pipeline_corpus_sha256 "$pipeline_corpus_sha256" \
   --argjson keys_manifest_sha256 "$keys_manifest_sha256" \
   --argjson credential_evidence "$credential_evidence" \
   '{
-    schema_version: 1,
+    schema_version: 2,
     campaign_id: $campaign_id,
     mode: $mode,
     started_at: $started_at,
@@ -363,6 +454,7 @@ jq -n \
     configuration: {
       required_repetitions: $repetitions,
       required_tools: ["fellaga", "subfinder", "amass", "bbot", "puredns"],
+      fellaga_active_max_runtime_seconds: $active_max_runtime,
       discovery_timeout_seconds: $discovery_timeout,
       validation_timeout_seconds: $validation_timeout,
       dns_transport_timeout_seconds: $transport_timeout,
@@ -375,6 +467,11 @@ jq -n \
       candidate_pipeline_candidates: $pipeline_candidates,
       candidate_pipeline_batch: $pipeline_batch,
       candidate_pipeline_concurrency: $pipeline_concurrency,
+      candidate_pipeline_bytes_per_candidate: $pipeline_bytes_per_candidate,
+      candidate_pipeline_fixed_bytes: $pipeline_fixed_bytes,
+      candidate_pipeline_disk_margin_percent: $pipeline_disk_margin,
+      puredns_headroom_percent: $puredns_headroom,
+      fellaga_profile_baselines: $baseline_profiles,
       fellaga_cache_mode: "fresh_database_per_run",
       fellaga_config_mode: "fresh_file_per_run"
     },
@@ -385,12 +482,17 @@ jq -n \
         domains_sha256: $domains_sha256,
         active_corpus_archive_sha256: $corpus_archive_sha256,
         active_corpus_sha256: $corpus_sha256,
+        active_corpus_candidates: $active_corpus_candidates,
         pipeline_corpus_sha256: $pipeline_corpus_sha256,
         resolvers_sha256: $resolvers_sha256,
         keys_manifest_sha256: $keys_manifest_sha256
       }
     },
     credentials: $credential_evidence,
+    preflight: {
+      candidate_pipeline_disk: $disk_preflight,
+      puredns_capacity: $puredns_preflight
+    },
     dns_fairness: {
       rate_limit_qps: $dns_rate,
       concurrency: $dns_concurrency,
@@ -434,7 +536,17 @@ fi
 
 run_tool() {
   local domain="$1" tool="$2" repetition="$3"
+  local fellaga_profile="${4:-deep}"
+  local result_file="${5:-$OUT/summary.jsonl}"
+  local benchmark_kind="${6:-qualification}"
   local base="$domain.$tool.r$repetition"
+  if [[ "$benchmark_kind" == "fellaga_profile_baseline" ]]; then
+    [[ "$tool" == "fellaga" ]] || {
+      echo "profile baselines support only Fellaga" >&2
+      return 2
+    }
+    base="$domain.fellaga-profile-$fellaga_profile.r$repetition"
+  fi
   local raw="$OUT/raw/$base.txt"
   local normalized="$OUT/raw/$base.normalized.txt"
   local live_raw="$OUT/live/$base.dnsx.txt"
@@ -468,7 +580,8 @@ run_tool() {
         --timeout "$BENCH_DISCOVERY_TIMEOUT" --grace "$BENCH_TIMEOUT_GRACE" \
         "$discovery_timing" -- \
         fellaga --db "$fellaga_db" --config "$fellaga_config" \
-          scan "$domain" --profile deep --max-runtime "$BENCH_MAX_RUNTIME" \
+          scan "$domain" --profile "$fellaga_profile" --max-runtime "$BENCH_MAX_RUNTIME" \
+          --active-max-runtime "$BENCH_ACTIVE_MAX_RUNTIME" \
           --dns-rate-limit "$BENCH_DNS_RATE" \
           --concurrency "$BENCH_DNS_CONCURRENCY" \
           --resolvers "$RESOLVERS_CSV" --trusted-resolvers "$RESOLVERS_CSV" --json \
@@ -610,6 +723,8 @@ run_tool() {
   jq -nc \
     --arg campaign_id "$CAMPAIGN_ID" \
     --arg domain "$domain" --arg tool "$tool" \
+    --arg profile "$fellaga_profile" \
+    --arg benchmark_kind "$benchmark_kind" \
     --argjson repetition "$repetition" \
     --arg discovery_status "$discovery_status" \
     --arg validation_status "$validation_status" \
@@ -635,6 +750,8 @@ run_tool() {
       campaign_id: $campaign_id,
       domain: $domain,
       tool: $tool,
+      profile: (if $tool == "fellaga" then $profile else null end),
+      benchmark_kind: $benchmark_kind,
       repetition: $repetition,
       status: $status,
       discovery_status: $discovery_status,
@@ -657,7 +774,7 @@ run_tool() {
       discovery_error_log: $discovery_error_log,
       validation_error_log: $validation_error_log,
       parse_error_log: $parse_error_log
-    }' >> "$OUT/summary.jsonl"
+    }' >> "$result_file"
 }
 
 tools=(fellaga subfinder amass bbot puredns)
@@ -671,6 +788,25 @@ for (( repetition = 1; repetition <= BENCH_REPETITIONS; repetition++ )); do
     done
   done
 done
+
+if (( ${#BENCH_PROFILE_BASELINES[@]} > 0 )); then
+  baseline_results="$OUT/fellaga-profile-baselines.jsonl"
+  : > "$baseline_results"
+  for profile in "${BENCH_PROFILE_BASELINES[@]}"; do
+    if [[ "$profile" == "deep" ]]; then
+      jq -c \
+        'select(.tool == "fellaga") | .benchmark_kind = "fellaga_profile_baseline"' \
+        "$OUT/summary.jsonl" >> "$baseline_results"
+      continue
+    fi
+    for (( repetition = 1; repetition <= BENCH_REPETITIONS; repetition++ )); do
+      for domain in "${authorized_domains[@]}"; do
+        run_tool "$domain" fellaga "$repetition" "$profile" \
+          "$baseline_results" fellaga_profile_baseline
+      done
+    done
+  done
+fi
 
 dns_timing="$OUT/dns-transport.time.json"
 dns_raw="$OUT/dns-transport.raw.json"

@@ -99,7 +99,7 @@ jobs:
       - name: Install verification dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends dnsutils libssl-dev pkg-config zstd
+          sudo apt-get install -y --no-install-recommends dnsutils libssl-dev pkg-config shellcheck zstd
           cargo "+${RUST_TOOLCHAIN}" install cargo-audit --version 0.22.2 --locked
 
       - name: Verify corpus, formatting, lints and tests
@@ -107,10 +107,60 @@ jobs:
           set -euo pipefail
           test "$(zstd -dc data/candidates-1m.txt.zst | wc -l)" -eq 1000000
           echo "cde7d80ff87e21ef2c6d3021b09931a469e4ca965f2bc7816e4c143682681d9b  data/candidates-1m.txt.zst" | sha256sum -c -
+          bash -n benchmarks/run.sh
+          shellcheck benchmarks/run.sh
+          python3 -m py_compile benchmarks/names.py benchmarks/preflight.py benchmarks/redact.py benchmarks/report.py benchmarks/timed.py
+          python3 -m py_compile packaging/generate_supply_chain.py
+          python3 -m unittest discover -s benchmarks/tests -v
+          python3 -m unittest discover -s packaging/tests -v
+          grep -Fqx "fellaga (${{ needs.gate.outputs.version }}-1) unstable; urgency=medium" \
+            packaging/debian/changelog
+          grep -Fqx 'Source: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder' \
+            packaging/debian/copyright
           cargo "+${RUST_TOOLCHAIN}" fmt --all -- --check
           cargo "+${RUST_TOOLCHAIN}" clippy --all-targets --all-features --locked -- -D warnings
           cargo "+${RUST_TOOLCHAIN}" test --all-targets --all-features --locked
           cargo "+${RUST_TOOLCHAIN}" audit --deny warnings
+          cargo "+${RUST_TOOLCHAIN}" build --release --locked
+          temp="$(mktemp -d)"
+          trap 'rm -rf -- "$temp"' EXIT
+          target/release/fellaga \
+            --db "$temp/pipeline.sqlite" \
+            benchmark candidate-pipeline \
+            --wordlist "$temp/candidates.txt" \
+            --candidates 2048 \
+            --batch-size 256 \
+            --concurrency 128 \
+            --timeout 1 \
+            --campaign-id release-candidate-pipeline \
+            --output "$temp/result.json"
+          python3 - "$temp/result.json" "$temp/candidates.txt" <<'PY'
+          import hashlib
+          import json
+          import pathlib
+          import sys
+
+          result = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          for field in (
+              "requested_candidates",
+              "loaded_candidates",
+              "persisted_candidates",
+              "scheduled_candidates",
+              "dns_dispatched_candidates",
+              "processed_candidates",
+              "definitive_negative_candidates",
+          ):
+              assert result[field] == 2048, (field, result[field])
+          assert result["status"] == "success"
+          assert result["campaign_id"] == "release-candidate-pipeline"
+          assert result["positive_candidates"] == 0
+          assert result["indeterminate_candidates"] == 0
+          assert result["dns_queries"] == 4096
+          assert result["loopback_queries"] == 4096
+          fixture = pathlib.Path(sys.argv[2]).read_bytes()
+          assert hashlib.sha256(fixture).hexdigest() == result["wordlist_sha256"]
+          assert len(result["binary_sha256"]) == 64
+          PY
           tests/dns-lab/verify.sh
 
   build:
@@ -217,6 +267,53 @@ jobs:
             exit 1
           fi
 
+      - name: Generate and validate the Cargo dependency SBOM and licenses
+        run: |
+          set -euo pipefail
+          binary="target/${TARGET}/release/fellaga"
+          metadata_dir="dist/metadata/${TARGET}"
+          sbom="dist/fellaga-v${VERSION}-${TARGET}.cdx.json"
+          licenses="${metadata_dir}/THIRD_PARTY_LICENSES.txt"
+          mkdir -p "$metadata_dir"
+
+          RUSTUP_TOOLCHAIN="$RUST_TOOLCHAIN" python3 packaging/generate_supply_chain.py \
+            --manifest-path Cargo.toml \
+            --target "$TARGET" \
+            --binary "$binary" \
+            --sbom "$sbom" \
+            --licenses "$licenses" \
+            --source-date-epoch "$SOURCE_DATE_EPOCH" \
+            --features vendored-openssl
+
+          test -s "$sbom"
+          test -s "$licenses"
+          jq -e --arg version "$VERSION" --arg target "$TARGET" '
+            .bomFormat == "CycloneDX" and
+            .specVersion == "1.6" and
+            .metadata.component.name == "fellaga" and
+            .metadata.component.version == $version and
+            any(.metadata.component.properties[];
+                .name == "fellaga:binary-target" and .value == $target) and
+            (.components | length > 0) and
+            (.dependencies | length > 1) and
+            any(.components[]; .name == "tokio")
+          ' "$sbom" >/dev/null
+          expected_binary_sha="$(sha256sum "$binary" | cut -d' ' -f1)"
+          actual_binary_sha="$(jq -r '
+            .metadata.component.hashes[] |
+            select(.alg == "SHA-256") | .content
+          ' "$sbom")"
+          test "$actual_binary_sha" = "$expected_binary_sha"
+          expected_lock_sha="$(sha256sum Cargo.lock | cut -d' ' -f1)"
+          actual_lock_sha="$(jq -r '
+            .metadata.component.properties[] |
+            select(.name == "fellaga:cargo-lock-sha256") | .value
+          ' "$sbom")"
+          test "$actual_lock_sha" = "$expected_lock_sha"
+          grep -Fqx "Target: ${TARGET}" "$licenses"
+          grep -Eq '^Package: tokio [0-9]' "$licenses"
+          grep -Eq '^----- BEGIN .+ / (LICENSE|LICENCE|COPYING|NOTICE)' "$licenses"
+
       - name: Validate the canonical x86-64 binary in the DNS laboratory
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         run: |
@@ -229,10 +326,15 @@ jobs:
           package="fellaga-v${VERSION}-${TARGET}"
           stage="dist/stage/${package}"
           archive="dist/${package}.tar.gz"
+          sbom="dist/${package}.cdx.json"
+          licenses="dist/metadata/${TARGET}/THIRD_PARTY_LICENSES.txt"
           mkdir -p "$stage/docs" "$stage/data"
           install -m 0755 "target/${TARGET}/release/fellaga" "$stage/fellaga"
           install -m 0644 README.md CHANGELOG.md CONTRIBUTING.md SECURITY.md \
             LICENSE THIRD_PARTY_NOTICES.md "$stage/"
+          install -m 0644 Cargo.lock "$stage/Cargo.lock"
+          install -m 0644 "$sbom" "$stage/SBOM.cdx.json"
+          install -m 0644 "$licenses" "$stage/THIRD_PARTY_LICENSES.txt"
           install -m 0644 docs/*.md "$stage/docs/"
           install -m 0644 data/CORPUS_LICENSE.md data/corpus-manifest.json \
             "$stage/data/"
@@ -262,6 +364,10 @@ jobs:
           test -f "dist/archive-check/${package}/docs/installation.md"
           test -f "dist/archive-check/${package}/docs/release-verification.md"
           test -f "dist/archive-check/${package}/data/CORPUS_LICENSE.md"
+          test -s "dist/archive-check/${package}/SBOM.cdx.json"
+          test -s "dist/archive-check/${package}/THIRD_PARTY_LICENSES.txt"
+          cmp "$sbom" "dist/archive-check/${package}/SBOM.cdx.json"
+          cmp "$licenses" "dist/archive-check/${package}/THIRD_PARTY_LICENSES.txt"
 
       - name: Smoke-test x86-64 in pinned Kali
         if: matrix.target == 'x86_64-unknown-linux-gnu'
@@ -313,6 +419,25 @@ jobs:
           install -m 0755 "$binary" "$package_root/usr/bin/fellaga"
           install -m 0644 README.md CHANGELOG.md CONTRIBUTING.md SECURITY.md \
             LICENSE THIRD_PARTY_NOTICES.md "$package_root/usr/share/doc/fellaga/"
+          install -m 0644 Cargo.lock "$package_root/usr/share/doc/fellaga/Cargo.lock"
+          install -m 0644 \
+            "dist/fellaga-v${VERSION}-${TARGET}.cdx.json" \
+            "$package_root/usr/share/doc/fellaga/SBOM.cdx.json"
+          install -m 0644 \
+            "dist/metadata/${TARGET}/THIRD_PARTY_LICENSES.txt" \
+            "$package_root/usr/share/doc/fellaga/THIRD_PARTY_LICENSES.txt"
+          install -m 0644 packaging/debian/copyright \
+            "$package_root/usr/share/doc/fellaga/copyright"
+          {
+            printf '\n\nCorpus provenance and additional upstream notices follow.\n\n'
+            cat data/CORPUS_LICENSE.md
+            printf '\n\n'
+            cat THIRD_PARTY_NOTICES.md
+            printf '\n\nComplete generated Rust dependency license inventory follows.\n\n'
+            cat "dist/metadata/${TARGET}/THIRD_PARTY_LICENSES.txt"
+          } >> "$package_root/usr/share/doc/fellaga/copyright"
+          gzip -n -9 -c packaging/debian/changelog \
+            > "$package_root/usr/share/doc/fellaga/changelog.Debian.gz"
           install -m 0644 docs/*.md "$package_root/usr/share/doc/fellaga/docs/"
           install -m 0644 data/CORPUS_LICENSE.md data/corpus-manifest.json \
             "$package_root/usr/share/doc/fellaga/data/"
@@ -359,6 +484,13 @@ jobs:
           cmp "$binary" "$RUNNER_TEMP/deb-extract/usr/bin/fellaga"
           test -f "$RUNNER_TEMP/deb-extract/usr/share/doc/fellaga/docs/usage.md"
           test -f "$RUNNER_TEMP/deb-extract/usr/share/doc/fellaga/data/CORPUS_LICENSE.md"
+          test -s "$RUNNER_TEMP/deb-extract/usr/share/doc/fellaga/copyright"
+          test -s "$RUNNER_TEMP/deb-extract/usr/share/doc/fellaga/changelog.Debian.gz"
+          test -s "$RUNNER_TEMP/deb-extract/usr/share/doc/fellaga/SBOM.cdx.json"
+          test -s "$RUNNER_TEMP/deb-extract/usr/share/doc/fellaga/THIRD_PARTY_LICENSES.txt"
+          gzip -t "$RUNNER_TEMP/deb-extract/usr/share/doc/fellaga/changelog.Debian.gz"
+          grep -Fq 'Package: tokio ' \
+            "$RUNNER_TEMP/deb-extract/usr/share/doc/fellaga/copyright"
           dpkg-deb --info "$deb"
 
       - name: Install and smoke-test the Debian package in pinned Kali
@@ -371,23 +503,6 @@ jobs:
             -v "${deb}:/tmp/fellaga.deb:ro" \
             "$KALI_AMD64_IMAGE" \
             sh -euc 'dpkg -i /tmp/fellaga.deb >/dev/null; test "$(fellaga --version)" = "$EXPECTED_VERSION"'
-
-      - name: Generate the architecture SBOM
-        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
-        with:
-          file: dist/stage/fellaga-v${{ needs.gate.outputs.version }}-${{ matrix.target }}/fellaga
-          format: cyclonedx-json
-          output-file: dist/fellaga-v${{ needs.gate.outputs.version }}-${{ matrix.target }}.cdx.json
-          syft-version: v1.46.0
-          dependency-snapshot: false
-          upload-artifact: false
-          upload-release-assets: false
-
-      - name: Validate the SBOM
-        run: |
-          sbom="dist/fellaga-v${VERSION}-${TARGET}.cdx.json"
-          test -s "$sbom"
-          jq -e '.bomFormat == "CycloneDX"' "$sbom" >/dev/null
 
       - name: Upload the x86-64 release payload
         if: matrix.deb
@@ -454,7 +569,7 @@ jobs:
             sha256sum "${payload[@]}"
           ) > dist/SHA256SUMS
 
-      - name: Preserve published releases and clean up an interrupted draft
+      - name: Preserve published releases and clean up interrupted drafts
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -469,8 +584,20 @@ jobs:
             404)
               ;;
             200)
-              echo "Refusing to overwrite the published release for ${GITHUB_REF_NAME}" >&2
-              exit 1
+              jq -e 'type == "object" and (.id | type == "number") and (.draft | type == "boolean")' \
+                "$RUNNER_TEMP/existing-release.json" >/dev/null
+              if jq -e '.draft == true' "$RUNNER_TEMP/existing-release.json" >/dev/null; then
+                stale_release_id="$(jq -r '.id' "$RUNNER_TEMP/existing-release.json")"
+                curl --fail-with-body --silent --show-error \
+                  --request DELETE \
+                  --header "Accept: application/vnd.github+json" \
+                  --header "Authorization: Bearer ${GH_TOKEN}" \
+                  --header "X-GitHub-Api-Version: 2022-11-28" \
+                  "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/releases/${stale_release_id}"
+              else
+                echo "Refusing to overwrite the published release for ${GITHUB_REF_NAME}" >&2
+                exit 1
+              fi
               ;;
             *)
               echo "Unable to inspect release ${GITHUB_REF_NAME}; GitHub returned HTTP $status" >&2
@@ -479,13 +606,26 @@ jobs:
               ;;
           esac
 
-          curl --fail-with-body --silent --show-error \
-            --header "Accept: application/vnd.github+json" \
-            --header "Authorization: Bearer ${GH_TOKEN}" \
-            --header "X-GitHub-Api-Version: 2022-11-28" \
-            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
-            > "$RUNNER_TEMP/releases.json"
-          jq -e 'type == "array"' "$RUNNER_TEMP/releases.json" >/dev/null
+          printf '[]\n' > "$RUNNER_TEMP/releases.json"
+          page=1
+          while :; do
+            curl --fail-with-body --silent --show-error \
+              --header "Accept: application/vnd.github+json" \
+              --header "Authorization: Bearer ${GH_TOKEN}" \
+              --header "X-GitHub-Api-Version: 2022-11-28" \
+              "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/releases?per_page=100&page=${page}" \
+              > "$RUNNER_TEMP/releases-page.json"
+            jq -e 'type == "array"' "$RUNNER_TEMP/releases-page.json" >/dev/null
+            page_length="$(jq 'length' "$RUNNER_TEMP/releases-page.json")"
+            jq -s '.[0] + .[1]' \
+              "$RUNNER_TEMP/releases.json" "$RUNNER_TEMP/releases-page.json" \
+              > "$RUNNER_TEMP/releases-next.json"
+            mv "$RUNNER_TEMP/releases-next.json" "$RUNNER_TEMP/releases.json"
+            if (( page_length < 100 )); then
+              break
+            fi
+            page=$((page + 1))
+          done
           if jq -e --arg tag "$GITHUB_REF_NAME" \
             'any(.[]; .tag_name == $tag and .draft != true)' \
             "$RUNNER_TEMP/releases.json" >/dev/null; then

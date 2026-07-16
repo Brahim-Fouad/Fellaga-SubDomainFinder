@@ -12,11 +12,11 @@ Fellaga is a fast, adaptive subdomain enumerator written in Rust for Kali Linux 
 
 ## Highlights
 
-- Native asynchronous DNS engine with correlated UDP queries, EDNS0, TCP fallback, resolver balancing, retries, and global rate limiting.
+- Native asynchronous DNS engine with correlated UDP queries, EDNS0, TCP fallback, resolver balancing, retries, global rate limiting, and a health-qualified two-packet negative path for fresh generated candidates.
 - Adaptive `deep` scan by default: passive sources, Certificate Transparency, a one-million-candidate corpus, recursive DNS, AXFR, DNSSEC/NSEC, Web and JavaScript discovery, TLS/STARTTLS, and bounded PTR pivots.
 - Persistent, lazy candidate scheduling: passive/authoritative seeds and active word generators are consumed in bounded SQLite-backed waves instead of being materialized in memory before DNS starts.
 - Hierarchical wildcard detection, rotating-answer recognition, exact-signature filtering, trusted-resolver consensus, and optional authoritative validation.
-- Permanent SQLite inventory with `live`, `historical`, and `unverified` states; positive evidence is retained while weak wildcard-only false positives are purged automatically.
+- Permanent SQLite inventory with `live`, `historical`, and `unverified` states; a complete refresh quarantines exact wildcard-signature matches only after fresh trusted-resolver consensus, while retaining their provenance and validation history.
 - Evidence-family scoring so multiple providers backed by the same underlying dataset are not counted as independent proof.
 - Checkpoints every 30 seconds and `--resume latest` for interrupted or time-limited scans; queued work, retry counts, source provenance, and learning counters survive a restart.
 - Text, JSON, per-domain JSONL, streaming JSONL, CSV export, and import support for common enumeration tools.
@@ -29,12 +29,14 @@ Fellaga is a fast, adaptive subdomain enumerator written in Rust for Kali Linux 
 Download the release package and install it with APT. Checksums, a Sigstore-signed manifest, and GitHub attestations are available for independent verification:
 
 ```bash
-curl -fLO https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/download/v0.8.3/fellaga_0.8.3-1_amd64.deb
-sudo apt install ./fellaga_0.8.3-1_amd64.deb
+curl -fLO https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/download/v0.8.4/fellaga_0.8.4-1_amd64.deb
+sudo apt install ./fellaga_0.8.4-1_amd64.deb
 fellaga --version
 ```
 
-Portable x86-64 and ARM64 archives, checksums, SBOMs, Sigstore material, and GitHub attestations are available on the [latest release page](https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/latest).
+Portable x86-64 and ARM64 archives, dependency SBOMs, offline license
+inventories, checksums, Sigstore material, and GitHub attestations are available
+on the [latest release page](https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/latest).
 
 ### Build from source
 
@@ -67,9 +69,9 @@ fellaga scan your-domain.example --stream-jsonl > findings.jsonl
 fellaga scan your-domain.example --resume latest
 ```
 
-The default scan processes one domain at a time, caps DNS traffic at 100 queries per second, uses at most 128 concurrent DNS requests, and stops after 1,800 seconds per domain. Adaptive stopping applies only to low-yield generated candidates; explicit wordlists and bounded passive seeds continue until completed or another hard limit stops the scan. Transient candidate-resolution failures receive at most three total attempts. These safeguards can be changed explicitly, but disabling them may saturate the local connection, public resolvers, or the target.
+The default scan processes one domain at a time, caps shared DNS traffic at 100 logical queries per second, and keeps at most 128 host resolutions in flight. Runtime limits are profile-specific: `deep` stops after 600 seconds, `balanced` and `turbo` after 300 seconds, and `passive` after 180 seconds unless `--max-runtime` overrides the limit. The default `deep` profile also gives wildcard profiling and active candidate work a shared 120-second budget. Embedded and user wordlists, mutations, retries, and recursive candidate generation all consume that budget. At the deadline, completed outcomes are kept, unfinished names are requeued as indeterminate, and the scan can continue later with `--resume latest`. Set `--active-max-runtime 0` to disable this time bound. `--no-adaptive` disables low-yield stopping and uses the configured recursion ceilings, but it does not disable ranking, time limits, or DNS rate safeguards. Transient candidate-resolution failures receive at most three total attempts.
 
-Long-running phases emit periodic progress on standard error. Initial passive collection, direct CT monitoring, and AXFR run concurrently, while passive work has a separate profile-specific active-time budget so waiting in unrelated phases does not consume it. Completed connector pages are retained after a later page times out, and the affected source is reported as partial.
+Long-running phases emit periodic progress on standard error. Initial passive collection, direct CT monitoring, and AXFR run concurrently, while passive work has a separate profile-specific active-time budget so waiting in unrelated phases does not consume it. Web and JavaScript discovery also uses one cumulative profile budget across the initial crawl and later pipeline rounds. Completed connector pages and Web fetches are retained after a later operation times out, and the affected phase is reported as partial. Final JSON records include `phase_timings` for initial discovery, candidate DNS, enrichment, and finalization.
 
 Fellaga displays all retained states by default:
 
@@ -128,4 +130,4 @@ API keys are stored as plain JSON, not encrypted. Protect the user account and d
 
 ## License
 
-Fellaga is released under the [MIT License](LICENSE). The embedded candidate corpus is derived from a pinned SecLists revision; see [corpus provenance](data/CORPUS_LICENSE.md) and [third-party notices](THIRD_PARTY_NOTICES.md).
+Fellaga is released under the [MIT License](LICENSE). The embedded candidate corpus is derived from a pinned SecLists revision; see [corpus provenance](data/CORPUS_LICENSE.md) and [third-party notices](THIRD_PARTY_NOTICES.md). Release packages also include the complete generated Rust dependency license inventory.

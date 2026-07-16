@@ -17,6 +17,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{Instant, timeout_at};
 
 const AXFR_CONCURRENCY: usize = 2;
+const AXFR_MAX_TARGETS: usize = 8;
 const AXFR_MAX_RECORDS: usize = 250_000;
 const AXFR_MAX_BYTES: usize = 64 * 1024 * 1024;
 static AXFR_GATE: Semaphore = Semaphore::const_new(AXFR_CONCURRENCY);
@@ -262,6 +263,20 @@ fn unique_targets(
     targets
 }
 
+fn bounded_targets(
+    mut targets: Vec<(String, IpAddr)>,
+    warnings: &mut Vec<String>,
+) -> Vec<(String, IpAddr)> {
+    if targets.len() > AXFR_MAX_TARGETS {
+        warnings.push(format!(
+            "AXFR: {} cible(s) autoritaire(s) trouvée(s), seules les {AXFR_MAX_TARGETS} premières seront testées",
+            targets.len()
+        ));
+        targets.truncate(AXFR_MAX_TARGETS);
+    }
+    targets
+}
+
 pub async fn attempt_axfr(
     dns: &DnsEngine,
     domain: &str,
@@ -272,7 +287,7 @@ pub async fn attempt_axfr(
         Err(error) => return (Vec::new(), vec![format!("AXFR: {error:#}")]),
     };
     let mut warnings = Vec::new();
-    let targets = unique_targets(servers, &mut warnings);
+    let targets = bounded_targets(unique_targets(servers, &mut warnings), &mut warnings);
     let mut attempts = Vec::new();
     {
         let mut pending = stream::iter(targets)
@@ -412,6 +427,23 @@ mod tests {
             ]
         );
         assert_eq!(warnings, vec!["AXFR: aucune IP pour empty.example.test"]);
+    }
+
+    #[test]
+    fn axfr_targets_are_capped_to_a_bounded_phase() {
+        let targets = (0..(AXFR_MAX_TARGETS + 3))
+            .map(|index| {
+                (
+                    format!("ns{index}.example.test"),
+                    IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, index as u8 + 1)),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut warnings = Vec::new();
+        let bounded = bounded_targets(targets, &mut warnings);
+        assert_eq!(bounded.len(), AXFR_MAX_TARGETS);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("seules les 8 premières"));
     }
 
     #[tokio::test]

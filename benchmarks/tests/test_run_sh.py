@@ -39,6 +39,9 @@ class RunScriptTests(unittest.TestCase):
             target = fake_bin / command
             shutil.copyfile(true_binary, target)
             target.chmod(0o755)
+        zstd = fake_bin / "zstd"
+        zstd.write_text("#!/bin/sh\nprintf 'one\\ntwo\\n'\n", encoding="utf-8")
+        zstd.chmod(0o755)
         domains = root / "domains.txt"
         domains.write_text("example.test\n", encoding="utf-8")
         resolvers = root / "resolvers.txt"
@@ -50,6 +53,9 @@ class RunScriptTests(unittest.TestCase):
                 "BENCH_OUT": str(campaign),
                 "FELLAGA_BENCH_AUTHORIZED": "YES",
                 "FELLAGA_BENCH_RESOLVERS_FILE": str(resolvers),
+                "FELLAGA_BENCH_PIPELINE_BYTES_PER_CANDIDATE": "1",
+                "FELLAGA_BENCH_PIPELINE_FIXED_BYTES": "0",
+                "FELLAGA_BENCH_PIPELINE_DISK_MARGIN_PERCENT": "100",
             }
         )
         return environment, domains, resolvers
@@ -128,6 +134,88 @@ class RunScriptTests(unittest.TestCase):
             self.assertEqual(completed.returncode, 2)
             self.assertIn("at least 100000 queries", completed.stderr)
 
+            environment["BENCH_OUT"] = str(root / "campaign-c")
+            environment["FELLAGA_BENCH_RESOLVER_QUERIES"] = "100000"
+            environment["FELLAGA_BENCH_PROFILE_BASELINES"] = "deep,fast"
+            completed = subprocess.run(
+                ["bash", str(RUN_SH), "no-key", str(domains)],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                env=environment,
+            )
+            self.assertEqual(completed.returncode, 2)
+            self.assertIn("comma-separated subset", completed.stderr)
+
+    def test_pipeline_disk_preflight_rejects_insufficient_space(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            campaign = root / "campaign"
+            environment, domains, _ = self._early_policy_environment(root, campaign)
+            environment["FELLAGA_BENCH_PIPELINE_FIXED_BYTES"] = str(10**18)
+            completed = subprocess.run(
+                ["bash", str(RUN_SH), "no-key", str(domains)],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                env=environment,
+            )
+            self.assertEqual(completed.returncode, 6)
+            self.assertIn("disk preflight failed", completed.stderr)
+            evidence = json.loads(
+                (campaign / "disk-preflight.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(evidence["status"], "insufficient")
+            self.assertGreater(evidence["shortfall_bytes"], 0)
+
+    def test_active_runtime_must_be_a_non_negative_integer(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            campaign = root / "campaign"
+            environment, domains, _ = self._early_policy_environment(root, campaign)
+            environment["FELLAGA_BENCH_ACTIVE_MAX_RUNTIME"] = "-1"
+            completed = subprocess.run(
+                ["bash", str(RUN_SH), "no-key", str(domains)],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                env=environment,
+            )
+            self.assertEqual(completed.returncode, 2)
+            self.assertIn("non-negative integers", completed.stderr)
+
+    def test_puredns_preflight_rejects_impossible_qps_timeout_pair(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            campaign = root / "campaign"
+            environment, domains, _ = self._early_policy_environment(root, campaign)
+            environment.update(
+                {
+                    "FELLAGA_BENCH_MAX_RUNTIME": "1",
+                    "FELLAGA_BENCH_DISCOVERY_TIMEOUT": "1",
+                    "FELLAGA_BENCH_DNS_RATE": "1",
+                    "FELLAGA_BENCH_PUREDNS_HEADROOM_PERCENT": "100",
+                }
+            )
+            completed = subprocess.run(
+                ["bash", str(RUN_SH), "no-key", str(domains)],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                env=environment,
+            )
+            self.assertEqual(completed.returncode, 8, completed.stderr)
+            self.assertIn("PureDNS capacity preflight failed", completed.stderr)
+            evidence = json.loads(
+                (campaign / "puredns-preflight.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(evidence["status"], "incoherent")
+            self.assertEqual(evidence["minimum_coherent_rate_qps"], 2)
+
     def test_campaign_is_fresh_bounded_and_does_not_validate_failed_discovery(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
@@ -199,7 +287,10 @@ class RunScriptTests(unittest.TestCase):
                         database.write_text("fresh", encoding="utf-8")
                         config.write_text("{}", encoding="utf-8")
                         with pathlib.Path(os.environ["MOCK_FELLAGA_PATHS"]).open("a", encoding="utf-8") as log:
-                            log.write(f"{database} {config}\\n")
+                            log.write(
+                                f"{database} {config} {value('--profile')} "
+                                f"{value('--max-runtime')} {value('--active-max-runtime')}\\n"
+                            )
                         domain = args[args.index("scan") + 1]
                         print(json.dumps({
                             "findings": [{"fqdn": f"api.{domain}", "state": "live"}],
@@ -276,6 +367,10 @@ class RunScriptTests(unittest.TestCase):
                     "FELLAGA_BENCH_REPETITIONS": "3",
                     "FELLAGA_BENCH_RESOLVERS_FILE": str(resolvers),
                     "FELLAGA_BENCH_REQUIRE_PASS": "0",
+                    "FELLAGA_BENCH_PIPELINE_BYTES_PER_CANDIDATE": "1",
+                    "FELLAGA_BENCH_PIPELINE_FIXED_BYTES": "0",
+                    "FELLAGA_BENCH_PIPELINE_DISK_MARGIN_PERCENT": "100",
+                    "FELLAGA_BENCH_PROFILE_BASELINES": "all",
                     "MOCK_FELLAGA_PATHS": str(paths_log),
                     "MOCK_DNSX_CALLS": str(dnsx_log),
                     "MOCK_SECRET": secret,
@@ -292,16 +387,25 @@ class RunScriptTests(unittest.TestCase):
             self.assertEqual(completed.returncode, 0, completed.stderr)
 
             fellaga_paths = paths_log.read_text(encoding="utf-8").splitlines()
-            self.assertEqual(len(fellaga_paths), 3)
+            self.assertEqual(len(fellaga_paths), 12)
             databases = {line.split()[0] for line in fellaga_paths}
             configs = {line.split()[1] for line in fellaga_paths}
-            self.assertEqual(len(databases), 3)
-            self.assertEqual(len(configs), 3)
+            profiles = [line.split()[2] for line in fellaga_paths]
+            hard_runtimes = [line.split()[3] for line in fellaga_paths]
+            active_runtimes = [line.split()[4] for line in fellaga_paths]
+            self.assertEqual(len(databases), 12)
+            self.assertEqual(len(configs), 12)
+            self.assertEqual(
+                {profile: profiles.count(profile) for profile in set(profiles)},
+                {"deep": 3, "balanced": 3, "passive": 3, "turbo": 3},
+            )
+            self.assertEqual(set(hard_runtimes), {"1"})
+            self.assertEqual(set(active_runtimes), {"1"})
             self.assertTrue(all(pathlib.Path(path).is_file() for path in databases))
             self.assertTrue(all(pathlib.Path(path).is_file() for path in configs))
 
             dnsx_inputs = dnsx_log.read_text(encoding="utf-8").splitlines()
-            self.assertEqual(len(dnsx_inputs), 12)
+            self.assertEqual(len(dnsx_inputs), 21)
             self.assertFalse(any(".amass." in path for path in dnsx_inputs))
 
             summary_text = (campaign / "summary.jsonl").read_text(encoding="utf-8")
@@ -311,6 +415,29 @@ class RunScriptTests(unittest.TestCase):
             self.assertIn("credential-cleared", amass_log.read_text(encoding="utf-8"))
             rows = [json.loads(line) for line in summary_text.splitlines()]
             self.assertEqual(len(rows), 15)
+            fellaga_rows = [row for row in rows if row["tool"] == "fellaga"]
+            self.assertTrue(all(row["profile"] == "deep" for row in fellaga_rows))
+            self.assertTrue(
+                all(row["benchmark_kind"] == "qualification" for row in rows)
+            )
+            baseline_rows = [
+                json.loads(line)
+                for line in (campaign / "fellaga-profile-baselines.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            self.assertEqual(len(baseline_rows), 12)
+            self.assertEqual(
+                {row["profile"] for row in baseline_rows},
+                {"deep", "balanced", "passive", "turbo"},
+            )
+            self.assertTrue(
+                all(
+                    row["benchmark_kind"] == "fellaga_profile_baseline"
+                    and row["tool"] == "fellaga"
+                    for row in baseline_rows
+                )
+            )
             manifest = json.loads((campaign / "manifest.json").read_text(encoding="utf-8"))
             self.assertEqual(
                 manifest["configuration"]["dns_transport_timeout_seconds"], 3
@@ -322,6 +449,30 @@ class RunScriptTests(unittest.TestCase):
             self.assertEqual(
                 manifest["configuration"]["candidate_pipeline_candidates"],
                 10_000_000,
+            )
+            self.assertEqual(
+                manifest["configuration"]["fellaga_active_max_runtime_seconds"],
+                1,
+            )
+            self.assertEqual(
+                manifest["provenance"]["inputs"]["active_corpus_candidates"],
+                1,
+            )
+            self.assertEqual(
+                manifest["configuration"]["fellaga_profile_baselines"],
+                ["deep", "balanced", "passive", "turbo"],
+            )
+            self.assertEqual(
+                manifest["preflight"]["candidate_pipeline_disk"]["status"],
+                "sufficient",
+            )
+            self.assertEqual(
+                manifest["preflight"]["puredns_capacity"]["status"],
+                "coherent",
+            )
+            self.assertEqual(
+                manifest["preflight"]["puredns_capacity"]["corpus_candidates"],
+                manifest["provenance"]["inputs"]["active_corpus_candidates"],
             )
             amass_rows = [row for row in rows if row["tool"] == "amass"]
             self.assertTrue(

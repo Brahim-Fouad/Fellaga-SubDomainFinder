@@ -40,6 +40,61 @@ pub struct CandidatePipelinePhaseDurations {
     pub loading_and_sqlite: u128,
     pub scheduling: u128,
     pub dns: u128,
+    pub wordlist_refill: u128,
+    pub candidate_pending_count: u128,
+    pub candidate_claim: u128,
+    pub cache_journal: u128,
+    pub candidate_finalize: u128,
+    pub sqlite_total: u128,
+}
+
+impl CandidatePipelinePhaseDurations {
+    fn add_sqlite_duration(total: &mut u128, component: &mut u128, elapsed_ms: u128) {
+        *component = component.saturating_add(elapsed_ms);
+        *total = total.saturating_add(elapsed_ms);
+    }
+
+    fn record_wordlist_refill(&mut self, elapsed_ms: u128) {
+        Self::add_sqlite_duration(
+            &mut self.loading_and_sqlite,
+            &mut self.wordlist_refill,
+            elapsed_ms,
+        );
+        self.sqlite_total = self.sqlite_total.saturating_add(elapsed_ms);
+    }
+
+    fn record_candidate_claim(&mut self, elapsed_ms: u128) {
+        self.candidate_claim = self.candidate_claim.saturating_add(elapsed_ms);
+        self.scheduling = self.scheduling.saturating_add(elapsed_ms);
+        self.sqlite_total = self.sqlite_total.saturating_add(elapsed_ms);
+    }
+
+    fn record_pending_candidate_count(&mut self, elapsed_ms: u128) {
+        Self::add_sqlite_duration(
+            &mut self.loading_and_sqlite,
+            &mut self.candidate_pending_count,
+            elapsed_ms,
+        );
+        self.sqlite_total = self.sqlite_total.saturating_add(elapsed_ms);
+    }
+
+    fn record_cache_journal(&mut self, elapsed_ms: u128) {
+        Self::add_sqlite_duration(
+            &mut self.loading_and_sqlite,
+            &mut self.cache_journal,
+            elapsed_ms,
+        );
+        self.sqlite_total = self.sqlite_total.saturating_add(elapsed_ms);
+    }
+
+    fn record_candidate_finalize(&mut self, elapsed_ms: u128) {
+        Self::add_sqlite_duration(
+            &mut self.loading_and_sqlite,
+            &mut self.candidate_finalize,
+            elapsed_ms,
+        );
+        self.sqlite_total = self.sqlite_total.saturating_add(elapsed_ms);
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -451,18 +506,23 @@ pub async fn run_candidate_pipeline(
         let target = options
             .batch_size
             .min(options.candidates.saturating_sub(scheduled));
-        let loading_started = Instant::now();
-        let mut queued = database.pending_scan_candidate_count(scan_id)?.max(0) as usize;
+        let pending_count_started = Instant::now();
+        let pending_count_result = database.pending_scan_candidate_count(scan_id);
+        phases.record_pending_candidate_count(pending_count_started.elapsed().as_millis());
+        let mut queued = pending_count_result?.max(0) as usize;
         while queued < target && persisted < options.candidates {
             let capacity = target
                 .saturating_sub(queued)
                 .min(options.candidates.saturating_sub(persisted));
-            let (inserted, exhausted) = database.refill_wordlist_candidates(
+            let refill_started = Instant::now();
+            let refill_result = database.refill_wordlist_candidates(
                 scan_id,
                 BENCHMARK_DOMAIN,
                 &options.wordlist,
                 capacity,
-            )?;
+            );
+            phases.record_wordlist_refill(refill_started.elapsed().as_millis());
+            let (inserted, exhausted) = refill_result?;
             loaded = loaded.saturating_add(inserted);
             persisted = persisted.saturating_add(inserted);
             queued = queued.saturating_add(inserted);
@@ -474,15 +534,11 @@ pub async fn run_candidate_pipeline(
                 bail!("candidate fixture page made no progress before end of file");
             }
         }
-        phases.loading_and_sqlite = phases
-            .loading_and_sqlite
-            .saturating_add(loading_started.elapsed().as_millis());
 
-        let scheduling_started = Instant::now();
-        let claimed = database.pending_scan_candidates(scan_id, target)?;
-        phases.scheduling = phases
-            .scheduling
-            .saturating_add(scheduling_started.elapsed().as_millis());
+        let claim_started = Instant::now();
+        let claim_result = database.pending_scan_candidates(scan_id, target);
+        phases.record_candidate_claim(claim_started.elapsed().as_millis());
+        let claimed = claim_result?;
         ensure!(
             !claimed.is_empty(),
             "candidate queue ended after {scheduled} of {} candidates",
@@ -524,18 +580,21 @@ pub async fn run_candidate_pipeline(
             .saturating_add(positive_answers.len())
             .saturating_add(negative_hosts.len());
 
-        let persistence_started = Instant::now();
-        database.update_cache_outcomes(
+        let cache_started = Instant::now();
+        let cache_result = database.update_cache_outcomes(
             Some(scan_id),
             &positive_answers,
             &negative_hosts,
             &indeterminate_hosts,
             NEGATIVE_CACHE_TTL,
-        )?;
-        database.mark_scan_candidates_done(scan_id, &hosts)?;
-        phases.loading_and_sqlite = phases
-            .loading_and_sqlite
-            .saturating_add(persistence_started.elapsed().as_millis());
+        );
+        phases.record_cache_journal(cache_started.elapsed().as_millis());
+        cache_result?;
+
+        let finalize_started = Instant::now();
+        let finalize_result = database.mark_scan_candidates_done(scan_id, &hosts);
+        phases.record_candidate_finalize(finalize_started.elapsed().as_millis());
+        finalize_result?;
         ensure!(
             indeterminate_hosts.is_empty(),
             "controlled loopback DNS produced {} indeterminate candidates",
@@ -690,12 +749,50 @@ mod tests {
         assert_eq!(result.remaining_queued_candidates, 0);
         assert_eq!(result.wordlist_sha256.len(), 64);
         assert_eq!(result.binary_sha256.len(), 64);
+        assert_eq!(
+            result.phase_duration_ms.loading_and_sqlite,
+            result
+                .phase_duration_ms
+                .wordlist_refill
+                .saturating_add(result.phase_duration_ms.candidate_pending_count)
+                .saturating_add(result.phase_duration_ms.cache_journal)
+                .saturating_add(result.phase_duration_ms.candidate_finalize)
+        );
+        assert_eq!(
+            result.phase_duration_ms.scheduling,
+            result.phase_duration_ms.candidate_claim
+        );
+        assert_eq!(
+            result.phase_duration_ms.sqlite_total,
+            result
+                .phase_duration_ms
+                .loading_and_sqlite
+                .saturating_add(result.phase_duration_ms.scheduling)
+        );
         assert!(output.is_file());
 
         let persisted: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(output).unwrap()).unwrap();
         assert_eq!(persisted["campaign_id"], "ci-candidate-pipeline");
         assert_eq!(persisted["processed_candidates"], 256);
+        for phase in [
+            "fixture_generation",
+            "database_initialization",
+            "loading_and_sqlite",
+            "scheduling",
+            "dns",
+            "wordlist_refill",
+            "candidate_pending_count",
+            "candidate_claim",
+            "cache_journal",
+            "candidate_finalize",
+            "sqlite_total",
+        ] {
+            assert!(
+                persisted["phase_duration_ms"][phase].is_number(),
+                "missing numeric phase duration: {phase}"
+            );
+        }
     }
 
     #[tokio::test]

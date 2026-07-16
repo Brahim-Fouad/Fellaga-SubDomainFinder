@@ -26,12 +26,74 @@ pub struct WebDiscovery {
     pub cache_hits: usize,
     pub failures: usize,
     pub duration_ms: u128,
+    pub budget_exhausted: bool,
 }
 
 struct FetchResult {
     observation: WebObservation,
     assets: Vec<String>,
     network: bool,
+}
+
+struct BoundedFetch {
+    result: Option<FetchResult>,
+    budget_exhausted: bool,
+}
+
+struct HostFetchBatch {
+    results: Vec<FetchResult>,
+    budget_exhausted: bool,
+}
+
+fn operation_deadline(
+    timeout: Duration,
+    phase_deadline: Option<tokio::time::Instant>,
+) -> tokio::time::Instant {
+    let request_deadline = tokio::time::Instant::now() + timeout;
+    phase_deadline
+        .map(|deadline| deadline.min(request_deadline))
+        .unwrap_or(request_deadline)
+}
+
+async fn before_web_deadline<T, F>(deadline: Option<tokio::time::Instant>, future: F) -> Option<T>
+where
+    F: std::future::Future<Output = T>,
+{
+    match deadline {
+        Some(deadline) if deadline <= tokio::time::Instant::now() => None,
+        Some(deadline) => tokio::time::timeout_at(deadline, future).await.ok(),
+        None => Some(future.await),
+    }
+}
+
+fn web_deadline_expired(deadline: Option<tokio::time::Instant>) -> bool {
+    deadline.is_some_and(|deadline| deadline <= tokio::time::Instant::now())
+}
+
+fn merge_host_fetch_batch(discovery: &mut WebDiscovery, batch: HostFetchBatch) {
+    discovery.budget_exhausted |= batch.budget_exhausted;
+    for result in batch.results {
+        if result.network {
+            discovery.network_requests += 1;
+        } else {
+            discovery.cache_hits += 1;
+        }
+        discovery
+            .unique_names
+            .extend(result.observation.names.clone());
+        discovery.observations.push(result.observation);
+    }
+}
+
+fn finish_web_discovery(mut discovery: WebDiscovery, started: Instant) -> WebDiscovery {
+    discovery
+        .observations
+        .sort_by(|left, right| left.url.cmp(&right.url));
+    discovery
+        .observations
+        .dedup_by(|left, right| left.url == right.url);
+    discovery.duration_ms = started.elapsed().as_millis();
+    discovery
 }
 
 fn cached_observation(url: String, cache: WebCacheEntry) -> WebObservation {
@@ -41,6 +103,22 @@ fn cached_observation(url: String, cache: WebCacheEntry) -> WebObservation {
         names: cache.names.into_iter().collect(),
         from_cache: true,
     }
+}
+
+fn cached_root_fetch(database: &Database, domain: &str, host: &str) -> Result<Option<FetchResult>> {
+    for scheme in ["https", "http"] {
+        let url = format!("{scheme}://{host}/");
+        if let Some(cache) = database.web_cache(domain, &url)? {
+            return Ok(Some(FetchResult {
+                observation: cached_observation(url, cache),
+                // A cache-only fallback must not turn cached asset URLs into
+                // new network work after the Web phase deadline.
+                assets: Vec::new(),
+                network: false,
+            }));
+        }
+    }
+    Ok(None)
 }
 
 fn header_text(headers: &HeaderMap) -> String {
@@ -136,36 +214,43 @@ async fn resolve_public_web_hosts(
     dns: &DnsEngine,
     hosts: BTreeSet<String>,
     timeout: Duration,
-) -> Result<BTreeMap<String, Vec<SocketAddr>>> {
+    phase_deadline: Option<tokio::time::Instant>,
+) -> Result<(BTreeMap<String, Vec<SocketAddr>>, bool)> {
     if hosts.is_empty() {
-        return Ok(BTreeMap::new());
+        return Ok((BTreeMap::new(), false));
     }
     let dns = dns.clone();
-    Ok(stream::iter(hosts)
+    let results = stream::iter(hosts)
         .map(|host| {
             let dns = dns.clone();
             async move {
-                let deadline = tokio::time::Instant::now() + timeout;
-                let addresses =
+                let deadline = operation_deadline(timeout, phase_deadline);
+                let outcome =
                     tokio::time::timeout_at(deadline, dns.resolve_host_classified(host.as_str()))
-                        .await
-                        .ok()
-                        .and_then(|outcome| match outcome {
-                            DnsResolutionOutcome::Positive(answer) => Some(answer),
-                            DnsResolutionOutcome::Negative { .. }
-                            | DnsResolutionOutcome::Indeterminate { .. } => None,
-                        })
-                        .map(|answer| public_socket_addresses(&answer))
-                        .unwrap_or_default();
-                (host, addresses)
+                        .await;
+                let budget_exhausted =
+                    outcome.is_err() && phase_deadline.is_some_and(|phase| deadline == phase);
+                let addresses = outcome
+                    .ok()
+                    .and_then(|outcome| match outcome {
+                        DnsResolutionOutcome::Positive(answer) => Some(answer),
+                        DnsResolutionOutcome::Negative { .. }
+                        | DnsResolutionOutcome::Indeterminate { .. } => None,
+                    })
+                    .map(|answer| public_socket_addresses(&answer))
+                    .unwrap_or_default();
+                (host, addresses, budget_exhausted)
             }
         })
         .buffer_unordered(32)
-        .filter_map(|(host, addresses)| async move {
-            (!addresses.is_empty()).then_some((host, addresses))
-        })
-        .collect()
-        .await)
+        .collect::<Vec<_>>()
+        .await;
+    let budget_exhausted = results.iter().any(|(_, _, exhausted)| *exhausted);
+    let pinned = results
+        .into_iter()
+        .filter_map(|(host, addresses, _)| (!addresses.is_empty()).then_some((host, addresses)))
+        .collect();
+    Ok((pinned, budget_exhausted))
 }
 
 fn public_socket_addresses(answer: &ResolvedHost) -> Vec<SocketAddr> {
@@ -272,21 +357,25 @@ async fn fetch_url(
     refresh: Duration,
     max_bytes: usize,
     asset_limit: usize,
-) -> Result<FetchResult> {
+    phase_deadline: Option<tokio::time::Instant>,
+) -> Result<BoundedFetch> {
     let now = crate::util::now_epoch();
     let freshness = refresh.as_secs().min(i64::MAX as u64) as i64;
     let stale = database.web_cache(domain, &url)?;
     if let Some(cache) = &stale
         && now.saturating_sub(cache.updated_at) < freshness
     {
-        return Ok(FetchResult {
-            observation: cached_observation(url, cache.clone()),
-            assets: cache.assets.clone(),
-            network: false,
+        return Ok(BoundedFetch {
+            result: Some(FetchResult {
+                observation: cached_observation(url, cache.clone()),
+                assets: cache.assets.clone(),
+                network: false,
+            }),
+            budget_exhausted: web_deadline_expired(phase_deadline),
         });
     }
 
-    let fetched = async {
+    let fetched = before_web_deadline(phase_deadline, async {
         let mut request = client
             .get(&url)
             .header(RANGE, format!("bytes=0-{}", max_bytes.saturating_sub(1)));
@@ -380,20 +469,37 @@ async fn fetch_url(
             assets,
             network: true,
         })
-    }
+    })
     .await;
     match fetched {
-        Ok(result) => Ok(result),
-        Err(error) => stale
+        Some(Ok(result)) => Ok(BoundedFetch {
+            result: Some(result),
+            budget_exhausted: false,
+        }),
+        Some(Err(error)) => stale
             .map(|cache| {
+                let assets = cache.assets.clone();
+                BoundedFetch {
+                    result: Some(FetchResult {
+                        observation: cached_observation(url, cache),
+                        assets,
+                        network: false,
+                    }),
+                    budget_exhausted: false,
+                }
+            })
+            .ok_or(error),
+        None => Ok(BoundedFetch {
+            result: stale.map(|cache| {
                 let assets = cache.assets.clone();
                 FetchResult {
                     observation: cached_observation(url, cache),
                     assets,
                     network: false,
                 }
-            })
-            .ok_or(error),
+            }),
+            budget_exhausted: true,
+        }),
     }
 }
 
@@ -409,13 +515,58 @@ pub async fn discover_web(
     max_bytes: usize,
     assets_per_host: usize,
 ) -> Result<WebDiscovery> {
+    discover_web_bounded(
+        database,
+        dns,
+        domain,
+        hosts,
+        timeout,
+        refresh,
+        concurrency,
+        max_bytes,
+        assets_per_host,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn discover_web_bounded(
+    database: &Database,
+    dns: &DnsEngine,
+    domain: &str,
+    hosts: Vec<String>,
+    timeout: Duration,
+    refresh: Duration,
+    concurrency: usize,
+    max_bytes: usize,
+    assets_per_host: usize,
+    phase_deadline: Option<tokio::time::Instant>,
+) -> Result<WebDiscovery> {
     let started = Instant::now();
-    let pinned_hosts = resolve_public_web_hosts(dns, hosts.into_iter().collect(), timeout).await?;
+    let requested_hosts = hosts.into_iter().collect::<BTreeSet<_>>();
+    let (pinned_hosts, resolution_budget_exhausted) =
+        resolve_public_web_hosts(dns, requested_hosts.clone(), timeout, phase_deadline).await?;
+    let mut discovery = WebDiscovery {
+        budget_exhausted: resolution_budget_exhausted,
+        ..WebDiscovery::default()
+    };
+    for host in requested_hosts
+        .iter()
+        .filter(|host| !pinned_hosts.contains_key(*host))
+    {
+        if let Some(result) = cached_root_fetch(database, domain, host)? {
+            merge_host_fetch_batch(
+                &mut discovery,
+                HostFetchBatch {
+                    results: vec![result],
+                    budget_exhausted: resolution_budget_exhausted,
+                },
+            );
+        }
+    }
     if pinned_hosts.is_empty() {
-        return Ok(WebDiscovery {
-            duration_ms: started.elapsed().as_millis(),
-            ..WebDiscovery::default()
-        });
+        return Ok(finish_web_discovery(discovery, started));
     }
     let approved_hosts = Arc::new(pinned_hosts.keys().cloned().collect::<BTreeSet<_>>());
     let mut client_builder = Client::builder()
@@ -445,9 +596,12 @@ pub async fn discover_web(
             let approved_hosts = approved_hosts.clone();
             async move {
                 let Some(https) = claim_url(&visited, &format!("https://{host}/")).await else {
-                    return Ok::<_, anyhow::Error>(Vec::new());
+                    return Ok::<_, anyhow::Error>(HostFetchBatch {
+                        results: Vec::new(),
+                        budget_exhausted: false,
+                    });
                 };
-                let root = match fetch_url(
+                let https_result = fetch_url(
                     &database,
                     &client,
                     &domain,
@@ -455,16 +609,32 @@ pub async fn discover_web(
                     refresh,
                     max_bytes,
                     assets_per_host,
+                    phase_deadline,
                 )
-                .await
-                {
-                    Ok(result) => result,
-                    Err(_) => {
+                .await;
+                let root = match https_result {
+                    Ok(BoundedFetch {
+                        result: Some(result),
+                        budget_exhausted: false,
+                    }) => result,
+                    Ok(BoundedFetch {
+                        result: Some(result),
+                        budget_exhausted: true,
+                    }) => {
+                        return Ok(HostFetchBatch {
+                            results: vec![result],
+                            budget_exhausted: true,
+                        });
+                    }
+                    Ok(BoundedFetch { result: None, .. }) | Err(_) => {
                         let Some(http) = claim_url(&visited, &format!("http://{host}/")).await
                         else {
-                            return Ok(Vec::new());
+                            return Ok(HostFetchBatch {
+                                results: Vec::new(),
+                                budget_exhausted: web_deadline_expired(phase_deadline),
+                            });
                         };
-                        fetch_url(
+                        let http_result = fetch_url(
                             &database,
                             &client,
                             &domain,
@@ -472,13 +642,28 @@ pub async fn discover_web(
                             refresh,
                             max_bytes,
                             assets_per_host,
+                            phase_deadline,
                         )
-                        .await?
+                        .await?;
+                        if http_result.budget_exhausted {
+                            return Ok(HostFetchBatch {
+                                results: http_result.result.into_iter().collect(),
+                                budget_exhausted: true,
+                            });
+                        }
+                        let Some(result) = http_result.result else {
+                            return Ok(HostFetchBatch {
+                                results: Vec::new(),
+                                budget_exhausted: false,
+                            });
+                        };
+                        result
                     }
                 };
                 let mut results = vec![root];
                 let mut assets = results[0].assets.iter().cloned().collect::<VecDeque<_>>();
                 let mut attempted_assets = 0_usize;
+                let mut budget_exhausted = false;
                 while attempted_assets < assets_per_host {
                     let Some(asset) = assets.pop_front() else {
                         break;
@@ -490,7 +675,7 @@ pub async fn discover_web(
                         continue;
                     };
                     attempted_assets += 1;
-                    if let Ok(result) = fetch_url(
+                    if let Ok(asset_result) = fetch_url(
                         &database,
                         &client,
                         &domain,
@@ -498,45 +683,35 @@ pub async fn discover_web(
                         refresh,
                         max_bytes,
                         assets_per_host.saturating_sub(attempted_assets),
+                        phase_deadline,
                     )
                     .await
                     {
-                        assets.extend(result.assets.iter().cloned());
-                        results.push(result);
+                        if let Some(result) = asset_result.result {
+                            assets.extend(result.assets.iter().cloned());
+                            results.push(result);
+                        }
+                        if asset_result.budget_exhausted {
+                            budget_exhausted = true;
+                            break;
+                        }
                     }
                 }
-                Ok::<_, anyhow::Error>(results)
+                Ok::<_, anyhow::Error>(HostFetchBatch {
+                    results,
+                    budget_exhausted,
+                })
             }
         })
         .buffer_unordered(concurrency.max(1));
 
-    let mut discovery = WebDiscovery::default();
     while let Some(result) = pending.next().await {
         match result {
-            Ok(results) => {
-                for result in results {
-                    if result.network {
-                        discovery.network_requests += 1;
-                    } else {
-                        discovery.cache_hits += 1;
-                    }
-                    discovery
-                        .unique_names
-                        .extend(result.observation.names.clone());
-                    discovery.observations.push(result.observation);
-                }
-            }
+            Ok(batch) => merge_host_fetch_batch(&mut discovery, batch),
             Err(_) => discovery.failures += 1,
         }
     }
-    discovery
-        .observations
-        .sort_by(|left, right| left.url.cmp(&right.url));
-    discovery
-        .observations
-        .dedup_by(|left, right| left.url == right.url);
-    discovery.duration_ms = started.elapsed().as_millis();
-    Ok(discovery)
+    Ok(finish_web_discovery(discovery, started))
 }
 
 #[cfg(test)]
@@ -699,5 +874,139 @@ mod tests {
             claim_url(&visited, "https://www.example.com/#second").await,
             None
         );
+    }
+
+    #[tokio::test]
+    async fn expired_web_deadline_cancels_pending_work() {
+        let result = before_web_deadline(
+            Some(tokio::time::Instant::now() - Duration::from_millis(1)),
+            std::future::pending::<()>(),
+        )
+        .await;
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn expired_network_budget_still_returns_fresh_and_stale_cache() {
+        let database = Database::in_memory().unwrap();
+        let url = "https://www.example.com/";
+        database
+            .store_web_cache(
+                "example.com",
+                url,
+                200,
+                &BTreeSet::from(["api.example.com".to_owned()]),
+                &["https://www.example.com/app.js".to_owned()],
+                &WebCacheMetadata::default(),
+            )
+            .unwrap();
+        let client = Client::builder().build().unwrap();
+        let expired = Some(tokio::time::Instant::now() - Duration::from_millis(1));
+
+        for refresh in [Duration::from_secs(3_600), Duration::ZERO] {
+            let fetched = fetch_url(
+                &database,
+                &client,
+                "example.com",
+                url.to_owned(),
+                refresh,
+                1_024,
+                4,
+                expired,
+            )
+            .await
+            .unwrap();
+            assert!(fetched.budget_exhausted);
+            let cached = fetched.result.expect("cached result must survive deadline");
+            assert!(!cached.network);
+            assert!(cached.observation.from_cache);
+            assert!(cached.observation.names.contains("api.example.com"));
+        }
+    }
+
+    #[tokio::test]
+    async fn expired_public_web_budget_returns_cached_root_without_network() {
+        let database = Database::in_memory().unwrap();
+        database
+            .store_web_cache(
+                "example.com",
+                "https://www.example.com/",
+                200,
+                &BTreeSet::from(["api.example.com".to_owned()]),
+                &["https://www.example.com/app.js".to_owned()],
+                &WebCacheMetadata::default(),
+            )
+            .unwrap();
+        let dns = DnsEngine::new_with_socket_addresses(
+            1,
+            Duration::from_secs(1),
+            &["127.0.0.1:9".parse().unwrap()],
+            0,
+        )
+        .unwrap();
+
+        let discovery = discover_web_bounded(
+            &database,
+            &dns,
+            "example.com",
+            vec!["www.example.com".to_owned()],
+            Duration::from_secs(1),
+            Duration::ZERO,
+            1,
+            1_024,
+            4,
+            Some(tokio::time::Instant::now() - Duration::from_millis(1)),
+        )
+        .await
+        .unwrap();
+
+        assert!(discovery.budget_exhausted);
+        assert_eq!(discovery.cache_hits, 1);
+        assert_eq!(discovery.network_requests, 0);
+        assert_eq!(discovery.observations.len(), 1);
+        assert_eq!(discovery.observations[0].url, "https://www.example.com/");
+        assert!(discovery.observations[0].from_cache);
+        assert!(discovery.observations[0].names.contains("api.example.com"));
+        assert!(discovery.unique_names.contains("api.example.com"));
+    }
+
+    #[test]
+    fn phase_deadline_caps_each_web_operation() {
+        let phase = tokio::time::Instant::now() + Duration::from_secs(1);
+        assert_eq!(
+            operation_deadline(Duration::from_secs(30), Some(phase)),
+            phase
+        );
+        let per_request = operation_deadline(Duration::from_secs(1), None);
+        assert!(per_request > tokio::time::Instant::now());
+        assert!(per_request <= tokio::time::Instant::now() + Duration::from_secs(2));
+    }
+
+    #[test]
+    fn completed_results_survive_a_later_web_budget_expiration() {
+        let observation = WebObservation {
+            url: "https://www.example.com/app.js".to_owned(),
+            status: 200,
+            names: BTreeSet::from(["api.example.com".to_owned()]),
+            from_cache: false,
+        };
+        let mut discovery = WebDiscovery::default();
+        merge_host_fetch_batch(
+            &mut discovery,
+            HostFetchBatch {
+                results: vec![FetchResult {
+                    observation: observation.clone(),
+                    assets: Vec::new(),
+                    network: true,
+                }],
+                budget_exhausted: true,
+            },
+        );
+        assert!(discovery.budget_exhausted);
+        assert_eq!(discovery.network_requests, 1);
+        assert_eq!(discovery.observations.len(), 1);
+        assert_eq!(discovery.observations[0].url, observation.url);
+        assert_eq!(discovery.observations[0].names, observation.names);
+        assert!(discovery.unique_names.contains("api.example.com"));
     }
 }

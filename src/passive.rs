@@ -835,6 +835,22 @@ type ExternalHostLimiters = StdMutex<BTreeMap<String, Arc<TokioMutex<Option<Inst
 static EXTERNAL_HOST_LIMITERS: OnceLock<ExternalHostLimiters> = OnceLock::new();
 
 const MAX_EXTERNAL_BODY_BYTES: usize = 16 * 1024 * 1024;
+const COMMONCRAWL_INDEX_COUNT: usize = 5;
+const COMMONCRAWL_BLOCKS_PER_REQUEST: usize = 15;
+const COMMONCRAWL_MAX_RESULT_LINES: usize = 150_000;
+const COMMONCRAWL_MAX_BODY_BYTES: usize = 3 * MAX_EXTERNAL_BODY_BYTES;
+const MAX_INLINE_RETRY_AFTER: Duration = Duration::from_secs(5);
+
+fn commoncrawl_page_plan() -> [(usize, usize); 1] {
+    // The Common Crawl CDX API measures `pageSize` in compressed index blocks.
+    // One 15-block request covers the same index window as the previous three
+    // sequential 5-block pages, while avoiding two rate-limited round trips.
+    [(0, COMMONCRAWL_BLOCKS_PER_REQUEST)]
+}
+
+fn defer_retry_after(delay: Duration) -> bool {
+    delay > MAX_INLINE_RETRY_AFTER
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SourcePolicy {
@@ -857,7 +873,7 @@ impl fmt::Display for SourceBudgetExceeded {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "{}: budget total de {}s dépassé; résultat en cache conservé",
+            "{}: budget total de {}s dépassé; pages terminées conservées dans le résultat courant",
             self.source,
             self.budget.as_secs_f64()
         )
@@ -1212,17 +1228,18 @@ fn compact_external_error(body: &str) -> String {
     }
 }
 
-pub(super) async fn response_bytes_limited(
+async fn response_bytes_limited_to(
     mut response: reqwest::Response,
     source: &str,
+    max_bytes: usize,
 ) -> Result<(reqwest::StatusCode, Vec<u8>)> {
     if response
         .content_length()
-        .is_some_and(|length| length > MAX_EXTERNAL_BODY_BYTES as u64)
+        .is_some_and(|length| length > max_bytes as u64)
     {
         bail!(
             "{source}: réponse supérieure à {} Mio",
-            MAX_EXTERNAL_BODY_BYTES / 1024 / 1024
+            max_bytes / 1024 / 1024
         );
     }
     let status = response.status();
@@ -1232,15 +1249,22 @@ pub(super) async fn response_bytes_limited(
         .await
         .with_context(|| format!("lecture de la réponse {source}"))?
     {
-        if body.len().saturating_add(chunk.len()) > MAX_EXTERNAL_BODY_BYTES {
+        if body.len().saturating_add(chunk.len()) > max_bytes {
             bail!(
                 "{source}: réponse décompressée supérieure à {} Mio",
-                MAX_EXTERNAL_BODY_BYTES / 1024 / 1024
+                max_bytes / 1024 / 1024
             );
         }
         body.extend_from_slice(&chunk);
     }
     Ok((status, body))
+}
+
+pub(super) async fn response_bytes_limited(
+    response: reqwest::Response,
+    source: &str,
+) -> Result<(reqwest::StatusCode, Vec<u8>)> {
+    response_bytes_limited_to(response, source, MAX_EXTERNAL_BODY_BYTES).await
 }
 
 pub(super) async fn response_json<T: DeserializeOwned>(
@@ -1259,6 +1283,21 @@ pub(super) async fn response_json<T: DeserializeOwned>(
 
 pub(super) async fn response_text(response: reqwest::Response, source: &str) -> Result<String> {
     let (status, body) = response_bytes_limited(response, source).await?;
+    if !status.is_success() {
+        bail!(
+            "{source}: HTTP {status}: {}",
+            compact_external_error(&String::from_utf8_lossy(&body))
+        );
+    }
+    String::from_utf8(body).with_context(|| format!("texte {source} non UTF-8"))
+}
+
+async fn response_text_limited(
+    response: reqwest::Response,
+    source: &str,
+    max_bytes: usize,
+) -> Result<String> {
+    let (status, body) = response_bytes_limited_to(response, source, max_bytes).await?;
     if !status.is_success() {
         bail!(
             "{source}: HTTP {status}: {}",
@@ -1296,7 +1335,7 @@ pub(super) async fn send_with_retry(
             Ok(response) => {
                 let retry_after = server_retry_delay(&response);
                 if let Some(delay) = retry_after
-                    && delay > Duration::from_secs(30)
+                    && defer_retry_after(delay)
                 {
                     bail!(
                         "HTTP {} avec Retry-After={}s; nouvelle tentative différée",
@@ -1372,13 +1411,13 @@ where
     }
 }
 
-pub async fn fetch_detailed(
+async fn fetch_detailed_with_total_budget(
     source: &str,
     domain: &str,
     timeout: Duration,
     keys: &ApiKeyStore,
+    total_budget: Duration,
 ) -> Result<PassiveFetchResult> {
-    let budget = source_policy(source).total_timeout;
     let request = async {
         match source {
             "crtsh" => crtsh(domain, timeout).await,
@@ -1411,8 +1450,44 @@ pub async fn fetch_detailed(
             _ => Err(anyhow::anyhow!("source passive inconnue: {source}")),
         }
     };
-    let result = enforce_source_budget_preserving_partial(source, budget, request).await;
+    let result = enforce_source_budget_preserving_partial(source, total_budget, request).await;
     result.map_err(|error| anyhow::Error::msg(sanitize_external_error(&format!("{error:#}"), keys)))
+}
+
+pub async fn fetch_detailed(
+    source: &str,
+    domain: &str,
+    timeout: Duration,
+    keys: &ApiKeyStore,
+) -> Result<PassiveFetchResult> {
+    fetch_detailed_with_total_budget(
+        source,
+        domain,
+        timeout,
+        keys,
+        source_policy(source).total_timeout,
+    )
+    .await
+}
+
+/// Runs the complete connector under a caller-supplied wall deadline while
+/// retaining pages committed before the deadline. Source-specific safety
+/// limits remain an upper bound when the caller supplies a larger value.
+pub async fn fetch_detailed_bounded(
+    source: &str,
+    domain: &str,
+    timeout: Duration,
+    keys: &ApiKeyStore,
+    total_budget: Duration,
+) -> Result<PassiveFetchResult> {
+    fetch_detailed_with_total_budget(
+        source,
+        domain,
+        timeout,
+        keys,
+        total_budget.min(source_policy(source).total_timeout),
+    )
+    .await
 }
 
 pub async fn fetch(
@@ -1550,7 +1625,7 @@ async fn load_commoncrawl_endpoints(
     let collections = response_json::<Vec<CommonCrawlCollection>>(response, "Common Crawl").await?;
     let endpoints = collections
         .into_iter()
-        .take(5)
+        .take(COMMONCRAWL_INDEX_COUNT)
         .map(|collection| collection.cdx_api)
         .collect::<Vec<_>>();
     let endpoint = endpoints
@@ -1568,6 +1643,7 @@ async fn query_commoncrawl(
     domain: &str,
     policy: SourcePolicy,
     page: usize,
+    page_size: usize,
 ) -> Result<reqwest::Response> {
     throttle_commoncrawl().await;
     send_with_retry(
@@ -1575,9 +1651,10 @@ async fn query_commoncrawl(
             ("url", domain),
             ("matchType", "domain"),
             ("output", "json"),
+            ("fl", "url"),
             ("filter", "status:200"),
             ("collapse", "urlkey"),
-            ("pageSize", "5"),
+            ("pageSize", &page_size.to_string()),
             ("page", &page.to_string()),
         ]),
         policy.attempts,
@@ -1606,8 +1683,12 @@ async fn commoncrawl(domain: &str, timeout: Duration) -> Result<BTreeSet<String>
     let mut successful_requests = 0_usize;
     let mut errors = Vec::new();
     for endpoint in endpoints {
-        for page in 0..3 {
-            let response = match query_commoncrawl(&client, &endpoint, domain, policy, page).await {
+        for (page, page_size) in commoncrawl_page_plan() {
+            let response = match query_commoncrawl(
+                &client, &endpoint, domain, policy, page, page_size,
+            )
+            .await
+            {
                 Ok(response) => response,
                 Err(error) => {
                     errors.push(format!("{endpoint} page {page}: {error:#}"));
@@ -1620,7 +1701,9 @@ async fn commoncrawl(domain: &str, timeout: Duration) -> Result<BTreeSet<String>
             ) {
                 break;
             }
-            match response_text(response, "index Common Crawl").await {
+            match response_text_limited(response, "index Common Crawl", COMMONCRAWL_MAX_BODY_BYTES)
+                .await
+            {
                 Ok(body) => {
                     if body.trim().is_empty() {
                         break;
@@ -1628,7 +1711,7 @@ async fn commoncrawl(domain: &str, timeout: Duration) -> Result<BTreeSet<String>
                     successful_requests += 1;
                     let page_names = body
                         .lines()
-                        .take(50_000)
+                        .take(COMMONCRAWL_MAX_RESULT_LINES)
                         .filter_map(|line| serde_json::from_str::<CommonCrawlRow>(line).ok())
                         .filter_map(|row| hostname_from_url(&row.url, domain))
                         .collect();
@@ -2175,6 +2258,27 @@ mod tests {
         );
         assert!(hostname_from_url("https://example.net/", "example.com").is_none());
         assert!(hostname_from_url("not a url", "example.com").is_none());
+    }
+
+    #[test]
+    fn commoncrawl_coalesces_the_same_index_window_into_one_request() {
+        let plan = commoncrawl_page_plan();
+        assert_eq!(plan, [(0, 15)]);
+        assert_eq!(
+            plan.iter().map(|(_, blocks)| blocks).sum::<usize>(),
+            COMMONCRAWL_BLOCKS_PER_REQUEST
+        );
+        assert_eq!(COMMONCRAWL_MAX_RESULT_LINES, 3 * 50_000);
+        assert_eq!(COMMONCRAWL_MAX_BODY_BYTES, 3 * MAX_EXTERNAL_BODY_BYTES);
+        assert_eq!(COMMONCRAWL_INDEX_COUNT, 5);
+    }
+
+    #[test]
+    fn long_retry_after_is_deferred_instead_of_blocking_the_scan() {
+        assert!(!defer_retry_after(Duration::ZERO));
+        assert!(!defer_retry_after(MAX_INLINE_RETRY_AFTER));
+        assert!(defer_retry_after(Duration::from_secs(6)));
+        assert!(defer_retry_after(Duration::from_secs(30)));
     }
 
     #[test]

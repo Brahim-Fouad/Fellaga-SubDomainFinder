@@ -1,9 +1,11 @@
 # Third-party notices
 
-This file records third-party material redistributed by Fellaga and explicit
+This file records third-party data redistributed by Fellaga and explicit
 upstream design attribution. Rust dependency versions are pinned in
-`Cargo.lock`. Release SBOMs identify each packaged architecture binary and its
-digest; they do not replace `Cargo.lock` as the dependency inventory.
+`Cargo.lock`. Every release archive and Debian package also contains
+`THIRD_PARTY_LICENSES.txt`, generated from the locked Cargo graph and the
+license files in the resolved crate sources. The architecture SBOMs contain
+the same resolved dependency graph and bind it to the packaged binary digest.
 
 ## SecLists
 

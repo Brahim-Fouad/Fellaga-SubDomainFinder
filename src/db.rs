@@ -24,6 +24,50 @@ use std::sync::{
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 const PERMANENT_EXPIRY: i64 = i64::MAX;
+const CURRENT_SCAN_WILDCARD_MATCH_DETAILS: &str =
+    r#"{"network_positive":true,"reason":"current_scan_wildcard_match"}"#;
+const CURRENT_SCAN_WILDCARD_AMBIGUITY_DETAILS: &str =
+    r#"{"network_positive":true,"reason":"wildcard_profile_ambiguous"}"#;
+
+fn has_current_scan_wildcard_match(
+    transaction: &rusqlite::Transaction<'_>,
+    scan_id: i64,
+    fqdn: &str,
+) -> Result<bool> {
+    Ok(transaction
+        .query_row(
+            r#"SELECT 1
+               FROM dns_verifications verification
+               JOIN scans scan ON scan.id=verification.scan_id
+               WHERE verification.scan_id=?1 AND verification.fqdn=?2
+                  AND verification.outcome='unverified'
+                  AND (verification.resolver_count>=2 OR verification.authoritative<>0)
+                  AND verification.records_hash IS NOT NULL
+                  AND verification.details_json=?3
+                  AND verification.checked_at>=scan.started_at
+                  AND scan.status='running'
+               LIMIT 1"#,
+            params![scan_id, fqdn, CURRENT_SCAN_WILDCARD_MATCH_DETAILS],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
+fn canonical_dns_records_hash(records: &[crate::model::DnsRecord]) -> Result<String> {
+    let mut canonical = records
+        .iter()
+        .map(|record| {
+            (
+                record.record_type.trim().to_ascii_uppercase(),
+                record.value.trim().to_owned(),
+            )
+        })
+        .collect::<Vec<_>>();
+    canonical.sort();
+    canonical.dedup();
+    Ok(domain_hash(&serde_json::to_string(&canonical)?))
+}
 
 fn wildcard_cleanup_evidence_is_independent(kind: &str, source: &str) -> bool {
     matches!(
@@ -53,18 +97,19 @@ fn wildcard_cleanup_evidence_for_hosts(
     let placeholders = std::iter::repeat_n("?", hosts.len())
         .collect::<Vec<_>>()
         .join(",");
-    let mut values = Vec::<rusqlite::types::Value>::with_capacity(hosts.len() + 1);
-    values.push(root_domain.to_owned().into());
-    values.extend(hosts.iter().cloned().map(Into::into));
+    let mut inventory_values = Vec::<rusqlite::types::Value>::with_capacity(hosts.len() + 1);
+    inventory_values.push(root_domain.to_owned().into());
+    inventory_values.extend(hosts.iter().cloned().map(Into::into));
 
     {
         let sql = format!(
             "SELECT fqdn, sources FROM subdomains WHERE root_domain=? AND fqdn IN ({placeholders})"
         );
         let mut statement = transaction.prepare(&sql)?;
-        let rows = statement.query_map(rusqlite::params_from_iter(values.iter()), |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?;
+        let rows = statement
+            .query_map(rusqlite::params_from_iter(inventory_values.iter()), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
         for row in rows {
             let (fqdn, sources) = row?;
             let all = sources
@@ -89,16 +134,22 @@ fn wildcard_cleanup_evidence_for_hosts(
             r#"SELECT names.fqdn, evidence.kind, evidence.source
                FROM observation_evidence evidence
                JOIN observed_names names ON names.id=evidence.name_id
-               WHERE evidence.root_domain=? AND names.fqdn IN ({placeholders})"#
+               WHERE names.fqdn IN ({placeholders})"#
         );
+        let evidence_values = hosts
+            .iter()
+            .cloned()
+            .map(rusqlite::types::Value::from)
+            .collect::<Vec<_>>();
         let mut statement = transaction.prepare(&sql)?;
-        let rows = statement.query_map(rusqlite::params_from_iter(values.iter()), |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-            ))
-        })?;
+        let rows =
+            statement.query_map(rusqlite::params_from_iter(evidence_values.iter()), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?;
         for row in rows {
             let (fqdn, kind, source) = row?;
             if wildcard_cleanup_evidence_is_independent(&kind, &source) {
@@ -108,6 +159,37 @@ fn wildcard_cleanup_evidence_for_hosts(
     }
 
     Ok((stored_sources, independent_sources))
+}
+
+fn quarantine_wildcard_host(
+    transaction: &rusqlite::Transaction<'_>,
+    root_domain: &str,
+    fqdn: &str,
+    scan_id: i64,
+    reason: &str,
+    quarantined_at: i64,
+) -> Result<()> {
+    transaction.execute(
+        r#"INSERT INTO wildcard_quarantine(
+               root_domain, fqdn, scan_id, reason, quarantined_at
+           ) VALUES (?1, ?2, ?3, ?4, ?5)
+           ON CONFLICT(root_domain, fqdn) DO UPDATE SET
+               scan_id=excluded.scan_id,
+               reason=excluded.reason,
+               quarantined_at=excluded.quarantined_at"#,
+        params![root_domain, fqdn, scan_id, reason, quarantined_at],
+    )?;
+    transaction.execute("DELETE FROM dns_cache WHERE fqdn=?1", [fqdn])?;
+    let inventory_changed = transaction.execute(
+        r#"UPDATE subdomains
+           SET active=0, verification_state='unverified', last_verified_at=NULL
+           WHERE root_domain=?1 AND fqdn=?2"#,
+        params![root_domain, fqdn],
+    )?;
+    if inventory_changed > 0 {
+        transaction.execute("UPDATE dns_records SET active=0 WHERE fqdn=?1", [fqdn])?;
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -861,6 +943,17 @@ impl Database {
                 PRIMARY KEY(refresh_scan_id, affected_scan_id)
             ) WITHOUT ROWID;
 
+            CREATE TABLE IF NOT EXISTS wildcard_quarantine (
+                root_domain TEXT NOT NULL,
+                fqdn TEXT NOT NULL,
+                scan_id INTEGER NOT NULL REFERENCES scans(id),
+                reason TEXT NOT NULL,
+                quarantined_at INTEGER NOT NULL,
+                PRIMARY KEY(root_domain, fqdn)
+            ) WITHOUT ROWID;
+            CREATE INDEX IF NOT EXISTS idx_wildcard_quarantine_scan
+                ON wildcard_quarantine(scan_id, quarantined_at);
+
             CREATE TABLE IF NOT EXISTS scan_candidates (
                 scan_id INTEGER NOT NULL REFERENCES scans(id) ON DELETE CASCADE,
                 fqdn TEXT NOT NULL,
@@ -877,6 +970,39 @@ impl Database {
                 ON scan_candidates(scan_id, status, priority DESC, fqdn);
             CREATE INDEX IF NOT EXISTS idx_scan_candidates_relative
                 ON scan_candidates(scan_id, relative_name);
+
+            CREATE TABLE IF NOT EXISTS scan_recursive_words (
+                scan_id INTEGER NOT NULL REFERENCES scans(id) ON DELETE CASCADE,
+                ordinal INTEGER NOT NULL,
+                word TEXT NOT NULL,
+                PRIMARY KEY(scan_id, ordinal),
+                UNIQUE(scan_id, word)
+            );
+
+            CREATE TABLE IF NOT EXISTS scan_recursive_parents (
+                scan_id INTEGER NOT NULL REFERENCES scans(id) ON DELETE CASCADE,
+                depth INTEGER NOT NULL,
+                parent TEXT NOT NULL,
+                next_word INTEGER NOT NULL DEFAULT 0,
+                exhausted INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(scan_id, depth, parent)
+            );
+            CREATE INDEX IF NOT EXISTS idx_scan_recursive_parents_pending
+                ON scan_recursive_parents(scan_id, depth, exhausted, parent);
+
+            CREATE TABLE IF NOT EXISTS scan_recursive_candidates (
+                scan_id INTEGER NOT NULL REFERENCES scans(id) ON DELETE CASCADE,
+                fqdn TEXT NOT NULL,
+                parent TEXT NOT NULL,
+                depth INTEGER NOT NULL,
+                word TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'queued'
+                    CHECK(status IN ('queued', 'processing', 'done')),
+                PRIMARY KEY(scan_id, fqdn)
+            );
+            CREATE INDEX IF NOT EXISTS idx_scan_recursive_candidates_pending
+                ON scan_recursive_candidates(scan_id, depth, status, fqdn);
 
             CREATE TABLE IF NOT EXISTS scan_seed_candidates (
                 scan_id INTEGER NOT NULL REFERENCES scans(id) ON DELETE CASCADE,
@@ -1485,13 +1611,28 @@ impl Database {
         freshness: std::time::Duration,
         probed: bool,
     ) -> Result<()> {
+        self.store_wildcard_cache_with_algorithm(zone, signature, soa_serial, freshness, probed, 2)
+    }
+
+    pub fn store_wildcard_cache_with_algorithm(
+        &self,
+        zone: &str,
+        signature: &BTreeSet<String>,
+        soa_serial: Option<u64>,
+        freshness: std::time::Duration,
+        probed: bool,
+        algorithm_version: i64,
+    ) -> Result<()> {
+        if !matches!(algorithm_version, 2 | 3) {
+            bail!("version d'algorithme wildcard non prise en charge: {algorithm_version}");
+        }
         let now = now_epoch();
         let expires_at = now.saturating_add(freshness.as_secs().min(i64::MAX as u64) as i64);
         self.lock()?.execute(
             r#"INSERT INTO wildcard_cache(
                zone, signature_json, soa_serial, updated_at, expires_at, probe_count,
                algorithm_version
-               ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 2)
+               ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                ON CONFLICT(zone) DO UPDATE SET
                signature_json=excluded.signature_json,
                soa_serial=excluded.soa_serial,
@@ -1505,7 +1646,8 @@ impl Database {
                 soa_serial.map(|value| value.min(i64::MAX as u64) as i64),
                 now,
                 expires_at,
-                i64::from(probed)
+                i64::from(probed),
+                algorithm_version
             ],
         )?;
         Ok(())
@@ -1846,6 +1988,10 @@ impl Database {
             "UPDATE scan_seed_candidates SET status='queued' WHERE scan_id=?1 AND status='processing'",
             [scan_id],
         )?;
+        transaction.execute(
+            "UPDATE scan_recursive_candidates SET status='queued' WHERE scan_id=?1 AND status='processing'",
+            [scan_id],
+        )?;
         transaction.commit()?;
         Ok(())
     }
@@ -1916,6 +2062,21 @@ impl Database {
         )?;
         transaction.execute(
             r#"DELETE FROM scan_attempted_words
+               WHERE scan_id IN (SELECT scan_id FROM fellaga_superseded_scans)"#,
+            [],
+        )?;
+        transaction.execute(
+            r#"DELETE FROM scan_recursive_candidates
+               WHERE scan_id IN (SELECT scan_id FROM fellaga_superseded_scans)"#,
+            [],
+        )?;
+        transaction.execute(
+            r#"DELETE FROM scan_recursive_parents
+               WHERE scan_id IN (SELECT scan_id FROM fellaga_superseded_scans)"#,
+            [],
+        )?;
+        transaction.execute(
+            r#"DELETE FROM scan_recursive_words
                WHERE scan_id IN (SELECT scan_id FROM fellaga_superseded_scans)"#,
             [],
         )?;
@@ -2161,7 +2322,8 @@ impl Database {
                 r#"UPDATE scan_seed_candidates SET status=CASE
                        WHEN COALESCE((
                          SELECT verification.outcome
-                         FROM dns_verifications verification
+                         FROM dns_verifications AS verification
+                              INDEXED BY idx_dns_verifications_name
                          WHERE verification.scan_id=?
                            AND verification.fqdn=scan_seed_candidates.fqdn
                          ORDER BY verification.checked_at DESC, verification.id DESC
@@ -2278,13 +2440,19 @@ impl Database {
         let mut rank = 0_u64;
         let mut examined_lines = 0_usize;
         let mut examined_bytes = 0_usize;
-        const MAX_WORDLIST_PAGE_LINES: usize = 1_024;
+        // Match the common scheduler wave so a 4,096-candidate batch does not
+        // require four file reopens and four feed transactions. Small calls
+        // retain enough read headroom for invalid-heavy lists, while the hard
+        // line and byte caps keep memory bounded for very large batches.
+        const MIN_WORDLIST_PAGE_LINES: usize = 1_024;
+        const MAX_WORDLIST_PAGE_LINES: usize = 16_384;
+        let page_line_limit = limit.clamp(MIN_WORDLIST_PAGE_LINES, MAX_WORDLIST_PAGE_LINES);
         const MAX_WORDLIST_PAGE_BYTES: usize = 4 * 1024 * 1024;
         let mut exhausted = false;
         let mut discarding_oversized_line = cursor_text == "discard";
         let mut raw = Vec::new();
         let mut candidates = Vec::new();
-        while examined_lines < MAX_WORDLIST_PAGE_LINES && examined_bytes < MAX_WORDLIST_PAGE_BYTES {
+        while examined_lines < page_line_limit && examined_bytes < MAX_WORDLIST_PAGE_BYTES {
             let remaining_bytes = MAX_WORDLIST_PAGE_BYTES.saturating_sub(examined_bytes);
             if discarding_oversized_line {
                 raw.clear();
@@ -2553,6 +2721,19 @@ impl Database {
         scan_id: i64,
         limit: usize,
     ) -> Result<Vec<(String, String, i64)>> {
+        self.pending_scan_candidates_eligible(scan_id, limit, true)
+    }
+
+    /// Claim queued candidates that are still eligible for the current DNS
+    /// budget. No active source, including an explicit wordlist, may bypass an
+    /// exhausted deadline; every unclaimed row remains available to
+    /// `--resume`.
+    pub fn pending_scan_candidates_eligible(
+        &self,
+        scan_id: i64,
+        limit: usize,
+        include_active: bool,
+    ) -> Result<Vec<(String, String, i64)>> {
         if limit == 0 {
             return Ok(Vec::new());
         }
@@ -2561,19 +2742,24 @@ impl Database {
         let mut candidates = {
             let mut statement = transaction.prepare(
                 r#"UPDATE scan_candidates
-                   SET status='processing', attempts=attempts+1
+                   SET status='processing'
                    WHERE rowid IN (
-                       SELECT rowid FROM scan_candidates
-                       WHERE scan_id=?1 AND status='queued'
-                       ORDER BY priority DESC, fqdn
-                       LIMIT ?2
+                        SELECT rowid FROM scan_candidates
+                        WHERE scan_id=?1 AND status='queued'
+                          AND ?3<>0
+                        ORDER BY priority DESC, fqdn
+                        LIMIT ?2
                    )
                      AND scan_id=?1 AND status='queued'
                    RETURNING fqdn, relative_name, generator, priority"#,
             )?;
             statement
                 .query_map(
-                    params![scan_id, limit.min(i64::MAX as usize) as i64],
+                    params![
+                        scan_id,
+                        limit.min(i64::MAX as usize) as i64,
+                        i64::from(include_active)
+                    ],
                     |row| {
                         Ok((
                             row.get::<_, String>(0)?,
@@ -2593,10 +2779,483 @@ impl Database {
             .collect())
     }
 
+    /// Charge a retry uniquement lorsqu'une future DNS a réellement quitté la
+    /// file d'attente. Une deadline déjà expirée ne doit jamais transformer un
+    /// candidat non envoyé en échec réseau.
+    pub fn mark_scan_candidates_started(&self, scan_id: i64, hosts: &[String]) -> Result<()> {
+        if hosts.is_empty() {
+            return Ok(());
+        }
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        for chunk in hosts.chunks(500) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "UPDATE scan_candidates SET attempts=attempts+1 \
+                 WHERE scan_id=? AND status='processing' AND fqdn IN ({placeholders})"
+            );
+            let mut values = Vec::<rusqlite::types::Value>::with_capacity(chunk.len() + 1);
+            values.push(scan_id.into());
+            values.extend(chunk.iter().cloned().map(Into::into));
+            transaction.execute(&sql, rusqlite::params_from_iter(values))?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn requeue_unstarted_scan_candidates(&self, scan_id: i64, hosts: &[String]) -> Result<()> {
+        if hosts.is_empty() {
+            return Ok(());
+        }
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        for chunk in hosts.chunks(500) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "UPDATE scan_candidates SET status='queued' \
+                 WHERE scan_id=? AND status='processing' AND fqdn IN ({placeholders})"
+            );
+            let mut values = Vec::<rusqlite::types::Value>::with_capacity(chunk.len() + 1);
+            values.push(scan_id.into());
+            values.extend(chunk.iter().cloned().map(Into::into));
+            transaction.execute(&sql, rusqlite::params_from_iter(values))?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Freeze the recursive word order for the lifetime of a resumable scan.
+    /// Global learning may change while a checkpoint is paused, so a durable
+    /// ordinal list is required for parent cursors to remain exact.
+    pub fn ensure_scan_recursive_words(
+        &self,
+        scan_id: i64,
+        words: &[String],
+    ) -> Result<Vec<String>> {
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        let existing: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM scan_recursive_words WHERE scan_id=?1",
+            [scan_id],
+            |row| row.get(0),
+        )?;
+        if existing == 0 {
+            let mut insert = transaction.prepare(
+                "INSERT OR IGNORE INTO scan_recursive_words(scan_id, ordinal, word) \
+                 VALUES (?1, ?2, ?3)",
+            )?;
+            for (ordinal, word) in words.iter().enumerate() {
+                insert.execute(params![
+                    scan_id,
+                    ordinal.min(i64::MAX as usize) as i64,
+                    word
+                ])?;
+            }
+        }
+        let stored = {
+            let mut statement = transaction.prepare(
+                "SELECT word FROM scan_recursive_words WHERE scan_id=?1 ORDER BY ordinal",
+            )?;
+            statement
+                .query_map([scan_id], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        transaction.commit()?;
+        Ok(stored)
+    }
+
+    pub fn persist_scan_recursive_parents(
+        &self,
+        scan_id: i64,
+        depth: usize,
+        parents: &[String],
+    ) -> Result<usize> {
+        if parents.is_empty() {
+            return Ok(0);
+        }
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        let mut inserted = 0_usize;
+        {
+            let mut statement = transaction.prepare(
+                r#"INSERT OR IGNORE INTO scan_recursive_parents(
+                       scan_id, depth, parent, next_word, exhausted
+                   ) VALUES (?1, ?2, ?3, 0, 0)"#,
+            )?;
+            for parent in parents {
+                inserted = inserted.saturating_add(statement.execute(params![
+                    scan_id,
+                    depth.min(i64::MAX as usize) as i64,
+                    parent
+                ])?);
+            }
+        }
+        transaction.commit()?;
+        Ok(inserted)
+    }
+
+    pub fn scan_recursive_parents(&self, scan_id: i64, depth: usize) -> Result<Vec<String>> {
+        let connection = self.lock()?;
+        let mut statement = connection.prepare(
+            r#"SELECT parent FROM scan_recursive_parents
+               WHERE scan_id=?1 AND depth=?2 ORDER BY parent"#,
+        )?;
+        statement
+            .query_map(
+                params![scan_id, depth.min(i64::MAX as usize) as i64],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// Materialize only one bounded page of the recursive Cartesian product.
+    /// Parent cursors advance in the same transaction as queue insertion, so a
+    /// crash can repeat a queued row but can never skip an unpersisted name.
+    pub fn refill_scan_recursive_candidates(
+        &self,
+        scan_id: i64,
+        depth: usize,
+        target_queued: usize,
+    ) -> Result<usize> {
+        if target_queued == 0 {
+            return Ok(0);
+        }
+        let depth = depth.min(i64::MAX as usize) as i64;
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        let mut active = transaction
+            .query_row(
+                r#"SELECT COUNT(*) FROM scan_recursive_candidates
+                   WHERE scan_id=?1 AND depth=?2 AND status<>'done'"#,
+                params![scan_id, depth],
+                |row| row.get::<_, i64>(0),
+            )?
+            .max(0) as usize;
+        let word_count = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM scan_recursive_words WHERE scan_id=?1",
+                [scan_id],
+                |row| row.get::<_, i64>(0),
+            )?
+            .max(0);
+
+        while active < target_queued {
+            let parent_state = transaction
+                .query_row(
+                    r#"SELECT parent, next_word
+                       FROM scan_recursive_parents
+                       WHERE scan_id=?1 AND depth=?2 AND exhausted=0
+                       ORDER BY parent LIMIT 1"#,
+                    params![scan_id, depth],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .optional()?;
+            let Some((parent, next_word)) = parent_state else {
+                break;
+            };
+            let capacity = target_queued.saturating_sub(active).min(5_000);
+            let words = {
+                let mut statement = transaction.prepare(
+                    r#"SELECT ordinal, word FROM scan_recursive_words
+                       WHERE scan_id=?1 AND ordinal>=?2
+                       ORDER BY ordinal LIMIT ?3"#,
+                )?;
+                statement
+                    .query_map(
+                        params![scan_id, next_word, capacity.min(i64::MAX as usize) as i64],
+                        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                    )?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            if words.is_empty() {
+                transaction.execute(
+                    r#"UPDATE scan_recursive_parents SET exhausted=1
+                       WHERE scan_id=?1 AND depth=?2 AND parent=?3"#,
+                    params![scan_id, depth, parent],
+                )?;
+                continue;
+            }
+
+            let next_cursor = words
+                .last()
+                .map(|(ordinal, _)| ordinal.saturating_add(1))
+                .unwrap_or(next_word);
+            {
+                let mut insert = transaction.prepare(
+                    r#"INSERT OR IGNORE INTO scan_recursive_candidates(
+                           scan_id, fqdn, parent, depth, word, status
+                       ) VALUES (?1, ?2, ?3, ?4, ?5, 'queued')"#,
+                )?;
+                for (_, word) in &words {
+                    active = active.saturating_add(insert.execute(params![
+                        scan_id,
+                        format!("{word}.{parent}"),
+                        parent,
+                        depth,
+                        word
+                    ])?);
+                }
+            }
+            transaction.execute(
+                r#"UPDATE scan_recursive_parents
+                   SET next_word=?4, exhausted=?5
+                   WHERE scan_id=?1 AND depth=?2 AND parent=?3"#,
+                params![
+                    scan_id,
+                    depth,
+                    parent,
+                    next_cursor,
+                    i64::from(next_cursor >= word_count)
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(active)
+    }
+
+    pub fn pending_scan_recursive_candidates(
+        &self,
+        scan_id: i64,
+        depth: usize,
+        limit: usize,
+    ) -> Result<Vec<(String, String, String)>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        let mut rows = {
+            let mut statement = transaction.prepare(
+                r#"UPDATE scan_recursive_candidates SET status='processing'
+                   WHERE rowid IN (
+                       SELECT rowid FROM scan_recursive_candidates
+                       WHERE scan_id=?1 AND depth=?2 AND status='queued'
+                       ORDER BY fqdn LIMIT ?3
+                   )
+                     AND scan_id=?1 AND depth=?2 AND status='queued'
+                   RETURNING fqdn, parent, word"#,
+            )?;
+            statement
+                .query_map(
+                    params![
+                        scan_id,
+                        depth.min(i64::MAX as usize) as i64,
+                        limit.min(i64::MAX as usize) as i64
+                    ],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        rows.sort_by(|left, right| left.0.cmp(&right.0));
+        transaction.commit()?;
+        Ok(rows)
+    }
+
+    pub fn mark_scan_recursive_candidates_started(
+        &self,
+        scan_id: i64,
+        hosts: &[String],
+    ) -> Result<()> {
+        if hosts.is_empty() {
+            return Ok(());
+        }
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        for chunk in hosts.chunks(500) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let mut values = Vec::<rusqlite::types::Value>::with_capacity(chunk.len() + 1);
+            values.push(scan_id.into());
+            values.extend(chunk.iter().cloned().map(Into::into));
+            transaction.execute(
+                &format!(
+                    "UPDATE scan_recursive_candidates SET attempts=attempts+1 \
+                     WHERE scan_id=? AND status='processing' AND fqdn IN ({placeholders})"
+                ),
+                rusqlite::params_from_iter(values),
+            )?;
+
+            let mut values = Vec::<rusqlite::types::Value>::with_capacity(chunk.len() + 1);
+            values.push(scan_id.into());
+            values.extend(chunk.iter().cloned().map(Into::into));
+            transaction.execute(
+                &format!(
+                    "INSERT OR IGNORE INTO scan_attempted_words(scan_id, word) \
+                     SELECT scan_id, word FROM scan_recursive_candidates \
+                     WHERE scan_id=? AND status='processing' AND fqdn IN ({placeholders})"
+                ),
+                rusqlite::params_from_iter(values),
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn requeue_unstarted_scan_recursive_candidates(
+        &self,
+        scan_id: i64,
+        hosts: &[String],
+    ) -> Result<()> {
+        if hosts.is_empty() {
+            return Ok(());
+        }
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        for chunk in hosts.chunks(500) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let mut values = Vec::<rusqlite::types::Value>::with_capacity(chunk.len() + 1);
+            values.push(scan_id.into());
+            values.extend(chunk.iter().cloned().map(Into::into));
+            transaction.execute(
+                &format!(
+                    "UPDATE scan_recursive_candidates SET status='queued' \
+                     WHERE scan_id=? AND status='processing' AND fqdn IN ({placeholders})"
+                ),
+                rusqlite::params_from_iter(values),
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn mark_scan_recursive_candidates_done(
+        &self,
+        scan_id: i64,
+        hosts: &[String],
+    ) -> Result<()> {
+        if hosts.is_empty() {
+            return Ok(());
+        }
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        for chunk in hosts.chunks(500) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                r#"UPDATE scan_recursive_candidates SET status=CASE
+                       WHEN COALESCE((
+                         SELECT verification.outcome
+                         FROM dns_verifications AS verification
+                              INDEXED BY idx_dns_verifications_name
+                         WHERE verification.scan_id=?
+                           AND verification.fqdn=scan_recursive_candidates.fqdn
+                         ORDER BY verification.checked_at DESC, verification.id DESC
+                         LIMIT 1
+                       ), '')='error' AND attempts<3 THEN 'queued'
+                       ELSE 'done'
+                   END
+                   WHERE scan_id=? AND fqdn IN ({placeholders})"#
+            );
+            let mut values = Vec::<rusqlite::types::Value>::with_capacity(chunk.len() + 2);
+            values.push(scan_id.into());
+            values.push(scan_id.into());
+            values.extend(chunk.iter().cloned().map(Into::into));
+            transaction.execute(&sql, rusqlite::params_from_iter(values))?;
+
+            let mut values = Vec::<rusqlite::types::Value>::with_capacity(chunk.len() + 1);
+            values.push(scan_id.into());
+            values.extend(chunk.iter().cloned().map(Into::into));
+            transaction.execute(
+                &format!(
+                    "DELETE FROM scan_recursive_candidates \
+                     WHERE scan_id=? AND status='done' AND fqdn IN ({placeholders})"
+                ),
+                rusqlite::params_from_iter(values),
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Remove recursive rows whose positive answer was already persisted by
+    /// this same scan. A later transient verification journal entry must not
+    /// keep such a hydrated success in an endless retry loop.
+    pub fn complete_scan_recursive_candidates(&self, scan_id: i64, hosts: &[String]) -> Result<()> {
+        if hosts.is_empty() {
+            return Ok(());
+        }
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        for chunk in hosts.chunks(500) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let mut values = Vec::<rusqlite::types::Value>::with_capacity(chunk.len() + 1);
+            values.push(scan_id.into());
+            values.extend(chunk.iter().cloned().map(Into::into));
+            transaction.execute(
+                &format!(
+                    "DELETE FROM scan_recursive_candidates \
+                     WHERE scan_id=? AND fqdn IN ({placeholders})"
+                ),
+                rusqlite::params_from_iter(values),
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn scan_recursive_depth_has_more(&self, scan_id: i64, depth: usize) -> Result<bool> {
+        Ok(self.lock()?.query_row(
+            r#"SELECT EXISTS(
+                   SELECT 1 FROM scan_recursive_candidates
+                   WHERE scan_id=?1 AND depth=?2 AND status<>'done'
+               ) OR EXISTS(
+                   SELECT 1 FROM scan_recursive_parents
+                   WHERE scan_id=?1 AND depth=?2 AND exhausted=0
+               )"#,
+            params![scan_id, depth.min(i64::MAX as usize) as i64],
+            |row| row.get::<_, i64>(0),
+        )? != 0)
+    }
+
+    pub fn scan_recursive_has_more(&self, scan_id: i64) -> Result<bool> {
+        Ok(self.lock()?.query_row(
+            r#"SELECT EXISTS(
+                   SELECT 1 FROM scan_recursive_candidates
+                   WHERE scan_id=?1 AND status<>'done'
+               ) OR EXISTS(
+                   SELECT 1 FROM scan_recursive_parents
+                   WHERE scan_id=?1 AND exhausted=0
+               )"#,
+            [scan_id],
+            |row| row.get::<_, i64>(0),
+        )? != 0)
+    }
+
     pub fn pending_scan_candidate_count(&self, scan_id: i64) -> Result<i64> {
         Ok(self.lock()?.query_row(
             "SELECT COUNT(*) FROM scan_candidates WHERE scan_id=?1 AND status='queued'",
             [scan_id],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub fn pending_scan_candidate_count_eligible(
+        &self,
+        scan_id: i64,
+        include_active: bool,
+    ) -> Result<i64> {
+        Ok(self.lock()?.query_row(
+            r#"SELECT COUNT(*) FROM scan_candidates
+               WHERE scan_id=?1 AND status='queued'
+                 AND ?2<>0"#,
+            params![scan_id, i64::from(include_active)],
             |row| row.get(0),
         )?)
     }
@@ -2637,7 +3296,8 @@ impl Database {
                 r#"UPDATE scan_candidates SET status=CASE
                        WHEN COALESCE((
                          SELECT verification.outcome
-                         FROM dns_verifications verification
+                          FROM dns_verifications AS verification
+                               INDEXED BY idx_dns_verifications_name
                          WHERE verification.scan_id=?
                            AND verification.fqdn=scan_candidates.fqdn
                          ORDER BY verification.checked_at DESC, verification.id DESC
@@ -2687,7 +3347,8 @@ impl Database {
                          attempts>=3
                          OR COALESCE((
                              SELECT verification.outcome
-                             FROM dns_verifications verification
+                              FROM dns_verifications AS verification
+                                   INDEXED BY idx_dns_verifications_name
                              WHERE verification.scan_id=?1
                                AND verification.fqdn=scan_candidates.fqdn
                              ORDER BY verification.checked_at DESC, verification.id DESC
@@ -2800,6 +3461,52 @@ impl Database {
             .map_err(Into::into)
     }
 
+    /// Rehydrate positive answers already completed by this same resumable
+    /// scan. They are needed as recursive parents after a partial run because
+    /// terminal seed/candidate queue rows are intentionally not replayed.
+    pub fn live_scan_answers(&self, scan_id: i64) -> Result<Vec<(ResolvedHost, BTreeSet<String>)>> {
+        let connection = self.lock()?;
+        let mut statement = connection.prepare(
+            r#"SELECT finding.fqdn, cache.records_json, cache.last_checked,
+                      cache.resolver_count, cache.authoritative, inventory.sources
+               FROM scan_findings AS finding
+               JOIN dns_cache AS cache ON cache.fqdn=finding.fqdn AND cache.status='positive'
+               JOIN subdomains AS inventory ON inventory.fqdn=finding.fqdn
+               WHERE finding.scan_id=?1 AND finding.state='live' AND finding.wildcard=0
+               ORDER BY finding.fqdn"#,
+        )?;
+        statement
+            .query_map([scan_id], |row| {
+                let records_json = row.get::<_, String>(1)?;
+                let records = serde_json::from_str(&records_json).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        1,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?;
+                let sources = row
+                    .get::<_, String>(5)?
+                    .split(',')
+                    .filter(|source| !source.is_empty())
+                    .map(ToOwned::to_owned)
+                    .collect::<BTreeSet<_>>();
+                Ok((
+                    ResolvedHost {
+                        fqdn: row.get(0)?,
+                        records,
+                        from_cache: true,
+                        last_verified_at: row.get(2)?,
+                        resolver_count: row.get::<_, i64>(3)?.clamp(0, i64::from(u16::MAX)) as u16,
+                        authoritative_validation: row.get::<_, i64>(4)? != 0,
+                    },
+                    sources,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
     pub fn clear_scan_candidates(&self, scan_id: i64) -> Result<()> {
         let mut connection = self.lock()?;
         let transaction = connection.transaction()?;
@@ -2818,6 +3525,18 @@ impl Database {
         )?;
         transaction.execute(
             "DELETE FROM scan_attempted_words WHERE scan_id=?1",
+            [scan_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM scan_recursive_candidates WHERE scan_id=?1",
+            [scan_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM scan_recursive_parents WHERE scan_id=?1",
+            [scan_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM scan_recursive_words WHERE scan_id=?1",
             [scan_id],
         )?;
         transaction.commit()?;
@@ -2849,6 +3568,44 @@ impl Database {
                 scan_id
             ],
         )?;
+        Ok(())
+    }
+
+    /// Persist a successful partial result while deliberately keeping the
+    /// checkpoint and candidate feeds resumable.
+    #[allow(clippy::too_many_arguments)]
+    pub fn pause_scan(
+        &self,
+        scan_id: i64,
+        candidates: usize,
+        found: usize,
+        cache_hits: usize,
+        duration_ms: u128,
+        warnings: &[String],
+    ) -> Result<()> {
+        let now = now_epoch();
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            r#"UPDATE scans SET finished_at=?1, status='interrupted', candidates=?2,
+               found=?3, cache_hits=?4, duration_ms=?5, warnings_json=?6
+               WHERE id=?7 AND learning_applied=0"#,
+            params![
+                now,
+                candidates as i64,
+                found as i64,
+                cache_hits as i64,
+                duration_ms.min(i64::MAX as u128) as i64,
+                serde_json::to_string(warnings)?,
+                scan_id
+            ],
+        )?;
+        transaction.execute(
+            r#"UPDATE scan_checkpoints
+               SET stage='paused', updated_at=?1, completed=0 WHERE scan_id=?2"#,
+            params![now, scan_id],
+        )?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -2887,6 +3644,18 @@ impl Database {
         )?;
         transaction.execute(
             "DELETE FROM scan_seed_candidates WHERE scan_id=?1",
+            [scan_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM scan_recursive_candidates WHERE scan_id=?1",
+            [scan_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM scan_recursive_parents WHERE scan_id=?1",
+            [scan_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM scan_recursive_words WHERE scan_id=?1",
             [scan_id],
         )?;
         transaction.commit()?;
@@ -3005,6 +3774,49 @@ impl Database {
             .map_err(Into::into)
     }
 
+    /// Return candidates that have durable positive or observational history.
+    ///
+    /// The discovery-only one-resolver shortcut is safe only for names that
+    /// Fellaga has never seen. Expiry and active state are intentionally
+    /// ignored: retained inventory, normalized observations, and positive DNS
+    /// cache entries always require the conservative resolver path.
+    pub fn known_discovery_names(&self, hosts: &[String]) -> Result<BTreeSet<String>> {
+        const LOOKUP_BATCH_SIZE: usize = 500;
+
+        let connection = self.lock()?;
+        let mut known = BTreeSet::new();
+        for batch in hosts.chunks(LOOKUP_BATCH_SIZE) {
+            if batch.is_empty() {
+                continue;
+            }
+            let placeholders = std::iter::repeat_n("?", batch.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            for query in [
+                format!("SELECT fqdn FROM subdomains WHERE fqdn IN ({placeholders})"),
+                format!(
+                    "SELECT DISTINCT names.fqdn FROM observed_names names \
+                     JOIN observation_evidence evidence ON evidence.name_id=names.id \
+                     WHERE names.fqdn IN ({placeholders})"
+                ),
+                format!(
+                    "SELECT fqdn FROM dns_cache \
+                     WHERE status='positive' AND fqdn IN ({placeholders})"
+                ),
+            ] {
+                let mut statement = connection.prepare(&query)?;
+                let rows = statement
+                    .query_map(rusqlite::params_from_iter(batch.iter()), |row| {
+                        row.get::<_, String>(0)
+                    })?;
+                for row in rows {
+                    known.insert(row?);
+                }
+            }
+        }
+        Ok(known)
+    }
+
     pub fn update_cache(
         &self,
         queried_hosts: &[String],
@@ -3022,6 +3834,160 @@ impl Database {
             .cloned()
             .collect::<Vec<_>>();
         self.update_cache_outcomes(None, resolved, &negative, &[], negative_ttl)
+    }
+
+    /// Persist definitive negatives produced by the discovery-only fast path.
+    ///
+    /// These observations are deliberately journal-only: they may terminate a
+    /// candidate in the current scan, but they must not poison the reusable DNS
+    /// cache or demote permanent inventory that was validated previously.
+    pub fn record_discovery_negatives(&self, scan_id: i64, hosts: &[String]) -> Result<()> {
+        if hosts.is_empty() {
+            return Ok(());
+        }
+
+        const WRITE_BATCH_SIZE: usize = 500;
+        const DETAILS_JSON: &str =
+            r#"{"scope":"discovery-only","cache_write":false,"inventory_write":false}"#;
+
+        // Sorting references keeps duplicate inputs from creating duplicate
+        // journal events without cloning a potentially large hostname batch.
+        let mut unique_hosts = hosts.iter().map(String::as_str).collect::<Vec<_>>();
+        unique_hosts.sort_unstable();
+        unique_hosts.dedup();
+
+        let now = now_epoch();
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        {
+            // The statement has a fixed parameter count. Chunking bounds each
+            // write wave even when the caller supplies millions of candidates.
+            let mut statement = transaction.prepare(
+                r#"INSERT INTO dns_verifications(
+                       scan_id, fqdn, checked_at, outcome, resolver_count,
+                       authoritative, records_hash, details_json
+                   ) VALUES (?1, ?2, ?3, 'negative', 1, 0, NULL, ?4)"#,
+            )?;
+            for batch in unique_hosts.chunks(WRITE_BATCH_SIZE) {
+                for host in batch {
+                    statement.execute(params![scan_id, *host, now, DETAILS_JSON])?;
+                }
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Journal current-scan network positives that match a confirmed wildcard.
+    ///
+    /// This marker is the authorization boundary for wildcard quarantine
+    /// cleanup. Cached or single-resolver answers cannot create it, and
+    /// recording it does not mutate the reusable cache, inventory, or
+    /// historical DNS records.
+    pub fn record_current_wildcard_matches(
+        &self,
+        scan_id: i64,
+        answers: &[ResolvedHost],
+    ) -> Result<usize> {
+        let network_answers = answers
+            .iter()
+            .filter(|answer| {
+                !answer.from_cache && !answer.records.is_empty() && answer.resolver_count >= 2
+            })
+            .collect::<Vec<_>>();
+        if network_answers.is_empty() {
+            return Ok(0);
+        }
+
+        let now = now_epoch();
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        let mut inserted = 0_usize;
+        {
+            let mut statement = transaction.prepare(
+                r#"INSERT INTO dns_verifications(
+                       scan_id, fqdn, checked_at, outcome, resolver_count,
+                       authoritative, records_hash, details_json
+                   ) VALUES (?1, ?2, ?3, 'unverified', ?4, ?5, ?6, ?7)"#,
+            )?;
+            for answer in network_answers {
+                let records_hash = canonical_dns_records_hash(&answer.records)?;
+                inserted = inserted.saturating_add(statement.execute(params![
+                    scan_id,
+                    answer.fqdn,
+                    now,
+                    i64::from(answer.resolver_count),
+                    i64::from(answer.authoritative_validation),
+                    records_hash,
+                    CURRENT_SCAN_WILDCARD_MATCH_DETAILS
+                ])?);
+            }
+        }
+        transaction.commit()?;
+        Ok(inserted)
+    }
+
+    /// Records a current positive response that cannot be distinguished from
+    /// an indeterminate or rotating wildcard profile. Unlike the exact-match
+    /// marker above, this never authorizes quarantine. It removes reusable
+    /// positive cache material and demotes only the materialized inventory for
+    /// this root while retaining records, sources, and append-only history.
+    pub fn record_current_wildcard_ambiguities(
+        &self,
+        scan_id: i64,
+        root_domain: &str,
+        answers: &[ResolvedHost],
+    ) -> Result<usize> {
+        let network_answers = answers
+            .iter()
+            .filter(|answer| !answer.from_cache && !answer.records.is_empty())
+            .collect::<Vec<_>>();
+        if network_answers.is_empty() {
+            return Ok(0);
+        }
+
+        let now = now_epoch();
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        let mut inserted = 0_usize;
+        {
+            let mut statement = transaction.prepare(
+                r#"INSERT INTO dns_verifications(
+                       scan_id, fqdn, checked_at, outcome, resolver_count,
+                       authoritative, records_hash, details_json
+                   ) VALUES (?1, ?2, ?3, 'unverified', ?4, ?5, ?6, ?7)"#,
+            )?;
+            for answer in &network_answers {
+                let records_hash = canonical_dns_records_hash(&answer.records)?;
+                inserted = inserted.saturating_add(statement.execute(params![
+                    scan_id,
+                    answer.fqdn,
+                    now,
+                    i64::from(answer.resolver_count),
+                    i64::from(answer.authoritative_validation),
+                    records_hash,
+                    CURRENT_SCAN_WILDCARD_AMBIGUITY_DETAILS
+                ])?);
+            }
+        }
+        {
+            let mut delete_cache = transaction.prepare("DELETE FROM dns_cache WHERE fqdn=?1")?;
+            let mut demote_inventory = transaction.prepare(
+                r#"UPDATE subdomains
+                   SET active=0, verification_state='unverified', last_verified_at=NULL
+                   WHERE root_domain=?1 AND fqdn=?2"#,
+            )?;
+            let mut demote_records =
+                transaction.prepare("UPDATE dns_records SET active=0 WHERE fqdn=?1")?;
+            for answer in network_answers {
+                delete_cache.execute([answer.fqdn.as_str()])?;
+                if demote_inventory.execute(params![root_domain, answer.fqdn])? > 0 {
+                    demote_records.execute([answer.fqdn.as_str()])?;
+                }
+            }
+        }
+        transaction.commit()?;
+        Ok(inserted)
     }
 
     pub fn update_cache_outcomes(
@@ -3078,7 +4044,7 @@ impl Database {
                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
             )?;
             for answer in resolved {
-                let records_hash = domain_hash(&serde_json::to_string(&answer.records)?);
+                let records_hash = canonical_dns_records_hash(&answer.records)?;
                 statement.execute(params![
                     scan_id,
                     answer.fqdn,
@@ -3115,12 +4081,21 @@ impl Database {
                 ])?;
             }
         }
-        for host in definitive_negative {
+        for chunk in definitive_negative.chunks(500) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
             transaction.execute(
-                "UPDATE subdomains SET active=0, verification_state='historical' WHERE fqdn=?1",
-                [host],
+                &format!(
+                    "UPDATE subdomains SET active=0, verification_state='historical' \
+                     WHERE fqdn IN ({placeholders})"
+                ),
+                rusqlite::params_from_iter(chunk.iter()),
             )?;
-            transaction.execute("UPDATE dns_records SET active=0 WHERE fqdn=?1", [host])?;
+            transaction.execute(
+                &format!("UPDATE dns_records SET active=0 WHERE fqdn IN ({placeholders})"),
+                rusqlite::params_from_iter(chunk.iter()),
+            )?;
         }
         transaction.commit()?;
         Ok(())
@@ -3137,6 +4112,12 @@ impl Database {
         let mut connection = self.lock()?;
         let transaction = connection.transaction()?;
         for finding in findings {
+            if finding.state == ObservationState::Live && !finding.wildcard {
+                transaction.execute(
+                    "DELETE FROM wildcard_quarantine WHERE root_domain=?1 AND fqdn=?2",
+                    params![domain, finding.fqdn],
+                )?;
+            }
             let mut combined_sources = finding.sources.clone();
             if let Some(existing) = transaction
                 .query_row(
@@ -3397,8 +4378,6 @@ impl Database {
         }
         let page_size = page_size.clamp(1, 400);
         let now = now_epoch();
-        let details =
-            serde_json::to_string(&json!({ "reason": "refresh_confirmed_wildcard_match" }))?;
         let root_suffix = format!(".{root_domain}");
         let mut cursor = None::<String>;
         let mut processed = 0_usize;
@@ -3437,12 +4416,17 @@ impl Database {
                 if host != root_domain && !host.ends_with(&root_suffix) {
                     bail!("candidat wildcard hors zone refusé: {host}");
                 }
-                if let Some(independent) = independent_sources.get(host) {
+                let current_network_match =
+                    has_current_scan_wildcard_match(&transaction, scan_id, host)?;
+                if !current_network_match {
                     let merged = stored_sources.entry(host.clone()).or_default();
-                    merged.extend(independent.iter().cloned());
-                    transaction.execute(
+                    if let Some(independent) = independent_sources.get(host) {
+                        merged.extend(independent.iter().cloned());
+                    }
+                    let inventory_changed = transaction.execute(
                         r#"UPDATE subdomains
-                           SET active=0, verification_state='unverified', sources=?1
+                           SET active=0, verification_state='unverified', sources=?1,
+                               last_verified_at=NULL
                            WHERE fqdn=?2 AND root_domain=?3"#,
                         params![
                             merged.iter().cloned().collect::<Vec<_>>().join(","),
@@ -3450,59 +4434,34 @@ impl Database {
                             root_domain
                         ],
                     )?;
-                    transaction.execute("UPDATE dns_records SET active=0 WHERE fqdn=?1", [host])?;
-                    transaction.execute(
-                        r#"UPDATE scan_findings
-                           SET wildcard=1, state='unverified', last_verified_at=NULL
-                           WHERE fqdn=?1"#,
-                        [host],
-                    )?;
+                    if inventory_changed > 0 {
+                        transaction
+                            .execute("UPDATE dns_records SET active=0 WHERE fqdn=?1", [host])?;
+                    }
                     transaction.execute(
                         r#"INSERT INTO dns_verifications(
                            scan_id, fqdn, checked_at, outcome, resolver_count,
                            authoritative, records_hash, details_json
                            ) VALUES (?1, ?2, ?3, 'unverified', 0, 0, NULL, ?4)"#,
-                        params![scan_id, host, now, details],
+                        params![
+                            scan_id,
+                            host,
+                            now,
+                            serde_json::to_string(&json!({
+                                "reason": "cached_wildcard_match_without_current_network_confirmation"
+                            }))?
+                        ],
                     )?;
                     retained_unverified = retained_unverified.saturating_add(1);
                 } else {
-                    transaction.execute(
-                        r#"INSERT OR IGNORE INTO refresh_wildcard_affected_scans(
-                           refresh_scan_id, affected_scan_id
-                           ) SELECT ?1, scan_id FROM scan_findings WHERE fqdn=?2"#,
-                        params![scan_id, host],
+                    quarantine_wildcard_host(
+                        &transaction,
+                        root_domain,
+                        host,
+                        scan_id,
+                        "refresh_confirmed_wildcard_match",
+                        now,
                     )?;
-                    transaction.execute("DELETE FROM scan_findings WHERE fqdn=?1", [host])?;
-                    transaction.execute("DELETE FROM dns_cache WHERE fqdn=?1", [host])?;
-                    transaction.execute("DELETE FROM dns_records WHERE fqdn=?1", [host])?;
-                    transaction.execute("DELETE FROM scan_candidates WHERE fqdn=?1", [host])?;
-                    transaction
-                        .execute("DELETE FROM scan_seed_candidates WHERE fqdn=?1", [host])?;
-                    transaction.execute(
-                        r#"DELETE FROM observation_evidence
-                           WHERE root_domain=?1 AND name_id=(
-                               SELECT id FROM observed_names WHERE fqdn=?2
-                           )"#,
-                        params![root_domain, host],
-                    )?;
-                    transaction.execute(
-                        r#"DELETE FROM observed_names WHERE fqdn=?1
-                           AND NOT EXISTS (
-                               SELECT 1 FROM observation_evidence
-                               WHERE observation_evidence.name_id=observed_names.id
-                           )"#,
-                        [host],
-                    )?;
-                    transaction.execute(
-                        "DELETE FROM subdomains WHERE fqdn=?1 AND root_domain=?2",
-                        params![host, root_domain],
-                    )?;
-                    if let Some(relative) = host.strip_suffix(&root_suffix) {
-                        transaction.execute(
-                            "DELETE FROM relative_patterns WHERE relative_name=?1 AND unique_domains<=1",
-                            [relative],
-                        )?;
-                    }
                     purged = purged.saturating_add(1);
                 }
                 processed = processed.saturating_add(1);
@@ -3514,15 +4473,6 @@ impl Database {
             transaction.rollback()?;
             return Ok(None);
         }
-        transaction.execute(
-            r#"UPDATE scans SET found=(
-                   SELECT COUNT(*) FROM scan_findings WHERE scan_id=scans.id
-               ) WHERE id IN (
-                   SELECT affected_scan_id FROM refresh_wildcard_affected_scans
-                   WHERE refresh_scan_id=?1
-               )"#,
-            [scan_id],
-        )?;
         transaction.execute(
             "DELETE FROM refresh_wildcard_affected_scans WHERE refresh_scan_id=?1",
             [scan_id],
@@ -3538,12 +4488,13 @@ impl Database {
         }))
     }
 
-    /// Supprime de l'inventaire les réponses créées uniquement par le moteur
-    /// actif sous une zone wildcard confirmée. Les noms corroborés par une
-    /// source indépendante (CT, passif, Web, TLS, autoritaire ou import) sont
-    /// conservés afin de ne pas détruire une observation potentiellement réelle.
+    /// Quarantines exact current-network matches under a confirmed wildcard
+    /// zone. Passive and historical evidence remains available through
+    /// `explain`, but cannot make an indistinguishable wildcard answer visible.
+    /// A later non-wildcard live finding lifts the root-specific quarantine.
     pub fn purge_confirmed_wildcard_false_positives(
         &self,
+        scan_id: i64,
         root_domain: &str,
         hosts: &[String],
     ) -> Result<Vec<String>> {
@@ -3552,125 +4503,75 @@ impl Database {
         }
         let mut connection = self.lock()?;
         let transaction = connection.transaction()?;
+        let scan_domain = transaction
+            .query_row("SELECT domain FROM scans WHERE id=?1", [scan_id], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()?;
+        if scan_domain.as_deref() != Some(root_domain) {
+            bail!("la zone de purge wildcard ne correspond pas au scan {scan_id}");
+        }
         let mut purged = Vec::new();
-        let mut affected_scans = BTreeSet::new();
-
+        let root_suffix = format!(".{root_domain}");
         for host in hosts {
-            let evidence = {
-                let mut statement = transaction.prepare(
-                    r#"SELECT evidence.kind, evidence.source
-                       FROM observation_evidence evidence
-                       JOIN observed_names names ON names.id=evidence.name_id
-                       WHERE evidence.root_domain=?1 AND names.fqdn=?2"#,
-                )?;
-                statement
-                    .query_map(params![root_domain, host], |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                    })?
-                    .collect::<rusqlite::Result<Vec<_>>>()?
-            };
-            let mut independent_sources = evidence
-                .iter()
-                .filter(|(kind, source)| {
-                    matches!(
-                        evidence_family(source),
-                        Some(family) if family != EvidenceFamily::LiveDns
-                    ) || matches!(
-                        kind.as_str(),
-                        "passive" | "web" | "tls" | "dnssec" | "import"
-                    )
-                })
-                .map(|(_, source)| source.clone())
-                .collect::<BTreeSet<_>>();
-            let stored_sources = transaction
-                .query_row(
-                    "SELECT sources FROM subdomains WHERE fqdn=?1 AND root_domain=?2",
-                    params![host, root_domain],
-                    |row| row.get::<_, String>(0),
-                )
-                .optional()?;
-            if let Some(sources) = &stored_sources {
-                independent_sources.extend(
-                    sources
-                        .split(',')
-                        .filter(|source| {
-                            matches!(
-                                evidence_family(source),
-                                Some(family) if family != EvidenceFamily::LiveDns
-                            ) || *source == "import"
-                                || source.starts_with("import:")
-                        })
-                        .map(ToOwned::to_owned),
-                );
+            if host != root_domain && !host.ends_with(&root_suffix) {
+                bail!("candidat wildcard hors zone refusé: {host}");
             }
-            if !independent_sources.is_empty() {
-                let mut merged = stored_sources
-                    .as_deref()
-                    .unwrap_or_default()
-                    .split(',')
-                    .filter(|source| !source.is_empty())
-                    .map(ToOwned::to_owned)
-                    .collect::<BTreeSet<_>>();
-                merged.extend(independent_sources);
-                transaction.execute(
-                    "UPDATE subdomains SET sources=?1 WHERE fqdn=?2 AND root_domain=?3",
+        }
+
+        let now = now_epoch();
+        for page in hosts.chunks(400) {
+            let (mut stored_sources, independent_sources) =
+                wildcard_cleanup_evidence_for_hosts(&transaction, root_domain, page)?;
+            for host in page {
+                let current_network_match =
+                    has_current_scan_wildcard_match(&transaction, scan_id, host)?;
+                if current_network_match {
+                    quarantine_wildcard_host(
+                        &transaction,
+                        root_domain,
+                        host,
+                        scan_id,
+                        "confirmed_wildcard_match",
+                        now,
+                    )?;
+                    purged.push(host.clone());
+                    continue;
+                }
+
+                let merged = stored_sources.entry(host.clone()).or_default();
+                if let Some(independent) = independent_sources.get(host) {
+                    merged.extend(independent.iter().cloned());
+                }
+                let inventory_changed = transaction.execute(
+                    r#"UPDATE subdomains
+                       SET active=0, verification_state='unverified', sources=?1,
+                           last_verified_at=NULL
+                       WHERE fqdn=?2 AND root_domain=?3"#,
                     params![
-                        merged.into_iter().collect::<Vec<_>>().join(","),
+                        merged.iter().cloned().collect::<Vec<_>>().join(","),
                         host,
                         root_domain
                     ],
                 )?;
-                continue;
-            }
-
-            {
-                let mut statement =
-                    transaction.prepare("SELECT scan_id FROM scan_findings WHERE fqdn=?1")?;
-                affected_scans.extend(
-                    statement
-                        .query_map([host], |row| row.get::<_, i64>(0))?
-                        .collect::<rusqlite::Result<Vec<_>>>()?,
-                );
-            }
-            transaction.execute("DELETE FROM scan_findings WHERE fqdn=?1", [host])?;
-            transaction.execute("DELETE FROM dns_cache WHERE fqdn=?1", [host])?;
-            transaction.execute("DELETE FROM dns_records WHERE fqdn=?1", [host])?;
-            transaction.execute("DELETE FROM scan_candidates WHERE fqdn=?1", [host])?;
-            transaction.execute(
-                r#"DELETE FROM observation_evidence
-                   WHERE root_domain=?1 AND name_id=(
-                       SELECT id FROM observed_names WHERE fqdn=?2
-                   )"#,
-                params![root_domain, host],
-            )?;
-            transaction.execute(
-                r#"DELETE FROM observed_names WHERE fqdn=?1
-                   AND NOT EXISTS (
-                       SELECT 1 FROM observation_evidence
-                       WHERE observation_evidence.name_id=observed_names.id
-                   )"#,
-                [host],
-            )?;
-            transaction.execute(
-                "DELETE FROM subdomains WHERE fqdn=?1 AND root_domain=?2",
-                params![host, root_domain],
-            )?;
-            if let Some(relative) = host.strip_suffix(&format!(".{root_domain}")) {
+                if inventory_changed > 0 {
+                    transaction.execute("UPDATE dns_records SET active=0 WHERE fqdn=?1", [host])?;
+                }
                 transaction.execute(
-                    "DELETE FROM relative_patterns WHERE relative_name=?1 AND unique_domains<=1",
-                    [relative],
+                    r#"INSERT INTO dns_verifications(
+                       scan_id, fqdn, checked_at, outcome, resolver_count,
+                       authoritative, records_hash, details_json
+                       ) VALUES (?1, ?2, ?3, 'unverified', 0, 0, NULL, ?4)"#,
+                    params![
+                        scan_id,
+                        host,
+                        now,
+                        serde_json::to_string(&json!({
+                            "reason": "wildcard_match_without_current_network_confirmation"
+                        }))?
+                    ],
                 )?;
             }
-            purged.push(host.clone());
-        }
-
-        for scan_id in affected_scans {
-            transaction.execute(
-                r#"UPDATE scans SET found=(
-                       SELECT COUNT(*) FROM scan_findings WHERE scan_id=?1
-                   ) WHERE id=?1"#,
-                [scan_id],
-            )?;
         }
         transaction.commit()?;
         purged.sort();
@@ -4365,6 +5266,18 @@ impl Database {
             "DELETE FROM scan_seed_candidates WHERE scan_id=?1",
             [scan_id],
         )?;
+        transaction.execute(
+            "DELETE FROM scan_recursive_candidates WHERE scan_id=?1",
+            [scan_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM scan_recursive_parents WHERE scan_id=?1",
+            [scan_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM scan_recursive_words WHERE scan_id=?1",
+            [scan_id],
+        )?;
         transaction.commit()?;
         drop(connection);
         let _ = self.prune_superseded_candidate_queues(2_000);
@@ -4933,14 +5846,33 @@ impl Database {
             .map_err(Into::into)
     }
 
+    pub fn positive_cache_only_count(&self, domain: &str) -> Result<usize> {
+        let suffix = format!("%.{domain}");
+        let count = self.lock()?.query_row(
+            r#"SELECT COUNT(*) FROM dns_cache cache
+               WHERE cache.status='positive'
+                 AND (cache.fqdn=?1 OR cache.fqdn LIKE ?2)
+                 AND NOT EXISTS (
+                     SELECT 1 FROM subdomains inventory WHERE inventory.fqdn=cache.fqdn
+                 )"#,
+            params![domain, suffix],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(count.max(0) as usize)
+    }
+
     pub fn inventory(&self, domain: Option<&str>, only_live: bool) -> Result<Vec<InventoryEntry>> {
         let connection = self.lock()?;
-        let mut conditions = Vec::new();
+        let mut conditions = vec![
+            "NOT EXISTS (SELECT 1 FROM wildcard_quarantine quarantine \
+             WHERE quarantine.root_domain=subdomains.root_domain \
+               AND quarantine.fqdn=subdomains.fqdn)",
+        ];
         if domain.is_some() {
-            conditions.push("root_domain=?1");
+            conditions.push("subdomains.root_domain=?1");
         }
         if only_live {
-            conditions.push("verification_state='live'");
+            conditions.push("subdomains.verification_state='live'");
         }
         let where_clause = if conditions.is_empty() {
             String::new()
@@ -4989,6 +5921,64 @@ impl Database {
         }
     }
 
+    pub fn inventory_page(
+        &self,
+        domain: &str,
+        only_live: bool,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<InventoryEntry>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let live_clause = if only_live {
+            " AND subdomains.verification_state='live'"
+        } else {
+            ""
+        };
+        let sql = format!(
+            r#"SELECT fqdn, verification_state, last_verified_at,
+               first_seen, last_seen, times_seen, sources
+               FROM subdomains
+               WHERE subdomains.root_domain=?1
+                 AND NOT EXISTS (
+                     SELECT 1 FROM wildcard_quarantine quarantine
+                     WHERE quarantine.root_domain=subdomains.root_domain
+                       AND quarantine.fqdn=subdomains.fqdn
+                 )
+                 AND (?2 IS NULL OR subdomains.fqdn>?2){live_clause}
+               ORDER BY subdomains.fqdn LIMIT ?3"#
+        );
+        let connection = self.lock()?;
+        let mut statement = connection.prepare(&sql)?;
+        statement
+            .query_map(params![domain, after, limit as i64], |row| {
+                let raw_state: String = row.get(1)?;
+                let state = match raw_state.as_str() {
+                    "live" => ObservationState::Live,
+                    "historical" => ObservationState::Historical,
+                    _ => ObservationState::Unverified,
+                };
+                let sources = row
+                    .get::<_, String>(6)?
+                    .split(',')
+                    .filter(|source| !source.is_empty())
+                    .map(ToOwned::to_owned)
+                    .collect();
+                Ok(InventoryEntry {
+                    fqdn: row.get(0)?,
+                    state,
+                    last_verified_at: row.get(2)?,
+                    first_seen: row.get(3)?,
+                    last_seen: row.get(4)?,
+                    times_seen: row.get(5)?,
+                    sources,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
     pub fn explain(&self, fqdn: &str) -> Result<Value> {
         let connection = self.lock()?;
         let inventory = connection
@@ -5013,7 +6003,24 @@ impl Database {
                 },
             )
             .optional()?;
-        if inventory.is_none() {
+        let quarantine = {
+            let mut statement = connection.prepare(
+                r#"SELECT root_domain, scan_id, reason, quarantined_at
+                   FROM wildcard_quarantine WHERE fqdn=?1
+                   ORDER BY quarantined_at DESC, root_domain"#,
+            )?;
+            statement
+                .query_map([fqdn], |row| {
+                    Ok(json!({
+                        "root_domain": row.get::<_, String>(0)?,
+                        "scan_id": row.get::<_, i64>(1)?,
+                        "reason": row.get::<_, String>(2)?,
+                        "quarantined_at": row.get::<_, i64>(3)?
+                    }))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        if inventory.is_none() && quarantine.is_empty() {
             return Ok(json!({"known": false, "fqdn": fqdn}));
         }
 
@@ -5106,6 +6113,7 @@ impl Database {
             "known": true,
             "fqdn": fqdn,
             "inventory": inventory,
+            "quarantine": quarantine,
             "dns_records": dns_records,
             "evidence": evidence,
             "dns_verifications": dns_verifications,
@@ -5974,6 +6982,77 @@ mod tests {
     }
 
     #[test]
+    fn candidate_outcome_queries_force_the_fqdn_verification_index() {
+        let db = Database::in_memory().unwrap();
+        let connection = db.lock().unwrap();
+        let plans = [
+            r#"EXPLAIN QUERY PLAN
+               UPDATE scan_seed_candidates SET status=CASE
+                   WHEN COALESCE((
+                     SELECT verification.outcome
+                     FROM dns_verifications AS verification
+                          INDEXED BY idx_dns_verifications_name
+                     WHERE verification.scan_id=1
+                       AND verification.fqdn=scan_seed_candidates.fqdn
+                     ORDER BY verification.checked_at DESC, verification.id DESC
+                     LIMIT 1
+                   ), '')='error' AND attempts<3 THEN 'queued'
+                   ELSE 'done'
+               END
+               WHERE scan_id=1 AND fqdn IN ('plan.example.com')"#,
+            r#"EXPLAIN QUERY PLAN
+               UPDATE scan_candidates SET status=CASE
+                   WHEN COALESCE((
+                     SELECT verification.outcome
+                     FROM dns_verifications AS verification
+                          INDEXED BY idx_dns_verifications_name
+                     WHERE verification.scan_id=1
+                       AND verification.fqdn=scan_candidates.fqdn
+                     ORDER BY verification.checked_at DESC, verification.id DESC
+                     LIMIT 1
+                   ), '')='error' AND attempts<3 THEN 'queued'
+                   ELSE 'done'
+               END
+               WHERE scan_id=1 AND fqdn IN ('plan.example.com')"#,
+            r#"EXPLAIN QUERY PLAN
+               UPDATE scan_candidates SET learning_recorded=1
+               WHERE scan_id=1 AND fqdn='plan.example.com' AND learning_recorded=0
+                 AND (
+                   attempts>=3
+                   OR COALESCE((
+                     SELECT verification.outcome
+                     FROM dns_verifications AS verification
+                          INDEXED BY idx_dns_verifications_name
+                     WHERE verification.scan_id=1
+                       AND verification.fqdn=scan_candidates.fqdn
+                     ORDER BY verification.checked_at DESC, verification.id DESC
+                     LIMIT 1
+                   ), '')<>'error'
+                 )"#,
+        ];
+        for sql in plans {
+            let mut statement = connection.prepare(sql).unwrap();
+            let details = statement
+                .query_map([], |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert!(
+                details
+                    .iter()
+                    .any(|detail| detail.contains("idx_dns_verifications_name (fqdn=?)")),
+                "expected fqdn index in query plan: {details:?}"
+            );
+            assert!(
+                details
+                    .iter()
+                    .all(|detail| !detail.contains("idx_dns_verifications_scan (scan_id=?)")),
+                "scan-wide verification lookup leaked into query plan: {details:?}"
+            );
+        }
+    }
+
+    #[test]
     fn dns_validation_journal_is_append_only() {
         let db = Database::in_memory().unwrap();
         let host = "api.example.com".to_owned();
@@ -6013,6 +7092,373 @@ mod tests {
     }
 
     #[test]
+    fn discovery_fast_path_excludes_all_durable_known_name_sources() {
+        let db = Database::in_memory().unwrap();
+        let inventory = "inventory.example.com".to_owned();
+        let observed = "observed.example.com".to_owned();
+        let cached = "cached.example.com".to_owned();
+        let negative = "negative.example.com".to_owned();
+        let unknown = "unknown.example.com".to_owned();
+
+        db.lock()
+            .unwrap()
+            .execute(
+                r#"INSERT INTO subdomains(
+                       fqdn, root_domain, first_seen, last_seen, times_seen,
+                       active, sources, verification_state
+                   ) VALUES (?1, 'example.com', 1, 1, 1, 0, 'test', 'historical')"#,
+                [&inventory],
+            )
+            .unwrap();
+        db.store_observations(
+            "example.com",
+            vec![ObservationInput {
+                fqdn: observed.clone(),
+                kind: "passive".to_owned(),
+                source: "passive:test".to_owned(),
+                value: String::new(),
+            }],
+        )
+        .unwrap();
+        let answer = ResolvedHost {
+            fqdn: cached.clone(),
+            records: vec![DnsRecord {
+                record_type: "A".to_owned(),
+                value: "192.0.2.50".to_owned(),
+                ttl: 60,
+            }],
+            from_cache: false,
+            last_verified_at: Some(now_epoch()),
+            authoritative_validation: false,
+            resolver_count: 2,
+        };
+        db.update_cache_outcomes(None, &[answer], std::slice::from_ref(&negative), &[], 30)
+            .unwrap();
+
+        let known = db
+            .known_discovery_names(&[
+                inventory.clone(),
+                observed.clone(),
+                cached.clone(),
+                negative,
+                unknown,
+            ])
+            .unwrap();
+        assert_eq!(known, BTreeSet::from([cached, inventory, observed]));
+    }
+
+    #[test]
+    fn discovery_negatives_only_append_journal_and_finalize_candidates() {
+        let db = Database::in_memory().unwrap();
+        let previous_scan = db.create_scan("example.com", &json!({})).unwrap();
+        let live_host = "api.example.com".to_owned();
+        let answer = ResolvedHost {
+            fqdn: live_host.clone(),
+            records: vec![DnsRecord {
+                record_type: "A".to_owned(),
+                value: "192.0.2.10".to_owned(),
+                ttl: 60,
+            }],
+            from_cache: false,
+            last_verified_at: Some(now_epoch()),
+            authoritative_validation: true,
+            resolver_count: 3,
+        };
+        let sources = BTreeSet::from(["dns:trusted".to_owned()]);
+        let finding = Finding {
+            fqdn: live_host.clone(),
+            records: answer.records.clone(),
+            sources: sources.clone(),
+            wildcard: false,
+            from_cache: false,
+            confidence: crate::confidence::assess(&sources, false, true),
+            state: ObservationState::Live,
+            last_verified_at: answer.last_verified_at,
+            evidence_families: BTreeSet::from([crate::model::EvidenceFamily::LiveDns]),
+            authoritative_validation: true,
+        };
+        db.persist_findings(previous_scan, "example.com", &[finding], 86_400)
+            .unwrap();
+        db.update_cache_outcomes(
+            Some(previous_scan),
+            std::slice::from_ref(&answer),
+            &[],
+            &[],
+            300,
+        )
+        .unwrap();
+
+        let (inventory_before, record_before, cache_before) = {
+            let connection = db.lock().unwrap();
+            let inventory = connection
+                .query_row(
+                    r#"SELECT active, verification_state, last_verified_at
+                       FROM subdomains WHERE fqdn=?1"#,
+                    [&live_host],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, Option<i64>>(2)?,
+                        ))
+                    },
+                )
+                .unwrap();
+            let record = connection
+                .query_row(
+                    r#"SELECT record_type, value, ttl, expires_at, active
+                       FROM dns_records WHERE fqdn=?1"#,
+                    [&live_host],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, i64>(4)?,
+                        ))
+                    },
+                )
+                .unwrap();
+            let cache = connection
+                .query_row(
+                    r#"SELECT status, records_json, expires_at, last_checked,
+                              resolver_count, authoritative
+                       FROM dns_cache WHERE fqdn=?1"#,
+                    [&live_host],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, i64>(4)?,
+                            row.get::<_, i64>(5)?,
+                        ))
+                    },
+                )
+                .unwrap();
+            (inventory, record, cache)
+        };
+
+        let scan_id = db.create_scan("example.com", &json!({})).unwrap();
+        let mut candidates = vec![("api".to_owned(), "test".to_owned(), 1)];
+        candidates.extend((0..501).map(|index| (format!("absent-{index}"), "test".to_owned(), 1)));
+        db.persist_scan_candidates(scan_id, "example.com", &candidates)
+            .unwrap();
+        assert_eq!(
+            db.pending_scan_candidates(scan_id, 1_000).unwrap().len(),
+            502
+        );
+
+        let mut hosts = candidates
+            .iter()
+            .map(|(relative_name, _, _)| format!("{relative_name}.example.com"))
+            .collect::<Vec<_>>();
+        hosts.push(live_host.clone());
+        hosts.push("absent-0.example.com".to_owned());
+        db.record_discovery_negatives(scan_id, &hosts).unwrap();
+        hosts.truncate(502);
+        db.mark_scan_candidates_done(scan_id, &hosts).unwrap();
+
+        assert_eq!(db.pending_scan_candidate_count(scan_id).unwrap(), 0);
+        let connection = db.lock().unwrap();
+        let terminal: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM scan_candidates WHERE scan_id=?1 AND status='done'",
+                [scan_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(terminal, 502);
+
+        let journal: (i64, i64, i64, i64) = connection
+            .query_row(
+                r#"SELECT COUNT(*), COUNT(DISTINCT fqdn),
+                          COUNT(DISTINCT details_json),
+                          SUM(outcome='negative' AND resolver_count=1
+                              AND authoritative=0 AND records_hash IS NULL)
+                   FROM dns_verifications WHERE scan_id=?1"#,
+                [scan_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(journal, (502, 502, 1, 502));
+        let details: Value = serde_json::from_str(
+            &connection
+                .query_row(
+                    "SELECT details_json FROM dns_verifications WHERE scan_id=?1 LIMIT 1",
+                    [scan_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            details,
+            json!({
+                "scope": "discovery-only",
+                "cache_write": false,
+                "inventory_write": false
+            })
+        );
+
+        let inventory_after = connection
+            .query_row(
+                r#"SELECT active, verification_state, last_verified_at
+                   FROM subdomains WHERE fqdn=?1"#,
+                [&live_host],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                    ))
+                },
+            )
+            .unwrap();
+        let record_after = connection
+            .query_row(
+                r#"SELECT record_type, value, ttl, expires_at, active
+                   FROM dns_records WHERE fqdn=?1"#,
+                [&live_host],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        let cache_after = connection
+            .query_row(
+                r#"SELECT status, records_json, expires_at, last_checked,
+                          resolver_count, authoritative
+                   FROM dns_cache WHERE fqdn=?1"#,
+                [&live_host],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(inventory_after, inventory_before);
+        assert_eq!(inventory_after.0, 1);
+        assert_eq!(inventory_after.1, "live");
+        assert_eq!(record_after, record_before);
+        assert_eq!(record_after.4, 1);
+        assert_eq!(cache_after, cache_before);
+        assert_eq!(cache_after.0, "positive");
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM subdomains WHERE fqdn LIKE 'absent-%'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM dns_records WHERE fqdn LIKE 'absent-%'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM dns_cache WHERE fqdn LIKE 'absent-%'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn negative_demotions_are_chunked_without_creating_absent_inventory() {
+        let db = Database::in_memory().unwrap();
+        let scan_id = db.create_scan("example.com", &json!({})).unwrap();
+        let existing = ["first.example.com", "last.example.com"];
+        let now = now_epoch();
+        {
+            let connection = db.lock().unwrap();
+            for (offset, host) in existing.iter().enumerate() {
+                connection
+                    .execute(
+                        r#"INSERT INTO subdomains(
+                               fqdn, root_domain, first_seen, last_seen, last_scan_id,
+                               times_seen, active, sources, verification_state, last_verified_at
+                           ) VALUES (?1, 'example.com', ?2, ?2, ?3, 1, 1, 'dns:test', 'live', ?2)"#,
+                        params![host, now, scan_id],
+                    )
+                    .unwrap();
+                connection
+                    .execute(
+                        r#"INSERT INTO dns_records(
+                               fqdn, record_type, value, ttl, expires_at,
+                               first_seen, last_seen, active
+                           ) VALUES (?1, 'A', ?2, 60, ?3, ?4, ?4, 1)"#,
+                        params![
+                            host,
+                            format!("192.0.2.{}", offset + 10),
+                            PERMANENT_EXPIRY,
+                            now
+                        ],
+                    )
+                    .unwrap();
+            }
+        }
+
+        let mut negatives = Vec::with_capacity(502);
+        negatives.push(existing[0].to_owned());
+        negatives.extend((0..500).map(|index| format!("absent-{index}.example.com")));
+        negatives.push(existing[1].to_owned());
+        db.update_cache_outcomes(Some(scan_id), &[], &negatives, &[], 300)
+            .unwrap();
+
+        let connection = db.lock().unwrap();
+        let scalar = |sql: &str| {
+            connection
+                .query_row(sql, [], |row| row.get::<_, i64>(0))
+                .unwrap()
+        };
+        assert_eq!(scalar("SELECT COUNT(*) FROM subdomains"), 2);
+        assert_eq!(
+            scalar(
+                "SELECT COUNT(*) FROM subdomains \
+                 WHERE active=0 AND verification_state='historical'"
+            ),
+            2
+        );
+        assert_eq!(
+            scalar("SELECT COUNT(*) FROM subdomains WHERE fqdn LIKE 'absent-%'"),
+            0
+        );
+        assert_eq!(scalar("SELECT COUNT(*) FROM dns_records WHERE active=0"), 2);
+        assert_eq!(scalar("SELECT COUNT(*) FROM dns_cache"), 502);
+        assert_eq!(
+            scalar("SELECT COUNT(*) FROM dns_verifications WHERE scan_id IS NOT NULL"),
+            502
+        );
+    }
+
+    #[test]
     fn scan_candidates_are_loaded_in_bounded_persistent_batches() {
         let db = Database::in_memory().unwrap();
         let scan_id = db.create_scan("example.com", &json!({})).unwrap();
@@ -6034,6 +7480,183 @@ mod tests {
         );
         db.clear_scan_candidates(scan_id).unwrap();
         assert_eq!(db.scan_candidate_count(scan_id).unwrap(), 0);
+    }
+
+    #[test]
+    fn exhausted_active_budget_leaves_every_active_source_queued() {
+        let db = Database::in_memory().unwrap();
+        let scan_id = db.create_scan("example.com", &json!({})).unwrap();
+        db.persist_scan_candidates(
+            scan_id,
+            "example.com",
+            &[
+                ("generated".to_owned(), "builtin".to_owned(), 100),
+                ("resumed".to_owned(), "mutation".to_owned(), 90),
+                ("explicit".to_owned(), "wordlist".to_owned(), 1),
+            ],
+        )
+        .unwrap();
+
+        let eligible = db
+            .pending_scan_candidates_eligible(scan_id, 10, false)
+            .unwrap();
+        assert!(eligible.is_empty());
+        assert_eq!(db.pending_scan_candidate_count(scan_id).unwrap(), 3);
+        assert_eq!(
+            db.pending_scan_candidate_count_eligible(scan_id, false)
+                .unwrap(),
+            0
+        );
+        let untouched_active: i64 = db
+            .lock()
+            .unwrap()
+            .query_row(
+                r#"SELECT COUNT(*) FROM scan_candidates
+                   WHERE scan_id=?1 AND status='queued' AND attempts=0"#,
+                [scan_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(untouched_active, 3);
+
+        let resumed = db
+            .pending_scan_candidates_eligible(scan_id, 10, true)
+            .unwrap();
+        assert_eq!(
+            resumed.iter().map(|row| row.0.as_str()).collect::<Vec<_>>(),
+            vec!["generated", "resumed", "explicit"]
+        );
+    }
+
+    #[test]
+    fn unstarted_deadline_candidate_requeues_without_consuming_an_attempt() {
+        let db = Database::in_memory().unwrap();
+        let scan_id = db.create_scan("example.com", &json!({})).unwrap();
+        let fqdn = "never-sent.example.com".to_owned();
+        db.persist_scan_candidates(
+            scan_id,
+            "example.com",
+            &[("never-sent".to_owned(), "builtin".to_owned(), 1)],
+        )
+        .unwrap();
+        assert_eq!(db.pending_scan_candidates(scan_id, 1).unwrap().len(), 1);
+        db.requeue_unstarted_scan_candidates(scan_id, std::slice::from_ref(&fqdn))
+            .unwrap();
+        let (status, attempts): (String, i64) = db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT status,attempts FROM scan_candidates WHERE scan_id=?1 AND fqdn=?2",
+                params![scan_id, fqdn],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((status.as_str(), attempts), ("queued", 0));
+    }
+
+    #[test]
+    fn recursive_queue_pages_and_parent_cursors_survive_resume() {
+        let db = Database::in_memory().unwrap();
+        let scan_id = db.create_scan("example.com", &json!({})).unwrap();
+        db.upsert_checkpoint(scan_id, "example.com", "running", "options")
+            .unwrap();
+        let words = vec!["a".to_owned(), "b".to_owned(), "c".to_owned()];
+        assert_eq!(
+            db.ensure_scan_recursive_words(scan_id, &words).unwrap(),
+            words
+        );
+        assert_eq!(
+            db.ensure_scan_recursive_words(scan_id, &["changed".to_owned()])
+                .unwrap(),
+            words,
+            "a resume must retain the original ordinal word list"
+        );
+        db.persist_scan_recursive_parents(scan_id, 2, &["api.example.com".to_owned()])
+            .unwrap();
+        assert_eq!(
+            db.refill_scan_recursive_candidates(scan_id, 2, 2).unwrap(),
+            2
+        );
+        let first = db.pending_scan_recursive_candidates(scan_id, 2, 2).unwrap();
+        assert_eq!(
+            first.iter().map(|row| row.0.as_str()).collect::<Vec<_>>(),
+            vec!["a.api.example.com", "b.api.example.com"]
+        );
+        db.complete_scan_recursive_candidates(scan_id, &[first[0].0.clone()])
+            .unwrap();
+        db.requeue_unstarted_scan_recursive_candidates(scan_id, &[first[1].0.clone()])
+            .unwrap();
+        assert_eq!(
+            db.refill_scan_recursive_candidates(scan_id, 2, 2).unwrap(),
+            2
+        );
+        let second = db.pending_scan_recursive_candidates(scan_id, 2, 2).unwrap();
+        assert_eq!(
+            second.iter().map(|row| row.0.as_str()).collect::<Vec<_>>(),
+            vec!["b.api.example.com", "c.api.example.com"]
+        );
+
+        db.pause_scan(scan_id, 0, 0, 0, 1, &[]).unwrap();
+        db.reopen_scan(scan_id).unwrap();
+        let resumed = db.pending_scan_recursive_candidates(scan_id, 2, 2).unwrap();
+        assert_eq!(
+            resumed.iter().map(|row| row.0.as_str()).collect::<Vec<_>>(),
+            vec!["b.api.example.com", "c.api.example.com"]
+        );
+        db.complete_scan_recursive_candidates(
+            scan_id,
+            &resumed.into_iter().map(|row| row.0).collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert!(!db.scan_recursive_depth_has_more(scan_id, 2).unwrap());
+        assert!(!db.scan_recursive_has_more(scan_id).unwrap());
+    }
+
+    #[test]
+    fn live_results_from_the_same_scan_can_be_rehydrated_for_recursive_parents() {
+        let db = Database::in_memory().unwrap();
+        let scan_id = db.create_scan("example.com", &json!({})).unwrap();
+        let answer = ResolvedHost {
+            fqdn: "api.example.com".to_owned(),
+            records: vec![DnsRecord {
+                record_type: "A".to_owned(),
+                value: "192.0.2.44".to_owned(),
+                ttl: 60,
+            }],
+            from_cache: false,
+            last_verified_at: Some(123),
+            authoritative_validation: true,
+            resolver_count: 2,
+        };
+        db.update_cache_outcomes(Some(scan_id), std::slice::from_ref(&answer), &[], &[], 300)
+            .unwrap();
+        let sources = BTreeSet::from(["dns:test".to_owned()]);
+        db.persist_findings(
+            scan_id,
+            "example.com",
+            &[Finding {
+                fqdn: answer.fqdn.clone(),
+                records: answer.records.clone(),
+                sources: sources.clone(),
+                wildcard: false,
+                from_cache: false,
+                confidence: crate::confidence::assess(&sources, false, false),
+                state: ObservationState::Live,
+                last_verified_at: answer.last_verified_at,
+                evidence_families: BTreeSet::from([crate::model::EvidenceFamily::LiveDns]),
+                authoritative_validation: true,
+            }],
+            86_400,
+        )
+        .unwrap();
+
+        let hydrated = db.live_scan_answers(scan_id).unwrap();
+        assert_eq!(hydrated.len(), 1);
+        assert_eq!(hydrated[0].0.fqdn, answer.fqdn);
+        assert_eq!(hydrated[0].0.records, answer.records);
+        assert!(hydrated[0].0.from_cache);
+        assert!(hydrated[0].0.authoritative_validation);
+        assert_eq!(hydrated[0].1, sources);
     }
 
     #[test]
@@ -6424,7 +8047,15 @@ mod tests {
             ],
         )
         .unwrap();
-        db.pending_scan_candidates(scan_id, 10).unwrap();
+        let first_claim = db.pending_scan_candidates(scan_id, 10).unwrap();
+        db.mark_scan_candidates_started(
+            scan_id,
+            &first_claim
+                .iter()
+                .map(|row| format!("{}.example.com", row.0))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
         db.update_cache_outcomes(
             Some(scan_id),
             &[],
@@ -6442,14 +8073,16 @@ mod tests {
         )
         .unwrap();
 
+        let second_claim = db.pending_scan_candidates(scan_id, 10).unwrap();
         assert_eq!(
-            db.pending_scan_candidates(scan_id, 10)
-                .unwrap()
-                .into_iter()
-                .map(|(name, _, _)| name)
+            second_claim
+                .iter()
+                .map(|(name, _, _)| name.as_str())
                 .collect::<Vec<_>>(),
             vec!["deferred"]
         );
+        db.mark_scan_candidates_started(scan_id, &["deferred.example.com".to_owned()])
+            .unwrap();
         db.update_cache_outcomes(
             Some(scan_id),
             &[],
@@ -6460,14 +8093,16 @@ mod tests {
         .unwrap();
         db.mark_scan_candidates_done(scan_id, &["deferred.example.com".to_owned()])
             .unwrap();
+        let third_claim = db.pending_scan_candidates(scan_id, 10).unwrap();
         assert_eq!(
-            db.pending_scan_candidates(scan_id, 10)
-                .unwrap()
-                .into_iter()
-                .map(|(name, _, _)| name)
+            third_claim
+                .iter()
+                .map(|(name, _, _)| name.as_str())
                 .collect::<Vec<_>>(),
             vec!["deferred"]
         );
+        db.mark_scan_candidates_started(scan_id, &["deferred.example.com".to_owned()])
+            .unwrap();
         db.update_cache_outcomes(
             Some(scan_id),
             &[],
@@ -6640,7 +8275,7 @@ mod tests {
     }
 
     #[test]
-    fn confirmed_wildcard_purge_removes_dns_only_names_but_keeps_independent_evidence() {
+    fn confirmed_wildcard_cleanup_quarantines_all_exact_matches_and_keeps_audit() {
         let db = Database::in_memory().unwrap();
         let scan_id = db.create_scan("example.com", &json!({})).unwrap();
         let answer = |fqdn: &str| ResolvedHost {
@@ -6710,11 +8345,14 @@ mod tests {
             ],
         )
         .unwrap();
-        db.finish_scan(scan_id, "completed", 2, 2, 0, 1, &[])
-            .unwrap();
-
+        db.record_current_wildcard_matches(
+            scan_id,
+            &[answer(generated), answer(cached_only), answer(observed)],
+        )
+        .unwrap();
         let purged = db
             .purge_confirmed_wildcard_false_positives(
+                scan_id,
                 "example.com",
                 &[
                     generated.to_owned(),
@@ -6723,20 +8361,17 @@ mod tests {
                 ],
             )
             .unwrap();
-        assert_eq!(purged, vec![cached_only, generated]);
-        assert_eq!(
-            db.known_subdomains(Some("example.com"), true).unwrap(),
-            vec![observed]
-        );
+        assert_eq!(purged, vec![cached_only, generated, observed]);
+        assert!(db.inventory(Some("example.com"), false).unwrap().is_empty());
         assert!(
-            db.fresh_cache(&[generated.to_owned(), cached_only.to_owned()])
-                .unwrap()
-                .is_empty()
+            db.fresh_cache(&[
+                generated.to_owned(),
+                cached_only.to_owned(),
+                observed.to_owned(),
+            ])
+            .unwrap()
+            .is_empty()
         );
-        assert!(matches!(
-            db.fresh_cache(&[observed.to_owned()]).unwrap()[observed],
-            CachedAnswer::Positive(_)
-        ));
         let connection = db.lock().unwrap();
         assert_eq!(
             connection
@@ -6746,7 +8381,7 @@ mod tests {
                     |row| row.get::<_, i64>(0),
                 )
                 .unwrap(),
-            0
+            1
         );
         assert_eq!(
             connection
@@ -6756,7 +8391,7 @@ mod tests {
                     |row| row.get::<_, i64>(0),
                 )
                 .unwrap(),
-            1
+            2
         );
         assert_eq!(
             connection
@@ -6766,12 +8401,22 @@ mod tests {
                     |row| row.get::<_, i64>(0),
                 )
                 .unwrap(),
-            0
+            1
         );
         assert_eq!(
             connection
                 .query_row(
                     "SELECT COUNT(*) FROM dns_records WHERE fqdn=?1",
+                    [generated],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT active FROM dns_records WHERE fqdn=?1",
                     [generated],
                     |row| row.get::<_, i64>(0),
                 )
@@ -6784,7 +8429,380 @@ mod tests {
                     row.get::<_, i64>(0)
                 })
                 .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM wildcard_quarantine WHERE root_domain='example.com'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            3
+        );
+    }
+
+    #[test]
+    fn wildcard_marker_is_cache_independent_and_hashes_records_without_ttl_or_order() {
+        let db = Database::in_memory().unwrap();
+        let scan_id = db.create_scan("example.com", &json!({})).unwrap();
+        let mut answer = ResolvedHost {
+            fqdn: "candidate.example.com".to_owned(),
+            records: vec![DnsRecord {
+                record_type: "A".to_owned(),
+                value: "192.0.2.44".to_owned(),
+                ttl: 60,
+            }],
+            from_cache: false,
+            last_verified_at: Some(now_epoch()),
+            authoritative_validation: false,
+            resolver_count: 1,
+        };
+        assert_eq!(
+            db.record_current_wildcard_matches(scan_id, &[answer.clone()])
+                .unwrap(),
+            0
+        );
+        answer.authoritative_validation = true;
+        assert_eq!(
+            db.record_current_wildcard_matches(scan_id, &[answer.clone()])
+                .unwrap(),
+            0
+        );
+        answer.authoritative_validation = false;
+        answer.resolver_count = 2;
+        answer.records.clear();
+        assert_eq!(
+            db.record_current_wildcard_matches(scan_id, &[answer.clone()])
+                .unwrap(),
+            0
+        );
+        answer.records.push(DnsRecord {
+            record_type: "A".to_owned(),
+            value: "192.0.2.44".to_owned(),
+            ttl: 60,
+        });
+        answer.records.push(DnsRecord {
+            record_type: "CNAME".to_owned(),
+            value: "edge.example.net".to_owned(),
+            ttl: 120,
+        });
+        answer.from_cache = true;
+        assert_eq!(
+            db.record_current_wildcard_matches(scan_id, &[answer.clone()])
+                .unwrap(),
+            0
+        );
+        answer.from_cache = false;
+        assert_eq!(
+            db.record_current_wildcard_matches(scan_id, &[answer.clone()])
+                .unwrap(),
             1
+        );
+        let journal_hash = db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT records_hash FROM dns_verifications WHERE scan_id=?1 AND fqdn=?2",
+                params![scan_id, answer.fqdn],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        let reordered_with_new_ttls = vec![
+            DnsRecord {
+                record_type: "cname".to_owned(),
+                value: "edge.example.net".to_owned(),
+                ttl: 1,
+            },
+            DnsRecord {
+                record_type: "a".to_owned(),
+                value: "192.0.2.44".to_owned(),
+                ttl: 9_999,
+            },
+        ];
+        assert_eq!(
+            journal_hash,
+            canonical_dns_records_hash(&reordered_with_new_ttls).unwrap()
+        );
+        assert_eq!(
+            db.purge_confirmed_wildcard_false_positives(
+                scan_id,
+                "example.com",
+                &[answer.fqdn.clone()],
+            )
+            .unwrap(),
+            vec![answer.fqdn.clone()],
+            "cleanup authorization must not require a positive dns_cache row"
+        );
+        let explanation = db.explain(&answer.fqdn).unwrap();
+        assert_eq!(explanation["known"], true);
+        assert_eq!(explanation["quarantine"].as_array().unwrap().len(), 1);
+        assert!(
+            db.purge_confirmed_wildcard_false_positives(
+                scan_id,
+                "example.com",
+                &["outside.example.net".to_owned()],
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn wildcard_ambiguity_is_unverified_without_a_resolver_error() {
+        let db = Database::in_memory().unwrap();
+        let scan_id = db.create_scan("example.com", &json!({})).unwrap();
+        let fqdn = "rotating.example.com";
+        let answer = ResolvedHost {
+            fqdn: fqdn.to_owned(),
+            records: vec![DnsRecord {
+                record_type: "A".to_owned(),
+                value: "192.0.2.44".to_owned(),
+                ttl: 60,
+            }],
+            from_cache: false,
+            last_verified_at: Some(now_epoch()),
+            authoritative_validation: false,
+            resolver_count: 2,
+        };
+        let sources = BTreeSet::from(["passive:test".to_owned()]);
+        db.persist_findings(
+            scan_id,
+            "example.com",
+            &[Finding {
+                fqdn: fqdn.to_owned(),
+                records: answer.records.clone(),
+                sources: sources.clone(),
+                wildcard: false,
+                from_cache: false,
+                confidence: crate::confidence::assess(&sources, false, false),
+                state: ObservationState::Live,
+                last_verified_at: answer.last_verified_at,
+                evidence_families: BTreeSet::new(),
+                authoritative_validation: false,
+            }],
+            86_400,
+        )
+        .unwrap();
+        db.update_cache_outcomes(Some(scan_id), std::slice::from_ref(&answer), &[], &[], 300)
+            .unwrap();
+
+        assert_eq!(
+            db.record_current_wildcard_ambiguities(
+                scan_id,
+                "example.com",
+                std::slice::from_ref(&answer),
+            )
+            .unwrap(),
+            1
+        );
+        assert!(
+            !db.fresh_cache(&[fqdn.to_owned()])
+                .unwrap()
+                .contains_key(fqdn)
+        );
+        let inventory = db.inventory(Some("example.com"), false).unwrap();
+        assert_eq!(inventory.len(), 1);
+        assert_eq!(inventory[0].state, ObservationState::Unverified);
+        let connection = db.lock().unwrap();
+        let (outcome, details): (String, String) = connection
+            .query_row(
+                r#"SELECT outcome, details_json FROM dns_verifications
+                   WHERE scan_id=?1 AND fqdn=?2 ORDER BY id DESC LIMIT 1"#,
+                params![scan_id, fqdn],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(outcome, "unverified");
+        assert_eq!(details, CURRENT_SCAN_WILDCARD_AMBIGUITY_DETAILS);
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT active FROM dns_records WHERE fqdn=?1",
+                    [fqdn],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn wildcard_quarantine_is_root_scoped_hidden_and_reversible() {
+        let db = Database::in_memory().unwrap();
+        let parent_scan = db.create_scan("example.com", &json!({})).unwrap();
+        let child_scan = db.create_scan("sub.example.com", &json!({})).unwrap();
+        let fqdn = "api.sub.example.com";
+        let answer = ResolvedHost {
+            fqdn: fqdn.to_owned(),
+            records: vec![DnsRecord {
+                record_type: "A".to_owned(),
+                value: "192.0.2.70".to_owned(),
+                ttl: 60,
+            }],
+            from_cache: false,
+            last_verified_at: Some(now_epoch()),
+            authoritative_validation: false,
+            resolver_count: 2,
+        };
+        let finding = Finding {
+            fqdn: fqdn.to_owned(),
+            records: answer.records.clone(),
+            sources: BTreeSet::from(["dns-wave-2".to_owned()]),
+            wildcard: false,
+            from_cache: false,
+            confidence: crate::confidence::assess(
+                &BTreeSet::from(["dns-wave-2".to_owned()]),
+                false,
+                false,
+            ),
+            state: ObservationState::Live,
+            last_verified_at: answer.last_verified_at,
+            evidence_families: BTreeSet::from([crate::model::EvidenceFamily::LiveDns]),
+            authoritative_validation: false,
+        };
+        db.persist_findings(
+            parent_scan,
+            "example.com",
+            std::slice::from_ref(&finding),
+            86_400,
+        )
+        .unwrap();
+        db.record_current_wildcard_matches(parent_scan, std::slice::from_ref(&answer))
+            .unwrap();
+        db.record_current_wildcard_matches(child_scan, std::slice::from_ref(&answer))
+            .unwrap();
+        assert_eq!(
+            db.purge_confirmed_wildcard_false_positives(
+                parent_scan,
+                "example.com",
+                &[fqdn.to_owned()],
+            )
+            .unwrap(),
+            vec![fqdn]
+        );
+        assert_eq!(
+            db.purge_confirmed_wildcard_false_positives(
+                child_scan,
+                "sub.example.com",
+                &[fqdn.to_owned()],
+            )
+            .unwrap(),
+            vec![fqdn]
+        );
+        assert!(db.inventory(Some("example.com"), false).unwrap().is_empty());
+        let explanation = db.explain(fqdn).unwrap();
+        assert_eq!(explanation["quarantine"].as_array().unwrap().len(), 2);
+        assert_eq!(explanation["scan_history"].as_array().unwrap().len(), 1);
+
+        db.persist_findings(parent_scan, "example.com", &[finding], 86_400)
+            .unwrap();
+        assert_eq!(db.inventory(Some("example.com"), false).unwrap().len(), 1);
+        let connection = db.lock().unwrap();
+        let mut statement = connection
+            .prepare(
+                "SELECT root_domain FROM wildcard_quarantine WHERE fqdn=?1 ORDER BY root_domain",
+            )
+            .unwrap();
+        let quarantined_roots = statement
+            .query_map([fqdn], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(quarantined_roots, vec!["sub.example.com"]);
+    }
+
+    #[test]
+    fn wildcard_consensus_quarantines_despite_independent_passive_evidence() {
+        let db = Database::in_memory().unwrap();
+        let scan_id = db.create_scan("example.com", &json!({})).unwrap();
+        let fqdn = "api.example.com";
+        let answer = ResolvedHost {
+            fqdn: fqdn.to_owned(),
+            records: vec![DnsRecord {
+                record_type: "A".to_owned(),
+                value: "192.0.2.80".to_owned(),
+                ttl: 60,
+            }],
+            from_cache: false,
+            last_verified_at: Some(now_epoch()),
+            authoritative_validation: false,
+            resolver_count: 2,
+        };
+        let sources = BTreeSet::from(["dns-wave-2".to_owned()]);
+        db.persist_findings(
+            scan_id,
+            "example.com",
+            &[Finding {
+                fqdn: fqdn.to_owned(),
+                records: answer.records.clone(),
+                sources: sources.clone(),
+                wildcard: false,
+                from_cache: false,
+                confidence: crate::confidence::assess(&sources, false, false),
+                state: ObservationState::Live,
+                last_verified_at: answer.last_verified_at,
+                evidence_families: BTreeSet::from([crate::model::EvidenceFamily::LiveDns]),
+                authoritative_validation: false,
+            }],
+            86_400,
+        )
+        .unwrap();
+        db.record_current_wildcard_matches(scan_id, std::slice::from_ref(&answer))
+            .unwrap();
+        assert_eq!(
+            db.purge_confirmed_wildcard_false_positives(
+                scan_id,
+                "example.com",
+                &[fqdn.to_owned()],
+            )
+            .unwrap(),
+            vec![fqdn]
+        );
+        assert!(db.inventory(Some("example.com"), false).unwrap().is_empty());
+        db.store_observations(
+            "archive.example.net",
+            vec![ObservationInput {
+                fqdn: fqdn.to_owned(),
+                kind: "passive".to_owned(),
+                source: "passive:cross-root".to_owned(),
+                value: String::new(),
+            }],
+        )
+        .unwrap();
+        db.record_current_wildcard_matches(scan_id, &[answer])
+            .unwrap();
+        assert_eq!(
+            db.purge_confirmed_wildcard_false_positives(
+                scan_id,
+                "example.com",
+                &[fqdn.to_owned()],
+            )
+            .unwrap(),
+            vec![fqdn]
+        );
+        assert!(db.inventory(Some("example.com"), false).unwrap().is_empty());
+        let connection = db.lock().unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM wildcard_quarantine WHERE fqdn=?1",
+                    [fqdn],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM observation_evidence WHERE source='passive:cross-root'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1,
+            "quarantine must preserve passive evidence for explain/audit"
         );
     }
 
@@ -6815,6 +8833,97 @@ mod tests {
             20_000
         );
         assert_eq!(db.refresh_wildcard_candidate_count(scan_id).unwrap(), 0);
+    }
+
+    #[test]
+    fn cached_wildcard_match_without_current_network_marker_is_demoted_not_deleted() {
+        let db = Database::in_memory().unwrap();
+        let scan_id = db
+            .create_scan("example.com", &json!({"mode": "refresh"}))
+            .unwrap();
+        let fqdn = "cached.example.com";
+        let answer = ResolvedHost {
+            fqdn: fqdn.to_owned(),
+            records: vec![DnsRecord {
+                record_type: "A".to_owned(),
+                value: "192.0.2.44".to_owned(),
+                ttl: 60,
+            }],
+            from_cache: false,
+            last_verified_at: Some(now_epoch()),
+            authoritative_validation: false,
+            resolver_count: 2,
+        };
+        let finding = Finding {
+            fqdn: fqdn.to_owned(),
+            records: answer.records.clone(),
+            sources: BTreeSet::from(["dns-wave-2".to_owned()]),
+            wildcard: false,
+            from_cache: false,
+            confidence: crate::confidence::assess(
+                &BTreeSet::from(["dns-wave-2".to_owned()]),
+                false,
+                false,
+            ),
+            state: ObservationState::Live,
+            last_verified_at: answer.last_verified_at,
+            evidence_families: BTreeSet::new(),
+            authoritative_validation: false,
+        };
+        db.persist_findings(scan_id, "example.com", &[finding], 86_400)
+            .unwrap();
+        // An ordinary historical/live journal row and a positive cache entry
+        // are intentionally insufficient: cleanup requires the dedicated
+        // current-scan network wildcard marker.
+        db.update_cache_outcomes(Some(scan_id), &[answer], &[], &[], 300)
+            .unwrap();
+        db.stage_refresh_wildcard_candidates(scan_id, &[fqdn.to_owned()])
+            .unwrap();
+
+        let result = db
+            .apply_staged_refresh_wildcard_cleanup(
+                scan_id,
+                "example.com",
+                1,
+                &AtomicBool::new(false),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            result,
+            WildcardCleanupResult {
+                purged: 0,
+                retained_unverified: 1,
+            }
+        );
+        let inventory = db.inventory(Some("example.com"), false).unwrap();
+        assert_eq!(inventory.len(), 1);
+        assert_eq!(inventory[0].state, ObservationState::Unverified);
+        assert!(matches!(
+            db.fresh_cache(&[fqdn.to_owned()]).unwrap().get(fqdn),
+            Some(CachedAnswer::Positive(_))
+        ));
+        let connection = db.lock().unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM dns_records WHERE fqdn=?1",
+                    [fqdn],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT active FROM dns_records WHERE fqdn=?1",
+                    [fqdn],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
     }
 
     #[test]
@@ -6864,6 +8973,23 @@ mod tests {
             .iter()
             .map(|finding| finding.fqdn.clone())
             .collect::<Vec<_>>();
+        let wildcard_answers = names
+            .iter()
+            .map(|fqdn| ResolvedHost {
+                fqdn: fqdn.clone(),
+                records: vec![DnsRecord {
+                    record_type: "A".to_owned(),
+                    value: "192.0.2.44".to_owned(),
+                    ttl: 60,
+                }],
+                from_cache: false,
+                last_verified_at: Some(now_epoch()),
+                authoritative_validation: false,
+                resolver_count: 2,
+            })
+            .collect::<Vec<_>>();
+        db.record_current_wildcard_matches(refresh_scan, &wildcard_answers)
+            .unwrap();
         db.stage_refresh_wildcard_candidates(refresh_scan, &names)
             .unwrap();
 
@@ -6917,7 +9043,7 @@ mod tests {
                     |row| row.get::<_, i64>(0),
                 )
                 .unwrap(),
-            0
+            findings.len() as i64
         );
         assert_eq!(
             connection
@@ -6944,33 +9070,30 @@ mod tests {
         assert_eq!(
             applied,
             WildcardCleanupResult {
-                purged: 12,
-                retained_unverified: 1,
+                purged: 13,
+                retained_unverified: 0,
             }
         );
         assert_eq!(
             db.refresh_wildcard_candidate_count(refresh_scan).unwrap(),
             0
         );
-        let inventory = db.inventory(Some("example.com"), false).unwrap();
-        assert_eq!(inventory.len(), 1);
-        assert_eq!(inventory[0].fqdn, "a-independent.example.com");
-        assert_eq!(inventory[0].state, ObservationState::Unverified);
+        assert!(db.inventory(Some("example.com"), false).unwrap().is_empty());
         let connection = db.lock().unwrap();
-        let (finding_count, wildcard, state, found): (i64, i64, String, i64) = connection
+        let (finding_count, changed_findings, found): (i64, i64, i64) = connection
             .query_row(
-                r#"SELECT COUNT(*), finding.wildcard, finding.state, scans.found
+                r#"SELECT COUNT(*),
+                          SUM(CASE WHEN finding.wildcard<>0 OR finding.state<>'live'
+                                   THEN 1 ELSE 0 END),
+                          scans.found
                    FROM scan_findings finding
                    JOIN scans ON scans.id=finding.scan_id
                    WHERE finding.scan_id=?1"#,
                 [original_scan],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap();
-        assert_eq!(
-            (finding_count, wildcard, state.as_str(), found),
-            (1, 1, "unverified", 1)
-        );
+        assert_eq!((finding_count, changed_findings, found), (13, 0, 13));
         let (records, active_records): (i64, i64) = connection
             .query_row(
                 r#"SELECT COUNT(*), COALESCE(SUM(active), 0) FROM dns_records
@@ -6979,7 +9102,17 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!((records, active_records), (1, 0));
+        assert_eq!((records, active_records), (13, 0));
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM wildcard_quarantine WHERE root_domain='example.com'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            13
+        );
     }
 
     #[test]
@@ -7080,6 +9213,45 @@ mod tests {
     }
 
     #[test]
+    fn active_budget_pause_keeps_checkpoint_feeds_and_candidates_resumable() {
+        let db = Database::in_memory().unwrap();
+        let scan_id = db.create_scan("example.com", &json!({})).unwrap();
+        db.upsert_checkpoint(scan_id, "example.com", "running", "options")
+            .unwrap();
+        db.persist_scan_candidates(
+            scan_id,
+            "example.com",
+            &[("pending".to_owned(), "builtin".to_owned(), 10)],
+        )
+        .unwrap();
+        db.mark_scan_candidate_feed_exhausted(scan_id, "wordlist")
+            .unwrap();
+
+        db.pause_scan(scan_id, 1, 0, 0, 25, &["budget reached".to_owned()])
+            .unwrap();
+
+        let checkpoint = db
+            .resumable_checkpoint("example.com", "latest")
+            .unwrap()
+            .expect("partial scan checkpoint was closed");
+        assert_eq!(checkpoint.scan_id, scan_id);
+        assert_eq!(checkpoint.stage, "paused");
+        assert_eq!(db.pending_scan_candidate_count(scan_id).unwrap(), 1);
+        let (status, learning_applied): (String, i64) = db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT status,learning_applied FROM scans WHERE id=?1",
+                [scan_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((status.as_str(), learning_applied), ("interrupted", 0));
+        db.reopen_scan(scan_id).unwrap();
+        assert_eq!(db.pending_scan_candidate_count(scan_id).unwrap(), 1);
+    }
+
+    #[test]
     fn refresh_inventory_pages_are_stable_and_cache_only_pages_exclude_inventory() {
         let db = Database::in_memory().unwrap();
         let names = BTreeSet::from([
@@ -7110,6 +9282,23 @@ mod tests {
                 .collect::<Vec<_>>(),
             names.iter().cloned().collect::<Vec<_>>()
         );
+        let first_inventory = db.inventory_page("example.com", false, None, 3).unwrap();
+        let second_inventory = db
+            .inventory_page(
+                "example.com",
+                false,
+                first_inventory.last().map(|entry| entry.fqdn.as_str()),
+                3,
+            )
+            .unwrap();
+        assert_eq!(
+            first_inventory
+                .into_iter()
+                .chain(second_inventory)
+                .map(|entry| entry.fqdn)
+                .collect::<Vec<_>>(),
+            names.iter().cloned().collect::<Vec<_>>()
+        );
 
         let cached_only = ResolvedHost {
             fqdn: "cache-only.example.com".to_owned(),
@@ -7134,6 +9323,7 @@ mod tests {
                 .unwrap(),
             vec!["cache-only.example.com"]
         );
+        assert_eq!(db.positive_cache_only_count("example.com").unwrap(), 1);
     }
 
     #[test]
@@ -7173,6 +9363,55 @@ mod tests {
             "only the requested page may be queued"
         );
         assert_eq!(db.scan_candidate_count(scan_id).unwrap(), 3);
+    }
+
+    #[test]
+    fn wordlist_page_tracks_the_scheduler_batch_and_resumes_at_its_exact_cursor() {
+        let directory = tempfile::tempdir().unwrap();
+        let wordlist = directory.path().join("batch-words.txt");
+        let database_path = directory.path().join("fellaga.db");
+        let words = (0..5_000)
+            .map(|index| format!("batch-{index}"))
+            .collect::<Vec<_>>();
+        let expected_first_cursor = words[..4_096]
+            .iter()
+            .map(|word| word.len() + 1)
+            .sum::<usize>() as i64;
+        std::fs::write(&wordlist, format!("{}\n", words.join("\n"))).unwrap();
+
+        let db = Database::open(&database_path).unwrap();
+        let scan_id = db.create_scan("example.com", &json!({})).unwrap();
+        assert_eq!(
+            db.refill_wordlist_candidates(scan_id, "example.com", &wordlist, 4_096)
+                .unwrap(),
+            (4_096, false)
+        );
+        assert_eq!(db.pending_scan_candidate_count(scan_id).unwrap(), 4_096);
+        let first_cursor: i64 = db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT cursor FROM scan_candidate_feeds WHERE scan_id=?1 AND source='wordlist'",
+                [scan_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(first_cursor, expected_first_cursor);
+        drop(db);
+
+        let reopened = Database::open(&database_path).unwrap();
+        assert_eq!(
+            reopened
+                .refill_wordlist_candidates(scan_id, "example.com", &wordlist, 4_096)
+                .unwrap(),
+            (904, true)
+        );
+        assert_eq!(reopened.scan_candidate_count(scan_id).unwrap(), 5_000);
+        assert!(
+            reopened
+                .scan_candidate_feed_exhausted(scan_id, "wordlist")
+                .unwrap()
+        );
     }
 
     #[test]
@@ -7721,6 +9960,30 @@ mod tests {
         let legacy = db.wildcard_cache("example.com").unwrap().unwrap();
         assert!(legacy.signature.is_empty());
         assert_eq!(legacy.algorithm_version, 1);
+
+        db.store_wildcard_cache_with_algorithm(
+            "example.com",
+            &BTreeSet::from(["A:192.0.2.20".to_owned()]),
+            Some(43),
+            std::time::Duration::from_secs(600),
+            true,
+            3,
+        )
+        .unwrap();
+        let consensus = db.wildcard_cache("example.com").unwrap().unwrap();
+        assert_eq!(consensus.algorithm_version, 3);
+        assert!(consensus.signature.contains("A:192.0.2.20"));
+        assert!(
+            db.store_wildcard_cache_with_algorithm(
+                "example.com",
+                &BTreeSet::new(),
+                None,
+                std::time::Duration::from_secs(60),
+                false,
+                4,
+            )
+            .is_err()
+        );
 
         db.store_observations(
             "example.com",
