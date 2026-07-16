@@ -3,26 +3,154 @@ use crate::model::{
 };
 use anyhow::{Context, Result, bail};
 use futures_util::{StreamExt, stream};
-use hickory_client::proto::op::{Edns, Message, MessageType, OpCode, Query, ResponseCode};
-use hickory_client::proto::rr::Name;
+use hickory_net::proto::op::{Edns, Message, MessageType, OpCode, Query, ResponseCode};
+use hickory_net::proto::rr::{DNSClass, Name, RData, Record};
+use hickory_net::runtime::TokioRuntimeProvider;
 use hickory_resolver::TokioResolver;
-use hickory_resolver::config::{NameServerConfig, ResolverConfig};
-use hickory_resolver::name_server::TokioConnectionProvider;
+use hickory_resolver::config::{ConnectionConfig, NameServerConfig, ResolverConfig};
 use hickory_resolver::proto::rr::RecordType;
-use hickory_resolver::proto::xfer::Protocol;
 use std::collections::HashMap;
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 use std::sync::atomic::AtomicU16;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::net::UdpSocket;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::{OnceCell, oneshot};
 
 static PROBE_COUNTER: AtomicU64 = AtomicU64::new(0);
 const UDP_SOCKET_BUFFER_BYTES: usize = 16 * 1024 * 1024;
+type AuthoritativeServers = Vec<(String, Vec<IpAddr>)>;
+
+/// Compatibilité locale avec les anciens accesseurs Hickory. La version 0.26
+/// expose ces valeurs directement; les centraliser ici garde le moteur DNS
+/// lisible et rend la migration vérifiable.
+trait MessageCompat {
+    fn id(&self) -> u16;
+    fn set_id(&mut self, id: u16) -> &mut Self;
+    fn message_type(&self) -> MessageType;
+    fn set_message_type(&mut self, message_type: MessageType) -> &mut Self;
+    fn op_code(&self) -> OpCode;
+    fn set_op_code(&mut self, op_code: OpCode) -> &mut Self;
+    fn queries(&self) -> &[Query];
+    fn answers(&self) -> &[Record];
+    fn truncated(&self) -> bool;
+    #[cfg(test)]
+    fn set_truncated(&mut self, truncated: bool) -> &mut Self;
+    #[cfg(test)]
+    fn recursion_desired(&self) -> bool;
+    fn set_recursion_desired(&mut self, desired: bool) -> &mut Self;
+    fn authoritative(&self) -> bool;
+    fn authentic_data(&self) -> bool;
+    fn response_code(&self) -> ResponseCode;
+    #[cfg(test)]
+    fn set_response_code(&mut self, response_code: ResponseCode) -> &mut Self;
+    #[cfg(test)]
+    fn extensions(&self) -> Option<&Edns>;
+}
+
+impl MessageCompat for Message {
+    fn id(&self) -> u16 {
+        self.metadata.id
+    }
+
+    fn set_id(&mut self, id: u16) -> &mut Self {
+        self.metadata.id = id;
+        self
+    }
+
+    fn message_type(&self) -> MessageType {
+        self.metadata.message_type
+    }
+
+    fn set_message_type(&mut self, message_type: MessageType) -> &mut Self {
+        self.metadata.message_type = message_type;
+        self
+    }
+
+    fn op_code(&self) -> OpCode {
+        self.metadata.op_code
+    }
+
+    fn set_op_code(&mut self, op_code: OpCode) -> &mut Self {
+        self.metadata.op_code = op_code;
+        self
+    }
+
+    fn queries(&self) -> &[Query] {
+        &self.queries
+    }
+
+    fn answers(&self) -> &[Record] {
+        &self.answers
+    }
+
+    fn truncated(&self) -> bool {
+        self.metadata.truncation
+    }
+
+    #[cfg(test)]
+    fn set_truncated(&mut self, truncated: bool) -> &mut Self {
+        self.metadata.truncation = truncated;
+        self
+    }
+
+    #[cfg(test)]
+    fn recursion_desired(&self) -> bool {
+        self.metadata.recursion_desired
+    }
+
+    fn set_recursion_desired(&mut self, desired: bool) -> &mut Self {
+        self.metadata.recursion_desired = desired;
+        self
+    }
+
+    fn authoritative(&self) -> bool {
+        self.metadata.authoritative
+    }
+
+    fn authentic_data(&self) -> bool {
+        self.metadata.authentic_data
+    }
+
+    fn response_code(&self) -> ResponseCode {
+        self.metadata.response_code
+    }
+
+    #[cfg(test)]
+    fn set_response_code(&mut self, response_code: ResponseCode) -> &mut Self {
+        self.metadata.response_code = response_code;
+        self
+    }
+
+    #[cfg(test)]
+    fn extensions(&self) -> Option<&Edns> {
+        self.edns.as_ref()
+    }
+}
+
+trait RecordCompat {
+    fn name(&self) -> &Name;
+    fn data(&self) -> &RData;
+    fn ttl(&self) -> u32;
+}
+
+impl RecordCompat for Record {
+    fn name(&self) -> &Name {
+        &self.name
+    }
+
+    fn data(&self) -> &RData {
+        &self.data
+    }
+
+    fn ttl(&self) -> u32 {
+        self.ttl
+    }
+}
 
 fn bind_buffered_udp(address: SocketAddr) -> Result<UdpSocket> {
     let domain = if address.is_ipv4() {
@@ -45,6 +173,64 @@ pub struct DnsQueryResult {
     pub records: Vec<DnsRecord>,
 }
 
+#[derive(Debug, Clone)]
+pub enum DnsResolutionOutcome {
+    Positive(ResolvedHost),
+    Negative { fqdn: String },
+    Indeterminate { fqdn: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WildcardProbeOutcome {
+    Wildcard(BTreeSet<String>),
+    Normal,
+    Indeterminate,
+}
+
+impl DnsResolutionOutcome {
+    pub fn fqdn(&self) -> &str {
+        match self {
+            Self::Positive(answer) => &answer.fqdn,
+            Self::Negative { fqdn } | Self::Indeterminate { fqdn } => fqdn,
+        }
+    }
+
+    pub const fn answer(&self) -> Option<&ResolvedHost> {
+        match self {
+            Self::Positive(answer) => Some(answer),
+            Self::Negative { .. } | Self::Indeterminate { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+enum RecordLookupOutcome {
+    Positive(Vec<DnsRecord>),
+    Negative,
+    Indeterminate,
+}
+
+fn classify_wildcard_samples(
+    non_empty: Vec<BTreeSet<String>>,
+    negatives: usize,
+) -> WildcardProbeOutcome {
+    if non_empty.len() >= 3 {
+        let mut signature = BTreeSet::new();
+        for sample in non_empty {
+            signature.extend(sample);
+        }
+        WildcardProbeOutcome::Wildcard(signature)
+    } else if non_empty.is_empty() && negatives >= 3 {
+        WildcardProbeOutcome::Normal
+    } else {
+        WildcardProbeOutcome::Indeterminate
+    }
+}
+
+fn is_definitive_nxdomain(response: &Message) -> bool {
+    !response.truncated() && response.response_code() == ResponseCode::NXDomain
+}
+
 #[derive(Clone)]
 pub struct DnsEngine {
     resolvers: Arc<Vec<ResolverNode>>,
@@ -54,6 +240,8 @@ pub struct DnsEngine {
     rate_limit: u64,
     next_query_at: Arc<tokio::sync::Mutex<Instant>>,
     selection_counter: Arc<AtomicU64>,
+    authoritative_resolvers: Arc<Mutex<HashMap<SocketAddr, Arc<FastResolver>>>>,
+    authoritative_server_cache: Arc<tokio::sync::Mutex<HashMap<String, AuthoritativeServers>>>,
 }
 
 struct FastResolver {
@@ -63,8 +251,43 @@ struct FastResolver {
 
 struct FastUdpTransport {
     socket: Arc<UdpSocket>,
-    pending: Arc<tokio::sync::Mutex<HashMap<u16, oneshot::Sender<Vec<u8>>>>>,
+    pending: Arc<tokio::sync::Mutex<HashMap<u16, PendingDnsQuery>>>,
+    slots: Arc<tokio::sync::Semaphore>,
     next_id: AtomicU16,
+    receiver: tokio::task::AbortHandle,
+}
+
+struct PendingDnsQuery {
+    name: Name,
+    record_type: RecordType,
+    dns_class: DNSClass,
+    sender: oneshot::Sender<Vec<u8>>,
+}
+
+struct PendingQueryGuard {
+    id: u16,
+    pending: Arc<tokio::sync::Mutex<HashMap<u16, PendingDnsQuery>>>,
+}
+
+impl Drop for PendingQueryGuard {
+    fn drop(&mut self) {
+        if let Ok(mut pending) = self.pending.try_lock() {
+            pending.remove(&self.id);
+            return;
+        }
+        let id = self.id;
+        let pending = self.pending.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                pending.lock().await.remove(&id);
+            });
+        }
+    }
+}
+
+fn dns_tcp_slots() -> &'static Arc<tokio::sync::Semaphore> {
+    static SLOTS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+    SLOTS.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(16)))
 }
 
 impl FastUdpTransport {
@@ -76,28 +299,51 @@ impl FastUdpTransport {
         };
         let socket = Arc::new(bind_buffered_udp(bind_address)?);
         socket.connect(address).await?;
-        let pending = Arc::new(tokio::sync::Mutex::new(HashMap::<
-            u16,
-            oneshot::Sender<Vec<u8>>,
-        >::new()));
+        let pending = Arc::new(tokio::sync::Mutex::new(
+            HashMap::<u16, PendingDnsQuery>::new(),
+        ));
         let receiver_socket = socket.clone();
         let receiver_pending = pending.clone();
-        tokio::spawn(async move {
+        let receiver = tokio::spawn(async move {
             let mut buffer = vec![0_u8; 65_535];
-            while let Ok(length) = receiver_socket.recv(&mut buffer).await {
-                if length < 2 {
+            loop {
+                let length = match receiver_socket.recv(&mut buffer).await {
+                    Ok(length) => length,
+                    Err(_) => {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        continue;
+                    }
+                };
+                let Ok(response) = Message::from_vec(&buffer[..length]) else {
+                    continue;
+                };
+                if response.message_type() != MessageType::Response
+                    || response.op_code() != OpCode::Query
+                    || response.queries().len() != 1
+                {
                     continue;
                 }
-                let id = u16::from_be_bytes([buffer[0], buffer[1]]);
-                if let Some(sender) = receiver_pending.lock().await.remove(&id) {
-                    let _ = sender.send(buffer[..length].to_vec());
+                let id = response.id();
+                let question = &response.queries()[0];
+                let mut pending = receiver_pending.lock().await;
+                let correlated = pending.get(&id).is_some_and(|request| {
+                    question.name() == &request.name
+                        && question.query_type() == request.record_type
+                        && question.query_class() == request.dns_class
+                });
+                if correlated {
+                    let request = pending.remove(&id).expect("requête DNS présente");
+                    drop(pending);
+                    let _ = request.sender.send(buffer[..length].to_vec());
                 }
             }
         });
         Ok(Arc::new(Self {
             socket,
             pending,
+            slots: Arc::new(tokio::sync::Semaphore::new(4_096)),
             next_id: AtomicU16::new(1),
+            receiver: receiver.abort_handle(),
         }))
     }
 
@@ -108,6 +354,12 @@ impl FastUdpTransport {
         recursion_desired: bool,
         timeout_duration: Duration,
     ) -> Result<Message> {
+        let _slot = self
+            .slots
+            .clone()
+            .acquire_owned()
+            .await
+            .context("transport DNS UDP fermé")?;
         let id = loop {
             let candidate = self.next_id.fetch_add(1, Ordering::Relaxed);
             if !self.pending.lock().await.contains_key(&candidate) {
@@ -115,7 +367,8 @@ impl FastUdpTransport {
             }
         };
         let name = Name::from_str(&format!("{}.", fqdn.trim_end_matches('.')))?;
-        let mut message = Message::new();
+        let query = Query::query(name.clone(), record_type);
+        let mut message = Message::new(id, MessageType::Query, OpCode::Query);
         let mut edns = Edns::new();
         edns.set_max_payload(1_232)
             .set_version(0)
@@ -125,29 +378,110 @@ impl FastUdpTransport {
             .set_message_type(MessageType::Query)
             .set_op_code(OpCode::Query)
             .set_recursion_desired(recursion_desired)
-            .add_query(Query::query(name, record_type))
+            .add_query(query.clone())
             .set_edns(edns);
         let payload = message.to_vec()?;
         let (sender, receiver) = oneshot::channel();
-        self.pending.lock().await.insert(id, sender);
+        self.pending.lock().await.insert(
+            id,
+            PendingDnsQuery {
+                name: name.clone(),
+                record_type,
+                dns_class: query.query_class(),
+                sender,
+            },
+        );
+        // Cette garde retire l'identifiant même si Ctrl+C ou la deadline
+        // globale annule le future pendant l'attente de la réponse.
+        let _pending_guard = PendingQueryGuard {
+            id,
+            pending: self.pending.clone(),
+        };
         if let Err(error) = self.socket.send(&payload).await {
-            self.pending.lock().await.remove(&id);
             return Err(error.into());
         }
         let response = match tokio::time::timeout(timeout_duration, receiver).await {
             Ok(Ok(response)) => response,
             Ok(Err(error)) => return Err(error.into()),
-            Err(error) => {
-                self.pending.lock().await.remove(&id);
-                return Err(error.into());
-            }
+            Err(error) => return Err(error.into()),
         };
         let response = Message::from_vec(&response)?;
-        if response.id() != id || response.message_type() != MessageType::Response {
+        if response.id() != id
+            || response.message_type() != MessageType::Response
+            || response.op_code() != OpCode::Query
+            || response.queries().len() != 1
+            || response.queries()[0].name() != &name
+            || response.queries()[0].query_type() != record_type
+            || response.queries()[0].query_class() != query.query_class()
+        {
             bail!("réponse DNS UDP non corrélée");
         }
         Ok(response)
     }
+}
+
+impl Drop for FastUdpTransport {
+    fn drop(&mut self) {
+        self.receiver.abort();
+    }
+}
+
+async fn query_tcp(
+    address: SocketAddr,
+    fqdn: &str,
+    record_type: RecordType,
+    recursion_desired: bool,
+    timeout_duration: Duration,
+) -> Result<Message> {
+    let _tcp_slot = dns_tcp_slots()
+        .clone()
+        .acquire_owned()
+        .await
+        .context("transport DNS TCP fermé")?;
+    let id = PROBE_COUNTER.fetch_add(1, Ordering::Relaxed) as u16;
+    let name = Name::from_str(&format!("{}.", fqdn.trim_end_matches('.')))?;
+    let query = Query::query(name.clone(), record_type);
+    let mut message = Message::new(id, MessageType::Query, OpCode::Query);
+    let mut edns = Edns::new();
+    edns.set_max_payload(1_232)
+        .set_version(0)
+        .set_dnssec_ok(true);
+    message
+        .set_id(id)
+        .set_message_type(MessageType::Query)
+        .set_op_code(OpCode::Query)
+        .set_recursion_desired(recursion_desired)
+        .add_query(query.clone())
+        .set_edns(edns);
+    let payload = message.to_vec()?;
+    let response = tokio::time::timeout(timeout_duration, async move {
+        let mut stream = TcpStream::connect(address).await?;
+        stream
+            .write_all(&(payload.len() as u16).to_be_bytes())
+            .await?;
+        stream.write_all(&payload).await?;
+        let length = stream.read_u16().await? as usize;
+        if length < 12 {
+            bail!("réponse DNS TCP trop courte");
+        }
+        let mut response = vec![0_u8; length];
+        stream.read_exact(&mut response).await?;
+        Ok::<_, anyhow::Error>(response)
+    })
+    .await
+    .context("délai DNS TCP dépassé")??;
+    let response = Message::from_vec(&response)?;
+    if response.id() != id
+        || response.message_type() != MessageType::Response
+        || response.op_code() != OpCode::Query
+        || response.queries().len() != 1
+        || response.queries()[0].name() != &name
+        || response.queries()[0].query_type() != record_type
+        || response.queries()[0].query_class() != query.query_class()
+    {
+        bail!("réponse DNS TCP non corrélée");
+    }
+    Ok(response)
 }
 
 impl FastResolver {
@@ -162,9 +496,14 @@ impl FastResolver {
             .transport
             .get_or_try_init(|| FastUdpTransport::connect(self.address))
             .await?;
-        transport
+        let response = transport
             .query(fqdn, record_type, recursion_desired, timeout)
-            .await
+            .await?;
+        if response.truncated() {
+            query_tcp(self.address, fqdn, record_type, recursion_desired, timeout).await
+        } else {
+            Ok(response)
+        }
     }
 }
 
@@ -299,7 +638,11 @@ impl DnsEngine {
             builder.options_mut().cache_size = 0;
             resolvers.push(ResolverNode {
                 label: "system".to_owned(),
-                resolver: Arc::new(builder.build()),
+                resolver: Arc::new(
+                    builder
+                        .build()
+                        .context("initialisation du résolveur système")?,
+                ),
                 state: Mutex::new(ResolverState::default()),
                 inflight: AtomicUsize::new(0),
             });
@@ -310,29 +653,33 @@ impl DnsEngine {
                 });
             }
         } else {
-            for address in nameservers {
-                let mut config = ResolverConfig::new();
-                config.add_name_server(NameServerConfig::new(
-                    SocketAddr::new(*address, 53),
-                    Protocol::Udp,
-                ));
-                config.add_name_server(NameServerConfig::new(
-                    SocketAddr::new(*address, 53),
-                    Protocol::Tcp,
-                ));
+            for address in nameservers.iter().copied().collect::<BTreeSet<_>>() {
+                let config = ResolverConfig::from_parts(
+                    None,
+                    Vec::new(),
+                    vec![NameServerConfig::new(
+                        address,
+                        true,
+                        vec![ConnectionConfig::udp(), ConnectionConfig::tcp()],
+                    )],
+                );
                 let mut resolver_builder =
-                    TokioResolver::builder_with_config(config, TokioConnectionProvider::default());
+                    TokioResolver::builder_with_config(config, TokioRuntimeProvider::default());
                 resolver_builder.options_mut().timeout = timeout;
                 resolver_builder.options_mut().attempts = 1;
                 resolver_builder.options_mut().cache_size = 0;
                 resolvers.push(ResolverNode {
                     label: address.to_string(),
-                    resolver: Arc::new(resolver_builder.build()),
+                    resolver: Arc::new(
+                        resolver_builder
+                            .build()
+                            .with_context(|| format!("initialisation du résolveur {address}"))?,
+                    ),
                     state: Mutex::new(ResolverState::default()),
                     inflight: AtomicUsize::new(0),
                 });
                 fast_resolvers.push(FastResolver {
-                    address: SocketAddr::new(*address, 53),
+                    address: SocketAddr::new(address, 53),
                     transport: OnceCell::new(),
                 });
             }
@@ -346,7 +693,21 @@ impl DnsEngine {
             rate_limit,
             next_query_at: Arc::new(tokio::sync::Mutex::new(Instant::now())),
             selection_counter: Arc::new(AtomicU64::new(0)),
+            authoritative_resolvers: Arc::new(Mutex::new(HashMap::new())),
+            authoritative_server_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         })
+    }
+
+    /// Partage le même cadenceur avec un second moteur (par exemple le
+    /// consensus trusted) afin que la limite CLI soit réellement commune.
+    pub fn share_rate_limit_with(mut self, other: &Self) -> Self {
+        self.rate_limit = other.rate_limit;
+        self.next_query_at = other.next_query_at.clone();
+        self
+    }
+
+    pub const fn concurrency(&self) -> usize {
+        self.concurrency
     }
 
     async fn wait_for_rate_slot(&self) {
@@ -427,6 +788,7 @@ impl DnsEngine {
                     response.response_code() == ResponseCode::NoError
                         && !response.answers().is_empty()
                 });
+                let nxdomain_ok = nxdomain.as_ref().is_ok_and(is_definitive_nxdomain);
                 let dnssec_records = dnssec.as_ref().is_ok_and(|response| {
                     response.response_code() == ResponseCode::NoError
                         && response
@@ -443,12 +805,22 @@ impl DnsEngine {
                         .next()
                         .is_some_and(|values| !values.is_empty())
                     && query_error.is_none();
-                let error = nxdomain
+                let nxdomain_error = match &nxdomain {
+                    Err(error) => Some(format!("NXDOMAIN: {error:#}")),
+                    Ok(response) if !nxdomain_ok => Some(format!(
+                        "NXDOMAIN: réponse non définitive ({:?}, TC={})",
+                        response.response_code(),
+                        response.truncated()
+                    )),
+                    Ok(_) => None,
+                };
+                let dnssec_error = dnssec
+                    .as_ref()
                     .err()
-                    .map(|error| format!("NXDOMAIN: {error:#}"))
-                    .or_else(|| dnssec.err().map(|error| format!("DNSSEC: {error:#}")))
-                    .or(query_error);
-                let usable = !hijacks_nxdomain
+                    .map(|error| format!("DNSSEC: {error:#}"));
+                let error = nxdomain_error.or(dnssec_error).or(query_error);
+                let usable = nxdomain_ok
+                    && !hijacks_nxdomain
                     && dnssec_records
                     && validates_dnssec
                     && consistent
@@ -471,55 +843,99 @@ impl DnsEngine {
         tests
     }
 
-    pub async fn resolve_host_consensus(&self, fqdn: &str) -> Option<ResolvedHost> {
+    pub async fn resolve_host_consensus_classified(&self, fqdn: &str) -> DnsResolutionOutcome {
         let required = if self.fast_resolvers.len() >= 2 { 2 } else { 1 };
-        let mut results = stream::iter(self.fast_resolvers.iter())
+        let results = stream::iter(self.fast_resolvers.iter())
             .map(|resolver| async move {
-                let (a, aaaa) = tokio::join!(
-                    resolver.query(fqdn, RecordType::A, true, self.timeout),
-                    resolver.query(fqdn, RecordType::AAAA, true, self.timeout),
-                );
-                [a.ok(), aaaa.ok()]
-                    .into_iter()
-                    .flatten()
-                    .filter(|response| {
-                        !response.truncated() && response.response_code() == ResponseCode::NoError
-                    })
-                    .flat_map(|response| {
-                        response
-                            .answers()
-                            .iter()
-                            .filter(|record| {
-                                matches!(
-                                    record.record_type(),
-                                    RecordType::A | RecordType::AAAA | RecordType::CNAME
-                                )
-                            })
-                            .map(|record| DnsRecord {
-                                record_type: record.record_type().to_string(),
-                                value: record.data().to_string().trim_end_matches('.').to_owned(),
-                                ttl: record.ttl(),
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                    .collect::<Vec<_>>()
+                self.wait_for_rate_slot().await;
+                let a = resolver
+                    .query(fqdn, RecordType::A, true, self.timeout)
+                    .await;
+                self.wait_for_rate_slot().await;
+                let aaaa = resolver
+                    .query(fqdn, RecordType::AAAA, true, self.timeout)
+                    .await;
+                let mut records = Vec::new();
+                let mut definitive_negative = 0_usize;
+                for response in [a, aaaa] {
+                    let Ok(response) = response else {
+                        continue;
+                    };
+                    if response.truncated() {
+                        continue;
+                    }
+                    match response.response_code() {
+                        ResponseCode::NXDomain => definitive_negative += 1,
+                        ResponseCode::NoError => {
+                            let before = records.len();
+                            records.extend(
+                                response
+                                    .answers()
+                                    .iter()
+                                    .filter(|record| {
+                                        matches!(
+                                            record.record_type(),
+                                            RecordType::A | RecordType::AAAA | RecordType::CNAME
+                                        )
+                                    })
+                                    .map(|record| DnsRecord {
+                                        record_type: record.record_type().to_string(),
+                                        value: record
+                                            .data()
+                                            .to_string()
+                                            .trim_end_matches('.')
+                                            .to_owned(),
+                                        ttl: record.ttl(),
+                                    }),
+                            );
+                            if records.len() == before {
+                                definitive_negative += 1;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if !records.is_empty() {
+                    RecordLookupOutcome::Positive(records)
+                } else if definitive_negative == 2 {
+                    RecordLookupOutcome::Negative
+                } else {
+                    RecordLookupOutcome::Indeterminate
+                }
             })
             .buffer_unordered(self.fast_resolvers.len().max(1))
             .collect::<Vec<_>>()
             .await;
-        results.retain(|records| !records.is_empty());
-        if results.len() < required {
-            return None;
+        let mut positives = Vec::new();
+        let mut negatives = 0_usize;
+        let mut indeterminate = 0_usize;
+        for result in results {
+            match result {
+                RecordLookupOutcome::Positive(records) => positives.push(records),
+                RecordLookupOutcome::Negative => negatives += 1,
+                RecordLookupOutcome::Indeterminate => indeterminate += 1,
+            }
         }
-        let resolver_count = results.len().min(u16::MAX as usize) as u16;
-        let mut records = results.into_iter().flatten().collect::<Vec<_>>();
+        if positives.len() < required {
+            return if positives.is_empty() && negatives >= required && indeterminate == 0 {
+                DnsResolutionOutcome::Negative {
+                    fqdn: fqdn.to_owned(),
+                }
+            } else {
+                DnsResolutionOutcome::Indeterminate {
+                    fqdn: fqdn.to_owned(),
+                }
+            };
+        }
+        let resolver_count = positives.len().min(u16::MAX as usize) as u16;
+        let mut records = positives.into_iter().flatten().collect::<Vec<_>>();
         records.sort_by(|left, right| {
             (&left.record_type, &left.value).cmp(&(&right.record_type, &right.value))
         });
         records.dedup_by(|left, right| {
             left.record_type == right.record_type && left.value == right.value
         });
-        Some(ResolvedHost {
+        DnsResolutionOutcome::Positive(ResolvedHost {
             fqdn: fqdn.to_owned(),
             records,
             from_cache: false,
@@ -532,40 +948,81 @@ impl DnsEngine {
         })
     }
 
+    pub async fn resolve_host_consensus(&self, fqdn: &str) -> Option<ResolvedHost> {
+        match self.resolve_host_consensus_classified(fqdn).await {
+            DnsResolutionOutcome::Positive(answer) => Some(answer),
+            DnsResolutionOutcome::Negative { .. } | DnsResolutionOutcome::Indeterminate { .. } => {
+                None
+            }
+        }
+    }
+
     pub async fn authoritative_confirms(&self, fqdn: &str) -> bool {
         let Some(root_domain) = crate::util::registrable_domain(fqdn) else {
             return false;
         };
-        let Ok(servers) = self.authoritative_servers(&root_domain).await else {
+        let mut servers = None;
+        let labels = fqdn.trim_end_matches('.').split('.').collect::<Vec<_>>();
+        let root_labels = root_domain.split('.').count();
+        let first_parent = usize::from(labels.len() > root_labels);
+        for start in first_parent..=labels.len().saturating_sub(root_labels) {
+            let zone = labels[start..].join(".");
+            if let Ok(candidate) = self.authoritative_servers(&zone).await
+                && !candidate.is_empty()
+            {
+                servers = Some(candidate);
+                break;
+            }
+        }
+        let Some(servers) = servers else {
             return false;
         };
-        let addresses = servers
+        let resolvers = servers
             .into_iter()
             .flat_map(|(_, addresses)| addresses)
             .collect::<BTreeSet<_>>()
             .into_iter()
             .take(4)
+            .filter_map(|address| {
+                self.authoritative_resolver(SocketAddr::new(address, 53))
+                    .ok()
+            })
             .collect::<Vec<_>>();
-        let mut results = stream::iter(addresses)
-            .map(|address| async move {
-                let resolver = FastResolver {
-                    address: SocketAddr::new(address, 53),
-                    transport: OnceCell::new(),
-                };
-                let (a, aaaa) = tokio::join!(
-                    resolver.query(fqdn, RecordType::A, false, self.timeout),
-                    resolver.query(fqdn, RecordType::AAAA, false, self.timeout),
-                );
-                [a.ok(), aaaa.ok()].into_iter().flatten().any(|response| {
-                    response.authoritative()
-                        && response.response_code() == ResponseCode::NoError
-                        && response.answers().iter().any(|record| {
-                            matches!(
-                                record.record_type(),
-                                RecordType::A | RecordType::AAAA | RecordType::CNAME
-                            )
-                        })
-                })
+        let expected_owner = fqdn.trim_end_matches('.').to_ascii_lowercase();
+        let mut results = stream::iter(resolvers)
+            .map(|resolver| {
+                let expected_owner = expected_owner.clone();
+                async move {
+                    let a = async {
+                        self.wait_for_rate_slot().await;
+                        resolver
+                            .query(fqdn, RecordType::A, false, self.timeout)
+                            .await
+                    };
+                    let aaaa = async {
+                        self.wait_for_rate_slot().await;
+                        resolver
+                            .query(fqdn, RecordType::AAAA, false, self.timeout)
+                            .await
+                    };
+                    let (a, aaaa) = tokio::join!(a, aaaa);
+                    [a.ok(), aaaa.ok()].into_iter().flatten().any(|response| {
+                        response.authoritative()
+                            && !response.truncated()
+                            && response.response_code() == ResponseCode::NoError
+                            && response.answers().iter().any(|record| {
+                                record
+                                    .name()
+                                    .to_utf8()
+                                    .trim_end_matches('.')
+                                    .eq_ignore_ascii_case(&expected_owner)
+                                    && matches!(
+                                        record.record_type(),
+                                        RecordType::A | RecordType::AAAA | RecordType::CNAME
+                                    )
+                            })
+                    })
+                }
             })
             .buffer_unordered(4);
         while let Some(confirmed) = results.next().await {
@@ -574,6 +1031,22 @@ impl DnsEngine {
             }
         }
         false
+    }
+
+    fn authoritative_resolver(&self, address: SocketAddr) -> Result<Arc<FastResolver>> {
+        let mut resolvers = self
+            .authoritative_resolvers
+            .lock()
+            .map_err(|_| anyhow::anyhow!("cache des résolveurs autoritaires empoisonné"))?;
+        Ok(resolvers
+            .entry(address)
+            .or_insert_with(|| {
+                Arc::new(FastResolver {
+                    address,
+                    transport: OnceCell::new(),
+                })
+            })
+            .clone())
     }
 
     fn resolver_order(&self) -> Vec<usize> {
@@ -610,7 +1083,7 @@ impl DnsEngine {
             })
             .collect::<Vec<_>>();
         scored.sort_by_key(|(index, score)| (*score, *index));
-        if self.resolvers.len() > 1 && tick % 8 == 0 {
+        if self.resolvers.len() > 1 && tick.is_multiple_of(8) {
             let explore = (tick as usize / 8) % self.resolvers.len();
             if let Some(position) = scored.iter().position(|(index, _)| *index == explore) {
                 let item = scored.remove(position);
@@ -646,18 +1119,26 @@ impl DnsEngine {
             .collect()
     }
 
-    pub async fn lookup_records(&self, fqdn: &str, record_type: RecordType) -> Vec<DnsRecord> {
-        for index in self.resolver_order().into_iter().take(2) {
+    async fn lookup_records_classified(
+        &self,
+        fqdn: &str,
+        record_type: RecordType,
+    ) -> RecordLookupOutcome {
+        let order = self
+            .resolver_order()
+            .into_iter()
+            .take(2)
+            .collect::<Vec<_>>();
+        let required_negatives = order.len().clamp(1, 2);
+        let mut definitive_negatives = 0_usize;
+        for index in order {
             self.wait_for_rate_slot().await;
             let node = &self.resolvers[index];
             node.inflight.fetch_add(1, Ordering::Relaxed);
             let started = Instant::now();
             let fast_response = if matches!(record_type, RecordType::A | RecordType::AAAA) {
                 if let Some(resolver) = self.fast_resolvers.get(index) {
-                    resolver
-                        .query(fqdn, record_type, true, self.timeout)
-                        .await
-                        .ok()
+                    Some(resolver.query(fqdn, record_type, true, self.timeout).await)
                 } else {
                     None
                 }
@@ -665,12 +1146,15 @@ impl DnsEngine {
                 None
             };
             let fast_result = fast_response.as_ref().and_then(|response| {
+                let Ok(response) = response else {
+                    return None;
+                };
                 if response.truncated() {
                     return None;
                 }
                 match response.response_code() {
-                    ResponseCode::NoError => Some(
-                        response
+                    ResponseCode::NoError => {
+                        let records = response
                             .answers()
                             .iter()
                             .filter(|record| {
@@ -682,30 +1166,66 @@ impl DnsEngine {
                                 value: record.data().to_string().trim_end_matches('.').to_owned(),
                                 ttl: record.ttl(),
                             })
-                            .collect::<Vec<_>>(),
-                    ),
-                    ResponseCode::NXDomain => Some(Vec::new()),
+                            .collect::<Vec<_>>();
+                        Some(if records.is_empty() {
+                            RecordLookupOutcome::Negative
+                        } else {
+                            RecordLookupOutcome::Positive(records)
+                        })
+                    }
+                    ResponseCode::NXDomain => Some(RecordLookupOutcome::Negative),
                     _ => None,
                 }
             });
             let result = if fast_result.is_none() {
+                if fast_response.is_some() {
+                    // Le repli Hickory produit une seconde sortie réseau.
+                    self.wait_for_rate_slot().await;
+                }
                 Some(node.resolver.lookup(fqdn, record_type).await)
             } else {
                 None
             };
             node.inflight.fetch_sub(1, Ordering::Relaxed);
             let duration_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
-            let no_records = result
-                .as_ref()
-                .and_then(|result| result.as_ref().err())
-                .is_some_and(|error| error.is_no_records_found() || error.is_nx_domain());
+            let classified = if let Some(result) = fast_result {
+                result
+            } else {
+                match result.expect("le résultat hickory existe sans résultat UDP") {
+                    Ok(lookup) => {
+                        let records = lookup
+                            .answers()
+                            .iter()
+                            .filter_map(|record| {
+                                let data = record.data();
+                                (record.record_type() == record_type
+                                    || record.record_type() == RecordType::CNAME)
+                                    .then(|| DnsRecord {
+                                        record_type: record.record_type().to_string(),
+                                        value: data.to_string().trim_end_matches('.').to_owned(),
+                                        ttl: record.ttl(),
+                                    })
+                            })
+                            .collect::<Vec<_>>();
+                        if records.is_empty() {
+                            RecordLookupOutcome::Negative
+                        } else {
+                            RecordLookupOutcome::Positive(records)
+                        }
+                    }
+                    Err(error) if error.is_no_records_found() || error.is_nx_domain() => {
+                        RecordLookupOutcome::Negative
+                    }
+                    Err(_) => RecordLookupOutcome::Indeterminate,
+                }
+            };
             if let Ok(mut state) = node.state.lock() {
                 state.requests += 1;
                 state.total_ms = state.total_ms.saturating_add(duration_ms);
-                if fast_result.is_some()
-                    || result.as_ref().is_some_and(|result| result.is_ok())
-                    || no_records
-                {
+                if matches!(
+                    classified,
+                    RecordLookupOutcome::Positive(_) | RecordLookupOutcome::Negative
+                ) {
                     state.successes += 1;
                     state.consecutive_failures = 0;
                 } else {
@@ -713,30 +1233,26 @@ impl DnsEngine {
                     state.consecutive_failures += 1;
                 }
             }
-            if let Some(records) = fast_result {
-                return records;
-            }
-            match result.expect("le résultat hickory existe sans résultat UDP") {
-                Ok(lookup) => {
-                    return lookup
-                        .record_iter()
-                        .filter_map(|record| {
-                            let data = record.data();
-                            (record.record_type() == record_type
-                                || record.record_type() == RecordType::CNAME)
-                                .then(|| DnsRecord {
-                                    record_type: record.record_type().to_string(),
-                                    value: data.to_string().trim_end_matches('.').to_owned(),
-                                    ttl: record.ttl(),
-                                })
-                        })
-                        .collect();
+            match classified {
+                RecordLookupOutcome::Positive(records) => {
+                    return RecordLookupOutcome::Positive(records);
                 }
-                Err(_) if no_records => return Vec::new(),
-                Err(_) => continue,
+                RecordLookupOutcome::Negative => definitive_negatives += 1,
+                RecordLookupOutcome::Indeterminate => {}
             }
         }
-        Vec::new()
+        if definitive_negatives >= required_negatives {
+            RecordLookupOutcome::Negative
+        } else {
+            RecordLookupOutcome::Indeterminate
+        }
+    }
+
+    pub async fn lookup_records(&self, fqdn: &str, record_type: RecordType) -> Vec<DnsRecord> {
+        match self.lookup_records_classified(fqdn, record_type).await {
+            RecordLookupOutcome::Positive(records) => records,
+            RecordLookupOutcome::Negative | RecordLookupOutcome::Indeterminate => Vec::new(),
+        }
     }
 
     pub async fn soa_serial(&self, zone: &str) -> Option<u64> {
@@ -792,9 +1308,13 @@ impl DnsEngine {
                         .await
                         .map(|lookup| {
                             lookup
+                                .answers()
                                 .iter()
-                                .map(|name| {
-                                    name.to_utf8().trim_end_matches('.').to_ascii_lowercase()
+                                .filter_map(|record| match &record.data {
+                                    RData::PTR(name) => Some(
+                                        name.to_utf8().trim_end_matches('.').to_ascii_lowercase(),
+                                    ),
+                                    _ => None,
                                 })
                                 .collect()
                         })
@@ -807,30 +1327,58 @@ impl DnsEngine {
             .await
     }
 
-    pub async fn resolve_host(&self, fqdn: &str) -> Option<ResolvedHost> {
+    pub async fn resolve_host_classified(&self, fqdn: &str) -> DnsResolutionOutcome {
         let (a, aaaa) = tokio::join!(
-            self.lookup_records(fqdn, RecordType::A),
-            self.lookup_records(fqdn, RecordType::AAAA),
+            self.lookup_records_classified(fqdn, RecordType::A),
+            self.lookup_records_classified(fqdn, RecordType::AAAA),
         );
-        let mut records = a;
-        records.extend(aaaa);
+        let both_negative = matches!(&a, RecordLookupOutcome::Negative)
+            && matches!(&aaaa, RecordLookupOutcome::Negative);
+        let mut records = match a {
+            RecordLookupOutcome::Positive(records) => records,
+            RecordLookupOutcome::Negative | RecordLookupOutcome::Indeterminate => Vec::new(),
+        };
+        if let RecordLookupOutcome::Positive(aaaa) = aaaa {
+            records.extend(aaaa);
+        }
         records.sort_by(|left, right| {
             (&left.record_type, &left.value).cmp(&(&right.record_type, &right.value))
         });
         records.dedup_by(|left, right| {
             left.record_type == right.record_type && left.value == right.value
         });
-        (!records.is_empty()).then(|| ResolvedHost {
-            fqdn: fqdn.to_owned(),
-            records,
-            from_cache: false,
-            last_verified_at: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .ok()
-                .map(|duration| duration.as_secs().min(i64::MAX as u64) as i64),
-            authoritative_validation: false,
-            resolver_count: 1,
-        })
+        if records.is_empty() {
+            if both_negative {
+                DnsResolutionOutcome::Negative {
+                    fqdn: fqdn.to_owned(),
+                }
+            } else {
+                DnsResolutionOutcome::Indeterminate {
+                    fqdn: fqdn.to_owned(),
+                }
+            }
+        } else {
+            DnsResolutionOutcome::Positive(ResolvedHost {
+                fqdn: fqdn.to_owned(),
+                records,
+                from_cache: false,
+                last_verified_at: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .ok()
+                    .map(|duration| duration.as_secs().min(i64::MAX as u64) as i64),
+                authoritative_validation: false,
+                resolver_count: 1,
+            })
+        }
+    }
+
+    pub async fn resolve_host(&self, fqdn: &str) -> Option<ResolvedHost> {
+        match self.resolve_host_classified(fqdn).await {
+            DnsResolutionOutcome::Positive(answer) => Some(answer),
+            DnsResolutionOutcome::Negative { .. } | DnsResolutionOutcome::Indeterminate { .. } => {
+                None
+            }
+        }
     }
 
     pub async fn resolve_many(&self, hosts: Vec<String>) -> Vec<ResolvedHost> {
@@ -845,64 +1393,68 @@ impl DnsEngine {
     where
         F: FnMut(&str, Option<&ResolvedHost>),
     {
+        self.resolve_many_classified_with_progress(hosts, |outcome| {
+            on_completed(outcome.fqdn(), outcome.answer());
+        })
+        .await
+        .into_iter()
+        .filter_map(|outcome| match outcome {
+            DnsResolutionOutcome::Positive(answer) => Some(answer),
+            DnsResolutionOutcome::Negative { .. } | DnsResolutionOutcome::Indeterminate { .. } => {
+                None
+            }
+        })
+        .collect()
+    }
+
+    pub async fn resolve_many_classified_with_progress<F>(
+        &self,
+        hosts: Vec<String>,
+        mut on_completed: F,
+    ) -> Vec<DnsResolutionOutcome>
+    where
+        F: FnMut(&DnsResolutionOutcome),
+    {
         let engine = self.clone();
         let mut pending = stream::iter(hosts)
             .map(move |host| {
                 let engine = engine.clone();
-                async move {
-                    let answer = engine.resolve_host(&host).await;
-                    (host, answer)
-                }
+                async move { engine.resolve_host_classified(&host).await }
             })
             .buffer_unordered(self.concurrency);
-        let mut answers = Vec::new();
-        while let Some((host, answer)) = pending.next().await {
-            on_completed(&host, answer.as_ref());
-            if let Some(answer) = answer {
-                answers.push(answer);
-            }
+        let mut outcomes = Vec::new();
+        while let Some(outcome) = pending.next().await {
+            on_completed(&outcome);
+            outcomes.push(outcome);
         }
-        answers.sort_by(|left, right| left.fqdn.cmp(&right.fqdn));
-        answers
+        outcomes.sort_by(|left, right| left.fqdn().cmp(right.fqdn()));
+        outcomes
     }
 
-    pub async fn wildcard_signature(&self, domain: &str) -> BTreeSet<String> {
+    pub async fn wildcard_probe(&self, domain: &str) -> WildcardProbeOutcome {
         let seed = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
         let mut non_empty = Vec::new();
+        let mut negatives = 0_usize;
         for _ in 0..5 {
             let counter = PROBE_COUNTER.fetch_add(1, Ordering::Relaxed);
             let host = format!("fellaga-{seed:x}-{counter:x}.{domain}");
-            if let Some(answer) = self.resolve_host(&host).await {
-                non_empty.push(answer.signature());
+            match self.resolve_host_classified(&host).await {
+                DnsResolutionOutcome::Positive(answer) => non_empty.push(answer.signature()),
+                DnsResolutionOutcome::Negative { .. } => negatives += 1,
+                DnsResolutionOutcome::Indeterminate { .. } => {}
             }
         }
-        if non_empty.len() < 3 {
-            return BTreeSet::new();
+        classify_wildcard_samples(non_empty, negatives)
+    }
+
+    pub async fn wildcard_signature(&self, domain: &str) -> BTreeSet<String> {
+        match self.wildcard_probe(domain).await {
+            WildcardProbeOutcome::Wildcard(signature) => signature,
+            WildcardProbeOutcome::Normal | WildcardProbeOutcome::Indeterminate => BTreeSet::new(),
         }
-        let sample_count = non_empty.len();
-        let mut signature = BTreeSet::new();
-        let mut type_samples = HashMap::<String, usize>::new();
-        for sample in non_empty {
-            let mut seen_types = BTreeSet::new();
-            for record in sample {
-                if let Some((record_type, _)) = record.split_once(':') {
-                    seen_types.insert(record_type.to_owned());
-                }
-                signature.insert(record);
-            }
-            for record_type in seen_types {
-                *type_samples.entry(record_type).or_default() += 1;
-            }
-        }
-        for (record_type, count) in type_samples {
-            if count.saturating_mul(2) >= sample_count.saturating_add(1) {
-                signature.insert(format!("{record_type}:*"));
-            }
-        }
-        signature
     }
 
     pub fn matches_wildcard(answer: &ResolvedHost, signature: &BTreeSet<String>) -> bool {
@@ -910,29 +1462,49 @@ impl DnsEngine {
             && !answer.records.is_empty()
             && answer.records.iter().all(|record| {
                 signature.contains(&format!("{}:{}", record.record_type, record.value))
-                    || signature.contains(&format!("{}:*", record.record_type))
             })
     }
 
-    pub async fn authoritative_servers(&self, domain: &str) -> Result<Vec<(String, Vec<IpAddr>)>> {
+    pub async fn authoritative_servers(&self, domain: &str) -> Result<AuthoritativeServers> {
+        if let Some(cached) = self
+            .authoritative_server_cache
+            .lock()
+            .await
+            .get(domain)
+            .cloned()
+        {
+            return Ok(cached);
+        }
+        if self.resolvers.is_empty() {
+            bail!("aucun résolveur récursif disponible");
+        }
         let resolver = self.resolvers[self.resolver_order()[0]].resolver.clone();
+        self.wait_for_rate_slot().await;
         let lookup = resolver
             .lookup(domain, RecordType::NS)
             .await
             .with_context(|| format!("résolution NS de {domain}"))?;
         let names: BTreeSet<String> = lookup
-            .record_iter()
+            .answers()
+            .iter()
             .filter(|record| record.record_type() == RecordType::NS)
             .map(|record| record.data().to_string().trim_end_matches('.').to_owned())
             .collect();
         let mut result = Vec::new();
         for name in names {
+            self.wait_for_rate_slot().await;
             let addresses = resolver
                 .lookup_ip(name.as_str())
                 .await
                 .map(|lookup| lookup.iter().collect())
                 .unwrap_or_default();
             result.push((name, addresses));
+        }
+        if !result.is_empty() {
+            self.authoritative_server_cache
+                .lock()
+                .await
+                .insert(domain.to_owned(), result.clone());
         }
         Ok(result)
     }
@@ -941,6 +1513,88 @@ impl DnsEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn nxdomain_resolver() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = server.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            for _ in 0..2 {
+                let mut buffer = [0_u8; 2_048];
+                let (length, peer) = server.recv_from(&mut buffer).await.unwrap();
+                let mut message = Message::from_vec(&buffer[..length]).unwrap();
+                message
+                    .set_message_type(MessageType::Response)
+                    .set_response_code(ResponseCode::NXDomain);
+                server
+                    .send_to(&message.to_vec().unwrap(), peer)
+                    .await
+                    .unwrap();
+            }
+        });
+        (address, task)
+    }
+
+    fn consensus_test_engine(addresses: Vec<SocketAddr>) -> DnsEngine {
+        DnsEngine {
+            resolvers: Arc::new(Vec::new()),
+            fast_resolvers: Arc::new(
+                addresses
+                    .into_iter()
+                    .map(|address| FastResolver {
+                        address,
+                        transport: OnceCell::new(),
+                    })
+                    .collect(),
+            ),
+            concurrency: 8,
+            timeout: Duration::from_millis(100),
+            rate_limit: 0,
+            next_query_at: Arc::new(tokio::sync::Mutex::new(Instant::now())),
+            selection_counter: Arc::new(AtomicU64::new(0)),
+            authoritative_resolvers: Arc::new(Mutex::new(HashMap::new())),
+            authoritative_server_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        }
+    }
+
+    #[tokio::test]
+    async fn consensus_distinguishes_nxdomain_from_an_unavailable_quorum() {
+        let (first, first_task) = nxdomain_resolver().await;
+        let (second, second_task) = nxdomain_resolver().await;
+        let negative = consensus_test_engine(vec![first, second])
+            .resolve_host_consensus_classified("missing.example.test")
+            .await;
+        first_task.await.unwrap();
+        second_task.await.unwrap();
+        assert!(matches!(negative, DnsResolutionOutcome::Negative { .. }));
+
+        let (available, available_task) = nxdomain_resolver().await;
+        let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let indeterminate = consensus_test_engine(vec![available, silent.local_addr().unwrap()])
+            .resolve_host_consensus_classified("unknown.example.test")
+            .await;
+        available_task.await.unwrap();
+        assert!(matches!(
+            indeterminate,
+            DnsResolutionOutcome::Indeterminate { .. }
+        ));
+    }
+
+    #[test]
+    fn resolver_health_requires_a_strict_untruncated_nxdomain() {
+        let mut response = Message::new(0, MessageType::Response, OpCode::Query);
+        response
+            .set_message_type(MessageType::Response)
+            .set_response_code(ResponseCode::NXDomain);
+        assert!(is_definitive_nxdomain(&response));
+        response.set_truncated(true);
+        assert!(!is_definitive_nxdomain(&response));
+        response
+            .set_truncated(false)
+            .set_response_code(ResponseCode::NoError);
+        assert!(!is_definitive_nxdomain(&response));
+        response.set_response_code(ResponseCode::ServFail);
+        assert!(!is_definitive_nxdomain(&response));
+    }
 
     #[tokio::test]
     async fn udp_transport_correlates_out_of_order_responses_and_sends_edns0() {
@@ -993,6 +1647,178 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn udp_transport_rejects_a_reused_id_with_the_wrong_question() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = server.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let mut buffer = [0_u8; 2_048];
+            let (length, peer) = server.recv_from(&mut buffer).await.unwrap();
+            let mut request = Message::from_vec(&buffer[..length]).unwrap();
+            let mut wrong = Message::new(0, MessageType::Response, OpCode::Query);
+            wrong
+                .set_id(request.id())
+                .set_message_type(MessageType::Response)
+                .set_op_code(OpCode::Query)
+                .set_response_code(ResponseCode::NoError)
+                .add_query(Query::query(
+                    Name::from_str("wrong.example.com.").unwrap(),
+                    RecordType::A,
+                ));
+            server
+                .send_to(&wrong.to_vec().unwrap(), peer)
+                .await
+                .unwrap();
+            request
+                .set_message_type(MessageType::Response)
+                .set_response_code(ResponseCode::NXDomain);
+            server
+                .send_to(&request.to_vec().unwrap(), peer)
+                .await
+                .unwrap();
+        });
+        let transport = FastUdpTransport::connect(address).await.unwrap();
+        let response = transport
+            .query(
+                "expected.example.com",
+                RecordType::A,
+                true,
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        server_task.await.unwrap();
+        assert_eq!(
+            response.queries()[0].name().to_utf8(),
+            "expected.example.com."
+        );
+        assert_eq!(response.response_code(), ResponseCode::NXDomain);
+    }
+
+    #[tokio::test]
+    async fn truncated_udp_queries_fall_back_to_a_correlated_tcp_response() {
+        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = tcp.local_addr().unwrap();
+        let udp = UdpSocket::bind(address).await.unwrap();
+        let udp_task = tokio::spawn(async move {
+            let mut buffer = [0_u8; 2_048];
+            let (length, peer) = udp.recv_from(&mut buffer).await.unwrap();
+            let mut response = Message::from_vec(&buffer[..length]).unwrap();
+            response
+                .set_message_type(MessageType::Response)
+                .set_truncated(true)
+                .set_response_code(ResponseCode::NoError);
+            udp.send_to(&response.to_vec().unwrap(), peer)
+                .await
+                .unwrap();
+        });
+        let tcp_task = tokio::spawn(async move {
+            let (mut stream, _) = tcp.accept().await.unwrap();
+            let length = stream.read_u16().await.unwrap() as usize;
+            let mut payload = vec![0_u8; length];
+            stream.read_exact(&mut payload).await.unwrap();
+            let mut response = Message::from_vec(&payload).unwrap();
+            response
+                .set_message_type(MessageType::Response)
+                .set_truncated(false)
+                .set_response_code(ResponseCode::NXDomain);
+            let payload = response.to_vec().unwrap();
+            stream.write_u16(payload.len() as u16).await.unwrap();
+            stream.write_all(&payload).await.unwrap();
+        });
+        let resolver = FastResolver {
+            address,
+            transport: OnceCell::new(),
+        };
+        let response = resolver
+            .query(
+                "missing.example.test",
+                RecordType::A,
+                true,
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        udp_task.await.unwrap();
+        tcp_task.await.unwrap();
+        assert_eq!(response.response_code(), ResponseCode::NXDomain);
+        assert!(!response.truncated());
+    }
+
+    #[tokio::test]
+    async fn dropping_a_udp_transport_stops_its_receiver_task() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let transport = FastUdpTransport::connect(server.local_addr().unwrap())
+            .await
+            .unwrap();
+        let receiver = transport.receiver.clone();
+        assert!(!receiver.is_finished());
+        drop(transport);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !receiver.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_udp_query_releases_its_pending_id() {
+        let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let transport = FastUdpTransport::connect(silent.local_addr().unwrap())
+            .await
+            .unwrap();
+        let query_transport = transport.clone();
+        let query = tokio::spawn(async move {
+            query_transport
+                .query(
+                    "cancelled.example",
+                    RecordType::A,
+                    true,
+                    Duration::from_secs(30),
+                )
+                .await
+        });
+        for _ in 0..100 {
+            if !transport.pending.lock().await.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(transport.pending.lock().await.len(), 1);
+        query.abort();
+        let _ = query.await;
+        for _ in 0..100 {
+            if transport.pending.lock().await.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(transport.pending.lock().await.is_empty());
+    }
+
+    #[test]
+    fn trusted_engines_can_share_one_rate_limiter() {
+        let primary = DnsEngine::new_with_rate(
+            8,
+            Duration::from_secs(1),
+            &["1.1.1.1".parse().unwrap()],
+            100,
+        )
+        .unwrap();
+        let trusted = DnsEngine::new_with_rate(
+            4,
+            Duration::from_secs(1),
+            &["8.8.8.8".parse().unwrap()],
+            500,
+        )
+        .unwrap()
+        .share_rate_limit_with(&primary);
+        assert_eq!(trusted.rate_limit, 100);
+        assert!(Arc::ptr_eq(&primary.next_query_at, &trusted.next_query_at));
+    }
+
+    #[tokio::test]
     async fn loopback_benchmark_reports_completed_queries_and_loss() {
         let result = DnsEngine::benchmark_loopback(1_000, 128, Duration::from_secs(1))
             .await
@@ -1005,7 +1831,7 @@ mod tests {
     }
 
     #[test]
-    fn wildcard_profiles_accept_rotating_values_by_record_type() {
+    fn wildcard_profiles_require_an_observed_value_not_only_a_record_type() {
         let answer = ResolvedHost {
             fqdn: "random.example.com".to_owned(),
             records: vec![DnsRecord {
@@ -1018,14 +1844,48 @@ mod tests {
             authoritative_validation: false,
             resolver_count: 1,
         };
-        assert!(DnsEngine::matches_wildcard(
+        assert!(!DnsEngine::matches_wildcard(
             &answer,
             &BTreeSet::from(["A:*".to_owned()])
+        ));
+        assert!(DnsEngine::matches_wildcard(
+            &answer,
+            &BTreeSet::from(["A:192.0.2.99".to_owned()])
         ));
         assert!(!DnsEngine::matches_wildcard(
             &answer,
             &BTreeSet::from(["CNAME:wild.example.com".to_owned()])
         ));
+    }
+
+    #[test]
+    fn wildcard_probe_never_treats_timeouts_or_conflicts_as_a_normal_zone() {
+        assert_eq!(
+            classify_wildcard_samples(Vec::new(), 2),
+            WildcardProbeOutcome::Indeterminate
+        );
+        assert_eq!(
+            classify_wildcard_samples(vec![BTreeSet::from(["A:192.0.2.10".to_owned()])], 4,),
+            WildcardProbeOutcome::Indeterminate
+        );
+        assert_eq!(
+            classify_wildcard_samples(Vec::new(), 3),
+            WildcardProbeOutcome::Normal
+        );
+        assert_eq!(
+            classify_wildcard_samples(
+                vec![
+                    BTreeSet::from(["A:192.0.2.10".to_owned()]),
+                    BTreeSet::from(["A:192.0.2.11".to_owned()]),
+                    BTreeSet::from(["A:192.0.2.10".to_owned()]),
+                ],
+                0,
+            ),
+            WildcardProbeOutcome::Wildcard(BTreeSet::from([
+                "A:192.0.2.10".to_owned(),
+                "A:192.0.2.11".to_owned(),
+            ]))
+        );
     }
 
     #[test]
@@ -1064,5 +1924,23 @@ mod tests {
         let adaptive = engine.resolver_order();
         assert_eq!(exploratory[0], 0);
         assert_eq!(adaptive[0], 1);
+    }
+
+    #[test]
+    fn duplicate_resolver_addresses_cannot_fake_an_independent_quorum() {
+        let address = "1.1.1.1".parse().unwrap();
+        let engine = DnsEngine::new(10, Duration::from_secs(1), &[address, address]).unwrap();
+        assert_eq!(engine.resolvers.len(), 1);
+        assert_eq!(engine.fast_resolvers.len(), 1);
+    }
+
+    #[test]
+    fn authoritative_transports_are_reused_per_address() {
+        let engine =
+            DnsEngine::new(10, Duration::from_secs(1), &["1.1.1.1".parse().unwrap()]).unwrap();
+        let address = "192.0.2.53:53".parse().unwrap();
+        let first = engine.authoritative_resolver(address).unwrap();
+        let second = engine.authoritative_resolver(address).unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
     }
 }

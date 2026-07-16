@@ -2,76 +2,579 @@ name: release
 
 on:
   push:
-    tags: ["v*"]
-  workflow_dispatch:
+    tags:
+      - "v*.*.*"
 
-permissions:
-  contents: write
-  id-token: write
-  attestations: write
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  RUST_TOOLCHAIN: "1.95.0"
+  KALI_AMD64_IMAGE: "kalilinux/kali-rolling@sha256:45eeb73d6f144a6a2fcf699b849c1d72ff5f2007ec952c98ab3084b77e9114a5"
+  KALI_ARM64_IMAGE: "kalilinux/kali-rolling@sha256:f8c68c6212de26152766d41113b0d8c74b0adbef47efec039a68742738907ab3"
 
 jobs:
-  binaries:
+  gate:
+    name: Validate tag and main ancestry
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      source_date_epoch: ${{ steps.release.outputs.source_date_epoch }}
+    steps:
+      - name: Check out the tagged commit and all refs
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.ref }}
+
+      - name: Enforce release identity
+        id: release
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Release tags must match vX.Y.Z exactly: $TAG" >&2
+            exit 1
+          fi
+
+          version="${TAG#v}"
+          cargo_version="$(sed -n 's/^version = "\([0-9][0-9.]*\)"$/\1/p' Cargo.toml | head -n 1)"
+          if [[ -z "$cargo_version" || "$version" != "$cargo_version" ]]; then
+            echo "Tag $TAG does not match Cargo package version ${cargo_version:-<missing>}" >&2
+            exit 1
+          fi
+
+          tag_commit="$(git rev-list -n 1 "$GITHUB_REF")"
+          head_commit="$(git rev-parse HEAD)"
+          if [[ "$tag_commit" != "$head_commit" ]]; then
+            echo "Checked-out commit $head_commit does not match tag commit $tag_commit" >&2
+            exit 1
+          fi
+
+          if ! git show-ref --verify --quiet refs/remotes/origin/main; then
+            echo "origin/main was not fetched; ancestry cannot be verified" >&2
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$head_commit" refs/remotes/origin/main; then
+            echo "Tagged commit $head_commit is not reachable from origin/main" >&2
+            exit 1
+          fi
+
+          source_date_epoch="$(git show -s --format=%ct "$head_commit")"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "source_date_epoch=$source_date_epoch" >> "$GITHUB_OUTPUT"
+
+  verify:
+    name: Verify the tagged source
+    needs: gate
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the tagged commit
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.ref }}
+
+      - name: Install the pinned Rust toolchain
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup component add --toolchain "$RUST_TOOLCHAIN" rustfmt clippy
+
+      - name: Install verification dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends dnsutils libssl-dev pkg-config zstd
+          cargo "+${RUST_TOOLCHAIN}" install cargo-audit --version 0.22.2 --locked
+
+      - name: Verify corpus, formatting, lints and tests
+        run: |
+          set -euo pipefail
+          test "$(zstd -dc data/candidates-1m.txt.zst | wc -l)" -eq 1000000
+          echo "cde7d80ff87e21ef2c6d3021b09931a469e4ca965f2bc7816e4c143682681d9b  data/candidates-1m.txt.zst" | sha256sum -c -
+          cargo "+${RUST_TOOLCHAIN}" fmt --all -- --check
+          cargo "+${RUST_TOOLCHAIN}" clippy --all-targets --all-features --locked -- -D warnings
+          cargo "+${RUST_TOOLCHAIN}" test --all-targets --all-features --locked
+          cargo "+${RUST_TOOLCHAIN}" audit --deny warnings
+          tests/dns-lab/verify.sh
+
+  build:
+    name: Build and smoke-test ${{ matrix.target }}
+    needs:
+      - gate
+      - verify
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
     strategy:
+      fail-fast: true
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
-            archive: fellaga-kali-x86_64
+            deb: true
           - target: aarch64-unknown-linux-gnu
-            archive: fellaga-kali-arm64
-    runs-on: ubuntu-latest
+            deb: false
+    env:
+      VERSION: ${{ needs.gate.outputs.version }}
+      SOURCE_DATE_EPOCH: ${{ needs.gate.outputs.source_date_epoch }}
+      TARGET: ${{ matrix.target }}
+      CARGO_INCREMENTAL: "0"
+      OPENSSL_STATIC: "1"
+      RUSTFLAGS: "-C link-arg=-Wl,--build-id=none"
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: taiki-e/install-action@cross
-      - run: cross build --release --locked --features vendored-openssl --target ${{ matrix.target }}
-      - name: Assemble archive
-        run: |
-          mkdir -p dist/${{ matrix.archive }}
-          cp target/${{ matrix.target }}/release/fellaga dist/${{ matrix.archive }}/
-          cp README.md LICENSE data/CORPUS_LICENSE.md dist/${{ matrix.archive }}/
-          tar -C dist -czf dist/${{ matrix.archive }}.tar.gz ${{ matrix.archive }}
-      - uses: actions/upload-artifact@v4
+      - name: Check out the tagged commit
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
-          name: ${{ matrix.archive }}
-          path: dist/${{ matrix.archive }}.tar.gz
+          persist-credentials: false
+          ref: ${{ github.ref }}
+
+      - name: Install native and cross-build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            binutils build-essential dpkg-dev file gzip jq perl pkg-config qemu-user-static
+          if [[ "$TARGET" == "aarch64-unknown-linux-gnu" ]]; then
+            sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu
+          fi
+
+      - name: Install the pinned Rust target
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup target add --toolchain "$RUST_TOOLCHAIN" "$TARGET"
+
+      - name: Configure the ARM64 cross compiler
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          {
+            echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc"
+            echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc"
+            echo "AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar"
+            echo "RANLIB_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ranlib"
+          } >> "$GITHUB_ENV"
+
+      - name: Build the canonical binary
+        run: |
+          cargo "+${RUST_TOOLCHAIN}" build \
+            --release \
+            --locked \
+            --features vendored-openssl \
+            --target "$TARGET"
+
+      - name: Validate the canonical binary
+        run: |
+          set -euo pipefail
+          binary="target/${TARGET}/release/fellaga"
+          test -x "$binary"
+          test "$("$binary" --version 2>/dev/null || true)" = "fellaga $VERSION" || \
+            [[ "$TARGET" == "aarch64-unknown-linux-gnu" ]]
+
+          case "$TARGET" in
+            x86_64-unknown-linux-gnu)
+              file "$binary" | grep -q "x86-64"
+              ;;
+            aarch64-unknown-linux-gnu)
+              file "$binary" | grep -Eq "aarch64|ARM64"
+              ;;
+            *)
+              echo "Unexpected target: $TARGET" >&2
+              exit 1
+              ;;
+          esac
+
+          if readelf -d "$binary" | grep -Eq 'NEEDED.*lib(ssl|crypto)\.so'; then
+            echo "OpenSSL is dynamically linked despite vendored-openssl" >&2
+            exit 1
+          fi
+
+      - name: Assemble a deterministic archive
+        run: |
+          set -euo pipefail
+          package="fellaga-v${VERSION}-${TARGET}"
+          stage="dist/stage/${package}"
+          archive="dist/${package}.tar.gz"
+          mkdir -p "$stage"
+          install -m 0755 "target/${TARGET}/release/fellaga" "$stage/fellaga"
+          install -m 0644 README.md LICENSE THIRD_PARTY_NOTICES.md \
+            data/CORPUS_LICENSE.md data/corpus-manifest.json "$stage/"
+
+          create_archive() {
+            local output="$1"
+            tar \
+              --sort=name \
+              --format=gnu \
+              --mtime="@${SOURCE_DATE_EPOCH}" \
+              --owner=0 \
+              --group=0 \
+              --numeric-owner \
+              --mode='u+rw,go+rX,go-w' \
+              -C dist/stage \
+              -cf - "$package" | gzip -n -9 > "$output"
+          }
+
+          create_archive "$archive"
+          create_archive "${archive}.repro"
+          cmp "$archive" "${archive}.repro"
+          rm "${archive}.repro"
+
+          mkdir -p dist/archive-check
+          tar -xzf "$archive" -C dist/archive-check
+          cmp "target/${TARGET}/release/fellaga" "dist/archive-check/${package}/fellaga"
+
+      - name: Smoke-test x86-64 in pinned Kali
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          set -euo pipefail
+          binary="$PWD/dist/stage/fellaga-v${VERSION}-${TARGET}/fellaga"
+          output="$(docker run --rm --network none --platform linux/amd64 \
+            -v "${binary}:/usr/local/bin/fellaga:ro" \
+            "$KALI_AMD64_IMAGE" \
+            /usr/local/bin/fellaga --version)"
+          test "$output" = "fellaga $VERSION"
+
+      - name: Smoke-test ARM64 through QEMU with a pinned Kali rootfs
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          set -euo pipefail
+          rootfs="$RUNNER_TEMP/kali-arm64-rootfs"
+          mkdir -p "$rootfs"
+          container="$(docker create --platform linux/arm64 "$KALI_ARM64_IMAGE")"
+          cleanup() {
+            docker rm -f "$container" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+          docker export "$container" | sudo tar -C "$rootfs" -xf -
+          docker rm "$container" >/dev/null
+          trap - EXIT
+
+          sudo mkdir -p "$rootfs/usr/local/bin"
+          sudo install -m 0755 /usr/bin/qemu-aarch64-static "$rootfs/usr/bin/qemu-aarch64-static"
+          sudo install -m 0755 \
+            "dist/stage/fellaga-v${VERSION}-${TARGET}/fellaga" \
+            "$rootfs/usr/local/bin/fellaga"
+          output="$(sudo chroot "$rootfs" \
+            /usr/bin/qemu-aarch64-static /usr/local/bin/fellaga --version)"
+          test "$output" = "fellaga $VERSION"
+
+      - name: Build a deterministic amd64 Debian package from the canonical binary
+        if: matrix.deb
+        run: |
+          set -euo pipefail
+          binary="dist/stage/fellaga-v${VERSION}-${TARGET}/fellaga"
+          package_root="$RUNNER_TEMP/fellaga-deb-root"
+          metadata_root="$RUNNER_TEMP/fellaga-deb-metadata"
+          deb="dist/fellaga_${VERSION}-1_amd64.deb"
+          mkdir -p "$package_root/DEBIAN" "$package_root/usr/bin" \
+            "$package_root/usr/share/doc/fellaga" "$metadata_root/debian"
+
+          install -m 0755 "$binary" "$package_root/usr/bin/fellaga"
+          install -m 0644 README.md LICENSE THIRD_PARTY_NOTICES.md \
+            data/CORPUS_LICENSE.md data/corpus-manifest.json \
+            "$package_root/usr/share/doc/fellaga/"
+
+          cat > "$metadata_root/debian/control" <<EOF
+          Source: fellaga
+          Section: net
+          Priority: optional
+          Maintainer: Fellaga Project <${GITHUB_REPOSITORY_OWNER}@users.noreply.github.com>
+
+          Package: fellaga
+          Architecture: any
+          Description: Fast, learning subdomain enumerator
+          EOF
+          depends="$(cd "$metadata_root" && dpkg-shlibdeps -O -e"$GITHUB_WORKSPACE/$binary" | sed -n 's/^shlibs:Depends=//p')"
+          test -n "$depends"
+
+          installed_size="$(du -sk "$package_root/usr" | cut -f1)"
+          cat > "$package_root/DEBIAN/control" <<EOF
+          Package: fellaga
+          Version: ${VERSION}-1
+          Section: net
+          Priority: optional
+          Architecture: amd64
+          Maintainer: Fellaga Project <${GITHUB_REPOSITORY_OWNER}@users.noreply.github.com>
+          Installed-Size: ${installed_size}
+          Depends: ${depends}
+          Description: Fast, learning subdomain enumerator
+           Fellaga combines passive discovery, active DNS validation and a local SQLite knowledge base.
+          EOF
+
+          find "$package_root" -print0 | \
+            xargs -0 touch --no-dereference --date="@${SOURCE_DATE_EPOCH}"
+          SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" \
+            dpkg-deb --root-owner-group --build "$package_root" "${deb}.first"
+          SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" \
+            dpkg-deb --root-owner-group --build "$package_root" "${deb}.second"
+          cmp "${deb}.first" "${deb}.second"
+          mv "${deb}.first" "$deb"
+          rm "${deb}.second"
+
+          mkdir -p "$RUNNER_TEMP/deb-extract"
+          dpkg-deb --extract "$deb" "$RUNNER_TEMP/deb-extract"
+          cmp "$binary" "$RUNNER_TEMP/deb-extract/usr/bin/fellaga"
+          dpkg-deb --info "$deb"
+
+      - name: Install and smoke-test the Debian package in pinned Kali
+        if: matrix.deb
+        run: |
+          set -euo pipefail
+          deb="$PWD/dist/fellaga_${VERSION}-1_amd64.deb"
+          docker run --rm --network none --platform linux/amd64 \
+            -e EXPECTED_VERSION="fellaga $VERSION" \
+            -v "${deb}:/tmp/fellaga.deb:ro" \
+            "$KALI_AMD64_IMAGE" \
+            sh -euc 'dpkg -i /tmp/fellaga.deb >/dev/null; test "$(fellaga --version)" = "$EXPECTED_VERSION"'
+
+      - name: Generate the architecture SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          file: dist/stage/fellaga-v${{ needs.gate.outputs.version }}-${{ matrix.target }}/fellaga
+          format: cyclonedx-json
+          output-file: dist/fellaga-v${{ needs.gate.outputs.version }}-${{ matrix.target }}.cdx.json
+          syft-version: v1.46.0
+          dependency-snapshot: false
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Validate the SBOM
+        run: |
+          sbom="dist/fellaga-v${VERSION}-${TARGET}.cdx.json"
+          test -s "$sbom"
+          jq -e '.bomFormat == "CycloneDX"' "$sbom" >/dev/null
+
+      - name: Upload the x86-64 release payload
+        if: matrix.deb
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-x86_64-v${{ needs.gate.outputs.version }}
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+          path: |
+            dist/fellaga-v${{ needs.gate.outputs.version }}-x86_64-unknown-linux-gnu.tar.gz
+            dist/fellaga-v${{ needs.gate.outputs.version }}-x86_64-unknown-linux-gnu.cdx.json
+            dist/fellaga_${{ needs.gate.outputs.version }}-1_amd64.deb
+
+      - name: Upload the ARM64 release payload
+        if: ${{ !matrix.deb }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-arm64-v${{ needs.gate.outputs.version }}
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+          path: |
+            dist/fellaga-v${{ needs.gate.outputs.version }}-aarch64-unknown-linux-gnu.tar.gz
+            dist/fellaga-v${{ needs.gate.outputs.version }}-aarch64-unknown-linux-gnu.cdx.json
 
   publish:
-    needs: binaries
-    runs-on: ubuntu-latest
+    name: Sign, attest and publish the closed payload
+    needs:
+      - gate
+      - build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      VERSION: ${{ needs.gate.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/download-artifact@v4
+      - name: Download immutable build artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: dist
           merge-multiple: true
-      - uses: taiki-e/install-action@cargo-deb
-      - run: cargo build --release --locked && cargo deb --no-build
-      - run: cp target/debian/*.deb dist/
-      - uses: anchore/sbom-action@v0
+
+      - name: Verify the closed payload and create checksums
+        run: |
+          set -euo pipefail
+          payload=(
+            "fellaga-v${VERSION}-aarch64-unknown-linux-gnu.cdx.json"
+            "fellaga-v${VERSION}-aarch64-unknown-linux-gnu.tar.gz"
+            "fellaga-v${VERSION}-x86_64-unknown-linux-gnu.cdx.json"
+            "fellaga-v${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+            "fellaga_${VERSION}-1_amd64.deb"
+          )
+
+          printf '%s\n' "${payload[@]}" | sort > "$RUNNER_TEMP/expected-assets"
+          find dist -mindepth 1 -maxdepth 1 -printf '%f\n' | sort > "$RUNNER_TEMP/actual-assets"
+          diff -u "$RUNNER_TEMP/expected-assets" "$RUNNER_TEMP/actual-assets"
+
+          (
+            cd dist
+            sha256sum "${payload[@]}"
+          ) > dist/SHA256SUMS
+
+      - name: Preserve published releases and clean up an interrupted draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          status="$(curl --silent --show-error --output "$RUNNER_TEMP/existing-release.json" \
+            --write-out '%{http_code}' \
+            --header "Accept: application/vnd.github+json" \
+            --header "Authorization: Bearer ${GH_TOKEN}" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}")"
+          case "$status" in
+            404)
+              ;;
+            200)
+              echo "Refusing to overwrite the published release for ${GITHUB_REF_NAME}" >&2
+              exit 1
+              ;;
+            *)
+              echo "Unable to inspect release ${GITHUB_REF_NAME}; GitHub returned HTTP $status" >&2
+              cat "$RUNNER_TEMP/existing-release.json" >&2
+              exit 1
+              ;;
+          esac
+
+          curl --fail-with-body --silent --show-error \
+            --header "Accept: application/vnd.github+json" \
+            --header "Authorization: Bearer ${GH_TOKEN}" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+            > "$RUNNER_TEMP/releases.json"
+          jq -e 'type == "array"' "$RUNNER_TEMP/releases.json" >/dev/null
+          if jq -e --arg tag "$GITHUB_REF_NAME" \
+            'any(.[]; .tag_name == $tag and .draft != true)' \
+            "$RUNNER_TEMP/releases.json" >/dev/null; then
+            echo "Refusing to overwrite a non-draft release for ${GITHUB_REF_NAME}" >&2
+            exit 1
+          fi
+          while IFS= read -r stale_release_id; do
+            [[ "$stale_release_id" =~ ^[0-9]+$ ]]
+            curl --fail-with-body --silent --show-error \
+              --request DELETE \
+              --header "Accept: application/vnd.github+json" \
+              --header "Authorization: Bearer ${GH_TOKEN}" \
+              --header "X-GitHub-Api-Version: 2022-11-28" \
+              "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/releases/${stale_release_id}"
+          done < <(jq -r --arg tag "$GITHUB_REF_NAME" \
+            '.[] | select(.tag_name == $tag and .draft == true) | .id' \
+            "$RUNNER_TEMP/releases.json")
+
+      - name: Install verified Cosign
+        uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
         with:
-          path: target/release/fellaga
-          format: cyclonedx-json
-          output-file: dist/fellaga-sbom.cdx.json
-      - name: Checksums
-        run: cd dist && sha256sum *.tar.gz *.deb fellaga-sbom.cdx.json > SHA256SUMS
-      - uses: sigstore/cosign-installer@v3
-      - name: Keyless signature
-        run: cosign sign-blob --yes --bundle dist/SHA256SUMS.sigstore.json dist/SHA256SUMS
-      - uses: actions/attest-build-provenance@v2
+          cosign-release: v2.6.1
+
+      - name: Sign and verify the checksum manifest
+        run: |
+          set -euo pipefail
+          cosign sign-blob --yes \
+            --bundle dist/SHA256SUMS.sigstore.json \
+            dist/SHA256SUMS
+          cosign verify-blob \
+            --bundle dist/SHA256SUMS.sigstore.json \
+            --certificate-identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@${GITHUB_REF}" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            dist/SHA256SUMS
+
+      - name: Verify the final release asset list
+        run: |
+          set -euo pipefail
+          expected=(
+            "SHA256SUMS"
+            "SHA256SUMS.sigstore.json"
+            "fellaga-v${VERSION}-aarch64-unknown-linux-gnu.cdx.json"
+            "fellaga-v${VERSION}-aarch64-unknown-linux-gnu.tar.gz"
+            "fellaga-v${VERSION}-x86_64-unknown-linux-gnu.cdx.json"
+            "fellaga-v${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+            "fellaga_${VERSION}-1_amd64.deb"
+          )
+          printf '%s\n' "${expected[@]}" | sort > "$RUNNER_TEMP/expected-final-assets"
+          find dist -mindepth 1 -maxdepth 1 -printf '%f\n' | sort > "$RUNNER_TEMP/actual-final-assets"
+          diff -u "$RUNNER_TEMP/expected-final-assets" "$RUNNER_TEMP/actual-final-assets"
+
+      - name: Attest every release asset
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
         with:
           subject-path: |
-            dist/*.tar.gz
-            dist/*.deb
-            dist/fellaga-sbom.cdx.json
-            dist/SHA256SUMS
-      - uses: softprops/action-gh-release@v2
-        with:
-          generate_release_notes: true
-          files: |
-            dist/*.tar.gz
-            dist/*.deb
-            dist/fellaga-sbom.cdx.json
+            dist/fellaga-v${{ needs.gate.outputs.version }}-aarch64-unknown-linux-gnu.cdx.json
+            dist/fellaga-v${{ needs.gate.outputs.version }}-aarch64-unknown-linux-gnu.tar.gz
+            dist/fellaga-v${{ needs.gate.outputs.version }}-x86_64-unknown-linux-gnu.cdx.json
+            dist/fellaga-v${{ needs.gate.outputs.version }}-x86_64-unknown-linux-gnu.tar.gz
+            dist/fellaga_${{ needs.gate.outputs.version }}-1_amd64.deb
             dist/SHA256SUMS
             dist/SHA256SUMS.sigstore.json
+
+      - name: Create a draft release and upload the closed payload
+        id: draft_release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Fellaga v${{ needs.gate.outputs.version }}
+          draft: true
+          prerelease: false
+          generate_release_notes: true
+          overwrite_files: false
+          preserve_order: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/fellaga-v${{ needs.gate.outputs.version }}-aarch64-unknown-linux-gnu.cdx.json
+            dist/fellaga-v${{ needs.gate.outputs.version }}-aarch64-unknown-linux-gnu.tar.gz
+            dist/fellaga-v${{ needs.gate.outputs.version }}-x86_64-unknown-linux-gnu.cdx.json
+            dist/fellaga-v${{ needs.gate.outputs.version }}-x86_64-unknown-linux-gnu.tar.gz
+            dist/fellaga_${{ needs.gate.outputs.version }}-1_amd64.deb
+            dist/SHA256SUMS
+            dist/SHA256SUMS.sigstore.json
+
+      - name: Verify the uploaded draft before publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ steps.draft_release.outputs.id }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_ID" =~ ^[0-9]+$ ]]; then
+            echo "Invalid draft release id: $RELEASE_ID" >&2
+            exit 1
+          fi
+          curl --fail-with-body --silent --show-error \
+            --header "Accept: application/vnd.github+json" \
+            --header "Authorization: Bearer ${GH_TOKEN}" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" \
+            > "$RUNNER_TEMP/draft-release.json"
+          jq -e --arg tag "$GITHUB_REF_NAME" \
+            '.draft == true and .tag_name == $tag and all(.assets[]; .state == "uploaded" and .size > 0)' \
+            "$RUNNER_TEMP/draft-release.json" >/dev/null
+          jq -r '.assets[].name' "$RUNNER_TEMP/draft-release.json" | sort \
+            > "$RUNNER_TEMP/uploaded-assets"
+          diff -u "$RUNNER_TEMP/expected-final-assets" "$RUNNER_TEMP/uploaded-assets"
+
+      - name: Publish the fully populated draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ steps.draft_release.outputs.id }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_ID" =~ ^[0-9]+$ ]]; then
+            echo "Invalid draft release id: $RELEASE_ID" >&2
+            exit 1
+          fi
+          curl --fail-with-body --silent --show-error \
+            --request PATCH \
+            --header "Accept: application/vnd.github+json" \
+            --header "Authorization: Bearer ${GH_TOKEN}" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            --data '{"draft":false}' \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" \
+            > "$RUNNER_TEMP/published-release.json"
+          jq -e --arg tag "$GITHUB_REF_NAME" \
+            '.draft == false and .tag_name == $tag' \
+            "$RUNNER_TEMP/published-release.json" >/dev/null

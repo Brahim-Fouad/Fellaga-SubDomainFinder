@@ -7,7 +7,7 @@ use fellaga_core::model::{AxfrStatus, Finding, ScanResult};
 use fellaga_core::passive::{
     ApiKeyStore, automatic_sources_for_profile, source_statuses, validate_sources,
 };
-use fellaga_core::scanner::{ProgressEvent, ScanOptions, Scanner, refresh_inventory};
+use fellaga_core::scanner::{ProgressEvent, ScanOptions, Scanner, refresh_inventory_with_trusted};
 use fellaga_core::{passive, scanner, util};
 use futures_util::{StreamExt, stream};
 use std::collections::BTreeSet;
@@ -76,20 +76,21 @@ enum Command {
 
 #[derive(Debug, Args)]
 struct DnsArgs {
-    #[arg(short = 'c', long, default_value_t = 500)]
+    #[arg(short = 'c', long, default_value_t = 128)]
     concurrency: usize,
     #[arg(long, default_value_t = 2.0)]
     timeout: f64,
     #[arg(
         long,
         value_delimiter = ',',
+        default_value = "1.1.1.1,8.8.8.8,9.9.9.9",
         help = "Résolveurs DNS, ex. 1.1.1.1,8.8.8.8"
     )]
     resolvers: Vec<IpAddr>,
     #[arg(
         long,
-        default_value_t = 0,
-        help = "Limite DNS en requêtes/s; 0 = sans limite artificielle"
+        default_value_t = 100,
+        help = "Limite DNS globale en requêtes/s; 0 désactive volontairement la protection"
     )]
     dns_rate_limit: u64,
     #[arg(
@@ -134,21 +135,21 @@ impl ScanProfile {
         match self {
             Self::Deep => ProfileDefaults {
                 max_words: 1_000_000,
-                max_passive: 250_000,
+                max_passive: 25_000,
                 depth: 5,
                 recursive_words: 10_000,
                 recursive_hosts: 2_000,
                 pipeline_rounds: 10,
-                pipeline_budget: 1_000_000,
-                tls_hosts: 1_000,
-                graph_hosts: 5_000,
+                pipeline_budget: 100_000,
+                tls_hosts: 250,
+                graph_hosts: 1_000,
                 ptr_ips: 512,
-                nsec_max_names: 100_000,
+                nsec_max_names: 10_000,
                 ct_logs: 8,
                 ct_entries: 4_096,
                 ct_backfill: 4_096,
-                web_hosts: 1_000,
-                web_assets: 20,
+                web_hosts: 100,
+                web_assets: 8,
             },
             Self::Balanced => ProfileDefaults {
                 max_words: 5_000,
@@ -216,7 +217,7 @@ struct ScanArgs {
     targets_file: Option<PathBuf>,
     #[arg(long, value_enum, default_value_t = ScanProfile::Deep)]
     profile: ScanProfile,
-    #[arg(long, default_value_t = 2, help = "Domaines traités en parallèle")]
+    #[arg(long, default_value_t = 1, help = "Domaines traités en parallèle")]
     domain_concurrency: usize,
     #[command(flatten)]
     dns: DnsArgs,
@@ -386,7 +387,7 @@ struct ScanArgs {
     web_concurrency: usize,
     #[arg(
         long,
-        default_value_t = 524_288,
+        default_value_t = 262_144,
         help = "Octets lus au maximum par ressource web"
     )]
     web_max_bytes: usize,
@@ -394,8 +395,8 @@ struct ScanArgs {
     web_assets: Option<usize>,
     #[arg(
         long,
-        default_value_t = 0,
-        help = "Durée globale maximale en secondes; 0 = aucune limite"
+        default_value_t = 1_800,
+        help = "Durée globale maximale par domaine en secondes; 0 désactive volontairement la limite"
     )]
     max_runtime: u64,
     #[arg(
@@ -644,6 +645,12 @@ fn collect_targets(args: &ScanArgs) -> Result<Vec<String>> {
 fn make_dns(args: &DnsArgs) -> Result<DnsEngine> {
     if args.timeout <= 0.0 || !args.timeout.is_finite() {
         bail!("--timeout doit être un nombre positif");
+    }
+    if !(1..=4_096).contains(&args.concurrency) {
+        bail!("--concurrency doit être compris entre 1 et 4096");
+    }
+    if args.dns_rate_limit > 100_000 {
+        bail!("--dns-rate-limit ne peut pas dépasser 100000 requêtes/s");
     }
     DnsEngine::new_with_rate(
         args.concurrency,
@@ -1141,6 +1148,30 @@ async fn main() -> Result<()> {
             if max_passive == 0 {
                 bail!("--max-passive doit être supérieur à zéro");
             }
+            if max_words > 10_000_000 {
+                bail!("--max-words ne peut pas dépasser 10000000");
+            }
+            if max_passive > 1_000_000 {
+                bail!("--max-passive ne peut pas dépasser 1000000");
+            }
+            let effective_recursive_words = if args.no_adaptive {
+                recursive_words
+            } else {
+                recursive_words.min(50)
+            };
+            let effective_recursive_hosts = if args.no_adaptive {
+                recursive_hosts
+            } else {
+                recursive_hosts.min(20)
+            };
+            if effective_recursive_words.saturating_mul(effective_recursive_hosts) > 1_000_000 {
+                bail!(
+                    "--recursive-words × --recursive-hosts ne peut pas dépasser 1000000 par niveau"
+                );
+            }
+            if pipeline_budget > 1_000_000 {
+                bail!("--pipeline-budget ne peut pas dépasser 1000000");
+            }
             if args.domain_concurrency == 0 {
                 bail!("--domain-concurrency doit être supérieur à zéro");
             }
@@ -1235,7 +1266,8 @@ async fn main() -> Result<()> {
                     Duration::from_secs_f64(args.dns.timeout),
                     &args.dns.trusted_resolvers,
                     args.dns.dns_rate_limit,
-                )?;
+                )?
+                .share_rate_limit_with(&dns);
                 trusted.seed_metrics(&database.resolver_history()?);
                 Some(trusted)
             };
@@ -1271,7 +1303,7 @@ async fn main() -> Result<()> {
                 recursive_depth: depth,
                 recursive_words,
                 recursive_hosts,
-                adaptive: !args.no_adaptive && args.profile != ScanProfile::Deep,
+                adaptive: !args.no_adaptive,
                 pipeline: !args.no_pipeline && !profile_passive,
                 pipeline_rounds,
                 pipeline_budget,
@@ -1356,8 +1388,31 @@ async fn main() -> Result<()> {
                 })
                 .buffer_unordered(domain_concurrency);
             let mut results = Vec::new();
-            while let Some(result) = pending.next().await {
-                results.push(result?);
+            let mut first_error = None;
+            let mut interrupted = Box::pin(tokio::signal::ctrl_c());
+            loop {
+                let next = tokio::select! {
+                    signal = &mut interrupted => {
+                        match signal {
+                            Ok(()) => bail!(
+                                "scan interrompu par l'utilisateur; checkpoint conservé pour --resume latest"
+                            ),
+                            Err(error) => bail!("écoute de Ctrl+C impossible: {error}"),
+                        }
+                    }
+                    next = pending.next() => next,
+                };
+                let Some(result) = next else {
+                    break;
+                };
+                match result {
+                    Ok(result) => results.push(result),
+                    Err(error) => {
+                        if first_error.is_none() {
+                            first_error = Some(error);
+                        }
+                    }
+                }
             }
             results.sort_by(|left, right| left.domain.cmp(&right.domain));
             if args.stream_jsonl {
@@ -1394,6 +1449,9 @@ async fn main() -> Result<()> {
                     write_scan_results(&path, std::slice::from_ref(result), args.json, args.jsonl)?;
                 }
             }
+            if let Some(error) = first_error {
+                return Err(error);
+            }
         }
         Command::List(args) => {
             let database = Database::open(&database_path)?;
@@ -1423,9 +1481,18 @@ async fn main() -> Result<()> {
             let database = Database::open(&database_path)?;
             let dns = make_dns(&args.dns)?;
             dns.seed_metrics(&database.resolver_history()?);
-            let result = refresh_inventory(
+            let trusted_dns = DnsEngine::new_with_rate(
+                args.dns.concurrency.min(256),
+                Duration::from_secs_f64(args.dns.timeout),
+                &args.dns.trusted_resolvers,
+                args.dns.dns_rate_limit,
+            )?
+            .share_rate_limit_with(&dns);
+            trusted_dns.seed_metrics(&database.resolver_history()?);
+            let result = refresh_inventory_with_trusted(
                 &database,
                 &dns,
+                Some(&trusted_dns),
                 &args.target,
                 args.ttl_cap,
                 args.negative_ttl,
@@ -1461,7 +1528,6 @@ async fn main() -> Result<()> {
         }
         Command::Sources(args) => {
             let statuses = source_statuses(&api_keys);
-            let database = Database::open(&database_path)?;
             if args.check {
                 if args.timeout <= 0.0 || !args.timeout.is_finite() {
                     bail!("--timeout doit être un nombre positif");
@@ -1530,6 +1596,7 @@ async fn main() -> Result<()> {
                 }
                 return Ok(());
             }
+            let database = Database::open(&database_path)?;
             let diagnostics = database.source_diagnostics(Duration::from_secs(24 * 3_600))?;
             if args.json {
                 let sources = statuses

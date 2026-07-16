@@ -598,6 +598,7 @@ pub(super) async fn subdomain_center(domain: &str, timeout: Duration) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::passive::sanitize_external_error;
 
     #[test]
     fn extracts_only_target_subdomains_from_unstructured_text() {
@@ -653,5 +654,17 @@ mod tests {
                 "www.example.com".to_owned()
             ])
         );
+    }
+
+    #[test]
+    fn query_credentials_used_by_extra_connectors_are_redacted() {
+        let error = "request https://api.example.test/search?KEY=builtwith-secret&k=intelx-secret&key=shodan-secret&page=2 failed";
+        let sanitized = sanitize_external_error(error, &ApiKeyStore::default());
+
+        for secret in ["builtwith-secret", "intelx-secret", "shodan-secret"] {
+            assert!(!sanitized.contains(secret));
+        }
+        assert!(sanitized.contains("page=2"));
+        assert!(sanitized.contains("REDACTED"));
     }
 }

@@ -1,15 +1,16 @@
 use crate::db::{Database, WebCacheEntry, WebCacheMetadata};
 use crate::model::WebObservation;
 use crate::util::{extract_observed_names, is_subdomain};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use futures_util::{StreamExt, stream};
 use reqwest::header::{
-    ACCESS_CONTROL_ALLOW_ORIGIN, CONTENT_LOCATION, CONTENT_SECURITY_POLICY, ETAG, HeaderMap,
-    IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED, LINK, LOCATION, RANGE, REFRESH,
+    ACCESS_CONTROL_ALLOW_ORIGIN, CONTENT_LOCATION, CONTENT_SECURITY_POLICY, CONTENT_TYPE, ETAG,
+    HeaderMap, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED, LINK, LOCATION, RANGE, REFRESH,
 };
 use reqwest::{Client, Url};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
@@ -72,9 +73,16 @@ fn header_text(headers: &HeaderMap) -> String {
 }
 
 fn in_scope_url(url: &Url, domain: &str) -> bool {
+    let allowed_port = match url.scheme() {
+        "http" => url.port_or_known_default() == Some(80),
+        "https" => url.port_or_known_default() == Some(443),
+        _ => false,
+    };
     url.host_str()
         .is_some_and(|host| host == domain || is_subdomain(host, domain))
-        && matches!(url.scheme(), "http" | "https")
+        && allowed_port
+        && url.username().is_empty()
+        && url.password().is_none()
 }
 
 fn canonical_url(value: &str) -> Option<String> {
@@ -84,6 +92,98 @@ fn canonical_url(value: &str) -> Option<String> {
         url.set_path("/");
     }
     Some(url.to_string())
+}
+
+fn is_public_web_ip(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => {
+            let [a, b, c, _] = address.octets();
+            !(a == 0
+                || a == 10
+                || a == 127
+                || (a == 100 && (64..=127).contains(&b))
+                || (a == 169 && b == 254)
+                || (a == 172 && (16..=31).contains(&b))
+                || (a == 192 && b == 0 && c == 0)
+                || (a == 192 && b == 0 && c == 2)
+                || (a == 192 && b == 88 && c == 99)
+                || (a == 192 && b == 168)
+                || (a == 198 && (b == 18 || b == 19))
+                || (a == 198 && b == 51 && c == 100)
+                || (a == 203 && b == 0 && c == 113)
+                || a >= 224
+                || address == Ipv4Addr::BROADCAST)
+        }
+        IpAddr::V6(address) => {
+            if let Some(embedded) = address.to_ipv4() {
+                return is_public_web_ip(IpAddr::V4(embedded));
+            }
+            let segments = address.segments();
+            !(address == Ipv6Addr::UNSPECIFIED
+                || address == Ipv6Addr::LOCALHOST
+                || address.is_multicast()
+                || segments[0] & 0xfe00 == 0xfc00
+                || segments[0] & 0xffc0 == 0xfe80
+                || segments[0] & 0xffc0 == 0xfec0
+                || (segments[0] == 0x0064 && segments[1] == 0xff9b && matches!(segments[2], 0 | 1))
+                || (segments[0] == 0x2001 && segments[1] == 0x0db8))
+        }
+    }
+}
+
+async fn resolve_public_web_hosts(hosts: BTreeSet<String>) -> BTreeMap<String, Vec<SocketAddr>> {
+    stream::iter(hosts)
+        .map(|host| async move {
+            let addresses = tokio::net::lookup_host((host.as_str(), 0))
+                .await
+                .map(|addresses| {
+                    addresses
+                        .filter(|address| is_public_web_ip(address.ip()))
+                        .map(|address| SocketAddr::new(address.ip(), 0))
+                        .collect::<BTreeSet<_>>()
+                        .into_iter()
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            (host, addresses)
+        })
+        .buffer_unordered(32)
+        .filter_map(|(host, addresses)| async move {
+            (!addresses.is_empty()).then_some((host, addresses))
+        })
+        .collect()
+        .await
+}
+
+fn approved_asset_url(value: &str, domain: &str, approved_hosts: &BTreeSet<String>) -> bool {
+    Url::parse(value)
+        .ok()
+        .filter(|url| in_scope_url(url, domain))
+        .and_then(|url| url.host_str().map(ToOwned::to_owned))
+        .is_some_and(|host| approved_hosts.contains(&host))
+}
+
+fn textual_response(headers: &HeaderMap, url: &Url) -> bool {
+    let content_type = headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if content_type.is_empty()
+        || content_type.starts_with("text/")
+        || ["javascript", "json", "xml", "x-www-form-urlencoded"]
+            .iter()
+            .any(|marker| content_type.contains(marker))
+    {
+        return true;
+    }
+    matches!(
+        url.path()
+            .rsplit_once('.')
+            .map(|(_, extension)| extension.to_ascii_lowercase())
+            .as_deref(),
+        Some("js" | "mjs" | "map" | "json" | "html" | "htm" | "xml" | "webmanifest")
+    )
 }
 
 async fn claim_url(visited: &Mutex<BTreeSet<String>>, url: &str) -> Option<String> {
@@ -155,7 +255,7 @@ async fn fetch_url(
     {
         return Ok(FetchResult {
             observation: cached_observation(url, cache.clone()),
-            assets: Vec::new(),
+            assets: cache.assets.clone(),
             network: false,
         });
     }
@@ -182,7 +282,8 @@ async fn fetch_url(
                 domain,
                 &url,
                 cache.status,
-                &BTreeSet::new(),
+                &cache.names.iter().cloned().collect(),
+                &cache.assets,
                 &WebCacheMetadata {
                     etag: cache.etag.clone(),
                     last_modified: cache.last_modified.clone(),
@@ -191,23 +292,29 @@ async fn fetch_url(
             )?;
             return Ok::<_, anyhow::Error>(FetchResult {
                 observation: cached_observation(url.clone(), refreshed),
-                assets: Vec::new(),
+                assets: cache.assets.clone(),
                 network: true,
             });
         }
-        let mut body = Vec::new();
-        while body.len() < max_bytes {
-            let Some(chunk) = response.chunk().await? else {
-                break;
-            };
-            let remaining = max_bytes.saturating_sub(body.len());
-            body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+        if !status.is_success() && !status.is_redirection() {
+            bail!("GET {url}: HTTP {status}");
         }
+        let base = Url::parse(&url)?;
+        let read_body = textual_response(&headers, &base);
+        let mut body = Vec::new();
+        if read_body {
+            while body.len() < max_bytes {
+                let Some(chunk) = response.chunk().await? else {
+                    break;
+                };
+                let remaining = max_bytes.saturating_sub(body.len());
+                body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+            }
+        }
+        let content_hash = format!("{:x}", Sha256::digest(&body));
         let body = String::from_utf8_lossy(&body);
-        let content_hash = format!("{:x}", Sha256::digest(body.as_bytes()));
         let metadata = format!("{}\n{}", header_text(&headers), body);
         let names = extract_observed_names(&metadata, domain);
-        let base = Url::parse(&url)?;
         let mut assets = extract_asset_urls(&body, &base, domain, asset_limit);
         if status.is_redirection()
             && let Some(location) = headers.get(LOCATION).and_then(|value| value.to_str().ok())
@@ -230,6 +337,7 @@ async fn fetch_url(
             &url,
             status.as_u16(),
             &names,
+            &assets,
             &WebCacheMetadata {
                 etag,
                 last_modified,
@@ -251,10 +359,13 @@ async fn fetch_url(
     match fetched {
         Ok(result) => Ok(result),
         Err(error) => stale
-            .map(|cache| FetchResult {
-                observation: cached_observation(url, cache),
-                assets: Vec::new(),
-                network: false,
+            .map(|cache| {
+                let assets = cache.assets.clone();
+                FetchResult {
+                    observation: cached_observation(url, cache),
+                    assets,
+                    network: false,
+                }
             })
             .ok_or(error),
     }
@@ -272,24 +383,39 @@ pub async fn discover_web(
     assets_per_host: usize,
 ) -> Result<WebDiscovery> {
     let started = Instant::now();
-    let client = Client::builder()
+    let pinned_hosts = resolve_public_web_hosts(hosts.into_iter().collect()).await;
+    if pinned_hosts.is_empty() {
+        return Ok(WebDiscovery {
+            duration_ms: started.elapsed().as_millis(),
+            ..WebDiscovery::default()
+        });
+    }
+    let approved_hosts = Arc::new(pinned_hosts.keys().cloned().collect::<BTreeSet<_>>());
+    let mut client_builder = Client::builder()
         .timeout(timeout)
+        // Les IP ont été résolues et épinglées ci-dessus; un proxy système
+        // contournerait cette protection et pourrait réintroduire du SSRF.
+        .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .danger_accept_invalid_certs(true)
         .user_agent(concat!(
             "Fellaga-SubDomainFinder/",
             env!("CARGO_PKG_VERSION")
-        ))
-        .build()?;
+        ));
+    for (host, addresses) in &pinned_hosts {
+        client_builder = client_builder.resolve_to_addrs(host, addresses);
+    }
+    let client = client_builder.build()?;
     let database = database.clone();
     let domain_owned = domain.to_owned();
     let visited = Arc::new(Mutex::new(BTreeSet::new()));
-    let mut pending = stream::iter(hosts.into_iter().collect::<BTreeSet<_>>())
+    let mut pending = stream::iter(approved_hosts.iter().cloned())
         .map(|host| {
             let database = database.clone();
             let client = client.clone();
             let domain = domain_owned.clone();
             let visited = visited.clone();
+            let approved_hosts = approved_hosts.clone();
             async move {
                 let Some(https) = claim_url(&visited, &format!("https://{host}/")).await else {
                     return Ok::<_, anyhow::Error>(Vec::new());
@@ -324,14 +450,31 @@ pub async fn discover_web(
                     }
                 };
                 let mut results = vec![root];
-                let assets = results[0].assets.clone();
-                for asset in assets.into_iter().take(assets_per_host) {
+                let mut assets = results[0].assets.iter().cloned().collect::<VecDeque<_>>();
+                let mut attempted_assets = 0_usize;
+                while attempted_assets < assets_per_host {
+                    let Some(asset) = assets.pop_front() else {
+                        break;
+                    };
+                    if !approved_asset_url(&asset, &domain, &approved_hosts) {
+                        continue;
+                    }
                     let Some(asset) = claim_url(&visited, &asset).await else {
                         continue;
                     };
-                    if let Ok(result) =
-                        fetch_url(&database, &client, &domain, asset, refresh, max_bytes, 0).await
+                    attempted_assets += 1;
+                    if let Ok(result) = fetch_url(
+                        &database,
+                        &client,
+                        &domain,
+                        asset,
+                        refresh,
+                        max_bytes,
+                        assets_per_host.saturating_sub(attempted_assets),
+                    )
+                    .await
                     {
+                        assets.extend(result.assets.iter().cloned());
                         results.push(result);
                     }
                 }
@@ -398,6 +541,83 @@ mod tests {
             canonical_url("https://www.example.com#section").as_deref(),
             Some("https://www.example.com/")
         );
+    }
+
+    #[test]
+    fn scope_rejects_non_web_ports_and_embedded_credentials() {
+        assert!(in_scope_url(
+            &Url::parse("https://cdn.example.com/app.js").unwrap(),
+            "example.com"
+        ));
+        assert!(in_scope_url(
+            &Url::parse("http://cdn.example.com:80/app.js").unwrap(),
+            "example.com"
+        ));
+        assert!(!in_scope_url(
+            &Url::parse("https://cdn.example.com:8443/app.js").unwrap(),
+            "example.com"
+        ));
+        assert!(!in_scope_url(
+            &Url::parse("https://user:secret@cdn.example.com/app.js").unwrap(),
+            "example.com"
+        ));
+    }
+
+    #[test]
+    fn private_addresses_and_unvalidated_asset_hosts_are_rejected() {
+        for address in [
+            "127.0.0.1",
+            "10.0.0.1",
+            "169.254.169.254",
+            "172.16.0.1",
+            "192.168.1.1",
+            "100.64.0.1",
+            "::1",
+            "fc00::1",
+            "fe80::1",
+            "::ffff:192.168.1.1",
+            "64:ff9b::c0a8:101",
+        ] {
+            assert!(!is_public_web_ip(address.parse().unwrap()), "{address}");
+        }
+        assert!(is_public_web_ip("1.1.1.1".parse().unwrap()));
+        assert!(is_public_web_ip("2606:4700:4700::1111".parse().unwrap()));
+
+        let approved = BTreeSet::from(["www.example.com".to_owned()]);
+        assert!(approved_asset_url(
+            "https://www.example.com/app.js",
+            "example.com",
+            &approved
+        ));
+        assert!(!approved_asset_url(
+            "https://internal.example.com/app.js",
+            "example.com",
+            &approved
+        ));
+        assert!(!approved_asset_url(
+            "https://www.example.com:8443/app.js",
+            "example.com",
+            &approved
+        ));
+    }
+
+    #[test]
+    fn only_textual_or_explicit_script_representations_are_parsed() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, "image/png".parse().unwrap());
+        assert!(!textual_response(
+            &headers,
+            &Url::parse("https://www.example.com/logo.png").unwrap()
+        ));
+        assert!(textual_response(
+            &headers,
+            &Url::parse("https://www.example.com/app.js").unwrap()
+        ));
+        headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+        assert!(textual_response(
+            &headers,
+            &Url::parse("https://www.example.com/api").unwrap()
+        ));
     }
 
     #[tokio::test]

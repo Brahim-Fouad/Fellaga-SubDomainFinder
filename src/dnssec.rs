@@ -3,17 +3,41 @@ use crate::dns::DnsEngine;
 use crate::model::DnssecWalkResult;
 use crate::util::{normalize_observed_name, now_epoch};
 use futures_util::{StreamExt, stream};
-use hickory_client::client::Client;
-use hickory_client::proto::op::Query;
-use hickory_client::proto::rr::{DNSClass, Name, RData, RecordType};
-use hickory_client::proto::runtime::TokioRuntimeProvider;
-use hickory_client::proto::tcp::TcpClientStream;
-use hickory_client::proto::xfer::{DnsHandle, DnsRequestOptions};
+use hickory_net::client::Client;
+use hickory_net::proto::dnssec::rdata::DNSSECRData;
+use hickory_net::proto::op::{DnsRequestOptions, Query};
+use hickory_net::proto::rr::{DNSClass, Name, RData, RecordType};
+use hickory_net::runtime::TokioRuntimeProvider;
+use hickory_net::tcp::TcpClientStream;
+use hickory_net::xfer::DnsHandle;
 use std::collections::BTreeSet;
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::time::timeout;
+use tokio::time::{Instant, timeout};
+
+const NSEC_QUERIES_PER_SECOND: u64 = 20;
+const NSEC_ZONE_MAX_RUNTIME: Duration = Duration::from_secs(120);
+
+#[derive(Default)]
+struct NsecRateLimiter {
+    next: tokio::sync::Mutex<Option<Instant>>,
+}
+
+impl NsecRateLimiter {
+    async fn wait(&self) {
+        let spacing = Duration::from_secs_f64(1.0 / NSEC_QUERIES_PER_SECOND as f64);
+        let mut next = self.next.lock().await;
+        let now = Instant::now();
+        if let Some(scheduled) = *next
+            && scheduled > now
+        {
+            tokio::time::sleep_until(scheduled).await;
+        }
+        *next = Some(Instant::now() + spacing);
+    }
+}
 
 fn cached_result(zone: String, cache: DnssecCacheEntry) -> DnssecWalkResult {
     DnssecWalkResult {
@@ -34,6 +58,7 @@ async fn walk_one(
     address: IpAddr,
     operation_timeout: Duration,
     max_names: usize,
+    limiter: &NsecRateLimiter,
 ) -> DnssecWalkResult {
     let mut result = DnssecWalkResult {
         zone: zone.to_owned(),
@@ -53,8 +78,7 @@ async fn walk_one(
     };
     let socket = SocketAddr::new(address, 53);
     let (stream, sender) = TcpClientStream::new(socket, None, None, TokioRuntimeProvider::new());
-    let client_future = Client::new(stream, sender, None);
-    let (client, background) = match timeout(operation_timeout, client_future).await {
+    let connected_stream = match timeout(operation_timeout, stream).await {
         Ok(Ok(connected)) => connected,
         Ok(Err(error)) => {
             result.error = Some(error.to_string());
@@ -65,6 +89,7 @@ async fn walk_one(
             return result;
         }
     };
+    let (client, background) = Client::<TokioRuntimeProvider>::new(connected_stream, sender);
     tokio::spawn(background);
 
     let probe_name = match Name::from_str(&format!("fellaga-nsec-probe-7f4b9d.{zone}.")) {
@@ -75,6 +100,7 @@ async fn walk_one(
         }
     };
     result.queries += 1;
+    limiter.wait().await;
     let mut probe_query = Query::query(probe_name, RecordType::A);
     probe_query.set_query_class(DNSClass::IN);
     let mut options = DnsRequestOptions::default();
@@ -99,18 +125,18 @@ async fn walk_one(
     };
     let mut current = None;
     let mut nsec3 = false;
-    for record in probe.answers().iter().chain(probe.name_servers()) {
-        let RData::DNSSEC(data) = record.data() else {
+    for record in probe.answers.iter().chain(&probe.authorities) {
+        let RData::DNSSEC(data) = &record.data else {
             continue;
         };
-        if data.as_nsec3().is_some() {
+        if matches!(data, DNSSECRData::NSEC3(_)) {
             nsec3 = true;
         }
-        let Some(nsec) = data.as_nsec() else {
+        let DNSSECRData::NSEC(nsec) = data else {
             continue;
         };
         let owner = record
-            .name()
+            .name
             .to_utf8()
             .trim_end_matches('.')
             .to_ascii_lowercase();
@@ -154,6 +180,7 @@ async fn walk_one(
             break;
         }
         result.queries += 1;
+        limiter.wait().await;
         let mut nsec_query = Query::query(current.clone(), RecordType::NSEC);
         nsec_query.set_query_class(DNSClass::IN);
         let mut nsec_responses = client.lookup(nsec_query, options);
@@ -174,18 +201,18 @@ async fn walk_one(
         };
         let mut next = None;
         let mut nsec3 = false;
-        for record in response.answers().iter().chain(response.name_servers()) {
-            let RData::DNSSEC(data) = record.data() else {
+        for record in response.answers.iter().chain(&response.authorities) {
+            let RData::DNSSEC(data) = &record.data else {
                 continue;
             };
-            if data.as_nsec3().is_some() {
+            if matches!(data, DNSSECRData::NSEC3(_)) {
                 nsec3 = true;
             }
-            let Some(nsec) = data.as_nsec() else {
+            let DNSSECRData::NSEC(nsec) = data else {
                 continue;
             };
             let owner = record
-                .name()
+                .name
                 .to_utf8()
                 .trim_end_matches('.')
                 .to_ascii_lowercase();
@@ -234,11 +261,13 @@ pub async fn discover_nsec(
     let database = database.clone();
     let dns = dns.clone();
     let root = root_domain.to_owned();
+    let limiter = Arc::new(NsecRateLimiter::default());
     let mut pending = stream::iter(zones)
         .map(move |zone| {
             let database = database.clone();
             let dns = dns.clone();
             let root = root.clone();
+            let limiter = limiter.clone();
             async move {
                 let cached = database.dnssec_cache(&root, &zone).ok().flatten();
                 if let Some(cache) = &cached
@@ -256,17 +285,37 @@ pub async fn discover_nsec(
                     error: Some("aucun serveur DNS autoritaire joignable".to_owned()),
                 };
                 if let Ok(servers) = dns.authoritative_servers(&zone).await {
+                    let deadline = Instant::now() + NSEC_ZONE_MAX_RUNTIME;
                     'servers: for (nameserver, addresses) in servers {
                         for address in addresses {
-                            let attempt = walk_one(
-                                &root,
-                                &zone,
-                                &nameserver,
-                                address,
-                                operation_timeout,
-                                max_names,
+                            let remaining = deadline.saturating_duration_since(Instant::now());
+                            if remaining.is_zero() {
+                                best.error =
+                                    Some("deadline globale du parcours NSEC atteinte".to_owned());
+                                break 'servers;
+                            }
+                            let attempt = match timeout(
+                                remaining,
+                                walk_one(
+                                    &root,
+                                    &zone,
+                                    &nameserver,
+                                    address,
+                                    operation_timeout,
+                                    max_names,
+                                    &limiter,
+                                ),
                             )
-                            .await;
+                            .await
+                            {
+                                Ok(attempt) => attempt,
+                                Err(_) => {
+                                    best.error = Some(
+                                        "deadline globale du parcours NSEC atteinte".to_owned(),
+                                    );
+                                    break 'servers;
+                                }
+                            };
                             let terminal = matches!(
                                 attempt.status.as_str(),
                                 "walked" | "partial" | "nsec3-protected" | "nsec-minimal-protected"
@@ -299,7 +348,7 @@ pub async fn discover_nsec(
                 best
             }
         })
-        .buffer_unordered(4);
+        .buffer_unordered(2);
     let mut results = Vec::new();
     while let Some(result) = pending.next().await {
         results.push(result);

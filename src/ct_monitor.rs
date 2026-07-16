@@ -1,13 +1,13 @@
 use crate::db::Database;
 use crate::model::CtMonitorResult;
 use crate::util::{is_subdomain, normalize_hostname};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use base64::Engine;
 use futures_util::{StreamExt, stream};
 use openssl::nid::Nid;
 use openssl::x509::X509;
 use serde::Deserialize;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::time::{Duration, Instant};
 
 const CHROME_LOG_LIST: &str = "https://www.gstatic.com/ct/log_list/v3/log_list.json";
@@ -44,6 +44,35 @@ struct EntriesResponse {
 struct CtEntry {
     leaf_input: String,
     extra_data: String,
+}
+
+fn next_batch_cursor(start: u64, end: u64, processed: usize) -> Result<u64> {
+    if processed == 0 {
+        bail!("le journal CT a retourné une page vide pour {start}..={end}");
+    }
+    let requested = end.saturating_sub(start).saturating_add(1);
+    if processed as u64 > requested {
+        bail!("le journal CT a retourné {processed} entrées pour une fenêtre de {requested}");
+    }
+    Ok(start.saturating_add(processed as u64))
+}
+
+fn select_logs(
+    logs: BTreeSet<String>,
+    states: &HashMap<String, (u64, i64)>,
+    max_logs: usize,
+) -> Vec<String> {
+    let mut logs = logs.into_iter().collect::<Vec<_>>();
+    logs.sort_by_key(|log| {
+        let state = states.get(log);
+        (
+            state.is_some(),
+            state.map(|(_, updated)| *updated).unwrap_or(i64::MIN),
+            log.clone(),
+        )
+    });
+    logs.truncate(max_logs);
+    logs
 }
 
 fn read_u24(data: &[u8], offset: usize) -> Option<usize> {
@@ -126,15 +155,16 @@ pub async fn monitor_ct_logs(
         .json::<LogList>()
         .await
         .context("liste CT Chrome invalide")?;
-    let logs = list
+    let all_logs = list
         .operators
         .into_iter()
         .flat_map(|operator| operator.logs)
         .map(|log| log.url)
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .take(max_logs)
-        .collect::<Vec<_>>();
+        .collect::<BTreeSet<_>>();
+    if max_logs > 0 && all_logs.is_empty() {
+        bail!("la liste CT de Chrome ne contient aucun journal");
+    }
+    let logs = select_logs(all_logs, &database.ct_global_states()?, max_logs);
     let log_count = logs.len();
     let database = database.clone();
     let mut pending = stream::iter(logs)
@@ -150,41 +180,59 @@ pub async fn monitor_ct_logs(
                     .json::<SignedTreeHead>()
                     .await?;
                 if sth.tree_size == 0 {
+                    if database.ct_global_cursor(&log_url)?.unwrap_or_default() > 0 {
+                        bail!("le journal CT {log_url} annonce une taille nulle après indexation");
+                    }
+                    database.store_ct_global_batch(&log_url, 0, &BTreeSet::new())?;
                     return Ok::<_, anyhow::Error>((0, BTreeSet::new()));
                 }
-                let start = database
-                    .ct_global_cursor(&log_url)?
-                    .unwrap_or_else(|| {
-                        sth.tree_size
-                            .saturating_sub(initial_backfill.min(u64::MAX as usize) as u64)
-                    })
-                    .min(sth.tree_size);
-                if start >= sth.tree_size {
+                let stored = database.ct_global_cursor(&log_url)?;
+                let backfill_start = || {
+                    sth.tree_size
+                        .saturating_sub(initial_backfill.min(u64::MAX as usize) as u64)
+                };
+                let mut start = match stored {
+                    Some(cursor) if cursor > sth.tree_size => {
+                        let reset = backfill_start();
+                        database.reset_ct_global_cursor(&log_url, reset)?;
+                        reset
+                    }
+                    Some(cursor) => cursor,
+                    None => backfill_start(),
+                };
+                if start >= sth.tree_size || entries_per_log == 0 {
+                    database.store_ct_global_batch(&log_url, start, &BTreeSet::new())?;
                     return Ok((0, BTreeSet::new()));
                 }
-                let end = start
-                    .saturating_add(entries_per_log.saturating_sub(1) as u64)
-                    .min(sth.tree_size - 1);
-                let response = client
-                    .get(endpoint(&log_url, "ct/v1/get-entries"))
-                    .query(&[("start", start), ("end", end)])
-                    .send()
-                    .await?
-                    .error_for_status()?
-                    .json::<EntriesResponse>()
-                    .await?;
-                let processed = response.entries.len();
+                let mut total_processed = 0_usize;
+                let mut pages = 0_usize;
                 let mut names = BTreeSet::new();
-                for entry in &response.entries {
-                    names.extend(names_from_entry(entry));
+                while start < sth.tree_size && total_processed < entries_per_log && pages < 64 {
+                    let remaining = entries_per_log.saturating_sub(total_processed);
+                    let end = start
+                        .saturating_add(remaining.saturating_sub(1) as u64)
+                        .min(sth.tree_size - 1);
+                    let response = client
+                        .get(endpoint(&log_url, "ct/v1/get-entries"))
+                        .query(&[("start", start), ("end", end)])
+                        .send()
+                        .await?
+                        .error_for_status()?
+                        .json::<EntriesResponse>()
+                        .await?;
+                    let processed = response.entries.len();
+                    let mut batch_names = BTreeSet::new();
+                    for entry in &response.entries {
+                        batch_names.extend(names_from_entry(entry));
+                    }
+                    let next = next_batch_cursor(start, end, processed)?;
+                    database.store_ct_global_batch(&log_url, next, &batch_names)?;
+                    names.extend(batch_names);
+                    total_processed = total_processed.saturating_add(processed);
+                    pages += 1;
+                    start = next;
                 }
-                let next = if processed == 0 {
-                    end.saturating_add(1)
-                } else {
-                    start.saturating_add(processed as u64)
-                };
-                database.store_ct_global_batch(&log_url, next, &names)?;
-                Ok((processed, names))
+                Ok((total_processed, names))
             }
         })
         .buffer_unordered(4);
@@ -223,6 +271,33 @@ pub async fn monitor_ct_logs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_empty_ct_page_never_advances_the_cursor() {
+        assert!(next_batch_cursor(100, 199, 0).is_err());
+        assert_eq!(next_batch_cursor(100, 199, 25).unwrap(), 125);
+        assert!(next_batch_cursor(100, 199, 101).is_err());
+    }
+
+    #[test]
+    fn log_selection_prioritizes_unseen_then_oldest_logs() {
+        let logs = BTreeSet::from([
+            "https://a.example/".to_owned(),
+            "https://b.example/".to_owned(),
+            "https://c.example/".to_owned(),
+        ]);
+        let states = HashMap::from([
+            ("https://a.example/".to_owned(), (10, 200)),
+            ("https://b.example/".to_owned(), (20, 100)),
+        ]);
+        assert_eq!(
+            select_logs(logs, &states, 2),
+            vec![
+                "https://c.example/".to_owned(),
+                "https://b.example/".to_owned()
+            ]
+        );
+    }
 
     #[test]
     fn parses_three_byte_lengths() {

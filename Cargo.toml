@@ -2,10 +2,15 @@
 name = "fellaga-subdomainfinder"
 version = "0.8.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.95"
 description = "Fast, learning subdomain enumerator for Kali Linux"
 license = "MIT"
 readme = "README.md"
+authors = ["Brahim-Fouad GUIA <170998597+Brahim-Fouad@users.noreply.github.com>"]
+repository = "https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder"
+homepage = "https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder"
+documentation = "https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder#readme"
+publish = false
 keywords = ["dns", "subdomain", "reconnaissance", "kali", "sqlite"]
 categories = ["command-line-utilities", "network-programming"]
 
@@ -26,8 +31,8 @@ anyhow = "1.0"
 base64 = "0.22"
 clap = { version = "4.6", features = ["derive", "env"] }
 futures-util = "0.3"
-hickory-client = { version = "0.25.2", features = ["dnssec-ring"] }
-hickory-resolver = "0.25.2"
+hickory-net = { version = "0.26.1", features = ["dnssec-ring"] }
+hickory-resolver = "0.26.1"
 httpdate = "1.0"
 openssl = "0.10.81"
 psl = "2.1"
@@ -47,14 +52,16 @@ tempfile = "3.20"
 
 [package.metadata.deb]
 name = "fellaga"
-maintainer = "Fellaga Project"
+maintainer = "Brahim-Fouad GUIA <170998597+Brahim-Fouad@users.noreply.github.com>"
 section = "net"
 priority = "optional"
 assets = [
   ["target/release/fellaga", "usr/bin/fellaga", "755"],
   ["README.md", "usr/share/doc/fellaga/README.md", "644"],
   ["LICENSE", "usr/share/doc/fellaga/LICENSE", "644"],
+  ["THIRD_PARTY_NOTICES.md", "usr/share/doc/fellaga/THIRD_PARTY_NOTICES.md", "644"],
   ["data/CORPUS_LICENSE.md", "usr/share/doc/fellaga/CORPUS_LICENSE.md", "644"],
+  ["data/corpus-manifest.json", "usr/share/doc/fellaga/corpus-manifest.json", "644"],
 ]
 
 [profile.release]

@@ -6,6 +6,10 @@ DOMAINS_FILE="${2:-}"
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 OUT="${BENCH_OUT:-$ROOT/benchmarks/results/$STAMP-$MODE}"
+BENCH_MAX_RUNTIME="${FELLAGA_BENCH_MAX_RUNTIME:-1800}"
+BENCH_DNS_RATE="${FELLAGA_BENCH_DNS_RATE:-100}"
+BENCH_RESOLVER_QUERIES="${FELLAGA_BENCH_RESOLVER_QUERIES:-100000}"
+BENCH_RESOLVER_CONCURRENCY="${FELLAGA_BENCH_RESOLVER_CONCURRENCY:-128}"
 
 if [[ "$MODE" != "no-key" && "$MODE" != "equal-keys" ]]; then
   echo "usage: $0 no-key|equal-keys FICHIER_DOMAINES" >&2
@@ -35,9 +39,13 @@ if [[ "$MODE" == "no-key" ]]; then
   export HOME="$OUT/no-key-home"
   export XDG_CONFIG_HOME="$HOME/.config"
   mkdir -p "$XDG_CONFIG_HOME"
-  unset VIRUSTOTAL_API_KEY SECURITYTRAILS_API_KEY SHODAN_API_KEY \
-    CENSYS_API_ID CENSYS_API_SECRET CHAOS_API_KEY GITHUB_TOKEN \
-    WHOISXML_API_KEY NETLAS_API_KEY URLSCAN_API_KEY || true
+  unset BEVIGIL_API_KEY BUILTWITH_API_KEY CENSYS_API_KEY \
+    CENSYS_API_ID CENSYS_API_SECRET CERTSPOTTER_API_TOKEN \
+    CHAOS_API_KEY CIRCL_PDNS_CREDENTIALS FULLHUNT_API_KEY \
+    GITHUB_TOKEN GITHUB_TOKENS GITLAB_TOKEN INTELX_API_KEY \
+    LEAKIX_API_KEY NETLAS_API_KEY OTX_API_KEY X_OTX_API_KEY \
+    SECURITYTRAILS_API_KEY SHODAN_API_KEY URLSCAN_API_KEY \
+    VIRUSTOTAL_API_KEY WHOISXML_API_KEY || true
 fi
 {
   printf '{"mode":%s,"started_at":%s,"versions":{' "$(jq -Rn --arg v "$MODE" '$v')" "$(date -u +%s)"
@@ -52,7 +60,8 @@ fi
 } > "$OUT/manifest.json"
 
 run_tool() {
-  local domain="$1" tool="$2" raw="$OUT/raw/$domain.$tool.txt"
+  local domain="$1" tool="$2"
+  local raw="$OUT/raw/$domain.$tool.txt"
   local timing="$OUT/logs/$domain.$tool.time" error="$OUT/logs/$domain.$tool.stderr"
   local status=0 historical=null dns_queries=null capture_pid=""
   local capture="$OUT/logs/$domain.$tool.pcapng"
@@ -64,7 +73,10 @@ run_tool() {
   fi
   case "$tool" in
     fellaga)
-      python3 "$ROOT/benchmarks/timed.py" "$timing" fellaga scan "$domain" --profile deep --max-runtime 0 --json >"$raw.json" 2>"$error" || status=$?
+      python3 "$ROOT/benchmarks/timed.py" "$timing" fellaga scan "$domain" \
+        --profile deep --max-runtime "$BENCH_MAX_RUNTIME" \
+        --dns-rate-limit "$BENCH_DNS_RATE" --json \
+        >"$raw.json" 2>"$error" || status=$?
       jq -r '.findings[]? | select(.state == "live") | .fqdn' "$raw.json" 2>/dev/null | sort -u >"$raw" || true
       historical="$(jq '[.findings[]? | select(.state == "historical")] | length' "$raw.json" 2>/dev/null || echo 0)"
       ;;
@@ -117,7 +129,8 @@ while IFS= read -r domain; do
 done < "$DOMAINS_FILE"
 
 python3 "$ROOT/benchmarks/timed.py" "$OUT/dns-engine.time" \
-  fellaga resolvers benchmark --queries 10000000 --concurrency 5000 \
+  fellaga resolvers benchmark --queries "$BENCH_RESOLVER_QUERIES" \
+  --concurrency "$BENCH_RESOLVER_CONCURRENCY" \
   --output "$OUT/dns-engine.json" >/dev/null
 read -r dns_elapsed dns_rss < "$OUT/dns-engine.time"
 jq --argjson elapsed "$dns_elapsed" --argjson rss "$dns_rss" \

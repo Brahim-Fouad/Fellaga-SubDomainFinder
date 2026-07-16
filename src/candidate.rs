@@ -286,15 +286,16 @@ pub fn generate_contextual_with_rules(
         }
 
         let parts = label.split('-').collect::<Vec<_>>();
-        if parts.len() == 2 && parts.iter().all(|part| learnable_label(part)) {
-            if let Some(candidate) = proposal(
+        if parts.len() == 2
+            && parts.iter().all(|part| learnable_label(part))
+            && let Some(candidate) = proposal(
                 with_parent(format!("{}-{}", parts[1], parts[0])),
                 "token-order",
                 800,
                 learned_scores,
-            ) {
-                proposals.push(candidate);
-            }
+            )
+        {
+            proposals.push(candidate);
         }
 
         if HIGH_VALUE_SERVICES.contains(&label) {

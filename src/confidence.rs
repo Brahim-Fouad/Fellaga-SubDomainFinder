@@ -11,7 +11,9 @@ pub fn evidence_family(source: &str) -> Option<EvidenceFamily> {
     }
     if source == "dns"
         || source == "refresh"
+        || source.starts_with("refresh:wildcard")
         || source.starts_with("dns-wave-")
+        || source.starts_with("dns-recursive")
         || source.starts_with("dns-graph:")
     {
         return Some(EvidenceFamily::LiveDns);

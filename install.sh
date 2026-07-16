@@ -4,13 +4,18 @@ set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PREFIX="${PREFIX:-$HOME/.local}"
 
-if ! command -v cargo >/dev/null 2>&1; then
-  echo "Cargo est requis. Sous Kali: sudo apt install cargo rustc" >&2
+missing=()
+for command in cargo cc make perl; do
+  command -v "$command" >/dev/null 2>&1 || missing+=("$command")
+done
+if (( ${#missing[@]} > 0 )); then
+  echo "Prérequis absents: ${missing[*]}" >&2
+  echo "Sous Kali: sudo apt install cargo rustc build-essential perl pkg-config" >&2
   exit 1
 fi
 
 cd "$ROOT"
-cargo build --release --locked
+cargo build --release --locked --features vendored-openssl
 install -Dm755 target/release/fellaga "$PREFIX/bin/fellaga"
 
 echo "Fellaga installé dans $PREFIX/bin/fellaga"

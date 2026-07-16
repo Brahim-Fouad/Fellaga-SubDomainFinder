@@ -1,15 +1,37 @@
 {
+  "schema_version": 2,
   "name": "fellaga-candidates-1m",
   "version": 1,
+  "artifact": "data/candidates-1m.txt.zst",
   "entries": 1000000,
+  "content_format": "utf-8-lf-one-relative-name-per-line",
   "compression": "zstd",
-  "sha256": "cde7d80ff87e21ef2c6d3021b09931a469e4ca965f2bc7816e4c143682681d9b",
-  "license": "MIT",
+  "compressed_sha256": "cde7d80ff87e21ef2c6d3021b09931a469e4ca965f2bc7816e4c143682681d9b",
+  "uncompressed_sha256": "1a7f4dc7633897efe8ef3a1e9992bc2516b7ee9852c0b1126057f3c70f081ea2",
+  "license": "MIT; see data/CORPUS_LICENSE.md and THIRD_PARTY_NOTICES.md",
   "source_project": "https://github.com/danielmiessler/SecLists",
+  "source_tag": "2025.3",
+  "source_revision": "8a7c5daa498962e240a52c9b29164174478ffe78",
   "sources": [
-    "Discovery/DNS/subdomains-top1million-110000.txt",
-    "Discovery/DNS/bitquark-subdomains-top100000.txt"
+    {
+      "path": "Discovery/DNS/subdomains-top1million-110000.txt",
+      "sha256": "949b441f39cea44d88b14cca38315a09567cd057aede8b6a549bce4ea1827a9e",
+      "lines": 114442
+    },
+    {
+      "path": "Discovery/DNS/bitquark-subdomains-top100000.txt",
+      "sha256": "f5e0acdfc136bb08fa86a3b346d44780aabfe5bfac45935fdc5507578bbb8400",
+      "lines": 100000
+    }
   ],
-  "generator": "scripts/build-corpus.sh",
+  "generator": {
+    "path": "scripts/build-corpus.sh",
+    "algorithm_version": 1
+  },
+  "reference_toolchain": {
+    "zstd": "1.5.7",
+    "gawk": "5.3.2",
+    "coreutils": "9.10"
+  },
   "contains_target_data": false
 }

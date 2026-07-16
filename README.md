@@ -4,11 +4,13 @@ Fellaga est un énumérateur de sous-domaines écrit en Rust pour Kali Linux. Il
 
 > Utilisez Fellaga uniquement sur des domaines que vous êtes autorisé à tester. Un transfert de zone et une énumération DNS restent des actions actives visibles par l'opérateur de la cible.
 
+Documentation du projet : [contribution](CONTRIBUTING.md), [sécurité](SECURITY.md), [changements](CHANGELOG.md), [provenance du corpus](data/CORPUS_LICENSE.md) et [notices tierces](THIRD_PARTY_NOTICES.md).
+
 ## Ce qui fonctionne dans la version 0.8.0
 
 - moteur UDP natif corrélé, EDNS0, repli TCP, équilibrage, limite de débit et récursion jusqu'à cinq niveaux ;
 - graphe DNS `MX`, `NS`, `SOA`, `TXT`, `CAA`, `SRV`, `HTTPS` et `SVCB`, avec extraction des cibles, services et zones filles ;
-- 30 connecteurs passifs, dont WhoisXML et Netlas, et un collecteur Certificate Transparency global : chaque entrée CT est indexée une seule fois puis redistribuée localement à tous les domaines concernés ;
+- 27 connecteurs passifs enregistrés, dont WhoisXML et Netlas, et un collecteur Certificate Transparency global : chaque entrée CT est indexée une seule fois puis redistribuée localement à tous les domaines concernés ;
 - tentative AXFR automatique en TCP sur les serveurs NS autoritaires, réussie uniquement avec les deux SOA qui encadrent un transfert complet ;
 - détection wildcard automatique avec cinq sondes par zone, cache durable, contrôle du numéro de série SOA et reconnaissance des réponses tournantes ;
 - détection DNSSEC NSEC, parcours borné des zones énumérables, identification de NSEC3 et des réponses NSEC minimales non parcourables ;
@@ -27,11 +29,33 @@ Fellaga est un énumérateur de sous-domaines écrit en Rust pour Kali Linux. Il
 - sélection des sources selon les clés, leur rendement et leur historique d'échec ;
 - couche HTTP commune aux sources externes : connexions réutilisées, limitation par fournisseur, réponses bornées à 16 Mio, erreurs détaillées, backoff avec jitter et prise en compte de `Retry-After` ;
 - cache Web dédupliqué par URL canonique, avec revalidation ETag/Last-Modified et empreinte du contenu ;
-- sorties texte, JSON, JSONL et progression en temps réel par phase.
+- sorties texte, JSON, JSONL et progression en temps réel par phase ;
 - corpus embarqué compressé d'exactement un million de candidats, traité par vagues persistées dans SQLite ;
 - reprise `--resume latest`, checkpoints périodiques, consensus de résolveurs fiables et validation autoritaire ;
 - familles de preuves indépendantes afin que plusieurs fournisseurs CT ne soient jamais comptés comme plusieurs techniques ;
-- crate bibliothèque `fellaga-core`, CI, fuzzing, benchmark concurrentiel, SBOM, releases attestées et paquet Kali `.deb`.
+- paquet Cargo `fellaga-subdomainfinder`, avec le binaire `fellaga` et la cible de bibliothèque Rust `fellaga_core`.
+
+## Publications et vérification
+
+Le code source du dépôt est la référence. Un artefact binaire est considéré publié uniquement lorsqu'il apparaît sur la page GitHub Releases avec un workflow de release réussi ; la présence d'un numéro dans le changelog ou d'un tag ne suffit pas. Le workflow est configuré pour joindre les archives Linux/Kali, le paquet Debian, le SBOM, `SHA256SUMS`, sa signature Sigstore et des attestations GitHub.
+
+Après avoir téléchargé tous les fichiers d'une même release dans un dossier :
+
+```bash
+sha256sum -c SHA256SUMS
+gh attestation verify fellaga-v0.8.0-x86_64-unknown-linux-gnu.tar.gz \
+  --repo Brahim-Fouad/Fellaga-SubDomainFinder
+```
+
+La signature sans clé de la liste des empreintes peut aussi être contrôlée avec `cosign` :
+
+```bash
+cosign verify-blob \
+  --bundle SHA256SUMS.sigstore.json \
+  --certificate-identity "https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/.github/workflows/release.yml@refs/tags/v0.8.0" \
+  --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+  SHA256SUMS
+```
 
 ## Installation sous Kali
 
@@ -51,13 +75,17 @@ export PATH="$HOME/.local/bin:$PATH"
 Installation manuelle :
 
 ```bash
-cargo build --release --locked
+cargo build --release --locked --features vendored-openssl
 install -Dm755 target/release/fellaga ~/.local/bin/fellaga
 ```
 
 La base se trouve par défaut dans `~/.local/share/fellaga/fellaga.db`. Vous pouvez utiliser `--db CHEMIN` ou la variable `FELLAGA_DB`. Le fichier de clés est créé automatiquement dans `~/.config/fellaga/config.json` ; son emplacement peut être changé avec `--config` ou `FELLAGA_CONFIG`.
 
-Le moteur natif utilise 500 requêtes en vol par défaut. `--dns-rate-limit` permet d'imposer une limite adaptée au périmètre; `fellaga resolvers test` élimine d'abord les résolveurs qui détournent NXDOMAIN, perdent DNSSEC ou répondent de façon incohérente.
+Le fichier de configuration contient les clés API en clair : il n'est pas chiffré. Sous Unix, Fellaga protège ses dossiers dédiés de configuration et de données en mode `0700`, puis le fichier de configuration, la base SQLite, ses journaux WAL/SHM et ses sauvegardes en `0600`. Un dossier parent partagé fourni explicitement n'est pas reconfiguré. Ces permissions ne remplacent ni le chiffrement du disque ni la protection du compte utilisateur. Ne publiez, ne sauvegardez dans le dépôt et ne joignez jamais ce fichier, la base SQLite ou des résultats de cible confidentiels.
+
+Le moteur natif utilise par défaut une concurrence de 128, une limite globale de 100 requêtes DNS par seconde et un seul domaine actif à la fois. `fellaga resolvers test` permet d'écarter au préalable les résolveurs qui détournent NXDOMAIN, perdent DNSSEC ou répondent de façon incohérente.
+
+> Les garde-fous sont actifs par défaut. `--dns-rate-limit 0` désactive volontairement la limite DNS et `--no-adaptive` force l'épuisement des vagues de candidats. Ces options sont réservées aux utilisateurs expérimentés, sur un laboratoire ou un périmètre explicitement autorisé : elles peuvent saturer la connexion, les résolveurs et la cible.
 
 ## Démarrage rapide
 
@@ -67,23 +95,25 @@ Scan complet avec CT, bruteforce rapide et AXFR automatique :
 fellaga scan example.com
 ```
 
-Cette commande lance le profil `deep` par défaut, sans limite globale : passif, CT, corpus 1M, récursion jusqu'à cinq niveaux, wildcard, AXFR, graphe DNS, NSEC, Web/JavaScript, archives, TLS/STARTTLS et PTR borné. Les sources qui exigent une clé absente sont ignorées. Le bruteforce commence par les candidats les plus prometteurs et traite le reste en lots SQLite afin de garder une mémoire bornée.
+Cette commande lance le profil `deep` adaptatif par défaut : passif, CT, corpus 1M, récursion jusqu'à cinq niveaux, wildcard, AXFR, graphe DNS, NSEC, Web/JavaScript, archives, TLS/STARTTLS et PTR borné. Un domaine est traité à la fois, à 100 requêtes DNS par seconde, avec une durée maximale de 1 800 secondes par domaine. Les sources qui exigent une clé absente sont ignorées. Le bruteforce commence par les candidats les plus prometteurs, arrête les vagues dont le rendement devient insuffisant et traite les lots dans SQLite afin de garder une mémoire bornée. Utilisez `--resume latest` si la limite de temps est atteinte.
 
 ```bash
 fellaga scan example.com --profile balanced
-fellaga scan example.com --profile turbo --dns-rate-limit 25000
+fellaga scan example.com --profile turbo --dns-rate-limit 100
 fellaga scan example.com --resume latest
 fellaga scan example.com --only-live --verification-max-age 6
 fellaga scan example.com --stream-jsonl
 ```
 
-Pour forcer toutes les sources et épuiser exactement une grande wordlist sans arrêt adaptatif :
+Mode exhaustif expert, uniquement sur un laboratoire ou un périmètre explicitement autorisé. La limite DNS et la durée maximale restent volontairement actives, car `--no-adaptive` peut générer une charge très importante :
 
 ```bash
 fellaga scan example.com \
   --all-sources \
   --wordlist /usr/share/seclists/Discovery/DNS/subdomains-top1million-110000.txt \
   --max-words 110000 \
+  --dns-rate-limit 100 \
+  --max-runtime 1800 \
   --no-adaptive
 ```
 
@@ -94,7 +124,7 @@ Pendant le scan, Fellaga affiche immédiatement :
 [P] certspotter: 42 nom(s) (cache frais)
 [>] wildcard: racine normale, 0 sous-zone(s) wildcard
 [>] DNS niveau 1: 250 candidat(s) à valider
-[~] DNS niveau 1  [██████████░░░░░░░░░░] 50% 125/250 | +18 | cache 40 | 312/s | 2.4s
+[~] DNS niveau 1  [██████████░░░░░░░░░░] 50% 125/250 | +18 | cache 40 | 24/s | 5.2s
 [DNS+] 38 requête(s), 16 relation(s), 2 service(s), 1 zone(s) fille(s)
 [NSEC] 1 zone(s), 0 parcourue(s), 1 protégée(s), 1 requête(s), 0 nom(s)
 [CT] 2 journaux, 128 entrées, 0 échec, 4 noms cumulés, 1.2s
@@ -108,10 +138,12 @@ Les phases et la barre de progression sont écrites sur `stderr`. Les sous-domai
 Plusieurs domaines, fichier ou stdin :
 
 ```bash
-fellaga scan example.com example.org --domain-concurrency 2 --jsonl
+fellaga scan example.com example.org --jsonl
 fellaga scan --targets-file domains.txt --output-dir results
 printf 'example.com\nexample.org\n' | fellaga scan --no-axfr
 ```
+
+Ces commandes traitent un seul domaine à la fois. Augmenter `--domain-concurrency` multiplie la charge réseau et doit rester un choix explicite adapté au périmètre.
 
 Grande wordlist et résolveurs précis :
 
@@ -120,7 +152,8 @@ fellaga scan example.com \
   --wordlist /usr/share/seclists/Discovery/DNS/subdomains-top1million-110000.txt \
   --max-words 110000 \
   --resolvers 1.1.1.1,8.8.8.8 \
-  --concurrency 500 \
+  --concurrency 128 \
+  --dns-rate-limit 100 \
   --output example.com.json \
   --json
 ```
@@ -149,7 +182,7 @@ Chercher sous les sous-domaines découverts :
 fellaga scan example.com --depth 2 --recursive-words 150 --recursive-hosts 50
 ```
 
-Le profil `deep` utilise `--depth 5`, épuise le corpus demandé et n'a aucune limite globale de durée. Les profils `balanced` et `turbo` commencent par 500 mots, passent à une vague de 1 500, puis au reste seulement si le rendement reste utile. La récursion automatique limite d'abord le nombre de parents et de mots, puis s'arrête si un niveau produit moins de deux nouveaux noms.
+Le profil `deep` utilise `--depth 5`, mais reste adaptatif : il commence par 500 candidats, passe à une vague de 1 500, puis ne poursuit que si le rendement reste utile. La durée maximale par défaut est de 1 800 secondes par domaine. La récursion automatique limite d'abord le nombre de parents et de mots, puis s'arrête si un niveau produit moins de deux nouveaux noms. Seul `--no-adaptive`, réservé au mode expert, demande d'épuiser le corpus configuré.
 
 Choisir les sources passives ou forcer leur mise à jour :
 
@@ -167,7 +200,7 @@ Tester le pool de résolveurs avant une campagne, expliquer une preuve et échan
 
 ```bash
 fellaga resolvers test 1.1.1.1 8.8.8.8 9.9.9.9 --json
-fellaga resolvers benchmark --queries 1000000 --concurrency 5000 --json
+fellaga resolvers benchmark --queries 100000 --concurrency 128 --json
 fellaga explain api.example.com --json
 fellaga import example.com subfinder.txt --format subfinder
 fellaga import example.com amass.json --format amass
@@ -185,8 +218,8 @@ fellaga list --domain example.com
 # Uniquement les validations encore live
 fellaga list --domain example.com --only-live
 
-# Revalider tous les noms connus, puis rafraîchir SQLite
-fellaga refresh example.com --concurrency 500
+# Revalider tous les noms connus, puis rafraîchir SQLite avec les garde-fous par défaut
+fellaga refresh example.com --concurrency 128 --dns-rate-limit 100
 
 # Historique et statistiques d'apprentissage
 fellaga history --limit 20
@@ -334,6 +367,8 @@ Chaque ligne de résultat et chaque entrée `scan_findings` reçoit enfin un sco
 
 Les domaines sont représentés par un hash dans les tables de fréquence. L'inventaire complet reste nécessairement dans votre SQLite locale pour `list` et `refresh`. Rien n'est transmis à un serveur Fellaga, car aucun client de partage n'existe dans le binaire.
 
+Cette absence de télémétrie ne rend pas un scan anonyme : les fournisseurs passifs interrogés reçoivent nécessairement le domaine demandé, tandis que les résolveurs et les services de la cible peuvent observer les requêtes DNS, HTTP ou TLS actives. Choisissez les sources et résolveurs selon les règles du périmètre.
+
 Pour consulter cette mémoire :
 
 ```bash
@@ -388,6 +423,8 @@ Les clés peuvent être placées dans les variables affichées par cette command
 }
 ```
 
+Les valeurs ci-dessus sont des exemples factices. Le fichier JSON et les variables d'environnement ne constituent pas un coffre-fort : évitez les journaux de diagnostic contenant l'environnement, ne commitez jamais ces secrets et révoquez immédiatement toute clé exposée.
+
 Common Crawl est sérialisé globalement afin que plusieurs domaines ne frappent pas simultanément l'index public. L'URL du dernier index est conservée 30 jours dans `source_metadata_cache`; une réponse 404/410 force sa redécouverte. Wayback tente d'abord une requête bornée à 2 000 lignes, puis, en cas de timeout, quatre fenêtres temporelles parallèles de 1 000 lignes dont les résultats sont fusionnés au cache permanent.
 
 Cert Spotter parcourt désormais jusqu'à 25 pages avec détection de curseur bloqué. urlscan utilise `search_after` sur cinq pages et extrait les hôtes depuis les domaines comme depuis les URL. Shodan active l'historique et suit le champ `more` sur dix pages. VirusTotal suit ses curseurs uniquement lorsqu'ils restent en HTTPS sur le domaine officiel, afin qu'une réponse compromise ne puisse pas détourner la clé API. Pour les sources paginées, une page tardive indisponible ne fait plus perdre les noms déjà récupérés.
@@ -408,9 +445,9 @@ Un scan suit désormais cette boucle locale :
 8. poursuivre les enrichissements tant que le nombre de tours et le budget le permettent ;
 9. expliquer la confiance, écrire les preuves normalisées par lots et mettre à jour l'apprentissage.
 
-Le profil `deep` épuise ses limites sans arrêt adaptatif; `balanced` et `turbo` arrêtent naturellement les vagues à faible rendement. À mesure que SQLite accumule des succès sur plusieurs domaines, les mots et chemins récurrents remontent dans l'ordre de test, tandis que les sources lentes ou durablement défaillantes cessent temporairement de pénaliser le temps total. Toutes ces décisions restent sur la machine.
+Le profil `deep` est lui aussi adaptatif par défaut : comme `balanced` et `turbo`, il arrête les vagues à faible rendement, tout en utilisant des limites de profondeur et de couverture plus larges. Seul `--no-adaptive` lui demande d'épuiser les candidats configurés. À mesure que SQLite accumule des succès sur plusieurs domaines, les mots et chemins récurrents remontent dans l'ordre de test, tandis que les sources lentes ou durablement défaillantes cessent temporairement de pénaliser le temps total. Toutes ces décisions restent sur la machine.
 
-L'architecture des connecteurs et plusieurs conventions d'interface ont été inspirées de [xsubfind3r](https://github.com/hueristiq/xsubfind3r), distribué sous licence MIT. Fellaga conserve son propre moteur Rust, la validation DNS, SQLite permanent, l'AXFR, l'apprentissage et l'orchestration adaptative.
+L'architecture des connecteurs et plusieurs conventions d'interface ont été inspirées de [xsubfind3r](https://github.com/hueristiq/xsubfind3r), distribué sous licence MIT. L'attribution et la licence complète figurent dans [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Fellaga conserve son propre moteur Rust, la validation DNS, SQLite permanent, l'AXFR, l'apprentissage et l'orchestration adaptative.
 
 ## Développement
 
@@ -421,11 +458,11 @@ cargo clippy --all-targets --locked -- -D warnings
 tests/dns-lab/verify.sh
 ```
 
-Le banc `benchmarks/run.sh` compare Fellaga, Subfinder, Amass, BBOT, puredns et dnsx en modes sans clé et clés identiques. Il refuse de démarrer sans confirmation explicite du périmètre autorisé. La CI vérifie le corpus, le MSRV, les tests de propriétés, le fuzzing et le laboratoire DNS; les tags `v*` produisent binaires Kali x86-64/ARM64, `.deb`, SBOM, checksums et attestations Sigstore/GitHub.
+Le banc `benchmarks/run.sh` est prévu pour comparer Fellaga, Subfinder, Amass, BBOT, puredns et dnsx en modes sans clé et clés identiques. Il refuse de démarrer sans confirmation explicite du périmètre autorisé. Le workflow CI est configuré pour vérifier le corpus, le MSRV, les tests, le fuzzing et le laboratoire DNS. Le workflow des tags `v*` est configuré pour construire les binaires Linux/Kali x86-64 et ARM64, un `.deb`, un SBOM, des checksums, une signature Sigstore et des attestations GitHub ; son résultat doit être vérifié sur GitHub avant d'annoncer une release.
 
 Structure principale :
 
-- `src/lib.rs` : crate public `fellaga-core` ;
+- `src/lib.rs` : cible de bibliothèque `fellaga_core` du paquet `fellaga-subdomainfinder` ;
 - `src/dns.rs` : moteur UDP natif, consensus, validation autoritaire, résolveurs et wildcard ;
 - `src/pipeline.rs` : file d'événements priorisée, déduplication et budgets ;
 - `src/confidence.rs` : score de confiance et raisons associées ;
@@ -439,6 +476,6 @@ Structure principale :
 - `src/db.rs` : schéma SQLite, cache, inventaire et apprentissage ;
 - `src/scanner.rs` : orchestration d'un scan et rafraîchissement ;
 - `src/passive.rs` et `src/passive/extra.rs` : catalogue, configuration, sources passives et parsing ;
-- `data/candidates-1m.txt.zst` : corpus MIT reproductible d'un million de candidats ;
+- `data/candidates-1m.txt.zst` : corpus SecLists dérivé d'un million de candidats, avec provenance et empreintes dans `data/CORPUS_LICENSE.md` ;
 - `benchmarks/` : banc comparatif et seuil de publication ;
 - `tests/dns-lab/` : serveur DNS contrôlé reproductible.

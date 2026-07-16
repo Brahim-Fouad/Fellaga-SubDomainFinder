@@ -6,7 +6,12 @@ use reqwest::header::RETRY_AFTER;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+use std::fs::{self, OpenOptions};
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, RwLock};
@@ -16,23 +21,41 @@ use url::Url;
 
 mod extra;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct ApiKeyStore {
     keys: BTreeMap<String, Vec<String>>,
     cursor: Arc<AtomicUsize>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Default)]
+impl fmt::Debug for ApiKeyStore {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ApiKeyStore([REDACTED])")
+    }
+}
+
+#[derive(Deserialize, Serialize, Default)]
 struct ConfigFile {
     #[serde(default)]
     api_keys: BTreeMap<String, KeyList>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+impl fmt::Debug for ConfigFile {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ConfigFile { api_keys: [REDACTED] }")
+    }
+}
+
+#[derive(Deserialize, Serialize)]
 #[serde(untagged)]
 enum KeyList {
     One(String),
     Many(Vec<String>),
+}
+
+impl fmt::Debug for KeyList {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("[REDACTED]")
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -238,24 +261,105 @@ pub fn default_config_path() -> PathBuf {
     if let Some(path) = std::env::var_os("XDG_CONFIG_HOME") {
         return PathBuf::from(path).join("fellaga/config.json");
     }
+    #[cfg(windows)]
+    if let Some(path) = std::env::var_os("APPDATA") {
+        return PathBuf::from(path).join("fellaga/config.json");
+    }
+    #[cfg(windows)]
+    if let Some(path) = std::env::var_os("USERPROFILE") {
+        return PathBuf::from(path).join("AppData/Roaming/fellaga/config.json");
+    }
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".config/fellaga/config.json")
 }
 
+fn config_parent(path: &Path) -> Option<&Path> {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+}
+
+#[cfg(unix)]
+fn is_fellaga_config_directory(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("fellaga"))
+}
+
+fn ensure_config_parent(path: &Path) -> Result<()> {
+    let Some(parent) = config_parent(path) else {
+        return Ok(());
+    };
+
+    #[cfg(unix)]
+    {
+        let existed = parent.exists();
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700);
+        builder.create(parent).with_context(|| {
+            format!("création du dossier de configuration {}", parent.display())
+        })?;
+        // Never chmod a generic pre-existing parent such as /tmp.  Fellaga's
+        // dedicated directory, and any directory created for this path, are private.
+        if !existed || is_fellaga_config_directory(parent) {
+            fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).with_context(|| {
+                format!(
+                    "sécurisation du dossier de configuration {}",
+                    parent.display()
+                )
+            })?;
+        }
+    }
+
+    #[cfg(not(unix))]
+    fs::create_dir_all(parent)
+        .with_context(|| format!("création du dossier de configuration {}", parent.display()))?;
+
+    Ok(())
+}
+
+fn create_default_config(path: &Path) -> Result<()> {
+    let content = serde_json::to_string_pretty(&ConfigFile::default())? + "\n";
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+
+    match options.open(path) {
+        Ok(mut file) => {
+            file.write_all(content.as_bytes())
+                .with_context(|| format!("écriture de la configuration {}", path.display()))?;
+            file.sync_all().with_context(|| {
+                format!("synchronisation de la configuration {}", path.display())
+            })?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("création de la configuration {}", path.display()));
+        }
+    }
+    Ok(())
+}
+
+fn harden_config_file(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("sécurisation de la configuration {}", path.display()))?;
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
 impl ApiKeyStore {
     pub fn load_or_create(path: &Path) -> Result<Self> {
+        ensure_config_parent(path)?;
         if !path.exists() {
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::write(
-                path,
-                serde_json::to_string_pretty(&ConfigFile::default())? + "\n",
-            )?;
+            create_default_config(path)?;
         }
-        let content = std::fs::read_to_string(path)
+        harden_config_file(path)?;
+        let content = fs::read_to_string(path)
             .with_context(|| format!("lecture de la configuration {}", path.display()))?;
         let config: ConfigFile = serde_json::from_str(&content)
             .with_context(|| format!("JSON de configuration invalide: {}", path.display()))?;
@@ -318,6 +422,36 @@ impl ApiKeyStore {
         values.dedup();
         values
     }
+
+    fn redaction_values(&self) -> Vec<String> {
+        let mut values = self
+            .keys
+            .values()
+            .flatten()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>();
+        for source in SOURCE_DEFINITIONS {
+            for variable in environment_names(source.name) {
+                if let Ok(value) = std::env::var(variable) {
+                    values.extend(split_keys(&value));
+                }
+            }
+        }
+
+        let components = values
+            .iter()
+            .flat_map(|value| value.split(':'))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        values.extend(components);
+        values.retain(|value| !value.is_empty());
+        values.sort_by_key(|value| std::cmp::Reverse(value.len()));
+        values.dedup();
+        values
+    }
 }
 
 fn split_keys(value: &str) -> Vec<String> {
@@ -327,6 +461,248 @@ fn split_keys(value: &str) -> Vec<String> {
         .filter(|key| !key.is_empty())
         .map(ToOwned::to_owned)
         .collect()
+}
+
+const REDACTED_SECRET: &str = "[REDACTED]";
+
+fn sensitive_query_name(name: &str) -> bool {
+    let normalized = name
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    matches!(
+        normalized.as_str(),
+        "k" | "key"
+            | "apikey"
+            | "accesskey"
+            | "token"
+            | "accesstoken"
+            | "refreshtoken"
+            | "secret"
+            | "clientsecret"
+            | "password"
+            | "passwd"
+            | "auth"
+            | "authorization"
+            | "credential"
+            | "credentials"
+            | "signature"
+            | "sig"
+    )
+}
+
+fn redact_url(mut url: Url) -> String {
+    if !url.username().is_empty() {
+        let _ = url.set_username(REDACTED_SECRET);
+    }
+    if url.password().is_some() {
+        let _ = url.set_password(Some(REDACTED_SECRET));
+    }
+    if url.query().is_some() {
+        let pairs = url
+            .query_pairs()
+            .map(|(name, value)| {
+                let value = if sensitive_query_name(&name) {
+                    REDACTED_SECRET.to_owned()
+                } else {
+                    value.into_owned()
+                };
+                (name.into_owned(), value)
+            })
+            .collect::<Vec<_>>();
+        url.query_pairs_mut().clear().extend_pairs(pairs);
+    }
+    url.into()
+}
+
+fn next_url_start(message: &str, offset: usize) -> Option<usize> {
+    let remaining = &message[offset..];
+    let http = remaining.find("http://");
+    let https = remaining.find("https://");
+    match (http, https) {
+        (Some(left), Some(right)) => Some(offset + left.min(right)),
+        (Some(index), None) | (None, Some(index)) => Some(offset + index),
+        (None, None) => None,
+    }
+}
+
+fn sanitize_embedded_urls(message: &str) -> String {
+    let mut sanitized = String::with_capacity(message.len());
+    let mut cursor = 0;
+    while let Some(start) = next_url_start(message, cursor) {
+        sanitized.push_str(&message[cursor..start]);
+        let tail = &message[start..];
+        let end = tail
+            .char_indices()
+            .find_map(|(index, character)| {
+                (index > 0
+                    && (character.is_whitespace()
+                        || matches!(
+                            character,
+                            '"' | '\'' | '<' | '>' | '`' | ')' | ']' | '}' | ','
+                        )))
+                .then_some(start + index)
+            })
+            .unwrap_or(message.len());
+        let candidate = &message[start..end];
+        if let Ok(url) = Url::parse(candidate) {
+            sanitized.push_str(&redact_url(url));
+        } else {
+            sanitized.push_str(candidate);
+        }
+        cursor = end;
+    }
+    sanitized.push_str(&message[cursor..]);
+    sanitized
+}
+
+fn assignment_name_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')
+}
+
+fn assignment_value_terminator(byte: u8) -> bool {
+    byte.is_ascii_whitespace()
+        || matches!(byte, b'&' | b',' | b';' | b')' | b']' | b'}' | b'"' | b'\'')
+}
+
+fn redact_sensitive_assignments(message: &str) -> String {
+    let bytes = message.as_bytes();
+    let mut sanitized = String::with_capacity(message.len());
+    let mut copied_until = 0;
+    let mut cursor = 0;
+
+    while cursor < bytes.len() {
+        if !assignment_name_byte(bytes[cursor])
+            || (cursor > 0 && assignment_name_byte(bytes[cursor - 1]))
+        {
+            cursor += 1;
+            continue;
+        }
+        let name_start = cursor;
+        while cursor < bytes.len() && assignment_name_byte(bytes[cursor]) {
+            cursor += 1;
+        }
+        let name = &message[name_start..cursor];
+        if !sensitive_query_name(name) {
+            continue;
+        }
+
+        let mut separator = cursor;
+        if separator < bytes.len() && matches!(bytes[separator], b'"' | b'\'') {
+            separator += 1;
+        }
+        while separator < bytes.len() && bytes[separator].is_ascii_whitespace() {
+            separator += 1;
+        }
+        if separator >= bytes.len() || !matches!(bytes[separator], b'=' | b':') {
+            continue;
+        }
+        separator += 1;
+        while separator < bytes.len() && bytes[separator].is_ascii_whitespace() {
+            separator += 1;
+        }
+
+        let quote = (separator < bytes.len() && matches!(bytes[separator], b'"' | b'\''))
+            .then_some(bytes[separator]);
+        let value_start = separator + usize::from(quote.is_some());
+        let mut value_end = value_start;
+        if let Some(quote) = quote {
+            while value_end < bytes.len() {
+                if bytes[value_end] == quote
+                    && (value_end == value_start || bytes[value_end - 1] != b'\\')
+                {
+                    break;
+                }
+                value_end += 1;
+            }
+        } else {
+            while value_end < bytes.len() && !assignment_value_terminator(bytes[value_end]) {
+                value_end += 1;
+            }
+        }
+        if value_end == value_start {
+            continue;
+        }
+
+        sanitized.push_str(&message[copied_until..value_start]);
+        sanitized.push_str(REDACTED_SECRET);
+        copied_until = value_end;
+        cursor = value_end;
+    }
+    sanitized.push_str(&message[copied_until..]);
+    sanitized
+}
+
+fn encoded_secret_variants(secret: &str) -> Vec<String> {
+    let mut variants = vec![secret.to_owned()];
+    let form_encoded = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("secret", secret)
+        .finish();
+    if let Some(encoded) = form_encoded.strip_prefix("secret=") {
+        variants.push(encoded.to_owned());
+    }
+    if let Ok(json) = serde_json::to_string(secret)
+        && let Some(escaped) = json
+            .strip_prefix('"')
+            .and_then(|value| value.strip_suffix('"'))
+    {
+        variants.push(escaped.to_owned());
+    }
+    if secret.contains(':') {
+        use base64::Engine as _;
+        variants.push(base64::engine::general_purpose::STANDARD.encode(secret));
+    }
+    variants
+}
+
+fn replace_secret(message: &str, secret: &str) -> String {
+    if secret.len() >= 4 {
+        return message.replace(secret, REDACTED_SECRET);
+    }
+
+    let mut sanitized = String::with_capacity(message.len());
+    let mut copied_until = 0;
+    for (start, _) in message.match_indices(secret) {
+        if start < copied_until {
+            continue;
+        }
+        let end = start + secret.len();
+        let before_is_boundary = start == 0
+            || !message.as_bytes()[start - 1].is_ascii_alphanumeric()
+                && !matches!(message.as_bytes()[start - 1], b'_' | b'-');
+        let after_is_boundary = end == message.len()
+            || !message.as_bytes()[end].is_ascii_alphanumeric()
+                && !matches!(message.as_bytes()[end], b'_' | b'-');
+        if before_is_boundary && after_is_boundary {
+            sanitized.push_str(&message[copied_until..start]);
+            sanitized.push_str(REDACTED_SECRET);
+            copied_until = end;
+        }
+    }
+    sanitized.push_str(&message[copied_until..]);
+    sanitized
+}
+
+fn sanitize_external_message(message: &str, secrets: &[String]) -> String {
+    let mut sanitized = sanitize_embedded_urls(message);
+    sanitized = redact_sensitive_assignments(&sanitized);
+
+    let mut variants = secrets
+        .iter()
+        .flat_map(|secret| encoded_secret_variants(secret))
+        .filter(|secret| !secret.is_empty() && secret != REDACTED_SECRET)
+        .collect::<Vec<_>>();
+    variants.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
+    variants.dedup();
+    for secret in variants {
+        sanitized = replace_secret(&sanitized, &secret);
+    }
+    sanitized
+}
+
+pub(crate) fn sanitize_external_error(message: &str, keys: &ApiKeyStore) -> String {
+    sanitize_external_message(message, &keys.redaction_values())
 }
 
 fn definition(source: &str) -> Option<SourceDefinition> {
@@ -368,7 +744,9 @@ pub fn source_statuses(keys: &ApiKeyStore) -> Vec<SourceStatus> {
             requires_key: entry.requires_key,
             key_environment: entry.key_environment.map(ToOwned::to_owned),
             configured: keys.has(entry.name),
-            automatic: entry.automatic && (!entry.requires_key || keys.has(entry.name)),
+            automatic: entry.automatic
+                && (!entry.requires_key || keys.has(entry.name))
+                && (entry.name != "otx" || keys.has(entry.name)),
             metadata: source_metadata(entry.name),
         })
         .collect()
@@ -432,7 +810,7 @@ pub fn automatic_sources_for_profile(
     source_statuses(keys)
         .into_iter()
         .filter(|source| {
-            source.automatic
+            (source.automatic && (!source.metadata.experimental || include_experimental))
                 || (include_experimental
                     && source.metadata.experimental
                     && (!source.requires_key || source.configured))
@@ -863,7 +1241,10 @@ pub(super) async fn send_with_retry(
             }
             Err(error) => {
                 if attempt + 1 >= attempts {
-                    return Err(error.into());
+                    return Err(anyhow::Error::msg(sanitize_external_message(
+                        &format!("{error:#}"),
+                        &[],
+                    )));
                 }
                 tokio::time::sleep(backoff_delay(seed, attempt, base_backoff)).await;
             }
@@ -878,7 +1259,7 @@ pub async fn fetch(
     timeout: Duration,
     keys: &ApiKeyStore,
 ) -> Result<BTreeSet<String>> {
-    match source {
+    let result = match source {
         "crtsh" => crtsh(domain, timeout).await,
         "certspotter" => certspotter(domain, timeout, keys).await,
         "hackertarget" => hackertarget(domain, timeout).await,
@@ -906,8 +1287,9 @@ pub async fn fetch(
         "otx" => extra::otx(domain, timeout, keys).await,
         "shodan" => extra::shodan(domain, timeout, keys).await,
         "subdomaincenter" => extra::subdomain_center(domain, timeout).await,
-        _ => bail!("source passive inconnue: {source}"),
-    }
+        _ => Err(anyhow::anyhow!("source passive inconnue: {source}")),
+    };
+    result.map_err(|error| anyhow::Error::msg(sanitize_external_error(&format!("{error:#}"), keys)))
 }
 
 async fn crtsh(domain: &str, timeout: Duration) -> Result<BTreeSet<String>> {
@@ -1479,6 +1861,125 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
 
+    fn key_store(entries: &[(&str, &[&str])]) -> ApiKeyStore {
+        ApiKeyStore {
+            keys: entries
+                .iter()
+                .map(|(source, values)| {
+                    (
+                        (*source).to_owned(),
+                        values.iter().map(|value| (*value).to_owned()).collect(),
+                    )
+                })
+                .collect(),
+            cursor: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    #[test]
+    fn key_bearing_debug_output_is_fully_redacted() {
+        let store = key_store(&[("shodan", &["runtime-super-secret"])]);
+        let config = ConfigFile {
+            api_keys: BTreeMap::from([(
+                "shodan".to_owned(),
+                KeyList::One("runtime-super-secret".to_owned()),
+            )]),
+        };
+        let list = KeyList::Many(vec!["runtime-super-secret".to_owned()]);
+
+        for debug in [
+            format!("{store:?}"),
+            format!("{config:?}"),
+            format!("{list:?}"),
+        ] {
+            assert!(debug.contains("REDACTED"));
+            assert!(!debug.contains("runtime-super-secret"));
+            assert!(!debug.contains("shodan"));
+        }
+    }
+
+    #[test]
+    fn external_error_sanitizer_removes_urls_assignments_and_known_key_values() {
+        let store = key_store(&[
+            ("shodan", &["shodan-super-secret"]),
+            ("censys", &["client-identifier:client-super-secret"]),
+            ("intelx", &["abc"]),
+        ]);
+        use base64::Engine as _;
+        let basic = base64::engine::general_purpose::STANDARD
+            .encode("client-identifier:client-super-secret");
+        let message = format!(
+            "request https://api-user:url-password@example.test/path?key=unknown-query-secret&cursor=public failed: apiKey='unknown-json-secret'; body shodan-super-secret client-identifier client-super-secret short abc Basic {basic}"
+        );
+
+        let sanitized = sanitize_external_error(&message, &store);
+        for secret in [
+            "api-user",
+            "url-password",
+            "unknown-query-secret",
+            "unknown-json-secret",
+            "shodan-super-secret",
+            "client-identifier",
+            "client-super-secret",
+            "abc",
+            basic.as_str(),
+        ] {
+            assert!(
+                !sanitized.contains(secret),
+                "secret encore visible: {secret}"
+            );
+        }
+        assert!(sanitized.contains("REDACTED"));
+        assert!(sanitized.contains("cursor=public"));
+    }
+
+    #[test]
+    fn config_creation_preserves_existing_values() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("fellaga/config.json");
+        let empty = ApiKeyStore::load_or_create(&path).unwrap();
+        assert!(!empty.has("shodan"));
+        let configured = r#"{"api_keys":{"shodan":"fixture-secret-value"}}"#;
+        fs::write(&path, configured).unwrap();
+
+        let loaded = ApiKeyStore::load_or_create(&path).unwrap();
+        assert!(loaded.has("shodan"));
+        assert_eq!(fs::read_to_string(path).unwrap(), configured);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_directory_and_file_are_private_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let config_directory = directory.path().join("fellaga");
+        fs::create_dir(&config_directory).unwrap();
+        fs::set_permissions(&config_directory, fs::Permissions::from_mode(0o777)).unwrap();
+        let path = config_directory.join("config.json");
+
+        ApiKeyStore::load_or_create(&path).unwrap();
+        assert_eq!(
+            fs::metadata(&config_directory)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        ApiKeyStore::load_or_create(&path).unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
     #[test]
     fn whoisxml_contract_fixture_preserves_pagination_and_scope() {
         let page: WhoisXmlResponse =
@@ -1516,7 +2017,11 @@ mod tests {
         let keys = ApiKeyStore::default();
         let balanced = automatic_sources_for_profile(&keys, false);
         let deep = automatic_sources_for_profile(&keys, true);
+        assert!(!balanced.contains(&"anubisdb".to_owned()));
+        assert!(!balanced.contains(&"subdomainapp".to_owned()));
         assert!(!balanced.contains(&"driftnet".to_owned()));
+        assert!(deep.contains(&"anubisdb".to_owned()));
+        assert!(deep.contains(&"subdomainapp".to_owned()));
         assert!(deep.contains(&"driftnet".to_owned()));
         assert!(deep.contains(&"subdomaincenter".to_owned()));
         assert!(!deep.contains(&"bevigil".to_owned()));
@@ -1628,6 +2133,25 @@ mod tests {
         .unwrap();
         assert_eq!(response.status(), reqwest::StatusCode::OK);
         server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn terminal_transport_errors_never_expose_query_credentials() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let error = send_with_retry(
+            client(Duration::from_millis(250)).unwrap().get(format!(
+                "http://{address}/failure?apiKey=transport-super-secret&cursor=public"
+            )),
+            1,
+            Duration::ZERO,
+            "transport-redaction-test",
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(!error.contains("transport-super-secret"));
     }
 
     #[tokio::test]
