@@ -27,17 +27,17 @@ fellaga scan your-domain.example --profile deep
 | `passive` | Provider and CT collection with DNS validation but without AXFR, brute force, Web/TLS/DNS-graph/NSEC enrichment, or the event pipeline. | No brute-force candidates; depth 1. |
 | `turbo` | Broad candidate generation with less enrichment depth than `deep`. | Up to 1,000,000 initial candidates, depth 3, 4 pipeline rounds, 250,000 pipeline events. |
 
-These are ceilings, not promised request counts. Adaptive mode ranks candidates and stops low-yield waves early.
+The table lists upper bounds. Adaptive mode ranks candidates and stops low-yield waves early.
 
-Fellaga does not pre-insert the full embedded corpus before DNS validation. It keeps separate persistent queues for high-value seeds (passive, CT, AXFR, cached, and learned observations) and active candidates (wordlists, mutations, learned patterns, and the embedded corpus). The queues are consumed in bounded waves and interleaved so useful passive names do not wait behind a large brute-force corpus. On the first adaptive wave, approximately three quarters of the available slots are reserved for seeds when both queues have work.
+Fellaga streams the embedded corpus through two persistent queues while DNS validation runs: a seed queue for passive, CT, AXFR, cached, and learned observations, and an active queue for wordlists, mutations, learned patterns, and corpus entries. Bounded interleaved waves prioritize useful seeds; when both queues contain work, the first wave reserves about three quarters of its slots for seeds.
 
 Low-yield adaptive stopping applies to generated active candidates. Fellaga still drains the bounded seed queue, retries transiently failed queued names, and continues an explicit `--wordlist` until its durable cursor reaches the end or another configured hard limit stops the scan.
 
-`--passive-only` is different from `--profile passive`: it skips brute-force candidate generation but does not disable every active enrichment method. Use `--profile passive` when AXFR and the active Web, TLS, graph, NSEC, PTR, and pipeline stages must be disabled. Even the passive profile performs provider HTTP requests, Certificate Transparency collection, wildcard probes, and DNS validation, so it is not a zero-network mode.
+`--passive-only` skips brute-force generation but keeps active enrichment enabled. `--profile passive` disables AXFR and active Web, TLS, graph, NSEC, PTR, and pipeline stages. It still performs provider HTTP requests, CT collection, wildcard probes, and DNS validation.
 
 ## Custom mutation rules
 
-Pass a mutation DSL file with `--mutations`. Blank lines and text after `#` are ignored. A rule is `score:name:pattern`; a line containing only a pattern receives a default score and generated name.
+Pass a mutation DSL file with `--mutations`. Blank lines and text after `#` are ignored. A rule is `score:name:pattern`; a line containing only a pattern receives a default score and an automatically generated rule name.
 
 ```text
 # custom-mutations.txt
@@ -56,7 +56,7 @@ fellaga scan your-domain.example --mutations custom-mutations.txt
 
 | Control | Default | Purpose |
 | --- | ---: | --- |
-| `--domain-concurrency` | `1` | Prevents multiple large targets from multiplying network load. |
+| `--domain-concurrency` | `1` | Prevents multiple large targets from multiplying network load; accepted range is 1-4. |
 | `--concurrency` | `128` | Limits in-flight DNS work. |
 | `--dns-rate-limit` | `100` | Caps the shared DNS request rate per second. |
 | `--max-runtime` | `1800` | Stops each domain after 30 minutes. |
@@ -64,6 +64,8 @@ fellaga scan your-domain.example --mutations custom-mutations.txt
 | `--verification-max-age` | `24` | Treats a cached DNS validation as live for 24 hours. |
 
 Passive collection also has profile-specific safeguards: an active-time budget, a global connector concurrency limit, and a child-zone concurrency limit. The default active-time budgets are 75 seconds for `deep`, 45 for `balanced`, 90 for `passive`, and 30 for `turbo`; the global connector concurrency default is 8. Use `--passive-max-runtime`, `--passive-concurrency`, and `--passive-zone-concurrency` to override them. A value of `0` for `--passive-max-runtime` disables only the passive-time safeguard; the per-connector request limits still apply.
+
+NSEC and direct CT collection have separate cumulative per-target safeguards. `--nsec-max-runtime` defaults to 180/90/60 seconds for `deep`/`balanced`/`turbo`; `--ct-max-runtime` defaults to 90/30/90/20 seconds for `deep`/`balanced`/`passive`/`turbo`. Partial results and committed cache batches are retained when either budget is reached. A value of `0` disables only that total-phase safeguard. Web concurrency is capped at 16 and TLS concurrency at 32 to keep multi-target scans from multiplying connection pressure unexpectedly.
 
 `--dns-rate-limit 0` disables the DNS rate cap, and `--max-runtime 0` disables the global time limit. `--no-adaptive` asks Fellaga to exhaust configured candidate waves. These expert controls can create very high traffic and should be used only in an isolated laboratory or an explicitly authorized environment with suitable resolvers.
 
@@ -104,6 +106,8 @@ Use `--refresh-cache` to force network refresh during a scan, or revalidate the 
 ```bash
 fellaga refresh your-domain.example
 ```
+
+Refresh stops after five minutes by default and commits validation results in 256-name batches. Wildcard matches are staged in SQLite and the final purge is applied in one cancellable transaction. Progress is written to stderr; use `--quiet` to suppress it. Use `--max-runtime 0` to remove the global limit or `--batch-size` to select a batch size from 1 to 4096. On timeout or Ctrl+C, completed validation batches remain committed, unprocessed and indeterminate names retain their state, destructive wildcard cleanup is rolled back, and the non-resumable checkpoint is closed safely.
 
 ## Output formats
 
@@ -152,7 +156,7 @@ Test resolver behavior before intensive work:
 fellaga resolvers test --help
 ```
 
-The resolver test reports whether each candidate passes NXDOMAIN, DNSSEC, and answer-consistency checks, together with observed latency. It does not rewrite the scan configuration automatically: pass accepted addresses explicitly through `--resolvers` and `--trusted-resolvers`.
+The resolver test reports whether each candidate passes NXDOMAIN, DNSSEC, and answer-consistency checks, together with observed latency. Resolver selection remains explicit: pass accepted addresses through `--resolvers` and `--trusted-resolvers`.
 
 ## Inventory commands
 

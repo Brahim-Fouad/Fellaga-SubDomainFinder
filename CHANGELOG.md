@@ -2,9 +2,36 @@
 
 All notable changes to Fellaga are documented in this file. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-A version is available only when its artifacts appear on [GitHub Releases](https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases). A changelog entry or Git tag alone does not prove that publication succeeded.
+Published releases and downloadable artifacts are available on [GitHub Releases](https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases).
 
 ## [Unreleased]
+
+## [0.8.3] - 2026-07-16
+
+### Added
+
+- added `fellaga benchmark candidate-pipeline`, a deterministic ten-million-candidate exercise of fixture generation, SQLite persistence, bounded scheduling, native DNS dispatch, result accounting, and artifact provenance;
+- added refresh progress, `--quiet`, a five-minute default refresh limit, configurable validation batches, and interruption-safe non-resumable checkpoints;
+- added deadline-aware cumulative budgets for direct CT monitoring and NSEC traversal.
+
+### Changed
+
+- cancel slower trusted-resolver work as soon as positive consensus is reached, skip duplicate fallback against a timed-out fast resolver, and cache authoritative nameserver discovery with single-flight loading;
+- exclude intentional DNS rate-limit queue time from per-operation network timeouts while keeping every network operation and phase deadline bounded;
+- route Web, TLS, PTR, authoritative, trusted-consensus, and direct NSEC traffic through the configured shared DNS cadence;
+- cap cross-target, Web, TLS, passive, CT, NSEC, and enrichment concurrency while preserving partial results from completed work;
+- page refresh inventory and cache reads with stable SQLite cursors, rank parent wildcard zones in bounded memory, and stage wildcard matches in SQLite;
+- harden the competitor benchmark with isolated homes, equal-key validation, fresh output directories, process-group timeouts, recursive redaction, resolver fairness metadata, executable and input hashes, strict repetition accounting, and fail-closed qualification reports;
+- separate the 100,000-query transport test from the ten-million-candidate pipeline test and give each an independent wall timeout.
+
+### Fixed
+
+- prevent a stale wildcard signature from authorizing destructive cleanup when current randomized probes are indeterminate;
+- apply completed wildcard cleanup in one cancellable transaction, roll it back on timeout or interruption, retain independently supported names as `unverified`, and remove weak wildcard-only inventory, cache, scan findings, and DNS records;
+- recalculate historical scan result counts after wildcard cleanup and disable all cleanup when parent-zone coverage or current wildcard classification is incomplete;
+- keep low-rate DNS queues from turning valid hosts into indeterminate results before their requests are sent;
+- enforce `--dns-rate-limit` for direct NSEC traffic in addition to its local traversal cap;
+- preserve completed refresh batches and close the refresh checkpoint safely on timeout, Ctrl+C, or future cancellation.
 
 ## [0.8.2] - 2026-07-16
 
@@ -80,7 +107,8 @@ Initial public release of Fellaga.
 - public MIT repository with security policy, contribution guide, third-party notices, and verifiable corpus provenance;
 - verifiable v0.8.0 release with x86-64 and ARM64 GNU/Linux archives, an amd64 Debian package, architecture SBOMs, checksums, a keyless Sigstore signature over the checksum manifest, and GitHub attestations.
 
-[Unreleased]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/compare/v0.8.2...HEAD
+[Unreleased]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/compare/v0.8.3...HEAD
+[0.8.3]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/tag/v0.8.3
 [0.8.2]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/tag/v0.8.2
 [0.8.1]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/tag/v0.8.1
 [0.8.0]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/tag/v0.8.0

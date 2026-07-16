@@ -4,7 +4,7 @@ Fellaga performs active DNS, HTTP, and TLS operations. Use it only on domains fo
 
 ## Supported versions
 
-Security fixes target the latest version published on [GitHub Releases](https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases). The `main` branch receives fixes for the next release but may change before publication. Older releases do not receive guaranteed support.
+Security fixes are provided for the latest version on [GitHub Releases](https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases). The `main` branch contains work for the next release and may change before publication.
 
 ## Report a vulnerability in Fellaga
 
@@ -12,7 +12,7 @@ Security fixes target the latest version published on [GitHub Releases](https://
 2. If private reporting is unavailable, open a public issue that asks only for a private contact channel. Do not include exploit details, secrets, target data, or an unredacted proof of concept.
 3. In the private report, include the affected version or commit, operating system, relevant options, expected impact, and a minimal reproduction using controlled data.
 
-Reports are handled on a best-effort basis without a contractual response time. A fix may be prepared under embargo before coordinated disclosure.
+Response timing depends on severity and maintainer availability. Fixes may be prepared under embargo before coordinated disclosure.
 
 ## Never attach
 

@@ -1,6 +1,7 @@
 #![recursion_limit = "256"]
 
 pub mod axfr;
+pub mod benchmark;
 pub mod candidate;
 pub mod confidence;
 pub mod ct_monitor;

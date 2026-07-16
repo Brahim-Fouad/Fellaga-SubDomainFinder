@@ -11,7 +11,7 @@ Fellaga uses SQLite as a permanent local inventory and learning store. It has no
 
 `XDG_DATA_HOME` and `XDG_CONFIG_HOME` are respected when set.
 
-On Unix, Fellaga protects its dedicated data and configuration directories with mode `0700`. The configuration, SQLite database, WAL/SHM files, and migration backups use mode `0600`. A generic pre-existing parent directory supplied by the user is not silently re-permissioned.
+On Unix, Fellaga protects its dedicated data and configuration directories with mode `0700`. The configuration, SQLite database, WAL/SHM files, and migration backups use mode `0600`. Existing parent directories keep their current permissions.
 
 ## Retention model
 
@@ -35,6 +35,8 @@ Revalidate all known names for one domain:
 fellaga refresh your-domain.example
 ```
 
+Refresh is non-resumable and stops after 300 seconds by default. Fellaga reads the inventory with a stable keyset cursor and commits each completed 256-name validation batch. A bounded parent-zone ranking and SQLite-backed wildcard staging keep memory use stable. On timeout or Ctrl+C, completed validation batches remain committed, while unprocessed names and indeterminate DNS results keep their previous state. Wildcard deletion runs only after a complete refresh with reliable current classification, inside one cancellable transaction that rolls back on interruption. Retained wildcard matches supported by CT, passive, Web, TLS, DNSSEC, or imported evidence are set to `unverified`; weak wildcard-only names and their stored DNS records are removed.
+
 Force a scan to bypass fresh caches:
 
 ```bash
@@ -47,7 +49,7 @@ Remove entries that are explicitly defined as expired:
 fellaga cache prune
 ```
 
-`cache prune` is not a command to erase permanent positive observations. Wildcard cleanup occurs as part of scanning and validation: weak names that match a wildcard profile and their orphaned positive cache records are purged, while names with independent evidence remain available with wildcard context.
+`cache prune` removes only expired cache entries and preserves permanent positive observations. Wildcard cleanup occurs as part of scanning and validation: weak names that match a wildcard profile and their orphaned positive cache records are purged, while names with independent evidence remain available with wildcard context.
 
 Use `fellaga explain <fqdn>` before deciding that a retained historical name is a false positive. Use `--only-live` when stale or unverified names must not reach downstream automation.
 
@@ -55,7 +57,7 @@ Use `fellaga explain <fqdn>` before deciding that a retained historical name is 
 
 Fellaga records the yield of words, relative patterns, generators, and resolver choices. Successful labels and paths are prioritized in future scans, with contextual statistics for properties such as TLD, DNS depth, and DNS provider. Exploration prevents the ranking from becoming permanently locked to early results.
 
-The learning database stays on the local machine. Domain inventories are necessarily stored locally so that `list`, `refresh`, `explain`, and resume operations work, but Fellaga does not upload them.
+The local database supports `list`, `refresh`, `explain`, and resume operations. Fellaga never uploads it.
 
 ## Resumable work queues
 
@@ -82,7 +84,7 @@ Schema migrations are transactional and create a backup before modifying an exis
 
 ## Privacy boundaries
 
-No telemetry does not make a scan anonymous:
+Scans remain observable even with telemetry disabled:
 
 - passive providers receive the domain in API or HTTP requests;
 - recursive resolvers observe DNS questions;

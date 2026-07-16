@@ -1,5 +1,6 @@
 use crate::db::{Database, TlsCacheEntry};
-use crate::model::TlsCertificateObservation;
+use crate::dns::{DnsEngine, DnsResolutionOutcome};
+use crate::model::{ResolvedHost, TlsCertificateObservation};
 use crate::util::{normalize_observed_name, now_epoch};
 use anyhow::{Context, Result, anyhow};
 use futures_util::{StreamExt, stream};
@@ -8,7 +9,7 @@ use openssl::nid::Nid;
 use openssl::ssl::{HandshakeError, SslConnector, SslMethod, SslStream, SslVerifyMode};
 use std::collections::BTreeSet;
 use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
 
 #[derive(Debug)]
@@ -36,12 +37,7 @@ fn remaining_before(deadline: Instant, phase: &str) -> Result<Duration> {
         .with_context(|| format!("délai TLS dépassé pendant {phase}"))
 }
 
-fn connect_tcp(endpoint: &str, port: u16, deadline: Instant) -> Result<TcpStream> {
-    let addresses = (endpoint, port)
-        .to_socket_addrs()
-        .with_context(|| format!("résolution TLS de {endpoint}"))?
-        .collect::<Vec<_>>();
-    remaining_before(deadline, "la résolution du nom")?;
+fn connect_tcp(endpoint: &str, addresses: Vec<SocketAddr>, deadline: Instant) -> Result<TcpStream> {
     let mut last_error = None;
     for address in addresses {
         let remaining = remaining_before(deadline, "la connexion TCP")?;
@@ -177,12 +173,10 @@ fn inspect_certificate(
     domain: String,
     port: u16,
     transport: String,
-    timeout: Duration,
+    addresses: Vec<SocketAddr>,
+    deadline: Instant,
 ) -> Result<TlsInspection> {
-    let deadline = Instant::now()
-        .checked_add(timeout)
-        .context("délai TLS trop grand")?;
-    let mut stream = connect_tcp(&endpoint, port, deadline)?;
+    let mut stream = connect_tcp(&endpoint, addresses, deadline)?;
     prepare_starttls(&mut stream, &transport, deadline)?;
     let mut builder = SslConnector::builder(SslMethod::tls_client())?;
     // L'objectif est l'inventaire du certificat présenté, même s'il est expiré,
@@ -224,6 +218,43 @@ fn inspect_certificate(
     })
 }
 
+async fn resolve_endpoint_before(
+    dns: &DnsEngine,
+    endpoint: &str,
+    port: u16,
+    deadline: tokio::time::Instant,
+) -> Result<Vec<SocketAddr>> {
+    let outcome = tokio::time::timeout_at(deadline, dns.resolve_host_classified(endpoint))
+        .await
+        .with_context(|| format!("délai TLS dépassé pendant la résolution de {endpoint}"))?;
+    let answer = match outcome {
+        DnsResolutionOutcome::Positive(answer) => answer,
+        DnsResolutionOutcome::Negative { .. } => {
+            return Err(anyhow!("aucune adresse TLS pour {endpoint}"));
+        }
+        DnsResolutionOutcome::Indeterminate { .. } => {
+            return Err(anyhow!("résolution TLS indéterminée pour {endpoint}"));
+        }
+    };
+    let addresses = socket_addresses(&answer, port)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if addresses.is_empty() {
+        return Err(anyhow!("aucune adresse TLS pour {endpoint}"));
+    }
+    Ok(addresses)
+}
+
+fn socket_addresses(answer: &ResolvedHost, port: u16) -> impl Iterator<Item = SocketAddr> + '_ {
+    answer
+        .records
+        .iter()
+        .filter(|record| matches!(record.record_type.as_str(), "A" | "AAAA"))
+        .filter_map(|record| record.value.parse().ok())
+        .map(move |address| SocketAddr::new(address, port))
+}
+
 fn cached_observation(
     endpoint: String,
     port: u16,
@@ -241,6 +272,7 @@ fn cached_observation(
 #[allow(clippy::too_many_arguments)]
 pub async fn discover(
     database: &Database,
+    dns: &DnsEngine,
     domain: &str,
     endpoints: Vec<(String, u16, String)>,
     timeout: Duration,
@@ -270,14 +302,34 @@ pub async fn discover(
     let mut inspections = stream::iter(network)
         .map(|(endpoint, port, transport, stale)| {
             let domain = domain_owned.clone();
+            let dns = dns.clone();
             async move {
+                let async_deadline = tokio::time::Instant::now() + timeout;
+                let blocking_deadline = Instant::now()
+                    .checked_add(timeout)
+                    .context("délai TLS trop grand");
                 let inspected_endpoint = endpoint.clone();
-                let result = tokio::task::spawn_blocking(move || {
-                    inspect_certificate(inspected_endpoint, domain, port, transport, timeout)
-                })
-                .await
-                .map_err(|error| anyhow!("tâche TLS interrompue: {error}"))
-                .and_then(|result| result);
+                let result = async {
+                    let deadline = blocking_deadline?;
+                    let addresses =
+                        resolve_endpoint_before(&dns, &inspected_endpoint, port, async_deadline)
+                            .await?;
+                    let task = tokio::task::spawn_blocking(move || {
+                        inspect_certificate(
+                            inspected_endpoint,
+                            domain,
+                            port,
+                            transport,
+                            addresses,
+                            deadline,
+                        )
+                    });
+                    tokio::time::timeout_at(async_deadline, task)
+                        .await
+                        .context("délai TLS absolu dépassé")?
+                        .map_err(|error| anyhow!("tâche TLS interrompue: {error}"))?
+                }
+                .await;
                 (endpoint, port, stale, result)
             }
         })
@@ -324,6 +376,7 @@ pub async fn discover(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::DnsRecord;
     use openssl::asn1::Asn1Time;
     use openssl::bn::{BigNum, MsbOption};
     use openssl::pkey::PKey;
@@ -413,6 +466,46 @@ mod tests {
     }
 
     #[test]
+    fn tls_resolution_is_supplied_by_the_shared_dns_engine() {
+        let source = include_str!("tls.rs");
+        for forbidden in [
+            ["Tokio", "Resolver"].concat(),
+            ["lookup", "_host"].concat(),
+            ["ToSocket", "Addrs"].concat(),
+        ] {
+            assert!(
+                !source.contains(&forbidden),
+                "forbidden resolver: {forbidden}"
+            );
+        }
+        assert!(source.contains("dns: &DnsEngine"));
+
+        let answer = ResolvedHost {
+            fqdn: "api.example.com".to_owned(),
+            records: vec![
+                DnsRecord {
+                    record_type: "A".to_owned(),
+                    value: "192.0.2.8".to_owned(),
+                    ttl: 60,
+                },
+                DnsRecord {
+                    record_type: "TXT".to_owned(),
+                    value: "ignored".to_owned(),
+                    ttl: 60,
+                },
+            ],
+            from_cache: false,
+            last_verified_at: Some(1),
+            authoritative_validation: false,
+            resolver_count: 1,
+        };
+        assert_eq!(
+            socket_addresses(&answer, 443).collect::<Vec<_>>(),
+            vec!["192.0.2.8:443".parse().unwrap()]
+        );
+    }
+
+    #[test]
     fn starttls_uses_only_the_minimal_protocol_dialog() {
         assert_starttls_dialog(
             "smtp-starttls",
@@ -481,7 +574,8 @@ mod tests {
             "example.com".to_owned(),
             address.port(),
             "tcp-tls".to_owned(),
-            timeout,
+            vec![address],
+            started + timeout,
         )
         .unwrap_err();
         let elapsed = started.elapsed();
@@ -509,7 +603,8 @@ mod tests {
             "example.com".to_owned(),
             address.port(),
             "tcp-tls".to_owned(),
-            Duration::from_secs(2),
+            vec![address],
+            Instant::now() + Duration::from_secs(2),
         )
         .unwrap();
         server.join().unwrap();

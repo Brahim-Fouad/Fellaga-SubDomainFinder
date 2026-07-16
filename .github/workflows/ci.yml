@@ -14,6 +14,21 @@ env:
   RUST_TOOLCHAIN: "1.95.0"
 
 jobs:
+  benchmark-harness:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Validate benchmark scripts
+        run: |
+          bash -n benchmarks/run.sh
+          shellcheck benchmarks/run.sh
+          python3 -m py_compile benchmarks/names.py benchmarks/redact.py benchmarks/report.py benchmarks/timed.py
+      - name: Run deterministic benchmark harness tests
+        run: python3 -m unittest discover -s benchmarks/tests -v
+
   rust:
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -36,6 +51,48 @@ jobs:
       - run: cargo test --all-targets --all-features --locked
       - run: cargo install cargo-audit --version 0.22.2 --locked && cargo audit --deny warnings
       - run: cargo build --release --locked
+      - name: Smoke-test the candidate pipeline CLI
+        run: |
+          set -euo pipefail
+          temp="$(mktemp -d)"
+          trap 'rm -rf -- "$temp"' EXIT
+          target/release/fellaga \
+            --db "$temp/pipeline.sqlite" \
+            benchmark candidate-pipeline \
+            --wordlist "$temp/candidates.txt" \
+            --candidates 2048 \
+            --batch-size 256 \
+            --concurrency 128 \
+            --timeout 1 \
+            --campaign-id ci-candidate-pipeline \
+            --output "$temp/result.json"
+          python3 - "$temp/result.json" "$temp/candidates.txt" <<'PY'
+          import hashlib
+          import json
+          import pathlib
+          import sys
+
+          result = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          for field in (
+              "requested_candidates",
+              "loaded_candidates",
+              "persisted_candidates",
+              "scheduled_candidates",
+              "dns_dispatched_candidates",
+              "processed_candidates",
+              "definitive_negative_candidates",
+          ):
+              assert result[field] == 2048, (field, result[field])
+          assert result["status"] == "success"
+          assert result["campaign_id"] == "ci-candidate-pipeline"
+          assert result["positive_candidates"] == 0
+          assert result["indeterminate_candidates"] == 0
+          assert result["dns_queries"] == 4096
+          assert result["loopback_queries"] == 4096
+          fixture = pathlib.Path(sys.argv[2]).read_bytes()
+          assert hashlib.sha256(fixture).hexdigest() == result["wordlist_sha256"]
+          assert len(result["binary_sha256"]) == 64
+          PY
 
   msrv:
     runs-on: ubuntu-latest

@@ -9,7 +9,7 @@ Thank you for contributing. Changes must preserve three core properties: traceab
 - Never attach API keys, a real SQLite database, confidential targets, or unredacted scan output.
 - Keep undocumented connectors isolated, bounded, and marked `experimental`.
 - Do not add authentication or CAPTCHA bypasses.
-- Keep discussions respectful and support technical claims with reproducible evidence.
+- Keep discussions respectful and attach reproducible measurements to technical comparisons.
 
 Security vulnerabilities in Fellaga must follow [SECURITY.md](SECURITY.md), not a public issue.
 
@@ -39,7 +39,7 @@ The DNS laboratory is the preferred way to test rotating and multilevel wildcard
 4. Bound every new network loop with a timeout, response limit, work budget, and cancellation path.
 5. Record evidence provenance and the correct evidence family so correlated providers are not counted twice.
 6. Update the README, detailed guide, and changelog when user-visible behavior changes.
-7. Do not claim a coverage or performance improvement without a reproducible corpus, configuration, and measurements.
+7. Benchmark coverage and performance changes with a documented corpus, configuration, and measurement set.
 
 A pull request should describe its risk, verification method, and the exact tests that were run.
 
@@ -66,4 +66,4 @@ Commit `Cargo.lock` with dependency changes. Review the license and provenance o
 - [ ] New network work is bounded and cancellable.
 - [ ] No secret, target database, or confidential finding is included.
 - [ ] Public behavior and compatibility impact are documented.
-- [ ] Claims are supported by reproducible evidence.
+- [ ] Coverage and performance changes include reproducible measurements.

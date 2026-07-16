@@ -26,16 +26,84 @@ struct NsecRateLimiter {
 }
 
 impl NsecRateLimiter {
-    async fn wait(&self) {
+    async fn wait_before(&self, deadline: Instant) -> bool {
+        if deadline <= Instant::now() {
+            return false;
+        }
         let spacing = Duration::from_secs_f64(1.0 / NSEC_QUERIES_PER_SECOND as f64);
-        let mut next = self.next.lock().await;
+        let Ok(mut next) = tokio::time::timeout_at(deadline, self.next.lock()).await else {
+            return false;
+        };
         let now = Instant::now();
         if let Some(scheduled) = *next
             && scheduled > now
+            && tokio::time::timeout_at(deadline, tokio::time::sleep_until(scheduled))
+                .await
+                .is_err()
         {
-            tokio::time::sleep_until(scheduled).await;
+            return false;
         }
         *next = Some(Instant::now() + spacing);
+        true
+    }
+}
+
+async fn wait_for_nsec_query_slot(
+    dns: &DnsEngine,
+    limiter: &NsecRateLimiter,
+    deadline: Instant,
+) -> bool {
+    limiter.wait_before(deadline).await && dns.wait_for_rate_slot_before(deadline).await
+}
+
+fn earliest_deadline(zone_deadline: Instant, phase_deadline: Option<Instant>) -> Instant {
+    phase_deadline
+        .map(|deadline| deadline.min(zone_deadline))
+        .unwrap_or(zone_deadline)
+}
+
+fn operation_budget(deadline: Instant, operation_timeout: Duration) -> Option<Duration> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    (!remaining.is_zero()).then(|| remaining.min(operation_timeout))
+}
+
+fn mark_deadline(result: &mut DnssecWalkResult) {
+    if !result.names.is_empty() {
+        result.status = "partial".to_owned();
+    }
+    result.error = Some("budget de temps NSEC atteint".to_owned());
+}
+
+fn reusable_walk_status(status: &str) -> bool {
+    matches!(
+        status,
+        "walked" | "nsec3-protected" | "nsec-minimal-protected"
+    )
+}
+
+fn reusable_fresh_cache(cache: &DnssecCacheEntry, now: i64, freshness: i64) -> bool {
+    reusable_walk_status(&cache.status) && now.saturating_sub(cache.updated_at) < freshness
+}
+
+fn reached_walk_limit(result: &DnssecWalkResult, max_names: usize) -> bool {
+    result.status == "partial"
+        && result.error.is_none()
+        && (result.names.len() >= max_names || result.queries >= max_names.saturating_add(2))
+}
+
+fn stops_nameserver_fallback(result: &DnssecWalkResult, max_names: usize) -> bool {
+    reusable_walk_status(&result.status) || reached_walk_limit(result, max_names)
+}
+
+fn result_priority(result: &DnssecWalkResult, max_names: usize) -> u8 {
+    if reusable_walk_status(&result.status) {
+        3
+    } else if reached_walk_limit(result, max_names) {
+        2
+    } else if !result.names.is_empty() {
+        1
+    } else {
+        0
     }
 }
 
@@ -51,7 +119,9 @@ fn cached_result(zone: String, cache: DnssecCacheEntry) -> DnssecWalkResult {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn walk_one(
+    dns: &DnsEngine,
     root_domain: &str,
     zone: &str,
     nameserver: &str,
@@ -59,6 +129,7 @@ async fn walk_one(
     operation_timeout: Duration,
     max_names: usize,
     limiter: &NsecRateLimiter,
+    deadline: Instant,
 ) -> DnssecWalkResult {
     let mut result = DnssecWalkResult {
         zone: zone.to_owned(),
@@ -76,16 +147,24 @@ async fn walk_one(
             return result;
         }
     };
+    let Some(connect_timeout) = operation_budget(deadline, operation_timeout) else {
+        mark_deadline(&mut result);
+        return result;
+    };
     let socket = SocketAddr::new(address, 53);
     let (stream, sender) = TcpClientStream::new(socket, None, None, TokioRuntimeProvider::new());
-    let connected_stream = match timeout(operation_timeout, stream).await {
+    let connected_stream = match timeout(connect_timeout, stream).await {
         Ok(Ok(connected)) => connected,
         Ok(Err(error)) => {
             result.error = Some(error.to_string());
             return result;
         }
         Err(_) => {
-            result.error = Some("timeout de connexion DNSSEC".to_owned());
+            if Instant::now() >= deadline {
+                mark_deadline(&mut result);
+            } else {
+                result.error = Some("timeout de connexion DNSSEC".to_owned());
+            }
             return result;
         }
     };
@@ -99,8 +178,11 @@ async fn walk_one(
             return result;
         }
     };
+    if !wait_for_nsec_query_slot(dns, limiter, deadline).await {
+        mark_deadline(&mut result);
+        return result;
+    }
     result.queries += 1;
-    limiter.wait().await;
     let mut probe_query = Query::query(probe_name, RecordType::A);
     probe_query.set_query_class(DNSClass::IN);
     let mut options = DnsRequestOptions::default();
@@ -108,7 +190,11 @@ async fn walk_one(
     options.edns_set_dnssec_ok = true;
     options.recursion_desired = false;
     let mut probe_responses = client.lookup(probe_query, options);
-    let probe = match timeout(operation_timeout, probe_responses.next()).await {
+    let Some(probe_timeout) = operation_budget(deadline, operation_timeout) else {
+        mark_deadline(&mut result);
+        return result;
+    };
+    let probe = match timeout(probe_timeout, probe_responses.next()).await {
         Ok(Some(Ok(response))) => response,
         Ok(Some(Err(error))) => {
             result.error = Some(error.to_string());
@@ -119,7 +205,11 @@ async fn walk_one(
             return result;
         }
         Err(_) => {
-            result.error = Some("timeout de détection NSEC".to_owned());
+            if Instant::now() >= deadline {
+                mark_deadline(&mut result);
+            } else {
+                result.error = Some("timeout de détection NSEC".to_owned());
+            }
             return result;
         }
     };
@@ -179,12 +269,19 @@ async fn walk_one(
             result.status = "walked".to_owned();
             break;
         }
+        if !wait_for_nsec_query_slot(dns, limiter, deadline).await {
+            mark_deadline(&mut result);
+            break;
+        }
         result.queries += 1;
-        limiter.wait().await;
         let mut nsec_query = Query::query(current.clone(), RecordType::NSEC);
         nsec_query.set_query_class(DNSClass::IN);
         let mut nsec_responses = client.lookup(nsec_query, options);
-        let response = match timeout(operation_timeout, nsec_responses.next()).await {
+        let Some(query_timeout) = operation_budget(deadline, operation_timeout) else {
+            mark_deadline(&mut result);
+            break;
+        };
+        let response = match timeout(query_timeout, nsec_responses.next()).await {
             Ok(Some(Ok(response))) => response,
             Ok(Some(Err(error))) => {
                 result.error = Some(error.to_string());
@@ -195,7 +292,11 @@ async fn walk_one(
                 break;
             }
             Err(_) => {
-                result.error = Some("timeout pendant NSEC walking".to_owned());
+                if Instant::now() >= deadline {
+                    mark_deadline(&mut result);
+                } else {
+                    result.error = Some("timeout pendant NSEC walking".to_owned());
+                }
                 break;
             }
         };
@@ -243,6 +344,9 @@ async fn walk_one(
         }
         current = next_name;
     }
+    if result.status == "unsupported" && !result.names.is_empty() {
+        result.status = "partial".to_owned();
+    }
     result
 }
 
@@ -255,6 +359,54 @@ pub async fn discover_nsec(
     operation_timeout: Duration,
     refresh: Duration,
     max_names: usize,
+) -> Vec<DnssecWalkResult> {
+    discover_nsec_until(
+        database,
+        dns,
+        root_domain,
+        zones,
+        operation_timeout,
+        refresh,
+        max_names,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn discover_nsec_bounded(
+    database: &Database,
+    dns: &DnsEngine,
+    root_domain: &str,
+    zones: BTreeSet<String>,
+    operation_timeout: Duration,
+    refresh: Duration,
+    max_names: usize,
+    phase_deadline: Option<Instant>,
+) -> Vec<DnssecWalkResult> {
+    discover_nsec_until(
+        database,
+        dns,
+        root_domain,
+        zones,
+        operation_timeout,
+        refresh,
+        max_names,
+        phase_deadline,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn discover_nsec_until(
+    database: &Database,
+    dns: &DnsEngine,
+    root_domain: &str,
+    zones: BTreeSet<String>,
+    operation_timeout: Duration,
+    refresh: Duration,
+    max_names: usize,
+    phase_deadline: Option<Instant>,
 ) -> Vec<DnssecWalkResult> {
     let now = now_epoch();
     let freshness = refresh.as_secs().min(i64::MAX as u64) as i64;
@@ -269,9 +421,17 @@ pub async fn discover_nsec(
             let root = root.clone();
             let limiter = limiter.clone();
             async move {
-                let cached = database.dnssec_cache(&root, &zone).ok().flatten();
+                // Older releases persisted `partial` walks as if they were a
+                // complete reusable snapshot. Ignore those legacy rows: a
+                // deadline or transient nameserver failure must not suppress a
+                // later attempt for the whole refresh window.
+                let cached = database
+                    .dnssec_cache(&root, &zone)
+                    .ok()
+                    .flatten()
+                    .filter(|cache| reusable_walk_status(&cache.status));
                 if let Some(cache) = &cached
-                    && now.saturating_sub(cache.updated_at) < freshness
+                    && reusable_fresh_cache(cache, now, freshness)
                 {
                     return cached_result(zone, cache.clone());
                 }
@@ -284,65 +444,72 @@ pub async fn discover_nsec(
                     from_cache: false,
                     error: Some("aucun serveur DNS autoritaire joignable".to_owned()),
                 };
-                if let Ok(servers) = dns.authoritative_servers(&zone).await {
-                    let deadline = Instant::now() + NSEC_ZONE_MAX_RUNTIME;
-                    'servers: for (nameserver, addresses) in servers {
-                        for address in addresses {
-                            let remaining = deadline.saturating_duration_since(Instant::now());
-                            if remaining.is_zero() {
-                                best.error =
-                                    Some("deadline globale du parcours NSEC atteinte".to_owned());
-                                break 'servers;
-                            }
-                            let attempt = match timeout(
-                                remaining,
-                                walk_one(
-                                    &root,
-                                    &zone,
-                                    &nameserver,
-                                    address,
-                                    operation_timeout,
-                                    max_names,
-                                    &limiter,
-                                ),
-                            )
-                            .await
-                            {
-                                Ok(attempt) => attempt,
-                                Err(_) => {
-                                    best.error = Some(
-                                        "deadline globale du parcours NSEC atteinte".to_owned(),
-                                    );
-                                    break 'servers;
+                let zone_deadline = Instant::now() + NSEC_ZONE_MAX_RUNTIME;
+                let deadline = earliest_deadline(zone_deadline, phase_deadline);
+                let mut observed_names = BTreeSet::new();
+                let mut total_queries = 0_usize;
+                if deadline <= Instant::now() {
+                    mark_deadline(&mut best);
+                } else {
+                    match tokio::time::timeout_at(deadline, dns.authoritative_servers(&zone)).await
+                    {
+                        Ok(Ok(servers)) => {
+                            'servers: for (nameserver, addresses) in servers {
+                                for address in addresses {
+                                    if deadline <= Instant::now() {
+                                        mark_deadline(&mut best);
+                                        break 'servers;
+                                    }
+                                    let attempt = walk_one(
+                                        &dns,
+                                        &root,
+                                        &zone,
+                                        &nameserver,
+                                        address,
+                                        operation_timeout,
+                                        max_names,
+                                        &limiter,
+                                        deadline,
+                                    )
+                                    .await;
+                                    let terminal = stops_nameserver_fallback(&attempt, max_names);
+                                    total_queries = total_queries.saturating_add(attempt.queries);
+                                    observed_names.extend(attempt.names.iter().cloned());
+                                    if result_priority(&attempt, max_names)
+                                        > result_priority(&best, max_names)
+                                        || (result_priority(&attempt, max_names)
+                                            == result_priority(&best, max_names)
+                                            && attempt.names.len() > best.names.len())
+                                    {
+                                        best = attempt;
+                                    }
+                                    if terminal {
+                                        break 'servers;
+                                    }
                                 }
-                            };
-                            let terminal = matches!(
-                                attempt.status.as_str(),
-                                "walked" | "partial" | "nsec3-protected" | "nsec-minimal-protected"
-                            );
-                            best = attempt;
-                            if terminal {
-                                break 'servers;
                             }
                         }
+                        Ok(Err(error)) => best.error = Some(error.to_string()),
+                        Err(_) => mark_deadline(&mut best),
                     }
                 }
+                best.queries = total_queries;
+                best.names.extend(observed_names);
                 if best.names.is_empty()
                     && best.status == "unsupported"
                     && let Some(cache) = cached
                 {
                     return cached_result(zone, cache);
                 }
-                if matches!(
-                    best.status.as_str(),
-                    "walked" | "partial" | "nsec3-protected" | "nsec-minimal-protected"
-                ) && let Ok(cache) = database.store_dnssec_cache(
-                    &root,
-                    &zone,
-                    &best.nameserver,
-                    &best.status,
-                    &best.names,
-                ) {
+                if reusable_walk_status(&best.status)
+                    && let Ok(cache) = database.store_dnssec_cache(
+                        &root,
+                        &zone,
+                        &best.nameserver,
+                        &best.status,
+                        &best.names,
+                    )
+                {
                     best.names = cache.names.into_iter().collect();
                 }
                 best
@@ -355,4 +522,141 @@ pub async fn discover_nsec(
     }
     results.sort_by(|left, right| left.zone.cmp(&right.zone));
     results
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn walk_result(
+        status: &str,
+        names: impl IntoIterator<Item = &'static str>,
+        queries: usize,
+        error: Option<&str>,
+    ) -> DnssecWalkResult {
+        DnssecWalkResult {
+            zone: "example.test".to_owned(),
+            nameserver: "ns1.example.test".to_owned(),
+            status: status.to_owned(),
+            queries,
+            names: names.into_iter().map(str::to_owned).collect(),
+            from_cache: false,
+            error: error.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn cumulative_deadline_always_caps_the_per_zone_deadline() {
+        let now = Instant::now();
+        let zone = now + Duration::from_secs(120);
+        let phase = now + Duration::from_secs(3);
+        assert_eq!(earliest_deadline(zone, Some(phase)), phase);
+        assert_eq!(earliest_deadline(zone, None), zone);
+    }
+
+    #[test]
+    fn expired_deadline_has_no_operation_budget() {
+        let expired = Instant::now() - Duration::from_millis(1);
+        assert_eq!(operation_budget(expired, Duration::from_secs(3)), None);
+    }
+
+    #[tokio::test]
+    async fn rate_limiter_never_waits_past_an_expired_deadline() {
+        let limiter = NsecRateLimiter::default();
+        let expired = Instant::now() - Duration::from_millis(1);
+        assert!(!limiter.wait_before(expired).await);
+    }
+
+    #[tokio::test]
+    async fn nsec_queries_obey_the_shared_dns_engine_rate() {
+        let primary = DnsEngine::new_with_rate(
+            2,
+            Duration::from_secs(1),
+            &["192.0.2.1".parse().unwrap()],
+            2,
+        )
+        .unwrap();
+        let trusted = DnsEngine::new_with_rate(
+            2,
+            Duration::from_secs(1),
+            &["192.0.2.2".parse().unwrap()],
+            100,
+        )
+        .unwrap()
+        .share_rate_limit_with(&primary);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        assert!(trusted.wait_for_rate_slot_before(deadline).await);
+
+        let limiter = NsecRateLimiter::default();
+        let started = Instant::now();
+        assert!(wait_for_nsec_query_slot(&primary, &limiter, deadline).await);
+        assert!(
+            started.elapsed() >= Duration::from_millis(400),
+            "NSEC bypassed the shared two-queries-per-second cadence"
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_dns_rate_wait_stops_at_the_nsec_deadline() {
+        let dns = DnsEngine::new_with_rate(
+            1,
+            Duration::from_secs(1),
+            &["192.0.2.1".parse().unwrap()],
+            1,
+        )
+        .unwrap();
+        let initial_deadline = Instant::now() + Duration::from_secs(1);
+        assert!(dns.wait_for_rate_slot_before(initial_deadline).await);
+
+        let limiter = NsecRateLimiter::default();
+        let short_deadline = Instant::now() + Duration::from_millis(75);
+        assert!(!wait_for_nsec_query_slot(&dns, &limiter, short_deadline).await);
+    }
+
+    #[test]
+    fn only_complete_or_protected_walks_are_reused_from_cache() {
+        let cache = |status: &str| DnssecCacheEntry {
+            nameserver: "ns1.example.test".to_owned(),
+            status: status.to_owned(),
+            names: vec!["api.example.test".to_owned()],
+            updated_at: 99,
+        };
+        for status in ["walked", "nsec3-protected", "nsec-minimal-protected"] {
+            assert!(reusable_fresh_cache(&cache(status), 100, 3_600));
+        }
+        assert!(!reusable_fresh_cache(&cache("partial"), 100, 3_600));
+        assert!(!reusable_fresh_cache(&cache("unsupported"), 100, 3_600));
+        assert!(!reusable_fresh_cache(&cache("walked"), 3_700, 3_600));
+    }
+
+    #[test]
+    fn transient_and_deadline_partials_try_another_nameserver() {
+        let transient = walk_result(
+            "partial",
+            ["api.example.test"],
+            3,
+            Some("timeout pendant NSEC walking"),
+        );
+        let deadline = walk_result(
+            "partial",
+            ["api.example.test"],
+            3,
+            Some("budget de temps NSEC atteint"),
+        );
+        assert!(!stops_nameserver_fallback(&transient, 10));
+        assert!(!stops_nameserver_fallback(&deadline, 10));
+
+        let max_names = walk_result(
+            "partial",
+            ["api.example.test", "mail.example.test"],
+            2,
+            None,
+        );
+        assert!(stops_nameserver_fallback(&max_names, 2));
+        assert!(!reusable_walk_status(&max_names.status));
+
+        let complete = walk_result("walked", ["api.example.test"], 3, None);
+        assert!(stops_nameserver_fallback(&complete, 10));
+        assert!(reusable_walk_status(&complete.status));
+    }
 }

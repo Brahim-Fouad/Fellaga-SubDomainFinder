@@ -415,7 +415,7 @@ jobs:
             dist/fellaga-v${{ needs.gate.outputs.version }}-aarch64-unknown-linux-gnu.cdx.json
 
   publish:
-    name: Sign, attest and publish the closed payload
+    name: Sign, attest, and publish the verified release payload
     needs:
       - gate
       - build
@@ -434,7 +434,7 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: Verify the closed payload and create checksums
+      - name: Verify the release payload and create checksums
         run: |
           set -euo pipefail
           payload=(
