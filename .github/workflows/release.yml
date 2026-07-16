@@ -123,7 +123,7 @@ jobs:
     permissions:
       contents: read
     strategy:
-      fail-fast: true
+      fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
@@ -148,9 +148,10 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            binutils build-essential dpkg-dev file gzip jq perl pkg-config qemu-user-static
+            binutils build-essential cmake dpkg-dev file gzip jq perl pkg-config qemu-user-static
           if [[ "$TARGET" == "aarch64-unknown-linux-gnu" ]]; then
-            sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu
+            sudo apt-get install -y --no-install-recommends \
+              gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libc6-dev-arm64-cross
           fi
 
       - name: Install the pinned Rust target
@@ -164,9 +165,23 @@ jobs:
           {
             echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc"
             echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc"
+            echo "CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++"
             echo "AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar"
             echo "RANLIB_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ranlib"
           } >> "$GITHUB_ENV"
+
+      - name: Verify the ARM64 cross sysroot
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          set -euo pipefail
+          test -f /usr/aarch64-linux-gnu/include/sys/types.h
+          test -f /usr/aarch64-linux-gnu/include/asm/types.h
+          printf '#include <sys/types.h>\n#include <linux/random.h>\nint main(void) { return 0; }\n' | \
+            aarch64-linux-gnu-gcc -x c -o "$RUNNER_TEMP/arm64-sysroot" -
+          aarch64-linux-gnu-readelf -h "$RUNNER_TEMP/arm64-sysroot" | \
+            grep -q 'Machine:.*AArch64'
+          qemu-aarch64-static -L /usr/aarch64-linux-gnu \
+            "$RUNNER_TEMP/arm64-sysroot"
 
       - name: Build the canonical binary
         run: |

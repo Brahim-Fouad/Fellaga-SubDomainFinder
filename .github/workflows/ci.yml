@@ -52,6 +52,74 @@ jobs:
           key: msrv-1.95.0
       - run: cargo check --all-targets --locked
 
+  arm64-release-build:
+    name: ARM64 release build
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    env:
+      TARGET: aarch64-unknown-linux-gnu
+      CARGO_INCREMENTAL: "0"
+      OPENSSL_STATIC: "1"
+      RUSTFLAGS: "-C link-arg=-Wl,--build-id=none"
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # verified master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: ${{ env.TARGET }}
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: arm64-release-vendored-openssl
+      - name: Install the ARM64 cross toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            binutils build-essential cmake file gcc-aarch64-linux-gnu \
+            g++-aarch64-linux-gnu libc6-dev-arm64-cross perl pkg-config qemu-user-static
+      - name: Configure the ARM64 cross compiler
+        run: |
+          {
+            echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc"
+            echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc"
+            echo "CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++"
+            echo "AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar"
+            echo "RANLIB_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ranlib"
+          } >> "$GITHUB_ENV"
+      - name: Verify the ARM64 cross sysroot
+        run: |
+          set -euo pipefail
+          test -f /usr/aarch64-linux-gnu/include/sys/types.h
+          test -f /usr/aarch64-linux-gnu/include/asm/types.h
+          printf '#include <sys/types.h>\n#include <linux/random.h>\nint main(void) { return 0; }\n' | \
+            aarch64-linux-gnu-gcc -x c -o "$RUNNER_TEMP/arm64-sysroot" -
+          aarch64-linux-gnu-readelf -h "$RUNNER_TEMP/arm64-sysroot" | \
+            grep -q 'Machine:.*AArch64'
+          qemu-aarch64-static -L /usr/aarch64-linux-gnu \
+            "$RUNNER_TEMP/arm64-sysroot"
+      - name: Build the canonical ARM64 binary
+        run: |
+          cargo build \
+            --release \
+            --locked \
+            --features vendored-openssl \
+            --target "$TARGET"
+      - name: Validate the ARM64 binary
+        run: |
+          set -euo pipefail
+          binary="target/${TARGET}/release/fellaga"
+          test -x "$binary"
+          file "$binary" | grep -Eq 'aarch64|ARM64'
+          if readelf -d "$binary" | grep -Eq 'NEEDED.*lib(ssl|crypto)\.so'; then
+            echo "OpenSSL is dynamically linked despite vendored-openssl" >&2
+            exit 1
+          fi
+          version="$(sed -n 's/^version = "\([0-9][0-9.]*\)"$/\1/p' Cargo.toml | head -n 1)"
+          test -n "$version"
+          qemu-aarch64-static -L /usr/aarch64-linux-gnu "$binary" --version | \
+            grep -qx "fellaga ${version}"
+
   fuzz-smoke:
     runs-on: ubuntu-latest
     timeout-minutes: 15
