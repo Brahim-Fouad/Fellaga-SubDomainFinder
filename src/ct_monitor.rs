@@ -10,9 +10,12 @@ use serde::Deserialize;
 use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::time::{Duration, Instant};
+use tokio::sync::Semaphore;
 use tokio::time::Instant as TokioInstant;
 
 const CHROME_LOG_LIST: &str = "https://www.gstatic.com/ct/log_list/v3/log_list.json";
+const CT_GLOBAL_REFRESH: Duration = Duration::from_secs(10 * 60);
+static CT_GLOBAL_GATE: Semaphore = Semaphore::const_new(1);
 
 #[derive(Debug, Deserialize)]
 struct LogList {
@@ -57,6 +60,10 @@ fn next_batch_cursor(start: u64, end: u64, processed: usize) -> Result<u64> {
         bail!("le journal CT a retourné {processed} entrées pour une fenêtre de {requested}");
     }
     Ok(start.saturating_add(processed as u64))
+}
+
+fn completed_selected_log_pass(logs_checked: usize, failures: usize) -> bool {
+    logs_checked > 0 && failures == 0
 }
 
 fn select_logs(
@@ -195,7 +202,36 @@ async fn monitor_ct_logs_until(
     initial_backfill: usize,
     deadline: Option<TokioInstant>,
 ) -> Result<CtMonitorResult> {
+    let _global_permit = before_ct_deadline(deadline, async {
+        CT_GLOBAL_GATE
+            .acquire()
+            .await
+            .map_err(|error| anyhow::anyhow!("sémaphore CT fermé: {error}"))
+    })
+    .await?;
     let started = Instant::now();
+    let refresh_key =
+        format!("ct.global.last_refresh.{max_logs}.{entries_per_log}.{initial_backfill}");
+    if database
+        .source_metadata(&refresh_key, CT_GLOBAL_REFRESH)?
+        .is_some()
+    {
+        let names = database
+            .ct_names_for_domain(domain, 100_000)?
+            .into_iter()
+            .filter(|name| is_subdomain(name, domain))
+            .collect::<BTreeSet<_>>();
+        let names = database.store_passive_cache(
+            domain,
+            "ct-direct",
+            &names.into_iter().collect::<Vec<_>>(),
+        )?;
+        return Ok(CtMonitorResult {
+            names: names.into_iter().collect(),
+            duration_ms: started.elapsed().as_millis(),
+            ..CtMonitorResult::default()
+        });
+    }
     let client = reqwest::Client::builder()
         .timeout(timeout)
         .user_agent(concat!(
@@ -331,6 +367,9 @@ async fn monitor_ct_logs_until(
     if let Some(cache) = database.passive_cache(domain, "ct-direct")? {
         result.names = cache.names.into_iter().collect();
     }
+    if completed_selected_log_pass(result.logs_checked, result.failures) {
+        database.store_source_metadata(&refresh_key, &crate::util::now_epoch().to_string())?;
+    }
     result.duration_ms = started.elapsed().as_millis();
     Ok(result)
 }
@@ -344,6 +383,14 @@ mod tests {
         assert!(next_batch_cursor(100, 199, 0).is_err());
         assert_eq!(next_batch_cursor(100, 199, 25).unwrap(), 125);
         assert!(next_batch_cursor(100, 199, 101).is_err());
+    }
+
+    #[test]
+    fn refresh_marker_requires_every_selected_log_to_succeed() {
+        assert!(!completed_selected_log_pass(0, 0));
+        assert!(completed_selected_log_pass(3, 0));
+        assert!(!completed_selected_log_pass(3, 1));
+        assert!(!completed_selected_log_pass(3, 3));
     }
 
     #[test]

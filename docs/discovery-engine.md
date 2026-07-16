@@ -5,7 +5,7 @@ Fellaga separates discovery from validation. A provider response, certificate na
 ## Discovery stages
 
 1. Load permanent local observations and learned candidate priorities.
-2. Query selected passive providers and incrementally read Certificate Transparency data while strict AXFR checks run independently.
+2. Query selected passive providers and run strict AXFR checks while opportunistic direct Certificate Transparency indexing proceeds in the background.
 3. Detect wildcard behavior for the target and relevant child zones.
 4. Persist high-value discovery seeds and active generated candidates in separate SQLite queues, then validate them in interleaved bounded waves.
 5. Inspect the DNS graph and detect walkable NSEC zones.
@@ -15,7 +15,7 @@ Fellaga separates discovery from validation. A provider response, certificate na
 
 The `passive` profile disables stages that directly contact target application services or authoritative servers for enrichment, but passive-provider requests, CT collection, wildcard probes, and DNS validation still use the network.
 
-Initial passive collection, direct CT monitoring, and AXFR are independent futures and run concurrently. Their results are merged only after each bounded phase finishes, so a slow provider does not serialize unrelated CT or zone-transfer work.
+Initial passive collection, direct CT monitoring, and AXFR are independent futures. Direct CT-log indexing is opportunistic and never gates the first DNS-validation wave. A process-wide single-flight gate allows only one raw-log indexer at a time. After a completed global pass, its SQLite refresh marker and indexed names are reused for ten minutes instead of repeating the same log reads for another target. Completed results are merged within the bounded background window, and committed partial progress remains available to later scans. Profile CT budgets are 30 seconds for `deep`, 10 for `balanced`, 30 for `passive`, and 5 for `turbo`. Targeted CT providers such as crt.sh, Cert Spotter, and MerkleMap remain part of the passive connector phase.
 
 ## Persistent candidate scheduler
 
@@ -34,7 +34,7 @@ Active generation is lazy: the one-million-name corpus is traversed with a durab
 
 | Method | Behavior |
 | --- | --- |
-| Passive connectors | Queries a registry of public and credentialed services with per-provider rate limits, bounded responses, retry policy, partial-page retention, and permanent merged observations. |
+| Passive connectors | Queries a registry of 30 public and credentialed services with per-provider rate limits, bounded responses, retry policy, partial-page retention, and permanent merged observations. BinaryEdge, MerkleMap, and Brave use targeted one-page fast paths with at most one provider-signalled follow-up page. |
 | Certificate Transparency | Combines provider results with direct incremental CT-log monitoring and extracts in-scope SAN/CN names. |
 | DNS brute force | Processes an embedded one-million-candidate corpus, user wordlists, mutations, and locally learned patterns in prioritized waves. |
 | Recursive discovery | Tests high-yield labels below validated parents up to the selected profile depth. |
@@ -59,7 +59,7 @@ TLS and Web hostname pinning reuse the same configured DNS engine and shared rat
 
 ## Wildcard detection and cleanup
 
-Fellaga tests five randomized labels per relevant zone. Three or more positive probes classify the zone as wildcard only when they share a stable record value; three or more definitive NXDOMAIN responses with no positive probe classify it as normal. Mixed responses, incomplete evidence, and rotating pools without a stable value remain indeterminate. A stable CNAME remains usable even when its terminal addresses rotate.
+Fellaga first tests three randomized labels per relevant zone. A conclusive stable wildcard signature or three definitive NXDOMAIN responses complete classification immediately. Mixed, incomplete, or rotating first-stage evidence triggers two additional probes; the combined five-probe sample is then evaluated conservatively. Rotating pools without a stable value remain indeterminate. A stable CNAME remains usable even when its terminal addresses rotate.
 
 Wildcard profiles are reused for six hours by default. After that window, Fellaga revalidates the zone, including a SOA query and a new set of randomized probes. Set `--wildcard-refresh-hours 0` to force refresh on every scan.
 
@@ -81,6 +81,8 @@ An AXFR attempt is successful only when the TCP transfer is complete and contain
 
 An empty answer, refusal, timeout, or incomplete transfer is never counted as a successful source of names.
 
+Automatic scans use a four-second timeout per nameserver. A process-wide semaphore permits at most four concurrent AXFR transfers across all active targets, preventing a nameserver set from consuming an unbounded number of TCP connections.
+
 ## Evidence families and confidence
 
 Fellaga maps raw providers to underlying evidence families:
@@ -101,11 +103,11 @@ Multiple CT providers therefore count as one CT family, not several independent 
 Several independent limits prevent an intensive scan from running forever or exhausting the local connection:
 
 - one active target by default;
-- 100 DNS requests per second globally;
+- 250 DNS requests per second globally, with the safeguard shared by validation and enrichment traffic;
 - 128 concurrent host-resolution tasks;
 - profile-specific per-target limits of 600 seconds for `deep`, 300 for `balanced` and `turbo`, and 180 for `passive`;
 - bounded response sizes and per-provider timeouts;
-- a profile-specific passive active-time budget shared across root and recursive passive phases;
+- a profile-specific passive active-time budget shared across root and recursive passive phases: 45/25/60/15 seconds for `deep`/`balanced`/`passive`/`turbo`;
 - a global passive connector semaphore shared by root and child zones;
 - bounded AXFR, CT, NSEC, Web, TLS, graph, PTR, and pipeline work, including one cumulative Web/JavaScript deadline shared across all crawl rounds;
 - adaptive candidate waves that stop after insufficient yield;
@@ -113,7 +115,7 @@ Several independent limits prevent an intensive scan from running forever or exh
 - persistent lazy SQLite-backed seed and active batches so millions of candidates do not need to remain in memory or be inserted before validation begins;
 - a persistent checkpoint every 30 seconds.
 
-The passive budget advances only while passive work is running; time spent waiting for concurrent CT/AXFR completion or later non-passive phases is not charged to it. A connector that times out after returning one or more complete pages contributes those names as a partial result and is reported as degraded. Periodic heartbeats cover passive collection, CT, AXFR, DNS validation, and long enrichment phases. Final scan objects expose phase timings for performance diagnosis.
+The passive budget advances only while passive work is running; CT, AXFR, DNS validation, and later non-passive phases are not charged to it. A connector receives only the remaining phase time, preserving a small handoff margin for the scheduler. A connector that times out after returning one or more complete pages contributes those names as a partial result and is reported as degraded. The source order learns from marginal unique-name yield, reliability, and latency instead of rewarding duplicate-heavy raw response counts. Periodic heartbeats cover passive collection, CT, AXFR, DNS validation, and long enrichment phases. Final scan objects expose phase timings for performance diagnosis.
 
 Scan completion and learning are committed atomically. Prepared SQLite statements are reused for large word and pattern updates, and queue-selection indexes support bounded claims. Queue cleanup runs after the completion transaction on a best-effort basis and leaves the committed scan status unchanged.
 

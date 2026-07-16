@@ -6,6 +6,25 @@ Published releases and downloadable artifacts are available on [GitHub Releases]
 
 ## [Unreleased]
 
+## [0.8.5] - 2026-07-16
+
+### Added
+
+- added credentialed BinaryEdge passive-DNS discovery through `BINARYEDGE_API_KEY`, MerkleMap Certificate Transparency search through `MERKLEMAP_API_TOKEN`, and Brave Web discovery through `BRAVE_SEARCH_API_KEY`;
+- added targeted one-page fast paths for the three new connectors, with at most one follow-up page when the provider reports additional raw results.
+
+### Changed
+
+- run direct incremental CT-log indexing opportunistically in the background so unfinished raw-log work cannot delay the first DNS-validation wave, and reduce its `deep`/`balanced`/`passive`/`turbo` budgets to 30/10/30/5 seconds;
+- serialize raw CT-log indexing through one process-wide single-flight gate and reuse a completed global pass from SQLite for ten minutes, avoiding duplicate work across concurrent or successive target scans;
+- reduce passive-source budgets to 45/25/60/15 seconds for `deep`/`balanced`/`passive`/`turbo`, bound each connector by the remaining phase time, and preserve complete pages from a later failed or timed-out request;
+- rank sources from marginal unique-name yield, reliability, and latency, with metadata-based bootstrap priorities for connectors that do not yet have local history;
+- raise the guarded default DNS rate from 100 to 250 requests per second while retaining one shared limiter across validation and enrichment traffic;
+- use three wildcard probes for conclusive routine classification and spend two additional probes only when the first stage is ambiguous;
+- invalidate older wildcard profiles after tightening mixed and incomplete-sample classification, and keep unprofiled child zones unverified instead of inheriting a normal root result;
+- restrict external HTTP redirects to the same scheme, host, and port so credential headers cannot cross origins; partial pages remain permanent without being marked as a complete fresh cache;
+- default AXFR to four seconds per nameserver and enforce a process-wide limit of four concurrent transfers.
+
 ## [0.8.4] - 2026-07-16
 
 ### Added
@@ -137,7 +156,8 @@ Initial public release of Fellaga.
 - public MIT repository with security policy, contribution guide, third-party notices, and verifiable corpus provenance;
 - verifiable v0.8.0 release with x86-64 and ARM64 GNU/Linux archives, an amd64 Debian package, architecture SBOMs, checksums, a keyless Sigstore signature over the checksum manifest, and GitHub attestations.
 
-[Unreleased]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/compare/v0.8.4...HEAD
+[Unreleased]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/compare/v0.8.5...HEAD
+[0.8.5]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/tag/v0.8.5
 [0.8.4]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/tag/v0.8.4
 [0.8.3]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/tag/v0.8.3
 [0.8.2]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/tag/v0.8.2

@@ -11,7 +11,7 @@ use crate::model::{
     ResolvedHost, ScanResult, ServiceEndpoint, WebObservation,
 };
 use crate::passive::{
-    ApiKeyStore, current_commoncrawl_endpoint, fetch_detailed as fetch_passive,
+    ApiKeyStore, current_commoncrawl_endpoint, fetch_detailed_bounded as fetch_passive_bounded,
     sanitize_external_error, seed_commoncrawl_endpoint, source_metadata, source_policy,
 };
 use crate::pipeline::DiscoveryPipeline;
@@ -25,7 +25,7 @@ use anyhow::{Result, bail};
 use futures_util::{FutureExt, StreamExt, stream, stream::FuturesUnordered};
 use serde_json::json;
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::{
@@ -172,6 +172,7 @@ pub struct ScanOptions {
     pub web_assets_per_host: usize,
 }
 
+#[derive(Clone)]
 pub struct Scanner {
     database: Database,
     dns: DnsEngine,
@@ -323,12 +324,17 @@ async fn wildcard_profile_observed(
     force_probe: bool,
     require_positive_consensus: bool,
 ) -> WildcardProfileObservation {
-    let algorithm_version = if require_positive_consensus { 3 } else { 2 };
+    // Versions 4/5 invalidate signatures produced before the stricter mixed
+    // and incomplete-sample classifier. Consensus remains one level stronger
+    // so a trusted cache can still satisfy the non-consensus path.
+    let algorithm_version = if require_positive_consensus { 5 } else { 4 };
     let cached = database
         .wildcard_cache(zone)
         .ok()
         .flatten()
-        .filter(|cache| cache.algorithm_version >= algorithm_version);
+        .filter(|cache| {
+            wildcard_cache_algorithm_is_current(cache.algorithm_version, algorithm_version)
+        });
     if !force_probe
         && let Some(cache) = &cached
         && cache.expires_at > now_epoch()
@@ -369,6 +375,22 @@ async fn wildcard_profile_observed(
         WildcardProbeOutcome::Indeterminate => {}
     }
     wildcard_profile_after_probe(cached.map(|cache| cache.signature), probe)
+}
+
+fn wildcard_cache_algorithm_is_current(cached_version: i64, required_version: i64) -> bool {
+    cached_version >= required_version
+}
+
+fn unprofiled_deepest_parents(
+    parent_by_host: &HashMap<String, String>,
+    wildcard_by_parent: &BTreeMap<String, BTreeSet<String>>,
+    selected: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    parent_by_host
+        .values()
+        .filter(|parent| !wildcard_by_parent.contains_key(*parent) && !selected.contains(*parent))
+        .cloned()
+        .collect()
 }
 
 const WILDCARD_INDETERMINATE: &str = "FELLAGA:WILDCARD_INDETERMINATE";
@@ -543,11 +565,47 @@ fn seed_candidate_priority(sources: &BTreeSet<String>) -> i64 {
         .saturating_add((sources.len() as i64).saturating_mul(1_000))
 }
 
+fn merge_ct_fallback_names(domain: &str, indexed: Vec<String>, cached: Vec<String>) -> Vec<String> {
+    indexed
+        .into_iter()
+        .chain(cached)
+        .filter_map(|name| normalize_observed_name(&name, domain))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn source_bootstrap_score(source: &str) -> i64 {
+    let metadata = source_metadata(source);
+    let family = match metadata.evidence_family {
+        crate::model::EvidenceFamily::PassiveDns => 650,
+        crate::model::EvidenceFamily::CertificateTransparency => 600,
+        crate::model::EvidenceFamily::WebCrawl => 500,
+        crate::model::EvidenceFamily::Aggregator => 450,
+        crate::model::EvidenceFamily::WebArchive => 350,
+        crate::model::EvidenceFamily::CodeSearch => 300,
+        crate::model::EvidenceFamily::Authoritative | crate::model::EvidenceFamily::LiveDns => 550,
+    };
+    let cost = match metadata.cost {
+        "low" => 200,
+        "medium" => 100,
+        _ => -100,
+    };
+    family + cost + if metadata.experimental { -150 } else { 50 }
+}
+
 fn seed_share(batch_limit: usize, active_candidates_enabled: bool) -> usize {
     if !active_candidates_enabled {
         return batch_limit;
     }
     batch_limit.saturating_mul(3).saturating_div(4).max(1)
+}
+
+fn late_ct_seed_reserve(max_passive: usize, ct_task_pending: bool) -> usize {
+    if !ct_task_pending || max_passive <= 1 {
+        return 0;
+    }
+    max_passive.saturating_div(5).clamp(1, 2_000)
 }
 
 fn phase_deadline(remaining: Option<Duration>) -> Option<tokio::time::Instant> {
@@ -570,11 +628,13 @@ fn active_candidate_work_allowed(remaining: Option<Duration>) -> bool {
 
 fn active_resume_required(
     remaining: Option<Duration>,
+    pending_seed_candidates: usize,
     pending_candidates: usize,
     candidate_feed_remaining: bool,
     recursive_work_remaining: bool,
 ) -> bool {
-    recursive_work_remaining
+    pending_seed_candidates > 0
+        || recursive_work_remaining
         || (active_candidate_budget_exhausted(remaining)
             && (pending_candidates > 0 || candidate_feed_remaining))
 }
@@ -1094,11 +1154,19 @@ impl Scanner {
             .filter(|parent| !wildcard_by_parent.contains_key(parent))
             .take(limit)
             .collect::<Vec<_>>();
+        let selected = parents.iter().cloned().collect::<BTreeSet<_>>();
+        let omitted_deepest =
+            unprofiled_deepest_parents(parent_by_host, wildcard_by_parent, &selected);
         let (signatures, timed_out) = self
             .wildcard_signatures_cached_bounded(parents, deadline)
             .await;
         wildcard_by_parent.extend(signatures);
-        timed_out
+        for parent in &omitted_deepest {
+            wildcard_by_parent
+                .entry(parent.clone())
+                .or_insert_with(indeterminate_wildcard_signature);
+        }
+        timed_out || !omitted_deepest.is_empty()
     }
 
     async fn register_wildcard_parents_with_budget(
@@ -1470,7 +1538,12 @@ impl Scanner {
         let source_scores = self.database.source_scores()?;
         refresh.sort_by_key(|(source, _)| {
             (
-                Reverse(source_scores.get(source).copied().unwrap_or_default()),
+                Reverse(
+                    source_scores
+                        .get(source)
+                        .copied()
+                        .unwrap_or_else(|| source_bootstrap_score(source)),
+                ),
                 source.clone(),
             )
         });
@@ -1499,13 +1572,26 @@ impl Scanner {
                         .acquire_owned()
                         .await
                         .expect("le sémaphore passif reste ouvert pendant le scan");
+                    let policy = source_policy(&source);
+                    let remaining = passive_deadline
+                        .map(|deadline| {
+                            deadline
+                                .saturating_duration_since(tokio::time::Instant::now())
+                                .saturating_sub(Duration::from_millis(250))
+                        })
+                        .unwrap_or(policy.total_timeout)
+                        .min(policy.total_timeout);
+                    if remaining.is_zero() {
+                        return (source, 0, None);
+                    }
                     if let Ok(mut started_sources) = started_sources.lock() {
                         started_sources.insert(source.clone());
                     }
                     let started = Instant::now();
                     let result =
-                        fetch_passive(&source, domain, source_policy(&source).timeout, &keys).await;
-                    (source, started.elapsed().as_millis(), result)
+                        fetch_passive_bounded(&source, domain, policy.timeout, &keys, remaining)
+                            .await;
+                    (source, started.elapsed().as_millis(), Some(result))
                 }
             })
             // Providers use independent host-specific throttles; a slightly
@@ -1565,25 +1651,68 @@ impl Scanner {
             refresh_finished = refresh_finished.saturating_add(1);
             unfinished_sources.remove(&source);
             let stale = stale_fallbacks.remove(&source);
+            let Some(result) = result else {
+                let names = stale.unwrap_or_default();
+                self.emit(ProgressEvent::PassiveSource {
+                    source: source.clone(),
+                    status: "cache périmé, source différée par le budget".to_owned(),
+                    names: names.len(),
+                });
+                for name in names {
+                    sources
+                        .entry(name)
+                        .or_default()
+                        .insert(format!("passive:{source}:stale"));
+                }
+                continue;
+            };
             match result {
                 Ok(fetch) => {
                     let partial_warning = fetch.partial_warning;
                     let names = fetch.names.into_iter().collect::<Vec<_>>();
                     let network_names = names.len();
-                    let names = self.database.store_passive_cache(domain, &source, &names)?;
+                    let previously_known = stale
+                        .as_ref()
+                        .into_iter()
+                        .flatten()
+                        .map(String::as_str)
+                        .collect::<HashSet<_>>();
+                    let novel_names = names
+                        .iter()
+                        .filter(|name| {
+                            !sources.contains_key(*name)
+                                && !previously_known.contains(name.as_str())
+                        })
+                        .count();
+                    let names = if partial_warning.is_some() {
+                        self.database
+                            .store_partial_passive_cache(domain, &source, &names)?
+                    } else {
+                        self.database.store_passive_cache(domain, &source, &names)?
+                    };
                     if source == "commoncrawl"
                         && let Some(endpoint) = current_commoncrawl_endpoint()
                     {
                         self.database
                             .store_source_metadata("commoncrawl.latest_endpoint", &endpoint)?;
                     }
-                    self.database.record_source_result(
+                    self.database.record_source_result_with_counts(
                         &source,
                         network_names,
+                        novel_names,
                         duration_ms,
                         partial_warning.as_deref(),
                     )?;
                     if let Some(partial_warning) = &partial_warning {
+                        if let Some(delay) = external_retry_after_seconds(partial_warning) {
+                            let retry_until = now_epoch()
+                                .saturating_add(delay.min(i64::MAX as u64) as i64)
+                                .to_string();
+                            self.database.store_source_metadata(
+                                &format!("source.retry_until.{source}"),
+                                &retry_until,
+                            )?;
+                        }
                         let warning = format!(
                             "{source}: {partial_warning}; {} nom(s) frais conservé(s)",
                             network_names
@@ -1650,21 +1779,12 @@ impl Scanner {
         }
         drop(results);
         if phase_timed_out {
-            let timeout_ms = self.options.passive_phase_timeout.as_millis();
             let started_sources = started_sources
                 .lock()
                 .map(|sources| sources.clone())
                 .unwrap_or_default();
             for source in unfinished_sources {
                 let started = started_sources.contains(&source);
-                if started {
-                    self.database.record_source_result(
-                        &source,
-                        0,
-                        timeout_ms,
-                        Some("budget passif global dépassé"),
-                    )?;
-                }
                 let names = stale_fallbacks.remove(&source).unwrap_or_default();
                 self.emit(ProgressEvent::PassiveSource {
                     source: source.clone(),
@@ -2649,6 +2769,80 @@ impl Scanner {
         result
     }
 
+    async fn collect_incremental_ct(&self, domain: &str) -> Result<(CtMonitorResult, Vec<String>)> {
+        let mut ct_monitor = CtMonitorResult::default();
+        let mut ct_warnings = Vec::new();
+        if !self.options.ct_monitor {
+            return Ok((ct_monitor, ct_warnings));
+        }
+
+        let phase_started = Instant::now();
+        let phase_budget = if self.options.ct_phase_timeout.is_zero() {
+            "unlimited".to_owned()
+        } else {
+            format!("{} s", self.options.ct_phase_timeout.as_secs())
+        };
+        self.emit(ProgressEvent::Phase {
+            name: "CT incrémental".to_owned(),
+            detail: format!(
+                "indexation opportuniste en arrière-plan: {} journal(aux), {} entrées maximum par journal, budget {phase_budget}",
+                self.options.ct_max_logs, self.options.ct_entries_per_log,
+            ),
+        });
+        match self
+            .await_with_phase_heartbeat(
+                "CT incrémental",
+                "indexation opportuniste; les autres sources continuent en parallèle",
+                monitor_ct_logs_bounded(
+                    &self.database,
+                    domain,
+                    self.options.ct_timeout,
+                    self.options.ct_max_logs,
+                    self.options.ct_entries_per_log,
+                    self.options.ct_initial_backfill,
+                    self.options.ct_phase_timeout,
+                ),
+            )
+            .await
+        {
+            Ok(result) => ct_monitor = result,
+            Err(error) => {
+                let warning = format!("CT incrémental: {error:#}");
+                self.emit(ProgressEvent::Warning(warning.clone()));
+                ct_warnings.push(warning);
+                let indexed = self
+                    .database
+                    .ct_names_for_domain(domain, self.options.max_passive.min(100_000))?;
+                let cached = self
+                    .database
+                    .passive_cache(domain, "ct-direct")?
+                    .map(|cache| cache.names)
+                    .unwrap_or_default();
+                let recovered = merge_ct_fallback_names(domain, indexed, cached);
+                let recovered =
+                    self.database
+                        .store_passive_cache(domain, "ct-direct", &recovered)?;
+                ct_monitor.names = recovered.into_iter().collect();
+            }
+        }
+        if !self.options.ct_phase_timeout.is_zero()
+            && phase_started.elapsed() >= self.options.ct_phase_timeout
+        {
+            let warning =
+                "CT incrémental: budget cumulé atteint; résultats partiels conservés".to_owned();
+            self.emit(ProgressEvent::Warning(warning.clone()));
+            ct_warnings.push(warning);
+        }
+        self.emit(ProgressEvent::CtMonitor {
+            logs: ct_monitor.logs_checked,
+            entries: ct_monitor.entries_processed,
+            failures: ct_monitor.failures,
+            names: ct_monitor.names.len(),
+            duration_ms: ct_monitor.duration_ms,
+        });
+        Ok((ct_monitor, ct_warnings))
+    }
+
     async fn scan_inner(&self, scan_id: i64, domain: &str, started: Instant) -> Result<ScanResult> {
         let mut warnings = Vec::new();
         let mut pipeline_metrics = PipelineMetrics::default();
@@ -2721,68 +2915,13 @@ impl Scanner {
             ))
         };
 
-        let ct_phase = async {
-            let mut ct_monitor = CtMonitorResult::default();
-            let mut ct_warnings = Vec::new();
-            if self.options.ct_monitor {
-                let phase_started = Instant::now();
-                let phase_budget = if self.options.ct_phase_timeout.is_zero() {
-                    "unlimited".to_owned()
-                } else {
-                    format!("{} s", self.options.ct_phase_timeout.as_secs())
-                };
-                self.emit(ProgressEvent::Phase {
-                    name: "CT incrémental".to_owned(),
-                    detail: format!(
-                        "{} journal(aux), {} entrées maximum par journal, budget {phase_budget}",
-                        self.options.ct_max_logs, self.options.ct_entries_per_log,
-                    ),
-                });
-                match self
-                    .await_with_phase_heartbeat(
-                        "CT incrémental",
-                        "lecture bornée des journaux publics",
-                        monitor_ct_logs_bounded(
-                            &self.database,
-                            domain,
-                            self.options.ct_timeout,
-                            self.options.ct_max_logs,
-                            self.options.ct_entries_per_log,
-                            self.options.ct_initial_backfill,
-                            self.options.ct_phase_timeout,
-                        ),
-                    )
-                    .await
-                {
-                    Ok(result) => ct_monitor = result,
-                    Err(error) => {
-                        let warning = format!("CT incrémental: {error:#}");
-                        self.emit(ProgressEvent::Warning(warning.clone()));
-                        ct_warnings.push(warning);
-                        if let Some(cache) = self.database.passive_cache(domain, "ct-direct")? {
-                            ct_monitor.names = cache.names.into_iter().collect();
-                        }
-                    }
-                }
-                if !self.options.ct_phase_timeout.is_zero()
-                    && phase_started.elapsed() >= self.options.ct_phase_timeout
-                {
-                    let warning =
-                        "CT incrémental: budget cumulé atteint; résultats partiels conservés"
-                            .to_owned();
-                    self.emit(ProgressEvent::Warning(warning.clone()));
-                    ct_warnings.push(warning);
-                }
-                self.emit(ProgressEvent::CtMonitor {
-                    logs: ct_monitor.logs_checked,
-                    entries: ct_monitor.entries_processed,
-                    failures: ct_monitor.failures,
-                    names: ct_monitor.names.len(),
-                    duration_ms: ct_monitor.duration_ms,
-                });
-            }
-            Ok::<_, anyhow::Error>((ct_monitor, ct_warnings))
-        };
+        let ct_task_started = Instant::now();
+        let mut ct_tasks = tokio::task::JoinSet::new();
+        if !resume_from_discovery_checkpoint && self.options.ct_monitor {
+            let scanner = self.clone();
+            let ct_domain = domain.to_owned();
+            ct_tasks.spawn(async move { scanner.collect_incremental_ct(&ct_domain).await });
+        }
 
         let axfr_phase = async {
             if !self.options.axfr {
@@ -2813,13 +2952,10 @@ impl Scanner {
             passive_warnings,
             mut passive_zones_queried,
             passive_elapsed,
-            ct_monitor,
-            ct_warnings,
             axfr_attempts,
             axfr_warnings,
         ) = if resume_from_discovery_checkpoint {
             drop(passive_phase);
-            drop(ct_phase);
             drop(axfr_phase);
             self.emit(ProgressEvent::Phase {
                 name: "reprise".to_owned(),
@@ -2841,27 +2977,68 @@ impl Scanner {
                 Vec::new(),
                 restored_zones,
                 Duration::ZERO,
-                CtMonitorResult::default(),
-                Vec::new(),
                 Vec::new(),
                 Vec::new(),
             )
         } else {
-            let (passive_result, ct_result, (axfr_attempts, axfr_warnings)) =
-                tokio::join!(passive_phase, ct_phase, axfr_phase);
+            let (passive_result, (axfr_attempts, axfr_warnings)) =
+                tokio::join!(passive_phase, axfr_phase);
             let (passive_sources, passive_warnings, passive_zones_queried, passive_elapsed) =
                 passive_result?;
-            let (ct_monitor, ct_warnings) = ct_result?;
             (
                 passive_sources,
                 passive_warnings,
                 passive_zones_queried,
                 passive_elapsed,
-                ct_monitor,
-                ct_warnings,
                 axfr_attempts,
                 axfr_warnings,
             )
+        };
+
+        let mut ct_task_pending = false;
+        let (mut ct_monitor, ct_warnings) = if resume_from_discovery_checkpoint
+            || !self.options.ct_monitor
+        {
+            (CtMonitorResult::default(), Vec::new())
+        } else {
+            match ct_tasks.try_join_next() {
+                Some(Ok(Ok(result))) => result,
+                Some(Ok(Err(error))) => {
+                    let warning = format!("CT incrémental: {error:#}");
+                    self.emit(ProgressEvent::Warning(warning.clone()));
+                    (CtMonitorResult::default(), vec![warning])
+                }
+                Some(Err(error)) => {
+                    let warning = format!("CT incrémental: tâche interrompue: {error}");
+                    self.emit(ProgressEvent::Warning(warning.clone()));
+                    (CtMonitorResult::default(), vec![warning])
+                }
+                None => {
+                    ct_task_pending = true;
+                    let recovered = self
+                        .database
+                        .ct_names_for_domain(domain, self.options.max_passive.min(100_000))?
+                        .into_iter()
+                        .filter(|name| normalize_observed_name(name, domain).is_some())
+                        .collect::<Vec<_>>();
+                    let recovered =
+                        self.database
+                            .store_passive_cache(domain, "ct-direct", &recovered)?;
+                    let result = CtMonitorResult {
+                        names: recovered.into_iter().collect(),
+                        duration_ms: initial_discovery_started.elapsed().as_millis(),
+                        ..CtMonitorResult::default()
+                    };
+                    self.emit(ProgressEvent::Phase {
+                        name: "CT incrémental".to_owned(),
+                        detail: format!(
+                            "continue pendant la validation DNS; {} nom(s) ciblé(s) déjà indexé(s) disponibles immédiatement",
+                            result.names.len()
+                        ),
+                    });
+                    (result, Vec::new())
+                }
+            }
         };
         if self.options.passive {
             consume_phase_budget(&mut passive_budget_remaining, passive_elapsed);
@@ -2911,11 +3088,13 @@ impl Scanner {
             })
             .collect::<Vec<_>>();
         seed_payload.sort_by_key(|(fqdn, _, priority)| (Reverse(*priority), fqdn.clone()));
-        self.database.persist_scan_seed_candidates(
-            scan_id,
-            &seed_payload,
-            self.options.max_passive,
-        )?;
+        // CT runs opportunistically beside DNS. Keep a small bounded slice of
+        // the durable seed queue available until that task joins, then refill
+        // any unused capacity with the already ranked initial discoveries.
+        let late_ct_reserve = late_ct_seed_reserve(self.options.max_passive, ct_task_pending);
+        let initial_seed_limit = self.options.max_passive.saturating_sub(late_ct_reserve);
+        self.database
+            .persist_scan_seed_candidates(scan_id, &seed_payload, initial_seed_limit)?;
         let resumed_live_answers = if self.options.resume.is_some() {
             self.database.live_scan_answers(scan_id)?
         } else {
@@ -2936,8 +3115,6 @@ impl Scanner {
         let mut resume_candidate_queue_draining = self.options.resume.is_some()
             && self.database.pending_scan_candidate_count(scan_id)?.max(0) as usize > 0;
         let mut conservative_candidate_retries = BTreeSet::<String>::new();
-        let discovered_seed_count =
-            self.database.scan_seed_candidate_count(scan_id)?.max(0) as usize;
         let first_batch_limit = if self.options.adaptive { 500 } else { 5_000 };
         let first_seed_limit = seed_share(first_batch_limit, !self.options.passive_only);
         let first_seed_candidates = self
@@ -3817,6 +3994,221 @@ impl Scanner {
             );
             discard_failed_candidate_origins(&wave_candidates, domain, &answers, &mut sources);
             wave_number += 1;
+        }
+
+        if ct_task_pending {
+            let joined_ct = match ct_tasks.try_join_next() {
+                ready @ Some(_) => ready,
+                None => {
+                    let minimum_runtime = if self.options.ct_phase_timeout.is_zero() {
+                        Duration::from_secs(3)
+                    } else {
+                        self.options.ct_phase_timeout.min(Duration::from_secs(3))
+                    };
+                    let grace = minimum_runtime.saturating_sub(ct_task_started.elapsed());
+                    if grace.is_zero() {
+                        None
+                    } else {
+                        self.emit(ProgressEvent::Phase {
+                            name: "CT incrémental".to_owned(),
+                            detail: format!(
+                                "courte fenêtre finale bornée à {:.1}s; DNS déjà terminé",
+                                grace.as_secs_f64()
+                            ),
+                        });
+                        tokio::time::timeout(grace, ct_tasks.join_next())
+                            .await
+                            .ok()
+                            .flatten()
+                    }
+                }
+            };
+            let mut late_ct = match joined_ct {
+                Some(Ok(Ok((result, late_warnings)))) => {
+                    warnings.extend(late_warnings);
+                    result
+                }
+                Some(Ok(Err(error))) => {
+                    let warning = format!("CT incrémental: {error:#}");
+                    self.emit(ProgressEvent::Warning(warning.clone()));
+                    warnings.push(warning);
+                    CtMonitorResult::default()
+                }
+                Some(Err(error)) => {
+                    let warning = format!("CT incrémental: tâche interrompue: {error}");
+                    self.emit(ProgressEvent::Warning(warning.clone()));
+                    warnings.push(warning);
+                    CtMonitorResult::default()
+                }
+                None => {
+                    ct_tasks.abort_all();
+                    while ct_tasks.join_next().await.is_some() {}
+                    let recovered = self
+                        .database
+                        .ct_names_for_domain(domain, self.options.max_passive.min(100_000))?
+                        .into_iter()
+                        .filter(|name| normalize_observed_name(name, domain).is_some())
+                        .collect::<Vec<_>>();
+                    let recovered =
+                        self.database
+                            .store_passive_cache(domain, "ct-direct", &recovered)?;
+                    let result = CtMonitorResult {
+                        names: recovered.into_iter().collect(),
+                        duration_ms: ct_task_started.elapsed().as_millis(),
+                        ..CtMonitorResult::default()
+                    };
+                    self.emit(ProgressEvent::Phase {
+                        name: "CT incrémental".to_owned(),
+                        detail: format!(
+                            "arrêt opportuniste après la phase DNS; {} nom(s) ciblé(s) indexé(s) conservé(s)",
+                            result.names.len()
+                        ),
+                    });
+                    self.emit(ProgressEvent::CtMonitor {
+                        logs: result.logs_checked,
+                        entries: result.entries_processed,
+                        failures: result.failures,
+                        names: result.names.len(),
+                        duration_ms: result.duration_ms,
+                    });
+                    result
+                }
+            };
+            late_ct.names.extend(ct_monitor.names.iter().cloned());
+            ct_monitor = late_ct;
+
+            // Prefer the indexed recency order, then append any names that
+            // were recovered only from the per-domain cache. The final stable
+            // priority sort still promotes names corroborated by other
+            // evidence families before the bounded validation slice.
+            let mut late_names = self
+                .database
+                .ct_names_for_domain(domain, self.options.max_passive.min(100_000))?
+                .into_iter()
+                .filter(|name| normalize_observed_name(name, domain).is_some())
+                .collect::<Vec<_>>();
+            let mut late_seen = late_names.iter().cloned().collect::<BTreeSet<_>>();
+            for name in &ct_monitor.names {
+                if late_names.len() >= self.options.max_passive {
+                    break;
+                }
+                if normalize_observed_name(name, domain).is_some() && late_seen.insert(name.clone())
+                {
+                    late_names.push(name.clone());
+                }
+            }
+            for name in &late_names {
+                sources
+                    .entry(name.clone())
+                    .or_default()
+                    .insert("passive:ct-direct".to_owned());
+            }
+            let mut late_payload = late_names
+                .iter()
+                .filter_map(|name| {
+                    sources.get(name).map(|origins| {
+                        (
+                            name.clone(),
+                            origins.clone(),
+                            seed_candidate_priority(origins),
+                        )
+                    })
+                })
+                .collect::<Vec<_>>();
+            late_payload.sort_by_key(|(fqdn, _, priority)| (Reverse(*priority), fqdn.clone()));
+            self.database.persist_scan_seed_candidates(
+                scan_id,
+                &late_payload,
+                self.options.max_passive,
+            )?;
+
+            // If CT yielded fewer names than the reserve, fill the remaining
+            // slots with the initial discoveries that were deliberately held
+            // back. Existing rows are merged, so this also preserves CT
+            // provenance for names already validated through another source.
+            let mut refill_payload = sources
+                .iter()
+                .map(|(fqdn, origins)| {
+                    (
+                        fqdn.clone(),
+                        origins.clone(),
+                        seed_candidate_priority(origins),
+                    )
+                })
+                .collect::<Vec<_>>();
+            refill_payload.sort_by_key(|(fqdn, _, priority)| (Reverse(*priority), fqdn.clone()));
+            self.database.persist_scan_seed_candidates(
+                scan_id,
+                &refill_payload,
+                self.options.max_passive,
+            )?;
+
+            let accepted_seeds = self
+                .database
+                .scan_seed_candidates_for_output(scan_id)?
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect::<BTreeSet<_>>();
+            let validation_hosts = late_payload
+                .iter()
+                .map(|(name, _, _)| name.clone())
+                .filter(|name| accepted_seeds.contains(name))
+                .filter(|name| !answers.contains_key(name))
+                .take(2_000)
+                .collect::<Vec<_>>();
+            if !validation_hosts.is_empty() {
+                let late_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                let parent_timed_out = self
+                    .register_wildcard_parents_bounded(
+                        &validation_hosts,
+                        domain,
+                        &mut parent_by_host,
+                        &mut wildcard_by_parent,
+                        20,
+                        Some(late_deadline),
+                    )
+                    .await;
+                let late_resolution = self
+                    .resolve_batch_with_deadline(
+                        scan_id,
+                        domain,
+                        &validation_hosts,
+                        "DNS CT tardif",
+                        &started,
+                        &sources,
+                        &root_wildcard,
+                        &parent_by_host,
+                        &wildcard_by_parent,
+                        Some(late_deadline),
+                        BatchDnsMode::Conservative,
+                    )
+                    .await?;
+                let not_started = late_resolution
+                    .not_started_hosts
+                    .iter()
+                    .cloned()
+                    .collect::<BTreeSet<_>>();
+                let terminal = validation_hosts
+                    .iter()
+                    .filter(|name| !not_started.contains(*name))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                self.database
+                    .mark_scan_seed_candidates_done(scan_id, &terminal)?;
+                cache_hits += late_resolution.cache_hits;
+                network_resolved += late_resolution.resolved_from_network;
+                for answer in late_resolution.answers {
+                    answers.insert(answer.fqdn.clone(), answer);
+                }
+                if parent_timed_out || late_resolution.deadline_exhausted {
+                    let warning = format!(
+                        "CT incrémental: validation tardive bornée à 5s; {} nom(s) non démarré(s) restent non vérifiés",
+                        late_resolution.not_started_hosts.len()
+                    );
+                    self.emit(ProgressEvent::Warning(warning.clone()));
+                    warnings.push(warning);
+                }
+            }
         }
         phase_timings.push(PhaseTiming {
             phase: "candidate_dns".to_owned(),
@@ -4940,6 +5332,10 @@ impl Scanner {
             duration_ms: enrichment_started.elapsed().as_millis(),
         });
         let finalization_started = Instant::now();
+        let pending_seed_candidates = self
+            .database
+            .pending_scan_seed_candidate_count(scan_id)?
+            .max(0) as usize;
         let pending_active_candidates =
             self.database.pending_scan_candidate_count(scan_id)?.max(0) as usize;
         let recursive_work_remaining = self.database.scan_recursive_has_more(scan_id)?;
@@ -4947,13 +5343,14 @@ impl Scanner {
             !candidate_expansion_stopped_naturally && self.candidate_feeds_have_more(scan_id)?;
         let active_resume_required = active_resume_required(
             active_budget_remaining,
+            pending_seed_candidates,
             pending_active_candidates,
             candidate_feed_remaining,
             recursive_work_remaining,
         );
         if active_resume_required {
             let warning = format!(
-                "budget DNS actif atteint; {pending_active_candidates} candidat(s) en file et travail restant conservés pour --resume latest"
+                "travail DNS borné; {pending_seed_candidates} nom(s) passif(s) et {pending_active_candidates} candidat(s) actif(s) restent conservés pour --resume latest"
             );
             if !warnings.contains(&warning) {
                 self.emit(ProgressEvent::Warning(warning.clone()));
@@ -5103,6 +5500,8 @@ impl Scanner {
         self.database
             .store_pipeline_metrics(scan_id, &pipeline_metrics)?;
         let duration_before_learning_ms = started.elapsed().as_millis();
+        let discovered_seed_count =
+            self.database.scan_seed_candidate_count(scan_id)?.max(0) as usize;
         let candidate_count = discovered_seed_count.saturating_add(durable_candidate_attempts);
         if active_resume_required {
             self.database.pause_scan(
@@ -5992,11 +6391,13 @@ mod tests {
         cache_requires_revalidation, candidate_refill_capacity, candidate_uses_active_budget,
         candidate_uses_discovery_fast_path, capped_phase_deadline, collect_dns_outcomes_until,
         consume_phase_budget, external_pause_status, external_retry_after_seconds,
-        persist_routed_dns_outcomes, record_bounded_parent_candidate,
-        refresh_allows_wildcard_purge, refresh_parent_selection_is_complete,
-        refresh_wildcard_observation_is_reliable, refresh_wildcard_profile_is_reliable,
-        route_dns_outcomes, should_expand_adaptive_wave, should_retry_otx_after_key_added,
-        wildcard_profile_after_probe, wildcard_profile_observed,
+        late_ct_seed_reserve, merge_ct_fallback_names, persist_routed_dns_outcomes,
+        record_bounded_parent_candidate, refresh_allows_wildcard_purge,
+        refresh_parent_selection_is_complete, refresh_wildcard_observation_is_reliable,
+        refresh_wildcard_profile_is_reliable, route_dns_outcomes, should_expand_adaptive_wave,
+        should_retry_otx_after_key_added, source_bootstrap_score, unprofiled_deepest_parents,
+        wildcard_cache_algorithm_is_current, wildcard_profile_after_probe,
+        wildcard_profile_observed,
     };
     use crate::candidate::CandidateProposal;
     use crate::db::Database;
@@ -6009,6 +6410,55 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn ct_error_fallback_merges_indexed_and_cached_names_in_scope() {
+        assert_eq!(
+            merge_ct_fallback_names(
+                "example.com",
+                vec![
+                    "api.example.com".to_owned(),
+                    "shared.example.com".to_owned(),
+                    "outside.test".to_owned(),
+                ],
+                vec![
+                    "cached.example.com".to_owned(),
+                    "SHARED.EXAMPLE.COM.".to_owned(),
+                ],
+            ),
+            vec![
+                "api.example.com".to_owned(),
+                "cached.example.com".to_owned(),
+                "shared.example.com".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn late_ct_reserve_is_bounded_and_old_wildcard_caches_are_rejected() {
+        assert_eq!(late_ct_seed_reserve(10_000, true), 2_000);
+        assert_eq!(late_ct_seed_reserve(100, true), 20);
+        assert_eq!(late_ct_seed_reserve(100, false), 0);
+        assert!(!wildcard_cache_algorithm_is_current(3, 5));
+        assert!(wildcard_cache_algorithm_is_current(5, 5));
+    }
+
+    #[test]
+    fn omitted_child_wildcard_parents_are_marked_indeterminate() {
+        let parent_by_host = HashMap::from([
+            (
+                "a.prod.example.com".to_owned(),
+                "prod.example.com".to_owned(),
+            ),
+            ("b.dev.example.com".to_owned(), "dev.example.com".to_owned()),
+        ]);
+        let profiled = BTreeMap::new();
+        let selected = BTreeSet::from(["prod.example.com".to_owned()]);
+        assert_eq!(
+            unprofiled_deepest_parents(&parent_by_host, &profiled, &selected),
+            BTreeSet::from(["dev.example.com".to_owned()])
+        );
+    }
 
     #[test]
     fn verification_max_age_requeues_stale_permanent_cache_entries() {
@@ -6068,6 +6518,12 @@ mod tests {
         assert_eq!(candidate_refill_capacity(1_200, 1_200, 1_500, 10_000), 300);
         assert_eq!(candidate_refill_capacity(500, 500, 500, 10_000), 0);
         assert_eq!(candidate_refill_capacity(0, 10_000, 5_000, 10_000), 0);
+    }
+
+    #[test]
+    fn unseen_targeted_sources_start_ahead_of_expensive_archives() {
+        assert!(source_bootstrap_score("securitytrails") > source_bootstrap_score("wayback"));
+        assert!(source_bootstrap_score("merklemap") > source_bootstrap_score("commoncrawl"));
     }
 
     #[test]
@@ -6143,16 +6599,25 @@ mod tests {
         assert!(!active_resume_required(
             Some(Duration::ZERO),
             0,
+            0,
             false,
             false,
         ));
-        assert!(active_resume_required(Some(Duration::ZERO), 0, false, true,));
         assert!(active_resume_required(
             Some(Duration::ZERO),
+            0,
+            0,
+            false,
+            true,
+        ));
+        assert!(active_resume_required(
+            Some(Duration::ZERO),
+            0,
             1,
             false,
             false,
         ));
+        assert!(active_resume_required(None, 1, 0, false, false,));
     }
 
     #[test]
