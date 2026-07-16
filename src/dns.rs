@@ -211,6 +211,84 @@ enum RecordLookupOutcome {
     Indeterminate,
 }
 
+fn merge_record_lookup_outcomes(
+    first: RecordLookupOutcome,
+    second: RecordLookupOutcome,
+) -> RecordLookupOutcome {
+    match (first, second) {
+        (RecordLookupOutcome::Positive(mut records), RecordLookupOutcome::Positive(more)) => {
+            records.extend(more);
+            records.sort_by(|left, right| {
+                (&left.record_type, &left.value).cmp(&(&right.record_type, &right.value))
+            });
+            records.dedup_by(|left, right| {
+                left.record_type == right.record_type && left.value == right.value
+            });
+            RecordLookupOutcome::Positive(records)
+        }
+        (RecordLookupOutcome::Positive(records), _)
+        | (_, RecordLookupOutcome::Positive(records)) => RecordLookupOutcome::Positive(records),
+        (RecordLookupOutcome::Negative, RecordLookupOutcome::Negative) => {
+            RecordLookupOutcome::Negative
+        }
+        _ => RecordLookupOutcome::Indeterminate,
+    }
+}
+
+/// Poll both address families together. A validated positive establishes that
+/// the owner is live, so the other family can be cancelled immediately. A
+/// negative remains deliberately strict and is returned only after both
+/// families independently report NXDOMAIN.
+async fn first_positive_or_both<A, Aaaa>(a: A, aaaa: Aaaa) -> RecordLookupOutcome
+where
+    A: std::future::Future<Output = RecordLookupOutcome>,
+    Aaaa: std::future::Future<Output = RecordLookupOutcome>,
+{
+    tokio::pin!(a);
+    tokio::pin!(aaaa);
+    tokio::select! {
+        a = &mut a => {
+            if matches!(&a, RecordLookupOutcome::Positive(_)) {
+                a
+            } else {
+                merge_record_lookup_outcomes(a, aaaa.await)
+            }
+        }
+        aaaa = &mut aaaa => {
+            if matches!(&aaaa, RecordLookupOutcome::Positive(_)) {
+                aaaa
+            } else {
+                merge_record_lookup_outcomes(a.await, aaaa)
+            }
+        }
+    }
+}
+
+async fn first_true_or_both<A, B>(first: A, second: B) -> bool
+where
+    A: std::future::Future<Output = bool>,
+    B: std::future::Future<Output = bool>,
+{
+    tokio::pin!(first);
+    tokio::pin!(second);
+    tokio::select! {
+        confirmed = &mut first => {
+            if confirmed {
+                true
+            } else {
+                second.await
+            }
+        }
+        confirmed = &mut second => {
+            if confirmed {
+                true
+            } else {
+                first.await
+            }
+        }
+    }
+}
+
 fn positive_consensus(fqdn: &str, positives: Vec<Vec<DnsRecord>>) -> DnsResolutionOutcome {
     let resolver_count = positives.len().min(u16::MAX as usize) as u16;
     let mut records = positives.into_iter().flatten().collect::<Vec<_>>();
@@ -230,6 +308,14 @@ fn positive_consensus(fqdn: &str, positives: Vec<Vec<DnsRecord>>) -> DnsResoluti
         authoritative_validation: false,
         resolver_count,
     })
+}
+
+fn positive_quorum(resolver_count: usize) -> usize {
+    match resolver_count {
+        0 | 1 => 1,
+        2 | 3 => 2,
+        count => count / 2 + 1,
+    }
 }
 
 async fn collect_consensus_results<S>(
@@ -269,47 +355,15 @@ where
     }
 }
 
-fn classify_host_lookups(
-    fqdn: &str,
-    a: RecordLookupOutcome,
-    aaaa: RecordLookupOutcome,
-) -> DnsResolutionOutcome {
-    let both_negative = matches!(&a, RecordLookupOutcome::Negative)
-        && matches!(&aaaa, RecordLookupOutcome::Negative);
-    let mut records = match a {
-        RecordLookupOutcome::Positive(records) => records,
-        RecordLookupOutcome::Negative | RecordLookupOutcome::Indeterminate => Vec::new(),
-    };
-    if let RecordLookupOutcome::Positive(aaaa) = aaaa {
-        records.extend(aaaa);
-    }
-    records.sort_by(|left, right| {
-        (&left.record_type, &left.value).cmp(&(&right.record_type, &right.value))
-    });
-    records
-        .dedup_by(|left, right| left.record_type == right.record_type && left.value == right.value);
-    if records.is_empty() {
-        if both_negative {
-            DnsResolutionOutcome::Negative {
-                fqdn: fqdn.to_owned(),
-            }
-        } else {
-            DnsResolutionOutcome::Indeterminate {
-                fqdn: fqdn.to_owned(),
-            }
-        }
-    } else {
-        DnsResolutionOutcome::Positive(ResolvedHost {
+fn classify_host_lookup(fqdn: &str, outcome: RecordLookupOutcome) -> DnsResolutionOutcome {
+    match outcome {
+        RecordLookupOutcome::Positive(records) => positive_consensus(fqdn, vec![records]),
+        RecordLookupOutcome::Negative => DnsResolutionOutcome::Negative {
             fqdn: fqdn.to_owned(),
-            records,
-            from_cache: false,
-            last_verified_at: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .ok()
-                .map(|duration| duration.as_secs().min(i64::MAX as u64) as i64),
-            authoritative_validation: false,
-            resolver_count: 1,
-        })
+        },
+        RecordLookupOutcome::Indeterminate => DnsResolutionOutcome::Indeterminate {
+            fqdn: fqdn.to_owned(),
+        },
     }
 }
 
@@ -338,11 +392,16 @@ fn classify_wildcard_samples(
     negatives: usize,
 ) -> WildcardProbeOutcome {
     if non_empty.len() >= 3 {
-        let mut signature = BTreeSet::new();
-        for sample in non_empty {
-            signature.extend(sample);
+        let mut samples = non_empty.into_iter();
+        let mut signature = samples.next().unwrap_or_default();
+        for sample in samples {
+            signature.retain(|record| sample.contains(record));
         }
-        WildcardProbeOutcome::Wildcard(signature)
+        if signature.is_empty() {
+            WildcardProbeOutcome::Indeterminate
+        } else {
+            WildcardProbeOutcome::Wildcard(signature)
+        }
     } else if non_empty.is_empty() && negatives >= 3 {
         WildcardProbeOutcome::Normal
     } else {
@@ -350,8 +409,90 @@ fn classify_wildcard_samples(
     }
 }
 
+fn normalized_dns_name(value: &str) -> String {
+    value.trim_end_matches('.').to_ascii_lowercase()
+}
+
+/// Keep only records reachable from the original question owner. DNS answer
+/// sections may contain a CNAME chain, but unrelated records must never turn a
+/// candidate into a positive result. The reachability pass is independent from
+/// answer ordering and also handles multi-hop and cyclic CNAME responses.
+fn records_for_query(
+    answers: &[Record],
+    query_name: &Name,
+    record_type: RecordType,
+) -> Vec<DnsRecord> {
+    let mut reachable = BTreeSet::from([normalized_dns_name(&query_name.to_utf8())]);
+    loop {
+        let mut changed = false;
+        for record in answers {
+            if record.record_type() != RecordType::CNAME
+                || !reachable.contains(&normalized_dns_name(&record.name().to_utf8()))
+            {
+                continue;
+            }
+            changed |= reachable.insert(normalized_dns_name(&record.data().to_string()));
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    answers
+        .iter()
+        .filter(|record| {
+            reachable.contains(&normalized_dns_name(&record.name().to_utf8()))
+                && (record.record_type() == record_type
+                    || record.record_type() == RecordType::CNAME)
+        })
+        .map(|record| DnsRecord {
+            record_type: record.record_type().to_string(),
+            value: record.data().to_string().trim_end_matches('.').to_owned(),
+            ttl: record.ttl(),
+        })
+        .collect()
+}
+
+fn response_records(response: &Message, record_type: RecordType) -> Vec<DnsRecord> {
+    response
+        .queries()
+        .first()
+        .map(|query| records_for_query(response.answers(), query.name(), record_type))
+        .unwrap_or_default()
+}
+
 fn is_definitive_nxdomain(response: &Message) -> bool {
-    !response.truncated() && response.response_code() == ResponseCode::NXDomain
+    !response.truncated()
+        && response.response_code() == ResponseCode::NXDomain
+        && response.answers().is_empty()
+}
+
+fn classify_address_response(
+    response: Result<Message>,
+    record_type: RecordType,
+) -> RecordLookupOutcome {
+    let Ok(response) = response else {
+        return RecordLookupOutcome::Indeterminate;
+    };
+    if response.truncated() {
+        return RecordLookupOutcome::Indeterminate;
+    }
+    let records = response_records(&response, record_type);
+    if !records.is_empty() {
+        RecordLookupOutcome::Positive(records)
+    } else if is_definitive_nxdomain(&response) {
+        RecordLookupOutcome::Negative
+    } else {
+        RecordLookupOutcome::Indeterminate
+    }
+}
+
+fn authoritative_response_confirms(response: Result<Message>, record_type: RecordType) -> bool {
+    response.is_ok_and(|response| {
+        response.authoritative()
+            && !response.truncated()
+            && !response_records(&response, record_type).is_empty()
+    })
 }
 
 #[derive(Clone)]
@@ -649,6 +790,26 @@ struct ResolverNode {
     resolver: Arc<TokioResolver>,
     state: Mutex<ResolverState>,
     inflight: AtomicUsize,
+}
+
+/// Keeps resolver load accounting correct when a query future is cancelled by
+/// a scan deadline. Without a drop guard, cancellation between `fetch_add` and
+/// the matching `fetch_sub` would permanently inflate the resolver score.
+struct ResolverInflightGuard<'a> {
+    inflight: &'a AtomicUsize,
+}
+
+impl<'a> ResolverInflightGuard<'a> {
+    fn new(inflight: &'a AtomicUsize) -> Self {
+        inflight.fetch_add(1, Ordering::Relaxed);
+        Self { inflight }
+    }
+}
+
+impl Drop for ResolverInflightGuard<'_> {
+    fn drop(&mut self) {
+        self.inflight.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 #[derive(Debug, Default)]
@@ -994,8 +1155,11 @@ impl DnsEngine {
                     }
                 }
                 let hijacks_nxdomain = nxdomain.as_ref().is_ok_and(|response| {
-                    response.response_code() == ResponseCode::NoError
-                        && !response.answers().is_empty()
+                    !response.answers().is_empty()
+                        && matches!(
+                            response.response_code(),
+                            ResponseCode::NoError | ResponseCode::NXDomain
+                        )
                 });
                 let nxdomain_ok = nxdomain.as_ref().is_ok_and(is_definitive_nxdomain);
                 let dnssec_records = dnssec.as_ref().is_ok_and(|response| {
@@ -1053,69 +1217,28 @@ impl DnsEngine {
     }
 
     pub async fn resolve_host_consensus_classified(&self, fqdn: &str) -> DnsResolutionOutcome {
-        let required = if self.fast_resolvers.len() >= 2 { 2 } else { 1 };
+        let required = positive_quorum(self.fast_resolvers.len());
         let results = stream::iter(self.fast_resolvers.iter())
             .map(|resolver| async move {
                 let query_a = async {
                     self.wait_for_rate_slot().await;
-                    resolver
-                        .query(fqdn, RecordType::A, true, self.timeout)
-                        .await
+                    classify_address_response(
+                        resolver
+                            .query(fqdn, RecordType::A, true, self.timeout)
+                            .await,
+                        RecordType::A,
+                    )
                 };
                 let query_aaaa = async {
                     self.wait_for_rate_slot().await;
-                    resolver
-                        .query(fqdn, RecordType::AAAA, true, self.timeout)
-                        .await
+                    classify_address_response(
+                        resolver
+                            .query(fqdn, RecordType::AAAA, true, self.timeout)
+                            .await,
+                        RecordType::AAAA,
+                    )
                 };
-                let (a, aaaa) = tokio::join!(query_a, query_aaaa);
-                let mut records = Vec::new();
-                let mut definitive_negative = 0_usize;
-                for response in [a, aaaa] {
-                    let Ok(response) = response else {
-                        continue;
-                    };
-                    if response.truncated() {
-                        continue;
-                    }
-                    match response.response_code() {
-                        ResponseCode::NXDomain => definitive_negative += 1,
-                        ResponseCode::NoError => {
-                            let before = records.len();
-                            records.extend(
-                                response
-                                    .answers()
-                                    .iter()
-                                    .filter(|record| {
-                                        matches!(
-                                            record.record_type(),
-                                            RecordType::A | RecordType::AAAA | RecordType::CNAME
-                                        )
-                                    })
-                                    .map(|record| DnsRecord {
-                                        record_type: record.record_type().to_string(),
-                                        value: record
-                                            .data()
-                                            .to_string()
-                                            .trim_end_matches('.')
-                                            .to_owned(),
-                                        ttl: record.ttl(),
-                                    }),
-                            );
-                            if records.len() == before {
-                                definitive_negative += 1;
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                if !records.is_empty() {
-                    RecordLookupOutcome::Positive(records)
-                } else if definitive_negative == 2 {
-                    RecordLookupOutcome::Negative
-                } else {
-                    RecordLookupOutcome::Indeterminate
-                }
+                first_positive_or_both(query_a, query_aaaa).await
             })
             .buffer_unordered(self.fast_resolvers.len().max(1));
         // Each UDP/TCP/Hickory operation has its own network timeout. Do not
@@ -1165,41 +1288,27 @@ impl DnsEngine {
                     .ok()
             })
             .collect::<Vec<_>>();
-        let expected_owner = fqdn.trim_end_matches('.').to_ascii_lowercase();
         let mut results = stream::iter(resolvers)
-            .map(|resolver| {
-                let expected_owner = expected_owner.clone();
-                async move {
-                    let a = async {
-                        self.wait_for_rate_slot().await;
+            .map(|resolver| async move {
+                let a = async {
+                    self.wait_for_rate_slot().await;
+                    authoritative_response_confirms(
                         resolver
                             .query(fqdn, RecordType::A, false, self.timeout)
-                            .await
-                    };
-                    let aaaa = async {
-                        self.wait_for_rate_slot().await;
+                            .await,
+                        RecordType::A,
+                    )
+                };
+                let aaaa = async {
+                    self.wait_for_rate_slot().await;
+                    authoritative_response_confirms(
                         resolver
                             .query(fqdn, RecordType::AAAA, false, self.timeout)
-                            .await
-                    };
-                    let (a, aaaa) = tokio::join!(a, aaaa);
-                    [a.ok(), aaaa.ok()].into_iter().flatten().any(|response| {
-                        response.authoritative()
-                            && !response.truncated()
-                            && response.response_code() == ResponseCode::NoError
-                            && response.answers().iter().any(|record| {
-                                record
-                                    .name()
-                                    .to_utf8()
-                                    .trim_end_matches('.')
-                                    .eq_ignore_ascii_case(&expected_owner)
-                                    && matches!(
-                                        record.record_type(),
-                                        RecordType::A | RecordType::AAAA | RecordType::CNAME
-                                    )
-                            })
-                    })
-                }
+                            .await,
+                        RecordType::AAAA,
+                    )
+                };
+                first_true_or_both(a, aaaa).await
             })
             .buffer_unordered(4);
         while let Some(confirmed) = results.next().await {
@@ -1296,6 +1405,59 @@ impl DnsEngine {
             .collect()
     }
 
+    async fn resolver_reports_strict_nxdomain(&self, index: usize, fqdn: &str) -> bool {
+        let (Some(resolver), Some(node)) =
+            (self.fast_resolvers.get(index), self.resolvers.get(index))
+        else {
+            return false;
+        };
+        self.wait_for_rate_slot().await;
+        let _inflight = ResolverInflightGuard::new(&node.inflight);
+        let started = Instant::now();
+        let response = resolver
+            .query(fqdn, RecordType::A, true, self.timeout)
+            .await;
+        let strict = response.as_ref().is_ok_and(is_definitive_nxdomain);
+        let operational = response.as_ref().is_ok_and(|response| {
+            !response.truncated()
+                && matches!(
+                    response.response_code(),
+                    ResponseCode::NoError | ResponseCode::NXDomain
+                )
+        });
+        if let Ok(mut state) = node.state.lock() {
+            state.requests += 1;
+            state.total_ms = state
+                .total_ms
+                .saturating_add(started.elapsed().as_millis().min(u64::MAX as u128) as u64);
+            if operational {
+                state.successes += 1;
+                state.consecutive_failures = 0;
+            } else {
+                state.failures += 1;
+                state.consecutive_failures += 1;
+            }
+        }
+        strict
+    }
+
+    async fn discovery_nxdomain_quorum(&self, fqdn: &str) -> bool {
+        let order = self
+            .resolver_order()
+            .into_iter()
+            .filter(|index| *index < self.fast_resolvers.len())
+            .take(2)
+            .collect::<Vec<_>>();
+        let [first, second] = order.as_slice() else {
+            return false;
+        };
+        let (first_negative, second_negative) = tokio::join!(
+            self.resolver_reports_strict_nxdomain(*first, fqdn),
+            self.resolver_reports_strict_nxdomain(*second, fqdn),
+        );
+        first_negative && second_negative
+    }
+
     async fn lookup_records_classified(
         &self,
         fqdn: &str,
@@ -1306,12 +1468,22 @@ impl DnsEngine {
             .into_iter()
             .take(2)
             .collect::<Vec<_>>();
+        self.lookup_records_classified_in_order(fqdn, record_type, &order)
+            .await
+    }
+
+    async fn lookup_records_classified_in_order(
+        &self,
+        fqdn: &str,
+        record_type: RecordType,
+        order: &[usize],
+    ) -> RecordLookupOutcome {
         let required_negatives = order.len().clamp(1, 2);
         let mut definitive_negatives = 0_usize;
-        for index in order {
+        for index in order.iter().copied() {
             self.wait_for_rate_slot().await;
             let node = &self.resolvers[index];
-            node.inflight.fetch_add(1, Ordering::Relaxed);
+            let _inflight = ResolverInflightGuard::new(&node.inflight);
             let started = Instant::now();
             let fast_response = if matches!(record_type, RecordType::A | RecordType::AAAA) {
                 if let Some(resolver) = self.fast_resolvers.get(index) {
@@ -1329,29 +1501,17 @@ impl DnsEngine {
                 if response.truncated() {
                     return None;
                 }
-                match response.response_code() {
-                    ResponseCode::NoError => {
-                        let records = response
-                            .answers()
-                            .iter()
-                            .filter(|record| {
-                                record.record_type() == record_type
-                                    || record.record_type() == RecordType::CNAME
-                            })
-                            .map(|record| DnsRecord {
-                                record_type: record.record_type().to_string(),
-                                value: record.data().to_string().trim_end_matches('.').to_owned(),
-                                ttl: record.ttl(),
-                            })
-                            .collect::<Vec<_>>();
-                        Some(if records.is_empty() {
-                            RecordLookupOutcome::Negative
-                        } else {
-                            RecordLookupOutcome::Positive(records)
-                        })
-                    }
-                    ResponseCode::NXDomain => Some(RecordLookupOutcome::Negative),
-                    _ => None,
+                let records = response_records(response, record_type);
+                if !records.is_empty() {
+                    Some(RecordLookupOutcome::Positive(records))
+                } else if is_definitive_nxdomain(response) {
+                    Some(RecordLookupOutcome::Negative)
+                } else {
+                    // NODATA proves only that this RR type is absent, not that
+                    // the owner is absent. SERVFAIL/REFUSED/lame responses are
+                    // likewise indeterminate. Retrying the same endpoint via
+                    // Hickory would only duplicate traffic and latency.
+                    Some(RecordLookupOutcome::Indeterminate)
                 }
             });
             let fast_timed_out = matches!(
@@ -1367,7 +1527,6 @@ impl DnsEngine {
             } else {
                 None
             };
-            node.inflight.fetch_sub(1, Ordering::Relaxed);
             let duration_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
             let classified = if let Some(result) = fast_result {
                 result
@@ -1379,29 +1538,22 @@ impl DnsEngine {
             } else {
                 match result.expect("le résultat hickory existe sans résultat UDP") {
                     Ok(lookup) => {
-                        let records = lookup
-                            .answers()
-                            .iter()
-                            .filter_map(|record| {
-                                let data = record.data();
-                                (record.record_type() == record_type
-                                    || record.record_type() == RecordType::CNAME)
-                                    .then(|| DnsRecord {
-                                        record_type: record.record_type().to_string(),
-                                        value: data.to_string().trim_end_matches('.').to_owned(),
-                                        ttl: record.ttl(),
-                                    })
+                        let records = Name::from_str(&format!("{}.", fqdn.trim_end_matches('.')))
+                            .ok()
+                            .map(|query_name| {
+                                records_for_query(lookup.answers(), &query_name, record_type)
                             })
-                            .collect::<Vec<_>>();
+                            .unwrap_or_default();
                         if records.is_empty() {
-                            RecordLookupOutcome::Negative
+                            // An empty successful Hickory lookup is NODATA. It
+                            // must never demote a retained owner as NXDOMAIN.
+                            RecordLookupOutcome::Indeterminate
                         } else {
                             RecordLookupOutcome::Positive(records)
                         }
                     }
-                    Err(error) if error.is_no_records_found() || error.is_nx_domain() => {
-                        RecordLookupOutcome::Negative
-                    }
+                    Err(error) if error.is_nx_domain() => RecordLookupOutcome::Negative,
+                    Err(error) if error.is_no_records_found() => RecordLookupOutcome::Indeterminate,
                     Err(_) => RecordLookupOutcome::Indeterminate,
                 }
             };
@@ -1516,15 +1668,55 @@ impl DnsEngine {
             .await
     }
 
-    pub async fn resolve_host_classified(&self, fqdn: &str) -> DnsResolutionOutcome {
+    async fn resolve_host_classified_with_policy(
+        &self,
+        fqdn: &str,
+        allow_discovery_fast_negative: bool,
+    ) -> DnsResolutionOutcome {
+        // A strict NXDOMAIN from two independent resolvers proves that the
+        // owner does not exist and lets the discovery path skip AAAA. Any
+        // disagreement, NODATA, CNAME, timeout, or malformed response falls
+        // back to the full conservative A+AAAA path.
+        if allow_discovery_fast_negative && self.discovery_nxdomain_quorum(fqdn).await {
+            return DnsResolutionOutcome::Negative {
+                fqdn: fqdn.to_owned(),
+            };
+        }
         // The individual resolver operations are bounded by `self.timeout`.
         // The queue imposed by `--dns-rate-limit` is intentionally excluded:
         // callers retain cancellation through their phase/global deadline.
-        let (a, aaaa) = tokio::join!(
-            self.lookup_records_classified(fqdn, RecordType::A),
-            self.lookup_records_classified(fqdn, RecordType::AAAA),
-        );
-        classify_host_lookups(fqdn, a, aaaa)
+        // Freeze one resolver order for both address families so the
+        // conservative fallback evaluates one stable resolver quorum.
+        let order = self
+            .resolver_order()
+            .into_iter()
+            .take(2)
+            .collect::<Vec<_>>();
+        let outcome = first_positive_or_both(
+            self.lookup_records_classified_in_order(fqdn, RecordType::A, &order),
+            self.lookup_records_classified_in_order(fqdn, RecordType::AAAA, &order),
+        )
+        .await;
+        classify_host_lookup(fqdn, outcome)
+    }
+
+    /// Conservative host resolution for retained state, wildcard probes,
+    /// enrichment, refresh, and final validation. A negative requires the full
+    /// configured discovery quorum; this method never uses the fast-negative
+    /// shortcut.
+    pub async fn resolve_host_classified(&self, fqdn: &str) -> DnsResolutionOutcome {
+        self.resolve_host_classified_with_policy(fqdn, false).await
+    }
+
+    /// Fast classification for fresh enumeration candidates only. Callers must
+    /// not use its negative outcome to demote or purge a retained/live name.
+    /// Positive and indeterminate outcomes preserve the standard validation
+    /// pipeline; only a qualified, discovery-only negative may short-circuit.
+    pub(crate) async fn resolve_host_discovery_classified(
+        &self,
+        fqdn: &str,
+    ) -> DnsResolutionOutcome {
+        self.resolve_host_classified_with_policy(fqdn, true).await
     }
 
     pub async fn resolve_host(&self, fqdn: &str) -> Option<ResolvedHost> {
@@ -1565,7 +1757,20 @@ impl DnsEngine {
     pub async fn resolve_many_classified_with_progress<F>(
         &self,
         hosts: Vec<String>,
+        on_completed: F,
+    ) -> Vec<DnsResolutionOutcome>
+    where
+        F: FnMut(&DnsResolutionOutcome),
+    {
+        self.resolve_many_classified_with_progress_policy(hosts, on_completed, false)
+            .await
+    }
+
+    async fn resolve_many_classified_with_progress_policy<F>(
+        &self,
+        hosts: Vec<String>,
         mut on_completed: F,
+        discovery_fast_negative: bool,
     ) -> Vec<DnsResolutionOutcome>
     where
         F: FnMut(&DnsResolutionOutcome),
@@ -1574,7 +1779,11 @@ impl DnsEngine {
         let mut pending = stream::iter(hosts)
             .map(move |host| {
                 let engine = engine.clone();
-                async move { engine.resolve_host_classified(&host).await }
+                async move {
+                    engine
+                        .resolve_host_classified_with_policy(&host, discovery_fast_negative)
+                        .await
+                }
             })
             .buffer_unordered(self.concurrency);
         let mut outcomes = Vec::new();
@@ -1586,7 +1795,11 @@ impl DnsEngine {
         outcomes
     }
 
-    pub async fn wildcard_probe(&self, domain: &str) -> WildcardProbeOutcome {
+    async fn wildcard_probe_with_policy(
+        &self,
+        domain: &str,
+        require_positive_consensus: bool,
+    ) -> WildcardProbeOutcome {
         let seed = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -1595,7 +1808,11 @@ impl DnsEngine {
             .map(|_| async move {
                 let counter = PROBE_COUNTER.fetch_add(1, Ordering::Relaxed);
                 let host = format!("fellaga-{seed:x}-{counter:x}.{domain}");
-                self.resolve_host_classified(&host).await
+                if require_positive_consensus {
+                    self.resolve_host_consensus_classified(&host).await
+                } else {
+                    self.resolve_host_classified(&host).await
+                }
             })
             .buffer_unordered(5);
         let mut non_empty = Vec::new();
@@ -1610,6 +1827,14 @@ impl DnsEngine {
         classify_wildcard_samples(non_empty, negatives)
     }
 
+    pub async fn wildcard_probe(&self, domain: &str) -> WildcardProbeOutcome {
+        self.wildcard_probe_with_policy(domain, false).await
+    }
+
+    pub async fn wildcard_probe_consensus(&self, domain: &str) -> WildcardProbeOutcome {
+        self.wildcard_probe_with_policy(domain, true).await
+    }
+
     pub async fn wildcard_signature(&self, domain: &str) -> BTreeSet<String> {
         match self.wildcard_probe(domain).await {
             WildcardProbeOutcome::Wildcard(signature) => signature,
@@ -1618,11 +1843,19 @@ impl DnsEngine {
     }
 
     pub fn matches_wildcard(answer: &ResolvedHost, signature: &BTreeSet<String>) -> bool {
-        !signature.is_empty()
-            && !answer.records.is_empty()
-            && answer.records.iter().all(|record| {
-                signature.contains(&format!("{}:{}", record.record_type, record.value))
-            })
+        if signature.is_empty() || answer.records.is_empty() {
+            return false;
+        }
+        let answer_signature = answer.signature();
+        signature.is_subset(&answer_signature)
+    }
+
+    /// Exact matches may be quarantined after current trusted consensus.
+    /// Superset answers remain ambiguous in output but can contain legitimate
+    /// records in addition to the stable wildcard signature, so they are never
+    /// cleanup candidates.
+    pub fn exactly_matches_wildcard(answer: &ResolvedHost, signature: &BTreeSet<String>) -> bool {
+        !signature.is_empty() && !answer.records.is_empty() && answer.signature() == *signature
     }
 
     async fn load_authoritative_servers(&self, domain: &str) -> Result<AuthoritativeServers> {
@@ -1670,7 +1903,17 @@ impl DnsEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hickory_net::proto::rr::rdata::A;
+    use hickory_net::proto::rr::rdata::{A, CNAME};
+
+    #[test]
+    fn resolver_inflight_guard_releases_load_when_a_future_is_cancelled() {
+        let inflight = AtomicUsize::new(0);
+        {
+            let _guard = ResolverInflightGuard::new(&inflight);
+            assert_eq!(inflight.load(Ordering::Relaxed), 1);
+        }
+        assert_eq!(inflight.load(Ordering::Relaxed), 0);
+    }
 
     fn positive_records(value: &str) -> Vec<DnsRecord> {
         vec![DnsRecord {
@@ -1678,6 +1921,131 @@ mod tests {
             value: value.to_owned(),
             ttl: 60,
         }]
+    }
+
+    #[test]
+    fn response_records_follow_only_the_question_cname_chain() {
+        let query_name = Name::from_str("api.example.test.").unwrap();
+        let alias_name = Name::from_str("edge.example.test.").unwrap();
+        let final_name = Name::from_str("origin.example.test.").unwrap();
+        let unrelated_name = Name::from_str("poison.example.test.").unwrap();
+        let mut response = Message::new(7, MessageType::Response, OpCode::Query);
+        response
+            .set_response_code(ResponseCode::NoError)
+            .add_query(Query::query(query_name.clone(), RecordType::A))
+            // Put the terminal address before the CNAME records to verify that
+            // chain validation does not depend on answer ordering.
+            .add_answer(Record::from_rdata(
+                final_name.clone(),
+                60,
+                RData::A(A("192.0.2.20".parse().unwrap())),
+            ))
+            .add_answer(Record::from_rdata(
+                unrelated_name.clone(),
+                60,
+                RData::A(A("192.0.2.250".parse().unwrap())),
+            ))
+            .add_answer(Record::from_rdata(
+                alias_name.clone(),
+                60,
+                RData::CNAME(CNAME(final_name)),
+            ))
+            .add_answer(Record::from_rdata(
+                query_name,
+                60,
+                RData::CNAME(CNAME(alias_name)),
+            ))
+            .add_answer(Record::from_rdata(
+                unrelated_name,
+                60,
+                RData::CNAME(CNAME(Name::from_str("elsewhere.example.test.").unwrap())),
+            ));
+
+        let records = response_records(&response, RecordType::A);
+        let signatures = records
+            .iter()
+            .map(|record| format!("{}:{}", record.record_type, record.value))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            signatures,
+            BTreeSet::from([
+                "A:192.0.2.20".to_owned(),
+                "CNAME:edge.example.test".to_owned(),
+                "CNAME:origin.example.test".to_owned(),
+            ])
+        );
+        assert!(!records.iter().any(|record| {
+            record.value == "192.0.2.250" || record.value == "elsewhere.example.test"
+        }));
+    }
+
+    #[tokio::test]
+    async fn positive_consensus_uses_a_majority_above_three_resolvers() {
+        assert_eq!(positive_quorum(0), 1);
+        assert_eq!(positive_quorum(1), 1);
+        assert_eq!(positive_quorum(2), 2);
+        assert_eq!(positive_quorum(3), 2);
+        assert_eq!(positive_quorum(4), 3);
+        assert_eq!(positive_quorum(5), 3);
+        assert_eq!(positive_quorum(6), 4);
+
+        let minority = collect_consensus_results(
+            "minority.example.test",
+            positive_quorum(4),
+            stream::iter([
+                RecordLookupOutcome::Positive(positive_records("192.0.2.10")),
+                RecordLookupOutcome::Positive(positive_records("192.0.2.10")),
+                RecordLookupOutcome::Negative,
+                RecordLookupOutcome::Negative,
+            ]),
+        )
+        .await;
+        assert!(matches!(
+            minority,
+            DnsResolutionOutcome::Indeterminate { .. }
+        ));
+
+        let majority = collect_consensus_results(
+            "majority.example.test",
+            positive_quorum(5),
+            stream::iter([
+                RecordLookupOutcome::Positive(positive_records("192.0.2.10")),
+                RecordLookupOutcome::Positive(positive_records("192.0.2.11")),
+                RecordLookupOutcome::Positive(positive_records("192.0.2.12")),
+                RecordLookupOutcome::Negative,
+                RecordLookupOutcome::Negative,
+            ]),
+        )
+        .await;
+        let DnsResolutionOutcome::Positive(answer) = majority else {
+            panic!("a strict majority of positive resolvers was not accepted");
+        };
+        assert_eq!(answer.resolver_count, 3);
+    }
+
+    #[tokio::test]
+    async fn authoritative_family_confirmation_cancels_a_silent_sibling() {
+        let confirmed = tokio::time::timeout(
+            Duration::from_millis(100),
+            first_true_or_both(async { true }, async {
+                std::future::pending::<bool>().await
+            }),
+        )
+        .await
+        .expect("authoritative confirmation waited for an irrelevant silent family");
+        assert!(confirmed);
+    }
+
+    #[tokio::test]
+    async fn one_family_nxdomain_never_shortcuts_a_silent_sibling() {
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(50),
+            first_positive_or_both(async { RecordLookupOutcome::Negative }, async {
+                std::future::pending::<RecordLookupOutcome>().await
+            }),
+        )
+        .await;
+        assert!(outcome.is_err());
     }
 
     async fn nxdomain_resolver() -> (SocketAddr, tokio::task::JoinHandle<()>) {
@@ -1741,6 +2109,243 @@ mod tests {
             state: Mutex::new(ResolverState::default()),
             inflight: AtomicUsize::new(0),
         }
+    }
+
+    fn discovery_test_engine(addresses: &[SocketAddr], timeout: Duration) -> DnsEngine {
+        DnsEngine {
+            resolvers: Arc::new(
+                addresses
+                    .iter()
+                    .copied()
+                    .map(|address| resolver_node_at(address, timeout))
+                    .collect(),
+            ),
+            fast_resolvers: Arc::new(
+                addresses
+                    .iter()
+                    .copied()
+                    .map(|address| FastResolver {
+                        address,
+                        transport: OnceCell::new(),
+                    })
+                    .collect(),
+            ),
+            concurrency: 8,
+            timeout,
+            rate_limit: 0,
+            next_query_at: Arc::new(tokio::sync::Mutex::new(Instant::now())),
+            selection_counter: Arc::new(AtomicU64::new(0)),
+            authoritative_resolvers: Arc::new(Mutex::new(HashMap::new())),
+            authoritative_server_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        }
+    }
+
+    fn hickory_only_test_engine(address: SocketAddr, timeout: Duration) -> DnsEngine {
+        DnsEngine {
+            resolvers: Arc::new(vec![resolver_node_at(address, timeout)]),
+            fast_resolvers: Arc::new(Vec::new()),
+            concurrency: 8,
+            timeout,
+            rate_limit: 0,
+            next_query_at: Arc::new(tokio::sync::Mutex::new(Instant::now())),
+            selection_counter: Arc::new(AtomicU64::new(0)),
+            authoritative_resolvers: Arc::new(Mutex::new(HashMap::new())),
+            authoritative_server_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        }
+    }
+
+    async fn counting_nxdomain_resolver()
+    -> (SocketAddr, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = server.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let request_count = requests.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                let mut buffer = [0_u8; 2_048];
+                let Ok((length, peer)) = server.recv_from(&mut buffer).await else {
+                    break;
+                };
+                request_count.fetch_add(1, Ordering::SeqCst);
+                let mut message = Message::from_vec(&buffer[..length]).unwrap();
+                message
+                    .set_message_type(MessageType::Response)
+                    .set_response_code(ResponseCode::NXDomain);
+                server
+                    .send_to(&message.to_vec().unwrap(), peer)
+                    .await
+                    .unwrap();
+            }
+        });
+        (address, requests, task)
+    }
+
+    async fn target_positive_a_resolver(
+        target: &str,
+        value: &str,
+    ) -> (SocketAddr, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = server.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let request_count = requests.clone();
+        let target = format!("{}.", target.trim_end_matches('.'));
+        let value = value.parse().unwrap();
+        let task = tokio::spawn(async move {
+            loop {
+                let mut buffer = [0_u8; 2_048];
+                let Ok((length, peer)) = server.recv_from(&mut buffer).await else {
+                    break;
+                };
+                request_count.fetch_add(1, Ordering::SeqCst);
+                let mut message = Message::from_vec(&buffer[..length]).unwrap();
+                let question = &message.queries()[0];
+                let positive = question.name().to_utf8().eq_ignore_ascii_case(&target)
+                    && question.query_type() == RecordType::A;
+                message
+                    .set_message_type(MessageType::Response)
+                    .set_response_code(if positive {
+                        ResponseCode::NoError
+                    } else {
+                        ResponseCode::NXDomain
+                    });
+                if positive {
+                    message.add_answer(Record::from_rdata(
+                        message.queries()[0].name().clone(),
+                        60,
+                        RData::A(A(value)),
+                    ));
+                }
+                server
+                    .send_to(&message.to_vec().unwrap(), peer)
+                    .await
+                    .unwrap();
+            }
+        });
+        (address, requests, task)
+    }
+
+    async fn target_positive_a_silent_aaaa_resolver(
+        target: &str,
+        value: &str,
+    ) -> (SocketAddr, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = server.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let request_count = requests.clone();
+        let target = format!("{}.", target.trim_end_matches('.'));
+        let value = value.parse().unwrap();
+        let task = tokio::spawn(async move {
+            loop {
+                let mut buffer = [0_u8; 2_048];
+                let Ok((length, peer)) = server.recv_from(&mut buffer).await else {
+                    break;
+                };
+                request_count.fetch_add(1, Ordering::SeqCst);
+                let mut message = Message::from_vec(&buffer[..length]).unwrap();
+                let question = &message.queries()[0];
+                let target_query = question.name().to_utf8().eq_ignore_ascii_case(&target);
+                if target_query && question.query_type() == RecordType::AAAA {
+                    continue;
+                }
+                let positive = target_query && question.query_type() == RecordType::A;
+                message
+                    .set_message_type(MessageType::Response)
+                    .set_response_code(if positive {
+                        ResponseCode::NoError
+                    } else {
+                        ResponseCode::NXDomain
+                    });
+                if positive {
+                    message.add_answer(Record::from_rdata(
+                        message.queries()[0].name().clone(),
+                        60,
+                        RData::A(A(value)),
+                    ));
+                }
+                server
+                    .send_to(&message.to_vec().unwrap(), peer)
+                    .await
+                    .unwrap();
+            }
+        });
+        (address, requests, task)
+    }
+
+    async fn target_nodata_resolver(
+        target: &str,
+    ) -> (SocketAddr, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = server.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let request_count = requests.clone();
+        let target = format!("{}.", target.trim_end_matches('.'));
+        let task = tokio::spawn(async move {
+            loop {
+                let mut buffer = [0_u8; 2_048];
+                let Ok((length, peer)) = server.recv_from(&mut buffer).await else {
+                    break;
+                };
+                request_count.fetch_add(1, Ordering::SeqCst);
+                let mut message = Message::from_vec(&buffer[..length]).unwrap();
+                let target_query = message.queries()[0]
+                    .name()
+                    .to_utf8()
+                    .eq_ignore_ascii_case(&target);
+                message
+                    .set_message_type(MessageType::Response)
+                    .set_response_code(if target_query {
+                        ResponseCode::NoError
+                    } else {
+                        ResponseCode::NXDomain
+                    });
+                message.metadata.recursion_available = true;
+                server
+                    .send_to(&message.to_vec().unwrap(), peer)
+                    .await
+                    .unwrap();
+            }
+        });
+        (address, requests, task)
+    }
+
+    async fn cname_nxdomain_resolver(
+        target: &str,
+    ) -> (SocketAddr, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = server.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let request_count = requests.clone();
+        let target = format!("{}.", target.trim_end_matches('.'));
+        let cname = Name::from_str("missing-target.example.test.").unwrap();
+        let task = tokio::spawn(async move {
+            loop {
+                let mut buffer = [0_u8; 2_048];
+                let Ok((length, peer)) = server.recv_from(&mut buffer).await else {
+                    break;
+                };
+                request_count.fetch_add(1, Ordering::SeqCst);
+                let mut message = Message::from_vec(&buffer[..length]).unwrap();
+                let target_query = message.queries()[0]
+                    .name()
+                    .to_utf8()
+                    .eq_ignore_ascii_case(&target);
+                message
+                    .set_message_type(MessageType::Response)
+                    .set_response_code(ResponseCode::NXDomain);
+                if target_query {
+                    message.add_answer(Record::from_rdata(
+                        message.queries()[0].name().clone(),
+                        60,
+                        RData::CNAME(CNAME(cname.clone())),
+                    ));
+                }
+                server
+                    .send_to(&message.to_vec().unwrap(), peer)
+                    .await
+                    .unwrap();
+            }
+        });
+        (address, requests, task)
     }
 
     #[tokio::test]
@@ -1813,7 +2418,12 @@ mod tests {
         let server_task = tokio::spawn(async move {
             for _ in 0..2 {
                 let mut buffer = [0_u8; 2_048];
-                let (length, peer) = server.recv_from(&mut buffer).await.unwrap();
+                let Ok(Ok((length, peer))) =
+                    tokio::time::timeout(Duration::from_millis(500), server.recv_from(&mut buffer))
+                        .await
+                else {
+                    break;
+                };
                 let mut response = Message::from_vec(&buffer[..length]).unwrap();
                 response
                     .set_message_type(MessageType::Response)
@@ -1831,12 +2441,13 @@ mod tests {
                     .unwrap();
             }
         });
-        // The A and AAAA lookups need two 200 ms rate slots. Their network
-        // timeout is intentionally much shorter: an outer 3x timeout would
-        // expire in the queue before the second packet could be sent.
+        // Pre-consume one 200 ms rate slot so host resolution must wait in the
+        // intentional queue. Its network timeout is much shorter and must not
+        // begin until a packet is actually sent.
         let engine =
             DnsEngine::new_with_socket_addresses(8, Duration::from_millis(20), &[address], 5)
                 .unwrap();
+        engine.wait_for_rate_slot().await;
         let outcome = tokio::time::timeout(
             Duration::from_secs(2),
             engine.resolve_host_classified("rate-limited.example.test"),
@@ -2066,6 +2677,321 @@ mod tests {
         assert!(started.elapsed() < Duration::from_millis(800));
     }
 
+    #[tokio::test]
+    async fn positive_a_cancels_a_silent_aaaa_before_the_network_timeout() {
+        let target = "ipv4-only.example.test";
+        let (address, _, server_task) =
+            target_positive_a_silent_aaaa_resolver(target, "192.0.2.70").await;
+        let network_timeout = Duration::from_secs(3);
+        let completion_limit = Duration::from_millis(750);
+
+        let mut consensus = consensus_test_engine(vec![address]);
+        consensus.timeout = network_timeout;
+        let started = Instant::now();
+        let consensus_outcome = tokio::time::timeout(
+            completion_limit,
+            consensus.resolve_host_consensus_classified(target),
+        )
+        .await
+        .expect("a validated A answer waited for the silent AAAA timeout");
+        let DnsResolutionOutcome::Positive(answer) = consensus_outcome else {
+            panic!("the consensus path discarded a validated A answer");
+        };
+        assert_eq!(answer.records, positive_records("192.0.2.70"));
+        assert!(started.elapsed() < completion_limit);
+
+        let conservative = discovery_test_engine(&[address], network_timeout);
+        let started = Instant::now();
+        let conservative_outcome = tokio::time::timeout(
+            completion_limit,
+            conservative.resolve_host_classified(target),
+        )
+        .await
+        .expect("the conservative path waited for the silent AAAA timeout");
+        let DnsResolutionOutcome::Positive(answer) = conservative_outcome else {
+            panic!("the conservative path discarded a validated A answer");
+        };
+        assert_eq!(answer.records, positive_records("192.0.2.70"));
+        assert!(started.elapsed() < completion_limit);
+
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn discovery_negative_requires_two_independent_nxdomain_resolvers() {
+        let (primary, primary_requests, primary_task) = counting_nxdomain_resolver().await;
+        let (secondary, secondary_requests, secondary_task) = counting_nxdomain_resolver().await;
+        let engine = discovery_test_engine(&[primary, secondary], Duration::from_millis(100));
+
+        let first = engine
+            .resolve_host_discovery_classified("first-missing.example.test")
+            .await;
+        assert!(matches!(first, DnsResolutionOutcome::Negative { .. }));
+        assert_eq!(primary_requests.load(Ordering::SeqCst), 1);
+        assert_eq!(secondary_requests.load(Ordering::SeqCst), 1);
+
+        let second = engine
+            .resolve_host_discovery_classified("second-missing.example.test")
+            .await;
+        assert!(matches!(second, DnsResolutionOutcome::Negative { .. }));
+        // Two A packets prove NXDOMAIN without an unnecessary AAAA query.
+        assert_eq!(primary_requests.load(Ordering::SeqCst), 2);
+        assert_eq!(secondary_requests.load(Ordering::SeqCst), 2);
+
+        primary_task.abort();
+        secondary_task.abort();
+    }
+
+    #[tokio::test]
+    async fn qualified_fast_path_requires_explicit_nxdomain_not_nodata() {
+        let target = "nodata-on-primary.example.test";
+        let (primary, primary_requests, primary_task) = target_nodata_resolver(target).await;
+        let (secondary, secondary_requests, secondary_task) =
+            target_positive_a_resolver(target, "192.0.2.45").await;
+        let engine = discovery_test_engine(&[primary, secondary], Duration::from_millis(100));
+
+        let outcome = engine.resolve_host_discovery_classified(target).await;
+        let DnsResolutionOutcome::Positive(answer) = outcome else {
+            panic!("an empty NOERROR response incorrectly stopped resolver consensus");
+        };
+        assert_eq!(answer.records, positive_records("192.0.2.45"));
+        assert!(primary_requests.load(Ordering::SeqCst) >= 2);
+        assert!(secondary_requests.load(Ordering::SeqCst) >= 2);
+
+        primary_task.abort();
+        secondary_task.abort();
+    }
+
+    #[tokio::test]
+    async fn nodata_is_indeterminate_on_discovery_conservative_and_consensus_paths() {
+        let target = "addressless.example.test";
+        let (first, _, first_task) = target_nodata_resolver(target).await;
+        let (second, _, second_task) = target_nodata_resolver(target).await;
+        let engine = discovery_test_engine(&[first, second], Duration::from_millis(100));
+
+        for outcome in [
+            engine.resolve_host_discovery_classified(target).await,
+            engine.resolve_host_classified(target).await,
+            consensus_test_engine(vec![first, second])
+                .resolve_host_consensus_classified(target)
+                .await,
+        ] {
+            assert!(matches!(
+                outcome,
+                DnsResolutionOutcome::Indeterminate { .. }
+            ));
+        }
+
+        first_task.abort();
+        second_task.abort();
+    }
+
+    #[tokio::test]
+    async fn hickory_fallback_distinguishes_nxdomain_from_nodata() {
+        let target = "hickory-addressless.example.test";
+        let (nodata, _, nodata_task) = target_nodata_resolver(target).await;
+        let nodata_outcome = hickory_only_test_engine(nodata, Duration::from_millis(150))
+            .resolve_host_classified(target)
+            .await;
+        assert!(matches!(
+            nodata_outcome,
+            DnsResolutionOutcome::Indeterminate { .. }
+        ));
+        nodata_task.abort();
+
+        let (nxdomain, nxdomain_task) = nxdomain_resolver().await;
+        let nxdomain_outcome = hickory_only_test_engine(nxdomain, Duration::from_millis(150))
+            .resolve_host_classified("hickory-missing.example.test")
+            .await;
+        nxdomain_task.abort();
+        assert!(matches!(
+            nxdomain_outcome,
+            DnsResolutionOutcome::Negative { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn nxdomain_with_owner_cname_is_positive_on_every_resolution_path() {
+        let target = "dangling.example.test";
+        let (first, _, first_task) = cname_nxdomain_resolver(target).await;
+        let (second, _, second_task) = cname_nxdomain_resolver(target).await;
+        let engine = discovery_test_engine(&[first, second], Duration::from_millis(100));
+
+        for outcome in [
+            engine.resolve_host_discovery_classified(target).await,
+            engine.resolve_host_classified(target).await,
+            consensus_test_engine(vec![first, second])
+                .resolve_host_consensus_classified(target)
+                .await,
+        ] {
+            let DnsResolutionOutcome::Positive(answer) = outcome else {
+                panic!("a dangling CNAME was classified as a missing owner");
+            };
+            assert!(answer.records.iter().any(|record| {
+                record.record_type == "CNAME" && record.value == "missing-target.example.test"
+            }));
+        }
+
+        first_task.abort();
+        second_task.abort();
+    }
+
+    #[tokio::test]
+    async fn discovery_disagreement_never_hides_a_live_secondary_answer() {
+        let target = "live-on-secondary.example.test";
+        let (primary, _, primary_task) = counting_nxdomain_resolver().await;
+        let (secondary, _, secondary_task) = target_positive_a_resolver(target, "192.0.2.44").await;
+        let engine = discovery_test_engine(&[primary, secondary], Duration::from_millis(100));
+
+        let DnsResolutionOutcome::Positive(answer) =
+            engine.resolve_host_discovery_classified(target).await
+        else {
+            panic!("a primary NXDOMAIN hid the live secondary answer");
+        };
+        assert_eq!(answer.records, positive_records("192.0.2.44"));
+
+        primary_task.abort();
+        secondary_task.abort();
+    }
+
+    #[tokio::test]
+    async fn conservative_and_trusted_paths_find_positive_after_primary_nxdomain() {
+        let target = "live-on-secondary.example.test";
+        let (primary, primary_requests, primary_task) = counting_nxdomain_resolver().await;
+        let (secondary, secondary_requests, secondary_task) =
+            target_positive_a_resolver(target, "192.0.2.44").await;
+        let engine = discovery_test_engine(&[primary, secondary], Duration::from_millis(100));
+
+        let outcome = engine.resolve_host_classified(target).await;
+        let DnsResolutionOutcome::Positive(answer) = outcome else {
+            panic!("the conservative path stopped at the primary NXDOMAIN");
+        };
+        assert_eq!(answer.records, positive_records("192.0.2.44"));
+        assert_eq!(primary_requests.load(Ordering::SeqCst), 2);
+        assert_eq!(secondary_requests.load(Ordering::SeqCst), 2);
+
+        // Final trusted consensus remains independent from the discovery
+        // shortcut and still requires two positive resolvers.
+        let (tertiary, _, tertiary_task) = target_positive_a_resolver(target, "192.0.2.44").await;
+        let trusted = consensus_test_engine(vec![primary, secondary, tertiary])
+            .resolve_host_consensus_classified(target)
+            .await;
+        let DnsResolutionOutcome::Positive(answer) = trusted else {
+            panic!("trusted consensus did not retain the positive quorum");
+        };
+        assert_eq!(answer.resolver_count, 2);
+        assert_eq!(answer.records, positive_records("192.0.2.44"));
+
+        primary_task.abort();
+        secondary_task.abort();
+        tertiary_task.abort();
+    }
+
+    #[tokio::test]
+    async fn strict_two_resolver_nxdomain_needs_no_cached_health_probe() {
+        let primary_server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let primary = primary_server.local_addr().unwrap();
+        let primary_requests = Arc::new(AtomicUsize::new(0));
+        let request_count = primary_requests.clone();
+        let primary_task = tokio::spawn(async move {
+            loop {
+                let mut buffer = [0_u8; 2_048];
+                let Ok((length, peer)) = primary_server.recv_from(&mut buffer).await else {
+                    break;
+                };
+                request_count.fetch_add(1, Ordering::SeqCst);
+                let mut message = Message::from_vec(&buffer[..length]).unwrap();
+                let question = &message.queries()[0];
+                let health_aaaa = question
+                    .name()
+                    .to_utf8()
+                    .starts_with("fellaga-negative-health-")
+                    && question.query_type() == RecordType::AAAA;
+                message
+                    .set_message_type(MessageType::Response)
+                    .set_response_code(if health_aaaa {
+                        // An empty NOERROR is not a strict NXDOMAIN and must
+                        // reject the one-resolver shortcut.
+                        ResponseCode::NoError
+                    } else {
+                        ResponseCode::NXDomain
+                    });
+                primary_server
+                    .send_to(&message.to_vec().unwrap(), peer)
+                    .await
+                    .unwrap();
+            }
+        });
+        let (secondary, secondary_requests, secondary_task) = counting_nxdomain_resolver().await;
+        let engine = discovery_test_engine(&[primary, secondary], Duration::from_millis(100));
+
+        let first = engine
+            .resolve_host_discovery_classified("missing-after-bad-probe.example.test")
+            .await;
+        assert!(matches!(first, DnsResolutionOutcome::Negative { .. }));
+        assert_eq!(primary_requests.load(Ordering::SeqCst), 1);
+        assert_eq!(secondary_requests.load(Ordering::SeqCst), 1);
+
+        primary_task.abort();
+        secondary_task.abort();
+    }
+
+    #[tokio::test]
+    async fn discovery_quorum_timeout_falls_back_without_becoming_negative() {
+        let primary_server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let primary = primary_server.local_addr().unwrap();
+        let primary_requests = Arc::new(AtomicUsize::new(0));
+        let request_count = primary_requests.clone();
+        let primary_task = tokio::spawn(async move {
+            loop {
+                let mut buffer = [0_u8; 2_048];
+                let Ok((length, peer)) = primary_server.recv_from(&mut buffer).await else {
+                    break;
+                };
+                request_count.fetch_add(1, Ordering::SeqCst);
+                let mut message = Message::from_vec(&buffer[..length]).unwrap();
+                let question = &message.queries()[0];
+                let drop_response = question
+                    .name()
+                    .to_utf8()
+                    .eq_ignore_ascii_case("timeout.example.test.")
+                    && question.query_type() == RecordType::A;
+                if drop_response {
+                    continue;
+                }
+                message
+                    .set_message_type(MessageType::Response)
+                    .set_response_code(ResponseCode::NXDomain);
+                primary_server
+                    .send_to(&message.to_vec().unwrap(), peer)
+                    .await
+                    .unwrap();
+            }
+        });
+        let (secondary, secondary_requests, secondary_task) = counting_nxdomain_resolver().await;
+        let engine = discovery_test_engine(&[primary, secondary], Duration::from_millis(40));
+
+        let warmup = engine
+            .resolve_host_discovery_classified("warmup-missing.example.test")
+            .await;
+        assert!(matches!(warmup, DnsResolutionOutcome::Negative { .. }));
+        assert_eq!(primary_requests.load(Ordering::SeqCst), 1);
+        assert_eq!(secondary_requests.load(Ordering::SeqCst), 1);
+
+        let timed_out = engine
+            .resolve_host_discovery_classified("timeout.example.test")
+            .await;
+        assert!(matches!(
+            timed_out,
+            DnsResolutionOutcome::Indeterminate { .. }
+        ));
+        assert!(primary_requests.load(Ordering::SeqCst) >= 3);
+        assert!(secondary_requests.load(Ordering::SeqCst) >= 3);
+
+        primary_task.abort();
+        secondary_task.abort();
+    }
+
     #[test]
     fn resolver_health_requires_a_strict_untruncated_nxdomain() {
         let mut response = Message::new(0, MessageType::Response, OpCode::Query);
@@ -2073,6 +2999,13 @@ mod tests {
             .set_message_type(MessageType::Response)
             .set_response_code(ResponseCode::NXDomain);
         assert!(is_definitive_nxdomain(&response));
+        response.add_answer(Record::from_rdata(
+            Name::from_str("probe.invalid.").unwrap(),
+            60,
+            RData::A(A("192.0.2.1".parse().unwrap())),
+        ));
+        assert!(!is_definitive_nxdomain(&response));
+        response.answers.clear();
         response.set_truncated(true);
         assert!(!is_definitive_nxdomain(&response));
         response
@@ -2339,8 +3272,39 @@ mod tests {
             &answer,
             &BTreeSet::from(["A:192.0.2.99".to_owned()])
         ));
+        assert!(DnsEngine::exactly_matches_wildcard(
+            &answer,
+            &BTreeSet::from(["A:192.0.2.99".to_owned()])
+        ));
         assert!(!DnsEngine::matches_wildcard(
             &answer,
+            &BTreeSet::from(["CNAME:wild.example.com".to_owned()])
+        ));
+        let aliased = ResolvedHost {
+            fqdn: "random.example.com".to_owned(),
+            records: vec![
+                DnsRecord {
+                    record_type: "CNAME".to_owned(),
+                    value: "wild.example.com".to_owned(),
+                    ttl: 60,
+                },
+                DnsRecord {
+                    record_type: "A".to_owned(),
+                    value: "192.0.2.123".to_owned(),
+                    ttl: 60,
+                },
+            ],
+            from_cache: false,
+            last_verified_at: None,
+            authoritative_validation: false,
+            resolver_count: 2,
+        };
+        assert!(DnsEngine::matches_wildcard(
+            &aliased,
+            &BTreeSet::from(["CNAME:wild.example.com".to_owned()])
+        ));
+        assert!(!DnsEngine::exactly_matches_wildcard(
+            &aliased,
             &BTreeSet::from(["CNAME:wild.example.com".to_owned()])
         ));
     }
@@ -2362,16 +3326,33 @@ mod tests {
         assert_eq!(
             classify_wildcard_samples(
                 vec![
-                    BTreeSet::from(["A:192.0.2.10".to_owned()]),
-                    BTreeSet::from(["A:192.0.2.11".to_owned()]),
-                    BTreeSet::from(["A:192.0.2.10".to_owned()]),
+                    BTreeSet::from([
+                        "A:192.0.2.10".to_owned(),
+                        "CNAME:wild.example.com".to_owned(),
+                    ]),
+                    BTreeSet::from([
+                        "A:192.0.2.11".to_owned(),
+                        "CNAME:wild.example.com".to_owned(),
+                    ]),
+                    BTreeSet::from([
+                        "A:192.0.2.12".to_owned(),
+                        "CNAME:wild.example.com".to_owned(),
+                    ]),
                 ],
                 0,
             ),
-            WildcardProbeOutcome::Wildcard(BTreeSet::from([
-                "A:192.0.2.10".to_owned(),
-                "A:192.0.2.11".to_owned(),
-            ]))
+            WildcardProbeOutcome::Wildcard(BTreeSet::from(["CNAME:wild.example.com".to_owned()]))
+        );
+        assert_eq!(
+            classify_wildcard_samples(
+                vec![
+                    BTreeSet::from(["A:192.0.2.10".to_owned()]),
+                    BTreeSet::from(["A:192.0.2.11".to_owned()]),
+                    BTreeSet::from(["A:192.0.2.12".to_owned()]),
+                ],
+                0,
+            ),
+            WildcardProbeOutcome::Indeterminate
         );
     }
 

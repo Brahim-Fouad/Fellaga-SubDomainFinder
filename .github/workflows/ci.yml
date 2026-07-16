@@ -25,9 +25,12 @@ jobs:
         run: |
           bash -n benchmarks/run.sh
           shellcheck benchmarks/run.sh
-          python3 -m py_compile benchmarks/names.py benchmarks/redact.py benchmarks/report.py benchmarks/timed.py
+          python3 -m py_compile benchmarks/names.py benchmarks/preflight.py benchmarks/redact.py benchmarks/report.py benchmarks/timed.py
+          python3 -m py_compile packaging/generate_supply_chain.py
       - name: Run deterministic benchmark harness tests
-        run: python3 -m unittest discover -s benchmarks/tests -v
+        run: |
+          python3 -m unittest discover -s benchmarks/tests -v
+          python3 -m unittest discover -s packaging/tests -v
 
   rust:
     runs-on: ubuntu-latest
@@ -41,7 +44,7 @@ jobs:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-      - run: sudo apt-get update && sudo apt-get install -y zstd libssl-dev pkg-config
+      - run: sudo apt-get update && sudo apt-get install -y jq zstd libssl-dev pkg-config
       - name: Verify embedded corpus
         run: |
           test "$(zstd -dc data/candidates-1m.txt.zst | wc -l)" -eq 1000000
@@ -51,6 +54,26 @@ jobs:
       - run: cargo test --all-targets --all-features --locked
       - run: cargo install cargo-audit --version 0.22.2 --locked && cargo audit --deny warnings
       - run: cargo build --release --locked
+      - name: Validate generated release supply-chain metadata
+        run: |
+          set -euo pipefail
+          temp="$(mktemp -d)"
+          trap 'rm -rf -- "$temp"' EXIT
+          source_date_epoch="$(git show -s --format=%ct HEAD)"
+          python3 packaging/generate_supply_chain.py \
+            --manifest-path Cargo.toml \
+            --target x86_64-unknown-linux-gnu \
+            --binary target/release/fellaga \
+            --sbom "$temp/fellaga.cdx.json" \
+            --licenses "$temp/THIRD_PARTY_LICENSES.txt" \
+            --source-date-epoch "$source_date_epoch"
+          jq -e '
+            .bomFormat == "CycloneDX" and
+            (.components | length > 0) and
+            (.dependencies | length > 1) and
+            any(.components[]; .name == "tokio")
+          ' "$temp/fellaga.cdx.json" >/dev/null
+          grep -Eq '^Package: tokio [0-9]' "$temp/THIRD_PARTY_LICENSES.txt"
       - name: Smoke-test the candidate pipeline CLI
         run: |
           set -euo pipefail

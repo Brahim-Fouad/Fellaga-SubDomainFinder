@@ -57,7 +57,11 @@ The generator verifies both source fingerprints, canonical content, and the comp
 
 ## Dependencies and licenses
 
-Commit `Cargo.lock` with dependency changes. Review the license and provenance of redistributed material, and update [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) when required. A release SBOM complements this review; it does not replace it.
+Commit `Cargo.lock` with dependency changes. Review the license and provenance
+of redistributed material, and update
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) when required. CI validates the
+deterministic Cargo dependency SBOM generator and its offline license inventory;
+these generated files complement review rather than replacing it.
 
 ## Pull-request checklist
 

@@ -100,7 +100,7 @@ def _timing_evidence(row: dict[str, Any]) -> tuple[float, float, float] | None:
 
 def _manifest_evidence_issues(manifest: dict[str, Any]) -> list[str]:
     issues: list[str] = []
-    if manifest.get("schema_version") != 1:
+    if manifest.get("schema_version") not in {1, 2}:
         issues.append("invalid_manifest_schema")
     campaign_id = manifest.get("campaign_id")
     if not isinstance(campaign_id, str) or not SAFE_CAMPAIGN.fullmatch(campaign_id):
@@ -246,6 +246,139 @@ def _manifest_evidence_issues(manifest: dict[str, Any]) -> list[str]:
     return issues
 
 
+def _integer(document: dict[str, Any], key: str) -> int | None:
+    value = document.get(key)
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
+def _capacity_preflight_issues(
+    manifest: dict[str, Any], configuration: dict[str, Any]
+) -> list[str]:
+    """Validate schema-v2 capacity evidence and its internal calculations."""
+
+    issues: list[str] = []
+    provenance = manifest.get("provenance")
+    inputs = provenance.get("inputs") if isinstance(provenance, dict) else None
+    active_corpus_candidates = (
+        _integer(inputs, "active_corpus_candidates")
+        if isinstance(inputs, dict)
+        else None
+    )
+    preflight = manifest.get("preflight")
+    if not isinstance(preflight, dict):
+        return ["missing_capacity_preflight"]
+
+    disk = preflight.get("candidate_pipeline_disk")
+    if not isinstance(disk, dict):
+        issues.append("missing_disk_preflight")
+    else:
+        candidates = _integer(disk, "candidates")
+        bytes_per_candidate = _integer(disk, "bytes_per_candidate")
+        fixed_bytes = _integer(disk, "fixed_bytes")
+        margin = _integer(disk, "margin_percent")
+        estimated = _integer(disk, "estimated_payload_bytes")
+        required = _integer(disk, "required_free_bytes")
+        available = _integer(disk, "available_free_bytes")
+        shortfall = _integer(disk, "shortfall_bytes")
+        expected_estimated = (
+            candidates * bytes_per_candidate + fixed_bytes
+            if candidates is not None
+            and candidates > 0
+            and bytes_per_candidate is not None
+            and bytes_per_candidate > 0
+            and fixed_bytes is not None
+            and fixed_bytes >= 0
+            else None
+        )
+        expected_required = (
+            (expected_estimated * margin + 99) // 100
+            if expected_estimated is not None and margin is not None and margin >= 100
+            else None
+        )
+        if (
+            disk.get("schema_version") != 1
+            or disk.get("check") != "candidate_pipeline_disk"
+            or disk.get("status") != "sufficient"
+            or candidates != _integer(configuration, "candidate_pipeline_candidates")
+            or bytes_per_candidate
+            != _integer(configuration, "candidate_pipeline_bytes_per_candidate")
+            or fixed_bytes != _integer(configuration, "candidate_pipeline_fixed_bytes")
+            or margin
+            != _integer(configuration, "candidate_pipeline_disk_margin_percent")
+            or estimated != expected_estimated
+            or required != expected_required
+            or available is None
+            or required is None
+            or available < required
+            or shortfall != 0
+        ):
+            issues.append("invalid_disk_preflight")
+
+    puredns = preflight.get("puredns_capacity")
+    if not isinstance(puredns, dict):
+        issues.append("missing_puredns_preflight")
+    else:
+        corpus = _integer(puredns, "corpus_candidates")
+        rate = _integer(puredns, "rate_limit_qps")
+        timeout = _integer(puredns, "timeout_seconds")
+        headroom = _integer(puredns, "headroom_percent")
+        estimated_seconds = _integer(puredns, "estimated_minimum_seconds")
+        minimum_rate = _integer(puredns, "minimum_coherent_rate_qps")
+        capacity = _integer(puredns, "capacity_candidates")
+        valid_inputs = (
+            corpus is not None
+            and corpus > 0
+            and rate is not None
+            and rate > 0
+            and timeout is not None
+            and timeout > 0
+            and headroom is not None
+            and headroom >= 100
+        )
+        expected_seconds = (
+            (corpus * headroom + rate * 100 - 1) // (rate * 100)
+            if valid_inputs
+            else None
+        )
+        expected_rate = (
+            (corpus * headroom + timeout * 100 - 1) // (timeout * 100)
+            if valid_inputs
+            else None
+        )
+        expected_capacity = (
+            rate * timeout * 100 // headroom if valid_inputs else None
+        )
+        if (
+            puredns.get("schema_version") != 1
+            or puredns.get("check") != "puredns_capacity"
+            or puredns.get("status") != "coherent"
+            or corpus != active_corpus_candidates
+            or rate != _integer(configuration, "dns_rate_limit")
+            or timeout != _integer(configuration, "discovery_timeout_seconds")
+            or headroom != _integer(configuration, "puredns_headroom_percent")
+            or estimated_seconds != expected_seconds
+            or minimum_rate != expected_rate
+            or capacity != expected_capacity
+            or estimated_seconds is None
+            or timeout is None
+            or estimated_seconds > timeout
+        ):
+            issues.append("invalid_puredns_preflight")
+
+    profiles = configuration.get("fellaga_profile_baselines")
+    allowed_profiles = {"deep", "balanced", "passive", "turbo"}
+    if (
+        not isinstance(profiles, list)
+        or any(not isinstance(profile, str) for profile in profiles)
+        or len(profiles) != len(set(profiles))
+        or not set(profiles).issubset(allowed_profiles)
+    ):
+        issues.append("invalid_fellaga_profile_baselines")
+    return issues
+
+
 def _status(row: dict[str, Any], field: str) -> str:
     value = row.get(field)
     if value in {"success", "timeout", "error", "skipped", "interrupted"}:
@@ -336,6 +469,8 @@ def build_report(
     if not isinstance(configuration, dict):
         manifest_issues.append("invalid_configuration")
         configuration = {}
+    if manifest.get("schema_version") == 2:
+        manifest_issues.extend(_capacity_preflight_issues(manifest, configuration))
     requested_repetitions = configuration.get(
         "required_repetitions", manifest.get("repetitions", MINIMUM_REPETITIONS)
     )
@@ -362,6 +497,14 @@ def build_report(
         manifest_issues.append("invalid_configuration:candidate_pipeline_candidates")
     if _finite_number(configuration, "dns_transport_queries", 0) < 100_000:
         manifest_issues.append("invalid_configuration:dns_transport_queries")
+    if manifest.get("schema_version") == 2:
+        active_max_runtime = _integer(
+            configuration, "fellaga_active_max_runtime_seconds"
+        )
+        if active_max_runtime is None or active_max_runtime < 0:
+            manifest_issues.append(
+                "invalid_configuration:fellaga_active_max_runtime_seconds"
+            )
 
     manifest_domains = manifest.get("authorized_domains", [])
     domain_errors: list[str] = []

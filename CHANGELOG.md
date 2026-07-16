@@ -6,6 +6,36 @@ Published releases and downloadable artifacts are available on [GitHub Releases]
 
 ## [Unreleased]
 
+## [0.8.4] - 2026-07-16
+
+### Added
+
+- added `--active-max-runtime` and structured `phase_timings` so active candidate work has an attributable shared time bound;
+- added `--web-max-runtime` with one cumulative Web and JavaScript budget shared by initial enrichment and later pipeline rounds;
+- added periodic heartbeats while direct CT and AXFR checks are still running;
+- added bounded parallelism and true whole-connector deadlines to `sources --check`, with immediate human-readable results as each source finishes;
+- added detailed candidate-pipeline timings for wordlist loading, queue counts, claims, DNS journaling, finalization, and total SQLite work;
+- added architecture-bound CycloneDX dependency SBOMs and offline Rust license inventories to release archives and the Debian package.
+
+### Changed
+
+- replace the previous 1,800-second scan default with profile-specific limits: 600 seconds for `deep`, 300 for `balanced` and `turbo`, and 180 for `passive`; `--max-runtime 0` remains the explicit unlimited mode;
+- cap the default recursive word and parent ceilings at 1,000 each for `deep` and `turbo`, avoiding accidental multi-million candidate cross-products;
+- require a sustained yield from later adaptive DNS waves, limit those waves to 1,000 names, and charge recursive candidate generation to the same active budget;
+- coalesce each Common Crawl 15-block index window into one URL-only request and defer long `Retry-After` waits into the persistent source scheduler;
+- qualify generated-candidate NXDOMAIN fast paths with resolver health probes, keep their negatives journal-only, and use full consensus for retained names, wordlists, retries, refresh, wildcard, Web, and TLS work;
+- force per-name verification indexes in candidate finalization, align lazy wordlist pages with scheduler batches, and group negative inventory updates;
+- make full-coverage benchmarks pass an explicit active runtime and verify the exact active-corpus count against PureDNS capacity evidence.
+
+### Fixed
+
+- enforce the default 120-second `deep` active budget across embedded and user wordlists, mutations, retries, resumed active work, and recursive candidate generation; preserve completed outcomes at the deadline and requeue unfinished work for `--resume latest`;
+- keep time and DNS rate safeguards active with `--no-adaptive`; only `--active-max-runtime 0` disables the active-candidate time bound;
+- quarantine exact wildcard matches only after a complete refresh with fresh trusted-resolver consensus, while preserving provenance and validation history;
+- return fresh or stale Web cache entries when the cumulative Web deadline expires before DNS pinning, without starting an HTTP request;
+- retain completed passive pages under a connector deadline and report them accurately in both scans and `sources --check`;
+- recover release reruns by deleting an interrupted draft without permitting an existing published release to be overwritten.
+
 ## [0.8.3] - 2026-07-16
 
 ### Added
@@ -27,7 +57,7 @@ Published releases and downloadable artifacts are available on [GitHub Releases]
 ### Fixed
 
 - prevent a stale wildcard signature from authorizing destructive cleanup when current randomized probes are indeterminate;
-- apply completed wildcard cleanup in one cancellable transaction, roll it back on timeout or interruption, retain independently supported names as `unverified`, and remove weak wildcard-only inventory, cache, scan findings, and DNS records;
+- apply completed wildcard cleanup in one cancellable transaction, roll it back on timeout or interruption, quarantine exact current-consensus wildcard matches even when passive history exists, and retain all provenance for `explain`;
 - recalculate historical scan result counts after wildcard cleanup and disable all cleanup when parent-zone coverage or current wildcard classification is incomplete;
 - keep low-rate DNS queues from turning valid hosts into indeterminate results before their requests are sent;
 - enforce `--dns-rate-limit` for direct NSEC traffic in addition to its local traversal cap;
@@ -56,7 +86,7 @@ Published releases and downloadable artifacts are available on [GitHub Releases]
 ### Fixed
 
 - exclude exact wildcard-signature matches from normal scan output even when another discovery source supplied the name; `--include-wildcard` remains the explicit opt-in;
-- preserve legitimate answers whose records differ from a wildcard pool, and purge only weak wildcard-only inventory rows and orphaned positive cache entries;
+- preserve legitimate answers whose records differ from a wildcard pool, and quarantine exact wildcard-signature matches while retaining their stored provenance and validation history;
 - preserve seed provenance, queue position, retry state, and previously validated positive results across interruption and `--resume`;
 - prevent resumed or duplicate queue work from double-counting candidate learning;
 - repair additive v8 columns before creating dependent indexes and wrap same-version schema repair in one rollback-safe transaction;
@@ -107,7 +137,8 @@ Initial public release of Fellaga.
 - public MIT repository with security policy, contribution guide, third-party notices, and verifiable corpus provenance;
 - verifiable v0.8.0 release with x86-64 and ARM64 GNU/Linux archives, an amd64 Debian package, architecture SBOMs, checksums, a keyless Sigstore signature over the checksum manifest, and GitHub attestations.
 
-[Unreleased]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/compare/v0.8.3...HEAD
+[Unreleased]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/compare/v0.8.4...HEAD
+[0.8.4]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/tag/v0.8.4
 [0.8.3]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/tag/v0.8.3
 [0.8.2]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/tag/v0.8.2
 [0.8.1]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/tag/v0.8.1

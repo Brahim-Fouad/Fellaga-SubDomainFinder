@@ -41,7 +41,7 @@ class ReportTests(unittest.TestCase):
         (self.campaign / "manifest.json").write_text(
             json.dumps(
                 {
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "campaign_id": self.campaign_id,
                     "mode": "no-key",
                     "authorized_domains": self.domains,
@@ -49,17 +49,23 @@ class ReportTests(unittest.TestCase):
                     "versions": versions,
                     "configuration": {
                         "required_repetitions": 3,
+                        "fellaga_active_max_runtime_seconds": 1_800,
                         "discovery_timeout_seconds": 1_860,
                         "validation_timeout_seconds": 300,
                         "dns_transport_timeout_seconds": 900,
                         "candidate_pipeline_timeout_seconds": 5_400,
-                        "dns_rate_limit": 100,
+                        "dns_rate_limit": 1_000,
                         "dns_concurrency": 100,
                         "dns_transport_queries": 100_000,
                         "dns_transport_concurrency": 128,
                         "candidate_pipeline_candidates": 10_000_000,
                         "candidate_pipeline_batch": 4_096,
                         "candidate_pipeline_concurrency": 128,
+                        "candidate_pipeline_bytes_per_candidate": 2_048,
+                        "candidate_pipeline_fixed_bytes": 2_147_483_648,
+                        "candidate_pipeline_disk_margin_percent": 125,
+                        "puredns_headroom_percent": 125,
+                        "fellaga_profile_baselines": [],
                     },
                     "provenance": {
                         "repository": {"commit": "d" * 40, "dirty": False},
@@ -68,6 +74,7 @@ class ReportTests(unittest.TestCase):
                             "domains_sha256": "e" * 64,
                             "active_corpus_archive_sha256": "f" * 64,
                             "active_corpus_sha256": "1" * 64,
+                            "active_corpus_candidates": 1_000_000,
                             "pipeline_corpus_sha256": self.pipeline_sha256,
                             "resolvers_sha256": "2" * 64,
                             "keys_manifest_sha256": None,
@@ -79,8 +86,35 @@ class ReportTests(unittest.TestCase):
                         "policy": "no-credentials",
                         "providers": [],
                     },
+                    "preflight": {
+                        "candidate_pipeline_disk": {
+                            "schema_version": 1,
+                            "check": "candidate_pipeline_disk",
+                            "status": "sufficient",
+                            "candidates": 10_000_000,
+                            "bytes_per_candidate": 2_048,
+                            "fixed_bytes": 2_147_483_648,
+                            "estimated_payload_bytes": 22_627_483_648,
+                            "margin_percent": 125,
+                            "required_free_bytes": 28_284_354_560,
+                            "available_free_bytes": 40_000_000_000,
+                            "shortfall_bytes": 0,
+                        },
+                        "puredns_capacity": {
+                            "schema_version": 1,
+                            "check": "puredns_capacity",
+                            "status": "coherent",
+                            "corpus_candidates": 1_000_000,
+                            "rate_limit_qps": 1_000,
+                            "timeout_seconds": 1_860,
+                            "headroom_percent": 125,
+                            "estimated_minimum_seconds": 1_250,
+                            "minimum_coherent_rate_qps": 673,
+                            "capacity_candidates": 1_488_000,
+                        },
+                    },
                     "dns_fairness": {
-                        "rate_limit_qps": 100,
+                        "rate_limit_qps": 1_000,
                         "concurrency": 100,
                         "resolver_count": 3,
                         "resolvers_sha256": "2" * 64,
@@ -278,7 +312,6 @@ class ReportTests(unittest.TestCase):
             summary["qualification_failures"],
         )
         self.assertNotIn("false_positive_rate", summary)
-        self.assertNotIn("market_claim_ready", summary)
 
     def test_transport_status_must_be_explicitly_successful(self) -> None:
         transport = json.loads(
@@ -461,6 +494,52 @@ class ReportTests(unittest.TestCase):
             "invalid_configuration:dns_transport_queries",
             summary["manifest_issues"],
         )
+
+    def test_schema_two_capacity_preflights_fail_closed(self) -> None:
+        manifest_path = self.campaign / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["preflight"]["candidate_pipeline_disk"][
+            "available_free_bytes"
+        ] = 1
+        manifest["preflight"]["puredns_capacity"][
+            "estimated_minimum_seconds"
+        ] = 1
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+        summary = build_report(self.campaign, self.truth)["summary"]
+        self.assertFalse(summary["qualification_passed"])
+        self.assertIn("invalid_disk_preflight", summary["manifest_issues"])
+        self.assertIn("invalid_puredns_preflight", summary["manifest_issues"])
+
+    def test_puredns_preflight_must_match_manifest_corpus_count(self) -> None:
+        manifest_path = self.campaign / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["provenance"]["inputs"]["active_corpus_candidates"] = 999_999
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+        summary = build_report(self.campaign, self.truth)["summary"]
+        self.assertFalse(summary["qualification_passed"])
+        self.assertIn("invalid_puredns_preflight", summary["manifest_issues"])
+
+    def test_schema_one_campaign_remains_compatible(self) -> None:
+        manifest_path = self.campaign / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["schema_version"] = 1
+        manifest.pop("preflight")
+        for field in (
+            "fellaga_active_max_runtime_seconds",
+            "candidate_pipeline_bytes_per_candidate",
+            "candidate_pipeline_fixed_bytes",
+            "candidate_pipeline_disk_margin_percent",
+            "puredns_headroom_percent",
+            "fellaga_profile_baselines",
+        ):
+            manifest["configuration"].pop(field)
+        manifest["provenance"]["inputs"].pop("active_corpus_candidates")
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+        summary = build_report(self.campaign, self.truth)["summary"]
+        self.assertTrue(summary["qualification_passed"])
 
     def test_require_pass_returns_nonzero_for_failed_qualification(self) -> None:
         self.assertEqual(

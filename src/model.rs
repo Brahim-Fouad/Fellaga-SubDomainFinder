@@ -264,14 +264,26 @@ pub struct CtMonitorResult {
     pub duration_ms: u128,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PhaseTiming {
+    pub phase: String,
+    pub duration_ms: u128,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScanResult {
     pub scan_id: i64,
     pub domain: String,
+    #[serde(default = "default_completed_status")]
+    pub status: String,
+    #[serde(default)]
+    pub resumable: bool,
     pub candidates: usize,
     pub resolved_from_network: usize,
     pub cache_hits: usize,
     pub duration_ms: u128,
+    #[serde(default)]
+    pub phase_timings: Vec<PhaseTiming>,
     pub wildcard_detected: bool,
     pub findings: Vec<Finding>,
     pub axfr_attempts: Vec<AxfrAttempt>,
@@ -285,6 +297,10 @@ pub struct ScanResult {
     pub pipeline: PipelineMetrics,
     pub resolver_metrics: Vec<ResolverMetric>,
     pub warnings: Vec<String>,
+}
+
+fn default_completed_status() -> String {
+    "completed".to_owned()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

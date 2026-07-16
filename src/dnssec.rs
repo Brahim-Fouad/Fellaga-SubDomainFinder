@@ -20,6 +20,14 @@ use tokio::time::{Instant, timeout};
 const NSEC_QUERIES_PER_SECOND: u64 = 20;
 const NSEC_ZONE_MAX_RUNTIME: Duration = Duration::from_secs(120);
 
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 #[derive(Default)]
 struct NsecRateLimiter {
     next: tokio::sync::Mutex<Option<Instant>>,
@@ -169,7 +177,10 @@ async fn walk_one(
         }
     };
     let (client, background) = Client::<TokioRuntimeProvider>::new(connected_stream, sender);
-    tokio::spawn(background);
+    // Hickory's background driver owns the TCP transport. Keep its abort
+    // handle tied to this walk so a phase deadline, Ctrl+C, or an early return
+    // closes the task and socket instead of detaching them from the scan.
+    let _background = AbortOnDrop(tokio::spawn(background));
 
     let probe_name = match Name::from_str(&format!("fellaga-nsec-probe-7f4b9d.{zone}.")) {
         Ok(name) => name,
@@ -527,6 +538,15 @@ async fn discover_nsec_until(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct DropProbe(std::sync::Arc<AtomicBool>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
 
     fn walk_result(
         status: &str,
@@ -558,6 +578,29 @@ mod tests {
     fn expired_deadline_has_no_operation_budget() {
         let expired = Instant::now() - Duration::from_millis(1);
         assert_eq!(operation_budget(expired, Duration::from_secs(3)), None);
+    }
+
+    #[tokio::test]
+    async fn nsec_background_is_aborted_when_walk_is_cancelled() {
+        let dropped = std::sync::Arc::new(AtomicBool::new(false));
+        let task_dropped = std::sync::Arc::clone(&dropped);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _probe = DropProbe(task_dropped);
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        started_rx.await.unwrap();
+
+        drop(AbortOnDrop(task));
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !dropped.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("la tâche NSEC annulée doit libérer immédiatement ses ressources");
     }
 
     #[tokio::test]

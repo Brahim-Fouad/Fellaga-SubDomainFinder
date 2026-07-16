@@ -89,7 +89,7 @@ struct DnsArgs {
         short = 'c',
         long,
         default_value_t = 128,
-        help = "Maximum concurrent DNS requests"
+        help = "Maximum concurrent host-resolution tasks"
     )]
     concurrency: usize,
     #[arg(long, default_value_t = 2.0, help = "DNS query timeout in seconds")]
@@ -146,6 +146,7 @@ const fn is_strict_live(state: ObservationState, wildcard: bool) -> bool {
 const MAX_DOMAIN_CONCURRENCY: usize = 4;
 const MAX_WEB_CONCURRENCY: usize = 16;
 const MAX_TLS_CONCURRENCY: usize = 32;
+const MAX_SOURCE_CHECK_CONCURRENCY: usize = 32;
 
 fn validate_scan_concurrency(domain: usize, web: usize, tls: usize) -> Result<()> {
     if !(1..=MAX_DOMAIN_CONCURRENCY).contains(&domain) {
@@ -160,9 +161,26 @@ fn validate_scan_concurrency(domain: usize, web: usize, tls: usize) -> Result<()
     Ok(())
 }
 
+fn validate_source_check_concurrency(value: usize) -> Result<()> {
+    if !(1..=MAX_SOURCE_CHECK_CONCURRENCY).contains(&value) {
+        bail!("--concurrency doit être compris entre 1 et {MAX_SOURCE_CHECK_CONCURRENCY}");
+    }
+    Ok(())
+}
+
+fn source_check_error_status(message: &str) -> &'static str {
+    if message.contains("budget total de") && message.contains("dépassé") {
+        "timeout"
+    } else {
+        "error"
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ProfileDefaults {
+    max_runtime: u64,
     max_words: usize,
+    active_max_runtime: u64,
     max_passive: usize,
     depth: usize,
     recursive_words: usize,
@@ -179,6 +197,7 @@ struct ProfileDefaults {
     ct_backfill: usize,
     ct_max_runtime: u64,
     web_hosts: usize,
+    web_max_runtime: u64,
     web_assets: usize,
     passive_max_runtime: u64,
     passive_zone_concurrency: usize,
@@ -188,11 +207,13 @@ impl ScanProfile {
     const fn defaults(self) -> ProfileDefaults {
         match self {
             Self::Deep => ProfileDefaults {
+                max_runtime: 600,
                 max_words: 1_000_000,
+                active_max_runtime: 120,
                 max_passive: 25_000,
                 depth: 5,
-                recursive_words: 10_000,
-                recursive_hosts: 2_000,
+                recursive_words: 1_000,
+                recursive_hosts: 1_000,
                 pipeline_rounds: 10,
                 pipeline_budget: 100_000,
                 tls_hosts: 250,
@@ -205,12 +226,15 @@ impl ScanProfile {
                 ct_backfill: 4_096,
                 ct_max_runtime: 90,
                 web_hosts: 100,
+                web_max_runtime: 90,
                 web_assets: 8,
                 passive_max_runtime: 75,
                 passive_zone_concurrency: 4,
             },
             Self::Balanced => ProfileDefaults {
+                max_runtime: 300,
                 max_words: 5_000,
+                active_max_runtime: 45,
                 max_passive: 10_000,
                 depth: 3,
                 recursive_words: 100,
@@ -227,12 +251,15 @@ impl ScanProfile {
                 ct_backfill: 256,
                 ct_max_runtime: 30,
                 web_hosts: 30,
+                web_max_runtime: 45,
                 web_assets: 5,
                 passive_max_runtime: 45,
                 passive_zone_concurrency: 4,
             },
             Self::Passive => ProfileDefaults {
+                max_runtime: 180,
                 max_words: 0,
+                active_max_runtime: 0,
                 max_passive: 250_000,
                 depth: 1,
                 recursive_words: 1,
@@ -249,15 +276,18 @@ impl ScanProfile {
                 ct_backfill: 4_096,
                 ct_max_runtime: 90,
                 web_hosts: 1,
+                web_max_runtime: 0,
                 web_assets: 1,
                 passive_max_runtime: 90,
                 passive_zone_concurrency: 6,
             },
             Self::Turbo => ProfileDefaults {
+                max_runtime: 300,
                 max_words: 1_000_000,
+                active_max_runtime: 60,
                 max_passive: 50_000,
                 depth: 3,
-                recursive_words: 5_000,
+                recursive_words: 1_000,
                 recursive_hosts: 1_000,
                 pipeline_rounds: 4,
                 pipeline_budget: 250_000,
@@ -271,6 +301,7 @@ impl ScanProfile {
                 ct_backfill: 512,
                 ct_max_runtime: 20,
                 web_hosts: 50,
+                web_max_runtime: 45,
                 web_assets: 5,
                 passive_max_runtime: 30,
                 passive_zone_concurrency: 8,
@@ -307,6 +338,11 @@ struct ScanArgs {
         help = "Maximum brute-force candidates from configured generators"
     )]
     max_words: Option<usize>,
+    #[arg(
+        long,
+        help = "Cumulative runtime budget for adaptive generated candidates in seconds; 0 disables it"
+    )]
+    active_max_runtime: Option<u64>,
     #[arg(long, help = "Disable passive-provider discovery")]
     no_passive: bool,
     #[arg(
@@ -501,6 +537,11 @@ struct ScanArgs {
     web_timeout: f64,
     #[arg(
         long,
+        help = "Cumulative Web and JavaScript budget per target in seconds; 0 disables the safeguard"
+    )]
+    web_max_runtime: Option<u64>,
+    #[arg(
+        long,
         default_value_t = 24,
         help = "Web cache refresh interval in hours"
     )]
@@ -524,10 +565,9 @@ struct ScanArgs {
     web_assets: Option<usize>,
     #[arg(
         long,
-        default_value_t = 1_800,
-        help = "Maximum runtime per domain in seconds; 0 deliberately disables the limit"
+        help = "Maximum runtime per domain in seconds; profile default, 0 deliberately disables the limit"
     )]
-    max_runtime: u64,
+    max_runtime: Option<u64>,
     #[arg(
         long,
         default_value_t = 30,
@@ -660,6 +700,12 @@ struct SourcesArgs {
         help = "Timeout per connector in seconds"
     )]
     timeout: f64,
+    #[arg(
+        long,
+        default_value_t = 8,
+        help = "Connectors checked concurrently (1-32)"
+    )]
+    concurrency: usize,
 }
 
 #[derive(Debug, Args)]
@@ -1106,13 +1152,32 @@ impl ConsoleProgress {
 
 fn print_scan_summary(result: &ScanResult) {
     println!(
-        "\nScan #{}: {} trouvés / {} candidats, {} cache hits, {} ms",
+        "\nScan #{} [{}]: {} trouvés / {} candidats, {} cache hits, {} ms",
         result.scan_id,
+        result.status,
         result.findings.len(),
         result.candidates,
         result.cache_hits,
         result.duration_ms
     );
+    if result.resumable {
+        println!("[PAUSE] Travail actif restant conservé; reprenez avec --resume latest.");
+    }
+    if !result.phase_timings.is_empty() {
+        let timings = result
+            .phase_timings
+            .iter()
+            .map(|timing| {
+                format!(
+                    "{} {:.1}s",
+                    timing.phase.replace('_', " "),
+                    timing.duration_ms as f64 / 1_000.0
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" | ");
+        println!("[TIME] {timings}");
+    }
     if result.wildcard_detected {
         println!("[!] DNS wildcard détecté; faux positifs filtrés.");
     }
@@ -1351,7 +1416,11 @@ async fn main() -> Result<()> {
                 default_mutation_rules()
             };
             let defaults = args.profile.defaults();
+            let max_runtime_seconds = args.max_runtime.unwrap_or(defaults.max_runtime);
             let max_words = args.max_words.unwrap_or(defaults.max_words);
+            let active_max_runtime = args
+                .active_max_runtime
+                .unwrap_or(defaults.active_max_runtime);
             let max_passive = args.max_passive.unwrap_or(defaults.max_passive);
             let depth = args.depth.unwrap_or(defaults.depth);
             let recursive_words = args.recursive_words.unwrap_or(defaults.recursive_words);
@@ -1368,6 +1437,7 @@ async fn main() -> Result<()> {
             let ct_backfill = args.ct_backfill.unwrap_or(defaults.ct_backfill);
             let ct_max_runtime = args.ct_max_runtime.unwrap_or(defaults.ct_max_runtime);
             let web_hosts = args.web_hosts.unwrap_or(defaults.web_hosts);
+            let web_max_runtime = args.web_max_runtime.unwrap_or(defaults.web_max_runtime);
             let web_assets = args.web_assets.unwrap_or(defaults.web_assets);
             let passive_max_runtime = args
                 .passive_max_runtime
@@ -1401,6 +1471,9 @@ async fn main() -> Result<()> {
             }
             if max_passive > 1_000_000 {
                 bail!("--max-passive ne peut pas dépasser 1000000");
+            }
+            if args.checkpoint_every == 0 {
+                bail!("--checkpoint-every doit être supérieur à zéro");
             }
             let effective_recursive_words = if args.no_adaptive {
                 recursive_words
@@ -1523,6 +1596,7 @@ async fn main() -> Result<()> {
                 wordlist: args.wordlist.clone(),
                 mutation_rules,
                 max_words,
+                active_phase_timeout: Duration::from_secs(active_max_runtime),
                 passive: !args.no_passive,
                 passive_sources,
                 api_keys: api_keys.clone(),
@@ -1583,6 +1657,7 @@ async fn main() -> Result<()> {
                 web_discovery: !args.no_web && !profile_passive,
                 web_max_hosts: web_hosts,
                 web_timeout: Duration::from_secs_f64(args.web_timeout),
+                web_phase_timeout: Duration::from_secs(web_max_runtime),
                 web_refresh: Duration::from_secs(args.web_refresh_hours.saturating_mul(3_600)),
                 web_concurrency: args.web_concurrency,
                 web_max_bytes: args.web_max_bytes,
@@ -1608,7 +1683,8 @@ async fn main() -> Result<()> {
             } else {
                 None
             };
-            let max_runtime = (args.max_runtime > 0).then(|| Duration::from_secs(args.max_runtime));
+            let max_runtime =
+                (max_runtime_seconds > 0).then(|| Duration::from_secs(max_runtime_seconds));
             let domain_concurrency = args.domain_concurrency.min(targets.len()).max(1);
             let mut pending = stream::iter(targets)
                 .map(|target| {
@@ -1855,11 +1931,12 @@ async fn main() -> Result<()> {
             let statuses = source_statuses(&api_keys);
             if args.check {
                 if args.timeout <= 0.0 || !args.timeout.is_finite() {
-                    bail!("--timeout doit être un nombre positif");
+                    bail!("--timeout must be a positive number");
                 }
+                validate_source_check_concurrency(args.concurrency)?;
                 let target = util::normalize_domain(&args.target)?;
                 let timeout = Duration::from_secs_f64(args.timeout);
-                let checks = stream::iter(statuses.iter().cloned())
+                let mut pending_checks = stream::iter(statuses.iter().cloned())
                     .map(|source| {
                         let api_keys = api_keys.clone();
                         let target = target.clone();
@@ -1874,8 +1951,14 @@ async fn main() -> Result<()> {
                                 });
                             }
                             let started = std::time::Instant::now();
-                            match passive::fetch_detailed(&source.name, &target, timeout, &api_keys)
-                                .await
+                            match passive::fetch_detailed_bounded(
+                                &source.name,
+                                &target,
+                                timeout,
+                                &api_keys,
+                                timeout,
+                            )
+                            .await
                             {
                                 Ok(result) => serde_json::json!({
                                     "name": source.name,
@@ -1891,20 +1974,45 @@ async fn main() -> Result<()> {
                                     "warning": result.partial_warning,
                                     "metadata": source.metadata
                                 }),
-                                Err(error) => serde_json::json!({
+                                Err(error) => {
+                                    let error = format!("{error:#}");
+                                    serde_json::json!({
                                     "name": source.name,
-                                    "status": "error",
+                                    "status": source_check_error_status(&error),
                                     "names": 0,
                                     "duration_ms": started.elapsed().as_millis(),
-                                    "error": format!("{error:#}"),
+                                    "error": error,
                                     "metadata": source.metadata
-                                }),
+                                    })
+                                }
                             }
                         }
                     })
-                    .buffer_unordered(4)
-                    .collect::<Vec<_>>()
-                    .await;
+                    .buffer_unordered(args.concurrency);
+                let mut checks = Vec::with_capacity(statuses.len());
+                while let Some(check) = pending_checks.next().await {
+                    if !args.json {
+                        println!(
+                            "{:<22} {:<20} {:>6} name(s) {:>7} ms{}",
+                            check["name"].as_str().unwrap_or("?"),
+                            check["status"].as_str().unwrap_or("?"),
+                            check["names"].as_u64().unwrap_or_default(),
+                            check["duration_ms"].as_u64().unwrap_or_default(),
+                            check["error"]
+                                .as_str()
+                                .or_else(|| check["warning"].as_str())
+                                .map(|error| format!(" — {}", compact_error(error, 120)))
+                                .unwrap_or_default()
+                        );
+                    }
+                    checks.push(check);
+                }
+                checks.sort_by(|left, right| {
+                    left["name"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .cmp(right["name"].as_str().unwrap_or_default())
+                });
                 if args.json {
                     println!(
                         "{}",
@@ -1913,20 +2021,6 @@ async fn main() -> Result<()> {
                             "checks": checks
                         }))?
                     );
-                } else {
-                    for check in checks {
-                        println!(
-                            "{:<22} {:<20} {:>6} nom(s) {:>7} ms{}",
-                            check["name"].as_str().unwrap_or("?"),
-                            check["status"].as_str().unwrap_or("?"),
-                            check["names"].as_u64().unwrap_or_default(),
-                            check["duration_ms"].as_u64().unwrap_or_default(),
-                            check["error"]
-                                .as_str()
-                                .map(|error| format!(" — {}", compact_error(error, 120)))
-                                .unwrap_or_default()
-                        );
-                    }
                 }
                 return Ok(());
             }
@@ -1962,13 +2056,13 @@ async fn main() -> Result<()> {
                     let state = if let Some(wait) =
                         diagnostic.and_then(|diagnostic| diagnostic.retry_in_seconds)
                     {
-                        format!("pause {}", wait_label(wait))
+                        format!("paused {}", wait_label(wait))
                     } else if source.automatic {
                         "auto".to_owned()
                     } else if source.requires_key {
-                        "clé absente".to_owned()
+                        "missing key".to_owned()
                     } else {
-                        "manuel".to_owned()
+                        "manual".to_owned()
                     };
                     let key = source
                         .key_environment
@@ -1977,7 +2071,7 @@ async fn main() -> Result<()> {
                     let metrics = diagnostic
                         .map(|diagnostic| {
                             format!(
-                                " {}/{} succès, {} ms",
+                                " {}/{} successes, {} ms",
                                 diagnostic.successes, diagnostic.requests, diagnostic.average_ms
                             )
                         })
@@ -1987,7 +2081,7 @@ async fn main() -> Result<()> {
                         source.name, source.metadata.evidence_family, state, key, metrics
                     );
                     if let Some(error) = diagnostic.and_then(|value| value.last_error.as_deref()) {
-                        println!("  dernière erreur: {}", compact_error(error, 140));
+                        println!("  last error: {}", compact_error(error, 140));
                     }
                 }
             }
@@ -2020,6 +2114,21 @@ async fn main() -> Result<()> {
                         "    - {} ({}, {} fois)",
                         evidence["source"], evidence["kind"], evidence["times_seen"]
                     );
+                }
+                if let Some(quarantine) = explanation["quarantine"]
+                    .as_array()
+                    .filter(|entries| !entries.is_empty())
+                {
+                    println!("  quarantaine wildcard: {} zone(s)", quarantine.len());
+                    for entry in quarantine {
+                        println!(
+                            "    - zone {}, scan {}, raison {}, horodatage {}",
+                            entry["root_domain"],
+                            entry["scan_id"],
+                            entry["reason"],
+                            entry["quarantined_at"]
+                        );
+                    }
                 }
             }
         }
@@ -2225,11 +2334,49 @@ mod tests {
     }
 
     #[test]
-    fn active_profiles_have_finite_nsec_and_ct_phase_budgets() {
+    fn source_check_concurrency_is_bounded() {
+        assert!(validate_source_check_concurrency(1).is_ok());
+        assert!(validate_source_check_concurrency(8).is_ok());
+        assert!(validate_source_check_concurrency(MAX_SOURCE_CHECK_CONCURRENCY).is_ok());
+        assert!(validate_source_check_concurrency(0).is_err());
+        assert!(validate_source_check_concurrency(MAX_SOURCE_CHECK_CONCURRENCY + 1).is_err());
+    }
+
+    #[test]
+    fn source_check_distinguishes_connector_deadlines_from_errors() {
+        assert_eq!(
+            source_check_error_status(
+                "commoncrawl: budget total de 20s dépassé; résultat en cache conservé"
+            ),
+            "timeout"
+        );
+        assert_eq!(source_check_error_status("commoncrawl: HTTP 502"), "error");
+    }
+
+    #[test]
+    fn profiles_have_expected_finite_enrichment_budgets() {
         for profile in [ScanProfile::Deep, ScanProfile::Balanced, ScanProfile::Turbo] {
             let defaults = profile.defaults();
+            assert!(defaults.max_runtime > 0);
+            assert!(defaults.active_max_runtime > 0);
             assert!(defaults.nsec_max_runtime > 0);
             assert!(defaults.ct_max_runtime > 0);
+            assert!(defaults.web_max_runtime > 0);
+            assert!(
+                defaults
+                    .recursive_words
+                    .saturating_mul(defaults.recursive_hosts)
+                    <= 1_000_000
+            );
         }
+        assert_eq!(ScanProfile::Deep.defaults().max_runtime, 600);
+        assert_eq!(ScanProfile::Balanced.defaults().max_runtime, 300);
+        assert_eq!(ScanProfile::Passive.defaults().max_runtime, 180);
+        assert_eq!(ScanProfile::Turbo.defaults().max_runtime, 300);
+        assert_eq!(ScanProfile::Passive.defaults().active_max_runtime, 0);
+        assert_eq!(ScanProfile::Deep.defaults().web_max_runtime, 90);
+        assert_eq!(ScanProfile::Balanced.defaults().web_max_runtime, 45);
+        assert_eq!(ScanProfile::Passive.defaults().web_max_runtime, 0);
+        assert_eq!(ScanProfile::Turbo.defaults().web_max_runtime, 45);
     }
 }

@@ -22,16 +22,16 @@ fellaga scan your-domain.example --profile deep
 
 | Profile | Intended use | Main limits |
 | --- | --- | --- |
-| `deep` | Broad, adaptive discovery; the default. | Up to 1,000,000 initial candidates, depth 5, 10 pipeline rounds, 100,000 pipeline events. |
-| `balanced` | Faster routine reconnaissance. | 5,000 initial candidates, depth 3, 2 pipeline rounds, 5,000 pipeline events. |
+| `deep` | Broad, adaptive discovery; the default. | Up to 1,000,000 primary brute-force words, 120-second shared active-candidate budget, depth 5, 10 pipeline rounds, 100,000 pipeline events. |
+| `balanced` | Faster routine reconnaissance. | 5,000 primary brute-force words, 45-second shared active-candidate budget, depth 3, 2 pipeline rounds, 5,000 pipeline events. |
 | `passive` | Provider and CT collection with DNS validation but without AXFR, brute force, Web/TLS/DNS-graph/NSEC enrichment, or the event pipeline. | No brute-force candidates; depth 1. |
-| `turbo` | Broad candidate generation with less enrichment depth than `deep`. | Up to 1,000,000 initial candidates, depth 3, 4 pipeline rounds, 250,000 pipeline events. |
+| `turbo` | Broad candidate generation with less enrichment depth than `deep`. | Up to 1,000,000 primary brute-force words, 60-second shared active-candidate budget, depth 3, 4 pipeline rounds, 250,000 pipeline events. |
 
-The table lists upper bounds. Adaptive mode ranks candidates and stops low-yield waves early.
+The table lists per-stage limits. Seed queues, recursive candidates, mutations, and pipeline events are additional bounded inputs. Adaptive mode ranks candidates and stops low-yield waves early.
 
 Fellaga streams the embedded corpus through two persistent queues while DNS validation runs: a seed queue for passive, CT, AXFR, cached, and learned observations, and an active queue for wordlists, mutations, learned patterns, and corpus entries. Bounded interleaved waves prioritize useful seeds; when both queues contain work, the first wave reserves about three quarters of its slots for seeds.
 
-Low-yield adaptive stopping applies to generated active candidates. Fellaga still drains the bounded seed queue, retries transiently failed queued names, and continues an explicit `--wordlist` until its durable cursor reaches the end or another configured hard limit stops the scan.
+Low-yield adaptive stopping applies to active candidate waves. Later adaptive waves are limited to 1,000 names and must sustain a minimum yield. The profile-specific `--active-max-runtime` clock covers wildcard profiling and active candidate work. Embedded and user wordlists, mutations, retries, resumed active work, and recursive candidate generation all consume the same budget. When the deadline is reached, Fellaga commits every completed DNS outcome, records unfinished names as indeterminate, and keeps them queued under the existing three-attempt limit. Continue the checkpoint with `--resume latest`.
 
 `--passive-only` skips brute-force generation but keeps active enrichment enabled. `--profile passive` disables AXFR and active Web, TLS, graph, NSEC, PTR, and pipeline stages. It still performs provider HTTP requests, CT collection, wildcard probes, and DNS validation.
 
@@ -57,17 +57,18 @@ fellaga scan your-domain.example --mutations custom-mutations.txt
 | Control | Default | Purpose |
 | --- | ---: | --- |
 | `--domain-concurrency` | `1` | Prevents multiple large targets from multiplying network load; accepted range is 1-4. |
-| `--concurrency` | `128` | Limits in-flight DNS work. |
+| `--concurrency` | `128` | Limits concurrent host-resolution tasks; the shared rate limit controls DNS traffic. |
 | `--dns-rate-limit` | `100` | Caps the shared DNS request rate per second. |
-| `--max-runtime` | `1800` | Stops each domain after 30 minutes. |
+| `--active-max-runtime` | profile | Bounds all active candidate work; `deep` defaults to 120 seconds and `0` disables the bound. |
+| `--max-runtime` | profile | Stops each domain after 600/300/180/300 seconds for `deep`/`balanced`/`passive`/`turbo`. |
 | `--checkpoint-every` | `30` | Persists resumable progress every 30 seconds. |
 | `--verification-max-age` | `24` | Treats a cached DNS validation as live for 24 hours. |
 
 Passive collection also has profile-specific safeguards: an active-time budget, a global connector concurrency limit, and a child-zone concurrency limit. The default active-time budgets are 75 seconds for `deep`, 45 for `balanced`, 90 for `passive`, and 30 for `turbo`; the global connector concurrency default is 8. Use `--passive-max-runtime`, `--passive-concurrency`, and `--passive-zone-concurrency` to override them. A value of `0` for `--passive-max-runtime` disables only the passive-time safeguard; the per-connector request limits still apply.
 
-NSEC and direct CT collection have separate cumulative per-target safeguards. `--nsec-max-runtime` defaults to 180/90/60 seconds for `deep`/`balanced`/`turbo`; `--ct-max-runtime` defaults to 90/30/90/20 seconds for `deep`/`balanced`/`passive`/`turbo`. Partial results and committed cache batches are retained when either budget is reached. A value of `0` disables only that total-phase safeguard. Web concurrency is capped at 16 and TLS concurrency at 32 to keep multi-target scans from multiplying connection pressure unexpectedly.
+NSEC, direct CT collection, and Web/JavaScript discovery have separate cumulative per-target safeguards. `--nsec-max-runtime` defaults to 180/90/60 seconds for `deep`/`balanced`/`turbo`; `--ct-max-runtime` defaults to 90/30/90/20 seconds for `deep`/`balanced`/`passive`/`turbo`; `--web-max-runtime` defaults to 90/45/0/45 seconds. The Web budget is shared by the initial crawl and every later pipeline round. Completed requests, extracted names, and committed cache entries remain available when a budget is reached, and remaining work in that phase is skipped. A value of `0` disables only that total-phase safeguard. Web concurrency is capped at 16 and TLS concurrency at 32 to keep multi-target scans from multiplying connection pressure unexpectedly.
 
-`--dns-rate-limit 0` disables the DNS rate cap, and `--max-runtime 0` disables the global time limit. `--no-adaptive` asks Fellaga to exhaust configured candidate waves. These expert controls can create very high traffic and should be used only in an isolated laboratory or an explicitly authorized environment with suitable resolvers.
+`--active-max-runtime 0` disables the active DNS time bound. `--dns-rate-limit 0` disables the DNS rate cap, and `--max-runtime 0` disables the global time limit. `--no-adaptive` disables low-yield stopping and uses the configured recursion ceilings; ranking, the active budget, global deadline, concurrency limits, and DNS rate cap remain enabled. These expert controls can create very high traffic and should be used only in an isolated laboratory or an explicitly authorized environment with suitable resolvers.
 
 If a scan reaches its time limit or is interrupted with Ctrl+C, the latest checkpoint remains available:
 
@@ -75,11 +76,11 @@ If a scan reaches its time limit or is interrupted with Ctrl+C, the latest check
 fellaga scan your-domain.example --resume latest
 ```
 
-Resume restores the two candidate queues, feed cursors, merged seed provenance, attempt counts, and durable learning counters. Transient DNS failures are attempted no more than three times in total, including attempts made before an interruption. A definitive negative answer is terminal for that queue item. Previously validated positive cache entries are reclassified through the normal wildcard and freshness rules instead of being downgraded merely because the scan restarted.
+`--resume latest` restores the two candidate queues, feed cursors, merged seed provenance, attempt counts, and durable learning counters. It is also the continuation path after the shared active budget pauses unfinished work. Transient DNS failures are attempted no more than three times in total, including attempts made before an interruption. A definitive negative answer is terminal for that queue item. Previously validated positive cache entries are reclassified through the normal wildcard and freshness rules instead of being downgraded merely because the scan restarted.
 
 ### Large wordlists
 
-User wordlists are read lazily, without holding the SQLite write lock during file I/O. Each read page examines at most 1,024 lines or 4 MiB, whichever comes first. Invalid names are skipped, non-UTF-8 bytes are decoded safely, and an oversized line is discarded in bounded chunks. The byte cursor and oversized-line state are stored in SQLite, so `--resume` continues from the committed position rather than rereading the file from the beginning.
+User wordlists are read lazily, without holding the SQLite write lock during file I/O. Each read page follows the requested scheduler batch and is capped at 16,384 lines or 4 MiB, whichever comes first. Invalid names are skipped, non-UTF-8 bytes are decoded safely, and an oversized line is discarded in bounded chunks. The byte cursor and oversized-line state are stored in SQLite, so `--resume latest` continues from the committed position rather than rereading the file from the beginning.
 
 ```bash
 fellaga scan your-domain.example --wordlist candidates.txt --resume latest
@@ -107,7 +108,7 @@ Use `--refresh-cache` to force network refresh during a scan, or revalidate the 
 fellaga refresh your-domain.example
 ```
 
-Refresh stops after five minutes by default and commits validation results in 256-name batches. Wildcard matches are staged in SQLite and the final purge is applied in one cancellable transaction. Progress is written to stderr; use `--quiet` to suppress it. Use `--max-runtime 0` to remove the global limit or `--batch-size` to select a batch size from 1 to 4096. On timeout or Ctrl+C, completed validation batches remain committed, unprocessed and indeterminate names retain their state, destructive wildcard cleanup is rolled back, and the non-resumable checkpoint is closed safely.
+Refresh stops after five minutes by default and commits validation results in bounded batches. Its progress total includes retained inventory and positive cache-only names, so the final cache pass remains visible. Exact wildcard matches are staged in SQLite and a root-scoped quarantine is applied only after a complete refresh with fresh trusted-resolver consensus. Ambiguous supersets and indeterminate profiles remain retained as `unverified`; provenance and validation history are never deleted. Progress is written to stderr; use `--quiet` to suppress it. Use `--max-runtime 0` to remove the global limit or `--batch-size` to select a batch size from 1 to 4096. On timeout or Ctrl+C, completed validation batches remain committed, unprocessed and indeterminate names retain their state, staged wildcard changes are rolled back, and the non-resumable checkpoint is closed safely.
 
 ## Output formats
 
@@ -134,7 +135,7 @@ Long operations emit periodic heartbeats rather than leaving the terminal appare
 
 Normally, `--stream-jsonl` emits an event immediately and does not add a final domain record. With `--only-live`, Fellaga defers those events until each domain has completed its final wildcard classification, ensuring that the stream contains only final `live` non-wildcard findings.
 
-The public `Finding` object includes `fqdn`, DNS `records`, `sources`, `wildcard`, `from_cache`, `confidence`, `state`, `last_verified_at`, `evidence_families`, and `authoritative_validation`.
+The public `Finding` object includes `fqdn`, DNS `records`, `sources`, `wildcard`, `from_cache`, `confidence`, `state`, `last_verified_at`, `evidence_families`, and `authoritative_validation`. The final domain object includes `phase_timings`, which attributes wall time to initial discovery, candidate DNS, enrichment, and finalization.
 
 ## Sources and resolvers
 
@@ -170,6 +171,6 @@ The resolver test reports whether each candidate passes NXDOMAIN, DNSSEC, and an
 | `fellaga refresh <domain>` | Revalidate known names without erasing history. |
 | `fellaga import` | Import Subfinder, Amass, BBOT, or massdns data as unverified observations. |
 | `fellaga export` | Export retained inventory as JSONL or CSV. |
-| `fellaga cache prune` | Remove only cache entries that are defined as expired. |
+| `fellaga cache prune` | Remove expired negative DNS cache entries and abandoned temporary candidate queues. |
 
 Run `fellaga <command> --help` for the authoritative option list for the installed version.

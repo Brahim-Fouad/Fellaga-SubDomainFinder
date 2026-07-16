@@ -12,7 +12,7 @@ fellaga sources --check --target your-domain.example
 
 The registry reports authentication requirements, automatic selection, evidence family, recursive capabilities, estimated cost, rate policy, experimental status, success ratio, latency, recent errors, and adaptive pause state.
 
-`sources --check` performs real provider requests. Use an authorized target and expect the provider to observe it.
+`sources --check` performs real provider requests. Use an authorized target and expect the provider to observe it. Human output is emitted as each connector finishes; `--timeout` is a wall deadline for the complete connector including pagination, and `--concurrency` controls 1-32 parallel checks.
 
 ## Connector catalog
 
@@ -25,6 +25,7 @@ No required credential:
 - `crtsh`
 - `driftnet`
 - `hackertarget`
+- `otx` (optional key)
 - `subdomainapp`
 - `subdomaincenter`
 - `urlscan` (optional key)
@@ -45,7 +46,6 @@ Credentialed connectors:
 | `intelx` | `INTELX_API_KEY` |
 | `leakix` | `LEAKIX_API_KEY` |
 | `netlas` | `NETLAS_API_KEY` |
-| `otx` | `OTX_API_KEY` or `X_OTX_API_KEY` |
 | `securitytrails` | `SECURITYTRAILS_API_KEY` |
 | `shodan` | `SHODAN_API_KEY` |
 | `virustotal` | `VIRUSTOTAL_API_KEY` |
@@ -94,6 +94,6 @@ An explicitly selected source bypasses its adaptive pause. `--all-sources` attem
 
 Passive observations are merged permanently. A later empty or partial provider response cannot erase previously acquired names. The default provider refresh interval is 24 hours and can be changed with `--passive-refresh-hours`.
 
-The shared HTTP layer reuses connections, limits requests per provider, caps response bodies, validates sensitive pagination destinations, and retries selected transient statuses with exponential backoff and jitter. `Retry-After` is respected without blocking unrelated providers.
+The shared HTTP layer reuses connections, limits requests per provider, caps response bodies, validates sensitive pagination destinations, and retries selected transient statuses with exponential backoff and jitter. Short `Retry-After` values are honored inline; longer waits are persisted as an adaptive pause instead of holding the scan open. Common Crawl covers the same 15-block window per index in one field-restricted request rather than three sequential requests.
 
 Three consecutive failures place an automatically selected source in a 24-hour adaptive pause. Its retained observations remain available, and a later success resets the failure streak. Use `fellaga sources` to view the current source state and retry eligibility.

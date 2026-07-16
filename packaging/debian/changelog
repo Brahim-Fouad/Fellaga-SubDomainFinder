@@ -1,0 +1,6 @@
+fellaga (0.8.4-1) unstable; urgency=medium
+
+  * Release Fellaga 0.8.4.
+  * Ship a Cargo dependency SBOM and an offline third-party license inventory.
+
+ -- Brahim-Fouad GUIA <170998597+Brahim-Fouad@users.noreply.github.com>  Thu, 16 Jul 2026 00:00:00 -0400

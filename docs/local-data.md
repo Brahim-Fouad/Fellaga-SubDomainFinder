@@ -35,7 +35,7 @@ Revalidate all known names for one domain:
 fellaga refresh your-domain.example
 ```
 
-Refresh is non-resumable and stops after 300 seconds by default. Fellaga reads the inventory with a stable keyset cursor and commits each completed 256-name validation batch. A bounded parent-zone ranking and SQLite-backed wildcard staging keep memory use stable. On timeout or Ctrl+C, completed validation batches remain committed, while unprocessed names and indeterminate DNS results keep their previous state. Wildcard deletion runs only after a complete refresh with reliable current classification, inside one cancellable transaction that rolls back on interruption. Retained wildcard matches supported by CT, passive, Web, TLS, DNSSEC, or imported evidence are set to `unverified`; weak wildcard-only names and their stored DNS records are removed.
+Refresh is non-resumable and stops after 300 seconds by default. Fellaga reads retained inventory and positive cache-only names with stable keyset cursors, includes both in progress totals, and commits each completed validation batch. A bounded parent-zone ranking and SQLite-backed wildcard staging keep memory use stable. On timeout or Ctrl+C, completed validation batches remain committed, while unprocessed names and indeterminate DNS results keep their previous state. Root-scoped wildcard quarantine runs only after a complete refresh with fresh trusted-resolver consensus, inside one cancellable transaction that rolls back on interruption. Ambiguous supersets remain `unverified`; provenance, observations, and validation history remain stored.
 
 Force a scan to bypass fresh caches:
 
@@ -49,7 +49,7 @@ Remove entries that are explicitly defined as expired:
 fellaga cache prune
 ```
 
-`cache prune` removes only expired cache entries and preserves permanent positive observations. Wildcard cleanup occurs as part of scanning and validation: weak names that match a wildcard profile and their orphaned positive cache records are purged, while names with independent evidence remain available with wildcard context.
+`cache prune` removes expired negative DNS cache entries and abandoned temporary candidates from completed or superseded scan queues. It preserves permanent positive observations, retained inventory, provenance, and learning tables. Wildcard handling is conservative: only exact matches with current trusted consensus can enter the root-scoped quarantine. The reusable positive cache and materialized live state are demoted, while the stored name, provenance, observations, validation history, and quarantine audit entry remain available. Passive or historical evidence remains visible through `explain` but does not override a current exact wildcard match. A later validated non-wildcard finding lifts the quarantine.
 
 Use `fellaga explain <fqdn>` before deciding that a retained historical name is a false positive. Use `--only-live` when stale or unverified names must not reach downstream automation.
 
@@ -63,7 +63,7 @@ The local database supports `list`, `refresh`, `explain`, and resume operations.
 
 Each running scan stores two bounded work queues in SQLite. The seed queue contains full names and merged provenance from passive, CT, AXFR, cached, and learned discovery. The active queue contains generated relative names, priorities, and generator identities. Separate feed rows store cursors for the embedded corpus and optional user wordlist, so Fellaga does not need to insert or retain the entire candidate space in memory.
 
-Queue claims are atomic and include an attempt counter. Rows left in the processing state are requeued when the same checkpoint is resumed. Transient DNS failures receive at most three total attempts across runs, while definitive answers become terminal. Durable per-scan generator totals and attempted-word rows preserve learning accuracy even after terminal candidate rows are cleaned up.
+Queue claims are atomic and include an attempt counter. Rows left in the processing state are requeued with `--resume latest`. Embedded and user wordlists, mutations, retries, resumed active work, and recursive candidate generation share the profile's active budget; `deep` defaults to 120 seconds. Transient DNS failures receive at most three total attempts across runs, while definitive answers become terminal. Durable per-scan generator totals and attempted-word rows preserve learning accuracy even after terminal candidate rows are cleaned up.
 
 The final scan status, checkpoint completion, generator learning, successful words and patterns, and cleanup of temporary learning rows are committed in one transaction. The transaction is guarded against applying the same scan's learning twice. Prepared statements and queue-selection indexes keep finalization and bounded claims predictable on large databases. Physical deletion of completed or superseded queue rows is maintenance work performed after the completion commit; its failure does not reopen or fail the scan.
 

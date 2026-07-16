@@ -7,8 +7,8 @@ use crate::discovery::discover_dns_graph;
 use crate::dns::{DnsEngine, DnsResolutionOutcome, WildcardProbeOutcome};
 use crate::dnssec::discover_nsec_bounded;
 use crate::model::{
-    CtMonitorResult, DiscoveryEdge, DnssecWalkResult, Finding, PipelineMetrics, ResolvedHost,
-    ScanResult, ServiceEndpoint, WebObservation,
+    CtMonitorResult, DiscoveryEdge, DnssecWalkResult, Finding, PhaseTiming, PipelineMetrics,
+    ResolvedHost, ScanResult, ServiceEndpoint, WebObservation,
 };
 use crate::passive::{
     ApiKeyStore, current_commoncrawl_endpoint, fetch_detailed as fetch_passive,
@@ -20,12 +20,12 @@ use crate::util::{
     domain_hash, labels_from_name, learnable_label, learnable_relative_name, normalize_domain,
     normalize_observed_name, now_epoch,
 };
-use crate::web_discovery::discover_web;
+use crate::web_discovery::discover_web_bounded;
 use anyhow::{Result, bail};
-use futures_util::{StreamExt, stream};
+use futures_util::{FutureExt, StreamExt, stream, stream::FuturesUnordered};
 use serde_json::json;
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::{
@@ -110,6 +110,7 @@ pub struct ScanOptions {
     pub wordlist: Option<PathBuf>,
     pub mutation_rules: Vec<MutationRule>,
     pub max_words: usize,
+    pub active_phase_timeout: Duration,
     pub passive: bool,
     pub passive_sources: Vec<String>,
     pub api_keys: ApiKeyStore,
@@ -164,6 +165,7 @@ pub struct ScanOptions {
     pub web_discovery: bool,
     pub web_max_hosts: usize,
     pub web_timeout: Duration,
+    pub web_phase_timeout: Duration,
     pub web_refresh: Duration,
     pub web_concurrency: usize,
     pub web_max_bytes: usize,
@@ -203,11 +205,9 @@ impl CheckpointHeartbeat {
         every: Duration,
     ) -> Self {
         let (stop, mut stopped) = tokio::sync::watch::channel(false);
-        let every = every
-            .min(Duration::from_secs(30))
-            .max(Duration::from_secs(1));
+        let every = every.max(Duration::from_secs(1));
         let task = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(every);
+            let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tokio::select! {
@@ -247,6 +247,9 @@ impl Drop for CheckpointHeartbeat {
     fn drop(&mut self) {
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(true);
+        }
+        if let Some(task) = self.task.take() {
+            task.abort();
         }
     }
 }
@@ -318,12 +321,14 @@ async fn wildcard_profile_observed(
     zone: &str,
     freshness: Duration,
     force_probe: bool,
+    require_positive_consensus: bool,
 ) -> WildcardProfileObservation {
+    let algorithm_version = if require_positive_consensus { 3 } else { 2 };
     let cached = database
         .wildcard_cache(zone)
         .ok()
         .flatten()
-        .filter(|cache| cache.algorithm_version >= 2);
+        .filter(|cache| cache.algorithm_version >= algorithm_version);
     if !force_probe
         && let Some(cache) = &cached
         && cache.expires_at > now_epoch()
@@ -334,30 +339,36 @@ async fn wildcard_profile_observed(
         };
     }
     let serial = dns.soa_serial(zone).await;
-    let probe = dns.wildcard_probe(zone).await;
+    let probe = if require_positive_consensus {
+        dns.wildcard_probe_consensus(zone).await
+    } else {
+        dns.wildcard_probe(zone).await
+    };
     match &probe {
         WildcardProbeOutcome::Wildcard(signature) => {
-            let _ = database.store_wildcard_cache(zone, signature, serial, freshness, true);
+            let _ = database.store_wildcard_cache_with_algorithm(
+                zone,
+                signature,
+                serial,
+                freshness,
+                true,
+                algorithm_version,
+            );
         }
         WildcardProbeOutcome::Normal => {
             let signature = BTreeSet::new();
-            let _ = database.store_wildcard_cache(zone, &signature, serial, freshness, true);
+            let _ = database.store_wildcard_cache_with_algorithm(
+                zone,
+                &signature,
+                serial,
+                freshness,
+                true,
+                algorithm_version,
+            );
         }
         WildcardProbeOutcome::Indeterminate => {}
     }
     wildcard_profile_after_probe(cached.map(|cache| cache.signature), probe)
-}
-
-async fn wildcard_profile_cached(
-    database: &Database,
-    dns: &DnsEngine,
-    zone: &str,
-    freshness: Duration,
-    force_probe: bool,
-) -> Option<BTreeSet<String>> {
-    wildcard_profile_observed(database, dns, zone, freshness, force_probe)
-        .await
-        .signature
 }
 
 const WILDCARD_INDETERMINATE: &str = "FELLAGA:WILDCARD_INDETERMINATE";
@@ -377,11 +388,13 @@ fn wildcard_signature_is_confirmed(signature: &BTreeSet<String>) -> bool {
 fn should_expand_adaptive_wave(
     wildcard_classification_is_reliable: bool,
     previous_positive: usize,
+    previous_attempted: usize,
     wave_number: usize,
     passive_positive: usize,
 ) -> bool {
+    let minimum_yield = previous_attempted.div_ceil(500).max(2);
     wildcard_classification_is_reliable
-        && (previous_positive >= 2 || (wave_number == 2 && passive_positive >= 5))
+        && (previous_positive >= minimum_yield || (wave_number == 2 && passive_positive >= 5))
 }
 
 fn should_retry_otx_after_key_added(key_configured: bool, last_error: Option<&str>) -> bool {
@@ -397,7 +410,11 @@ fn cache_requires_revalidation(
     answer: &ResolvedHost,
     verification_max_age: Duration,
     now: i64,
+    require_trusted_consensus: bool,
 ) -> bool {
+    if require_trusted_consensus && answer.resolver_count < 2 && !answer.authoritative_validation {
+        return true;
+    }
     if verification_max_age.is_zero() {
         return true;
     }
@@ -405,6 +422,46 @@ fn cache_requires_revalidation(
     answer
         .last_verified_at
         .is_none_or(|verified_at| verified_at < now.saturating_sub(max_age))
+}
+
+async fn enrich_authoritative_answers(
+    dns: &DnsEngine,
+    answers: &mut [ResolvedHost],
+    deadline: Option<tokio::time::Instant>,
+) {
+    if answers.is_empty() {
+        return;
+    }
+    let hosts = answers
+        .iter()
+        .map(|answer| answer.fqdn.clone())
+        .collect::<Vec<_>>();
+    let mut pending = stream::iter(hosts)
+        .map(|fqdn| async move {
+            let confirmed = dns.authoritative_confirms(&fqdn).await;
+            (fqdn, confirmed)
+        })
+        .buffer_unordered(dns.concurrency().clamp(1, 16));
+    let mut confirmed = BTreeSet::new();
+    loop {
+        let next = match deadline {
+            Some(deadline) if deadline <= tokio::time::Instant::now() => break,
+            Some(deadline) => match tokio::time::timeout_at(deadline, pending.next()).await {
+                Ok(next) => next,
+                Err(_) => break,
+            },
+            None => pending.next().await,
+        };
+        let Some((fqdn, is_confirmed)) = next else {
+            break;
+        };
+        if is_confirmed {
+            confirmed.insert(fqdn);
+        }
+    }
+    for answer in answers.iter_mut() {
+        answer.authoritative_validation |= confirmed.contains(&answer.fqdn);
+    }
 }
 
 fn external_retry_after_seconds(error: &str) -> Option<u64> {
@@ -500,6 +557,278 @@ fn phase_deadline(remaining: Option<Duration>) -> Option<tokio::time::Instant> {
 fn consume_phase_budget(remaining: &mut Option<Duration>, elapsed: Duration) {
     if let Some(budget) = remaining {
         *budget = budget.saturating_sub(elapsed);
+    }
+}
+
+fn active_candidate_budget_exhausted(remaining: Option<Duration>) -> bool {
+    remaining.is_some_and(|remaining| remaining.is_zero())
+}
+
+fn active_candidate_work_allowed(remaining: Option<Duration>) -> bool {
+    !active_candidate_budget_exhausted(remaining)
+}
+
+fn active_resume_required(
+    remaining: Option<Duration>,
+    pending_candidates: usize,
+    candidate_feed_remaining: bool,
+    recursive_work_remaining: bool,
+) -> bool {
+    recursive_work_remaining
+        || (active_candidate_budget_exhausted(remaining)
+            && (pending_candidates > 0 || candidate_feed_remaining))
+}
+
+fn candidate_uses_active_budget(_candidate: &CandidateProposal) -> bool {
+    true
+}
+
+fn candidate_uses_discovery_fast_path(
+    candidate: &CandidateProposal,
+    generated_candidates_enabled: bool,
+    resume_queue_draining: bool,
+    is_retry: bool,
+    is_known: bool,
+) -> bool {
+    generated_candidates_enabled
+        && candidate_uses_active_budget(candidate)
+        && candidate.generator != "wordlist"
+        && !resume_queue_draining
+        && !is_retry
+        && !is_known
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BatchDnsMode {
+    Conservative,
+    /// Only fresh generated candidates may use this mode. Its negatives are
+    /// terminal for the current candidate row but journal-only globally.
+    GeneratedDiscovery,
+}
+
+impl BatchDnsMode {
+    async fn resolve_host(self, dns: &DnsEngine, fqdn: &str) -> DnsResolutionOutcome {
+        match self {
+            Self::Conservative => dns.resolve_host_classified(fqdn).await,
+            Self::GeneratedDiscovery => dns.resolve_host_discovery_classified(fqdn).await,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct RoutedDnsOutcomes {
+    positives: Vec<ResolvedHost>,
+    cacheable_negatives: Vec<String>,
+    discovery_negatives: Vec<String>,
+    indeterminate: Vec<String>,
+}
+
+fn route_dns_outcomes(
+    mode: BatchDnsMode,
+    completed: impl IntoIterator<Item = DnsResolutionOutcome>,
+    unfinished: impl IntoIterator<Item = String>,
+) -> RoutedDnsOutcomes {
+    let mut routed = RoutedDnsOutcomes {
+        indeterminate: unfinished.into_iter().collect(),
+        ..RoutedDnsOutcomes::default()
+    };
+    for outcome in completed {
+        match outcome {
+            DnsResolutionOutcome::Positive(answer) => routed.positives.push(answer),
+            DnsResolutionOutcome::Negative { fqdn } => match mode {
+                BatchDnsMode::Conservative => routed.cacheable_negatives.push(fqdn),
+                BatchDnsMode::GeneratedDiscovery => routed.discovery_negatives.push(fqdn),
+            },
+            DnsResolutionOutcome::Indeterminate { fqdn } => routed.indeterminate.push(fqdn),
+        }
+    }
+    routed
+}
+
+fn persist_routed_dns_outcomes(
+    database: &Database,
+    scan_id: i64,
+    resolved: &[ResolvedHost],
+    cacheable_negatives: &[String],
+    discovery_negatives: &[String],
+    indeterminate: &[String],
+    negative_ttl: u32,
+) -> Result<()> {
+    database.update_cache_outcomes(
+        Some(scan_id),
+        resolved,
+        cacheable_negatives,
+        indeterminate,
+        negative_ttl,
+    )?;
+    database.record_discovery_negatives(scan_id, discovery_negatives)
+}
+
+#[derive(Debug)]
+struct DeadlineDnsOutcomes {
+    completed: Vec<DnsResolutionOutcome>,
+    /// Resolver futures that were launched but did not finish before the
+    /// caller-owned deadline.
+    cancelled: Vec<String>,
+    /// Hosts that never left the scheduler queue. They must not consume a DNS
+    /// retry or create a verification journal entry.
+    not_started: Vec<String>,
+    started: Vec<String>,
+    deadline_exhausted: bool,
+}
+
+/// Drain every outcome that is already ready before observing the deadline,
+/// then cancel only the still-pending resolver futures. Keeping the ready branch
+/// biased makes the persistence boundary deterministic at the deadline.
+async fn collect_dns_outcomes_until<I, Resolve, ResolveFuture, F>(
+    expected_hosts: I,
+    concurrency: usize,
+    deadline: Option<tokio::time::Instant>,
+    mut resolve: Resolve,
+    mut on_completed: F,
+) -> DeadlineDnsOutcomes
+where
+    I: IntoIterator<Item = String>,
+    Resolve: FnMut(String) -> ResolveFuture,
+    ResolveFuture: Future<Output = DnsResolutionOutcome>,
+    F: FnMut(&DnsResolutionOutcome),
+{
+    let mut queued = expected_hosts.into_iter().collect::<VecDeque<_>>();
+    let mut unfinished = queued.iter().cloned().collect::<BTreeSet<_>>();
+    let mut started = BTreeSet::new();
+    let mut completed = Vec::new();
+    let mut pending = FuturesUnordered::new();
+    let mut deadline_sleep = deadline.map(|deadline| Box::pin(tokio::time::sleep_until(deadline)));
+
+    let record_completed = |outcome: DnsResolutionOutcome,
+                            unfinished: &mut BTreeSet<String>,
+                            completed: &mut Vec<DnsResolutionOutcome>,
+                            on_completed: &mut F| {
+        unfinished.remove(outcome.fqdn());
+        on_completed(&outcome);
+        completed.push(outcome);
+    };
+
+    'resolve: loop {
+        // FuturesUnordered only contains the currently in-flight window. Never
+        // refill it once the deadline is reached: a biased ready branch cannot
+        // starve the deadline by pulling and starting the entire host stream.
+        while pending.len() < concurrency.max(1)
+            && deadline.is_none_or(|deadline| tokio::time::Instant::now() < deadline)
+        {
+            let Some(host) = queued.pop_front() else {
+                break;
+            };
+            started.insert(host.clone());
+            pending.push(resolve(host));
+        }
+
+        if pending.is_empty() {
+            break;
+        }
+
+        if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+            // Preserve only futures that are already ready. Polling stops at
+            // the first pending result and no replacement work is scheduled.
+            while let Some(Some(outcome)) = pending.next().now_or_never() {
+                record_completed(outcome, &mut unfinished, &mut completed, &mut on_completed);
+            }
+            break;
+        }
+
+        if let Some(sleep) = deadline_sleep.as_mut() {
+            tokio::select! {
+                biased;
+                next = pending.next() => {
+                    let Some(outcome) = next else {
+                        break 'resolve;
+                    };
+                    record_completed(outcome, &mut unfinished, &mut completed, &mut on_completed);
+                }
+                _ = sleep.as_mut() => {
+                    while let Some(Some(outcome)) = pending.next().now_or_never() {
+                        record_completed(
+                            outcome,
+                            &mut unfinished,
+                            &mut completed,
+                            &mut on_completed,
+                        );
+                    }
+                    break 'resolve;
+                }
+            }
+        } else if let Some(outcome) = pending.next().await {
+            record_completed(outcome, &mut unfinished, &mut completed, &mut on_completed);
+        } else {
+            break;
+        }
+    }
+    completed.sort_by(|left, right| left.fqdn().cmp(right.fqdn()));
+    let deadline_exhausted = deadline.is_some() && !unfinished.is_empty();
+    let cancelled = unfinished
+        .intersection(&started)
+        .cloned()
+        .collect::<Vec<_>>();
+    let not_started = unfinished.difference(&started).cloned().collect::<Vec<_>>();
+    DeadlineDnsOutcomes {
+        completed,
+        cancelled,
+        not_started,
+        started: started.into_iter().collect(),
+        deadline_exhausted,
+    }
+}
+
+async fn collect_refresh_dns_outcomes(
+    dns: &DnsEngine,
+    trusted_dns: Option<&DnsEngine>,
+    hosts: Vec<String>,
+    deadline: Option<tokio::time::Instant>,
+) -> DeadlineDnsOutcomes {
+    if let Some(trusted_dns) = trusted_dns {
+        collect_dns_outcomes_until(
+            hosts,
+            trusted_dns.concurrency().clamp(1, 32),
+            deadline,
+            |fqdn| async move { trusted_dns.resolve_host_consensus_classified(&fqdn).await },
+            |_| {},
+        )
+        .await
+    } else {
+        collect_dns_outcomes_until(
+            hosts,
+            dns.concurrency().clamp(1, 32),
+            deadline,
+            |fqdn| async move { dns.resolve_host_classified(&fqdn).await },
+            |_| {},
+        )
+        .await
+    }
+}
+
+#[derive(Debug, Default)]
+struct BatchResolution {
+    answers: Vec<ResolvedHost>,
+    cache_hits: usize,
+    resolved_from_network: usize,
+    deadline_exhausted: bool,
+    indeterminate_hosts: Vec<String>,
+    not_started_hosts: Vec<String>,
+    started_hosts: Vec<String>,
+}
+
+impl BatchResolution {
+    fn merge(&mut self, mut other: Self) {
+        self.answers.append(&mut other.answers);
+        self.cache_hits = self.cache_hits.saturating_add(other.cache_hits);
+        self.resolved_from_network = self
+            .resolved_from_network
+            .saturating_add(other.resolved_from_network);
+        self.deadline_exhausted |= other.deadline_exhausted;
+        self.indeterminate_hosts
+            .append(&mut other.indeterminate_hosts);
+        self.not_started_hosts.append(&mut other.not_started_hosts);
+        self.started_hosts.append(&mut other.started_hosts);
     }
 }
 
@@ -625,74 +954,33 @@ impl Scanner {
                 && DnsEngine::matches_wildcard(answer, signature))
     }
 
-    fn reclassify_cached_wildcard_matches(
-        &self,
-        scan_id: i64,
-        domain: &str,
+    fn answer_matches_confirmed_wildcard(
+        answer: &ResolvedHost,
         root_wildcard: &BTreeSet<String>,
         wildcard_by_parent: &BTreeMap<String, BTreeSet<String>>,
-    ) -> Result<(usize, usize)> {
-        let inventory = self.database.inventory(Some(domain), false)?;
-        let inventory_states = inventory
-            .iter()
-            .map(|entry| (entry.fqdn.clone(), entry.state))
-            .collect::<BTreeMap<_, _>>();
-        let names = inventory
-            .iter()
-            .map(|entry| entry.fqdn.clone())
-            .chain(self.database.positive_cache_names(domain)?)
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        let cached = self.database.fresh_cache(&names)?;
-        let mut confirmed = Vec::new();
-        let mut uncertain = Vec::new();
-        for fqdn in names {
-            let signature =
-                Self::applicable_wildcard_signature(&fqdn, root_wildcard, wildcard_by_parent);
-            let answer = cached.get(&fqdn).and_then(|entry| match entry {
-                CachedAnswer::Positive(answer) => Some(answer),
-                CachedAnswer::Negative => None,
-            });
-            if wildcard_signature_is_confirmed(signature)
-                && answer.is_some_and(|answer| DnsEngine::matches_wildcard(answer, signature))
-            {
-                confirmed.push(fqdn);
-            } else if wildcard_signature_is_indeterminate(signature)
-                && inventory_states
-                    .get(&fqdn)
-                    .is_some_and(|state| *state != crate::model::ObservationState::Unverified)
-            {
-                uncertain.push(fqdn);
-            }
-        }
-        confirmed.sort();
-        confirmed.dedup();
-        let purged = self
-            .database
-            .purge_confirmed_wildcard_false_positives(domain, &confirmed)?;
-        let purged = purged.into_iter().collect::<BTreeSet<_>>();
-        let mut ambiguous = confirmed
-            .into_iter()
-            .filter(|host| !purged.contains(host))
-            .chain(uncertain)
-            .collect::<Vec<_>>();
-        ambiguous.sort();
-        ambiguous.dedup();
-        self.database
-            .mark_unverified(Some(scan_id), &ambiguous, "wildcard_ancestor_match")?;
-        Ok((ambiguous.len(), purged.len()))
+    ) -> bool {
+        let signature =
+            Self::applicable_wildcard_signature(&answer.fqdn, root_wildcard, wildcard_by_parent);
+        wildcard_signature_is_confirmed(signature)
+            && DnsEngine::exactly_matches_wildcard(answer, signature)
     }
 
     async fn wildcard_signature_cached(&self, zone: &str) -> Option<BTreeSet<String>> {
-        wildcard_profile_cached(
+        let (dns, require_positive_consensus) = self
+            .trusted_dns
+            .as_ref()
+            .map(|dns| (dns, true))
+            .unwrap_or((&self.dns, false));
+        wildcard_profile_observed(
             &self.database,
-            &self.dns,
+            dns,
             zone,
             self.options.wildcard_refresh,
             self.options.refresh_cache,
+            require_positive_consensus,
         )
         .await
+        .signature
     }
 
     async fn wildcard_signatures_cached(
@@ -713,14 +1001,80 @@ impl Scanner {
             .await
     }
 
-    async fn register_wildcard_parents(
+    async fn wildcard_signature_cached_bounded(
+        &self,
+        zone: &str,
+        deadline: Option<tokio::time::Instant>,
+    ) -> (BTreeSet<String>, bool) {
+        match deadline {
+            Some(deadline) if deadline <= tokio::time::Instant::now() => {
+                (indeterminate_wildcard_signature(), true)
+            }
+            Some(deadline) => {
+                match tokio::time::timeout_at(deadline, self.wildcard_signature_cached(zone)).await
+                {
+                    Ok(signature) => (
+                        signature.unwrap_or_else(indeterminate_wildcard_signature),
+                        false,
+                    ),
+                    Err(_) => (indeterminate_wildcard_signature(), true),
+                }
+            }
+            None => (
+                self.wildcard_signature_cached(zone)
+                    .await
+                    .unwrap_or_else(indeterminate_wildcard_signature),
+                false,
+            ),
+        }
+    }
+
+    async fn wildcard_signatures_cached_bounded(
+        &self,
+        zones: Vec<String>,
+        deadline: Option<tokio::time::Instant>,
+    ) -> (BTreeMap<String, BTreeSet<String>>, bool) {
+        if zones.is_empty() {
+            return (BTreeMap::new(), false);
+        }
+        if deadline.is_some_and(|deadline| deadline <= tokio::time::Instant::now()) {
+            return (
+                zones
+                    .into_iter()
+                    .map(|zone| (zone, indeterminate_wildcard_signature()))
+                    .collect(),
+                true,
+            );
+        }
+        let result = match deadline {
+            Some(deadline) => {
+                tokio::time::timeout_at(deadline, self.wildcard_signatures_cached(zones.clone()))
+                    .await
+                    .ok()
+            }
+            None => Some(self.wildcard_signatures_cached(zones.clone()).await),
+        };
+        match result {
+            Some(signatures) => (signatures, false),
+            None => (
+                zones
+                    .into_iter()
+                    .map(|zone| (zone, indeterminate_wildcard_signature()))
+                    .collect(),
+                true,
+            ),
+        }
+    }
+
+    async fn register_wildcard_parents_bounded(
         &self,
         hosts: &[String],
         domain: &str,
         parent_by_host: &mut HashMap<String, String>,
         wildcard_by_parent: &mut BTreeMap<String, BTreeSet<String>>,
         limit: usize,
-    ) {
+        deadline: Option<tokio::time::Instant>,
+    ) -> bool {
         let mut counts = HashMap::<String, usize>::new();
         for host in hosts {
             if let Some(parent) = Self::parent_zone(host, domain) {
@@ -740,7 +1094,38 @@ impl Scanner {
             .filter(|parent| !wildcard_by_parent.contains_key(parent))
             .take(limit)
             .collect::<Vec<_>>();
-        wildcard_by_parent.extend(self.wildcard_signatures_cached(parents).await);
+        let (signatures, timed_out) = self
+            .wildcard_signatures_cached_bounded(parents, deadline)
+            .await;
+        wildcard_by_parent.extend(signatures);
+        timed_out
+    }
+
+    async fn register_wildcard_parents_with_budget(
+        &self,
+        hosts: &[String],
+        domain: &str,
+        parent_by_host: &mut HashMap<String, String>,
+        wildcard_by_parent: &mut BTreeMap<String, BTreeSet<String>>,
+        limit: usize,
+        remaining: &mut Option<Duration>,
+    ) -> bool {
+        let started = Instant::now();
+        let timed_out = self
+            .register_wildcard_parents_bounded(
+                hosts,
+                domain,
+                parent_by_host,
+                wildcard_by_parent,
+                limit,
+                phase_deadline(*remaining),
+            )
+            .await;
+        consume_phase_budget(remaining, started.elapsed());
+        if timed_out && remaining.is_some() {
+            *remaining = Some(Duration::ZERO);
+        }
+        timed_out
     }
 
     fn tls_endpoints(
@@ -871,6 +1256,7 @@ impl Scanner {
         domain: &str,
         observed_names: &BTreeMap<String, BTreeSet<String>>,
         target_queued: usize,
+        allow_generated: bool,
     ) -> Result<usize> {
         let queued = self.database.pending_scan_candidate_count(scan_id)?.max(0) as usize;
         let total = self.database.scan_candidate_budget_count(scan_id)?.max(0) as usize;
@@ -900,6 +1286,13 @@ impl Scanner {
             if !exhausted {
                 return Ok(queued.saturating_add(inserted));
             }
+        }
+
+        // An expired active budget stops only newly generated expansion.
+        // Durable explicit wordlist pages above remain eligible, while already
+        // attempted transient failures are drained by the normal claim path.
+        if !allow_generated {
+            return Ok(queued.saturating_add(inserted));
         }
 
         const HIGH_VALUE_WINDOW: usize = 5_000;
@@ -1690,49 +2083,65 @@ impl Scanner {
             .iter()
             .map(|finding| finding.fqdn.clone())
             .collect::<BTreeSet<_>>();
-        let inventory = self.database.inventory(Some(domain), false)?;
-        let missing_names = inventory
-            .iter()
-            .filter(|entry| !known.contains(&entry.fqdn))
-            .map(|entry| entry.fqdn.clone())
-            .collect::<Vec<_>>();
-        let cached = self.database.fresh_cache(&missing_names)?;
         let before = findings.len();
-        for entry in inventory {
-            if !known.insert(entry.fqdn.clone()) {
-                continue;
+        let mut cursor = None::<String>;
+        loop {
+            let inventory =
+                self.database
+                    .inventory_page(domain, false, cursor.as_deref(), 4_096)?;
+            if inventory.is_empty() {
+                break;
             }
-            let answer = cached.get(&entry.fqdn).and_then(|cached| match cached {
-                CachedAnswer::Positive(answer) => Some(answer),
-                CachedAnswer::Negative => None,
-            });
-            let signature =
-                Self::applicable_wildcard_signature(&entry.fqdn, root_wildcard, wildcard_by_parent);
-            let wildcard = wildcard_signature_is_indeterminate(signature)
-                || (wildcard_signature_is_confirmed(signature)
-                    && answer.is_some_and(|answer| DnsEngine::matches_wildcard(answer, signature)));
-            let state = if wildcard {
-                crate::model::ObservationState::Unverified
-            } else {
-                entry.state
-            };
-            let families = evidence_families(&entry.sources);
-            let confidence = assess_confidence(&entry.sources, wildcard, state, false);
-            findings.push(Finding {
-                fqdn: entry.fqdn,
-                records: answer
-                    .map(|answer| answer.records.clone())
-                    .unwrap_or_default(),
-                sources: entry.sources,
-                wildcard,
-                from_cache: true,
-                confidence,
-                state,
-                last_verified_at: (!wildcard).then_some(entry.last_verified_at).flatten(),
-                evidence_families: families,
-                authoritative_validation: answer
-                    .is_some_and(|answer| answer.authoritative_validation),
-            });
+            cursor = inventory.last().map(|entry| entry.fqdn.clone());
+            let missing_names = inventory
+                .iter()
+                .filter(|entry| !known.contains(&entry.fqdn))
+                .map(|entry| entry.fqdn.clone())
+                .collect::<Vec<_>>();
+            let cached = self.database.fresh_cache(&missing_names)?;
+            for entry in inventory {
+                if !known.insert(entry.fqdn.clone()) {
+                    continue;
+                }
+                let answer = cached.get(&entry.fqdn).and_then(|cached| match cached {
+                    CachedAnswer::Positive(answer) => Some(answer),
+                    CachedAnswer::Negative => None,
+                });
+                let signature = Self::applicable_wildcard_signature(
+                    &entry.fqdn,
+                    root_wildcard,
+                    wildcard_by_parent,
+                );
+                let wildcard_indeterminate = wildcard_signature_is_indeterminate(signature);
+                let confirmed_wildcard_match = wildcard_signature_is_confirmed(signature)
+                    && answer.is_some_and(|answer| DnsEngine::matches_wildcard(answer, signature));
+                let wildcard = wildcard_indeterminate || confirmed_wildcard_match;
+                if confirmed_wildcard_match && !self.options.include_wildcard {
+                    continue;
+                }
+                let state = if wildcard {
+                    crate::model::ObservationState::Unverified
+                } else {
+                    entry.state
+                };
+                let families = evidence_families(&entry.sources);
+                let confidence = assess_confidence(&entry.sources, wildcard, state, false);
+                findings.push(Finding {
+                    fqdn: entry.fqdn,
+                    records: answer
+                        .map(|answer| answer.records.clone())
+                        .unwrap_or_default(),
+                    sources: entry.sources,
+                    wildcard,
+                    from_cache: true,
+                    confidence,
+                    state,
+                    last_verified_at: (!wildcard).then_some(entry.last_verified_at).flatten(),
+                    evidence_families: families,
+                    authoritative_validation: answer
+                        .is_some_and(|answer| answer.authoritative_validation),
+                });
+            }
         }
         findings.sort_by(|left, right| left.fqdn.cmp(&right.fqdn));
         Ok(findings.len().saturating_sub(before))
@@ -1751,6 +2160,43 @@ impl Scanner {
         parent_by_host: &HashMap<String, String>,
         wildcard_by_parent: &BTreeMap<String, BTreeSet<String>>,
     ) -> Result<(Vec<ResolvedHost>, usize, usize)> {
+        let result = self
+            .resolve_batch_with_deadline(
+                scan_id,
+                domain,
+                hosts,
+                phase,
+                scan_started,
+                sources,
+                root_wildcard,
+                parent_by_host,
+                wildcard_by_parent,
+                None,
+                BatchDnsMode::Conservative,
+            )
+            .await?;
+        Ok((
+            result.answers,
+            result.cache_hits,
+            result.resolved_from_network,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn resolve_batch_with_deadline(
+        &self,
+        scan_id: i64,
+        domain: &str,
+        hosts: &[String],
+        phase: &str,
+        scan_started: &Instant,
+        sources: &BTreeMap<String, BTreeSet<String>>,
+        root_wildcard: &BTreeSet<String>,
+        parent_by_host: &HashMap<String, String>,
+        wildcard_by_parent: &BTreeMap<String, BTreeSet<String>>,
+        deadline: Option<tokio::time::Instant>,
+        mode: BatchDnsMode,
+    ) -> Result<BatchResolution> {
         let cached = if self.options.refresh_cache {
             HashMap::new()
         } else {
@@ -1770,6 +2216,7 @@ impl Scanner {
                         answer,
                         self.options.verification_max_age,
                         now_epoch(),
+                        self.trusted_dns.is_some(),
                     ) {
                         network_hosts.push(host.clone());
                         continue;
@@ -1808,9 +2255,16 @@ impl Scanner {
         }
         let mut last_report = Instant::now();
         let mut last_reported = processed;
-        let network_outcomes = self
-            .dns
-            .resolve_many_classified_with_progress(network_hosts.clone(), |outcome| {
+        let dns = self.dns.clone();
+        let network_batch = collect_dns_outcomes_until(
+            network_hosts.clone(),
+            self.dns.concurrency(),
+            deadline,
+            move |host| {
+                let dns = dns.clone();
+                async move { mode.resolve_host(&dns, &host).await }
+            },
+            |outcome| {
                 processed += 1;
                 let found_now = (self.trusted_dns.is_none())
                     .then_some(outcome.answer())
@@ -1845,23 +2299,26 @@ impl Scanner {
                     last_report = Instant::now();
                     last_reported = processed;
                 }
-            })
-            .await;
-        let mut network_answers = Vec::new();
-        let mut definitive_negative = Vec::new();
-        let mut indeterminate = Vec::new();
-        for outcome in network_outcomes {
-            match outcome {
-                DnsResolutionOutcome::Positive(answer) => network_answers.push(answer),
-                DnsResolutionOutcome::Negative { fqdn } => definitive_negative.push(fqdn),
-                DnsResolutionOutcome::Indeterminate { fqdn } => indeterminate.push(fqdn),
-            }
-        }
+            },
+        )
+        .await;
+        self.database
+            .mark_scan_candidates_started(scan_id, &network_batch.started)?;
+        let started_hosts = network_batch.started.clone();
+        let mut deadline_exhausted = network_batch.deadline_exhausted;
+        let not_started = network_batch.not_started;
+        let routed = route_dns_outcomes(mode, network_batch.completed, network_batch.cancelled);
+        let mut network_answers = routed.positives;
+        let mut definitive_negative = routed.cacheable_negatives;
+        let mut discovery_negative = routed.discovery_negatives;
+        let mut indeterminate = routed.indeterminate;
         let mut wildcard_answers = Vec::new();
         let mut validation_candidates = Vec::new();
         let mut suppressed_wildcard = 0_usize;
         for answer in network_answers {
-            if Self::is_strict_enrichment_seed(&answer, root_wildcard, wildcard_by_parent) {
+            if self.trusted_dns.is_some()
+                || Self::is_strict_enrichment_seed(&answer, root_wildcard, wildcard_by_parent)
+            {
                 validation_candidates.push(answer);
             } else if self
                 .finding_for_answer(
@@ -1882,77 +2339,85 @@ impl Scanner {
             self.emit(ProgressEvent::Phase {
                 name: "wildcard".to_owned(),
                 detail: format!(
-                    "{suppressed_wildcard} réponse(s) candidate-only écartée(s) avant consensus et cache"
+                    "{suppressed_wildcard} réponse(s) wildcard ambiguë(s) écartée(s) du cache"
                 ),
             });
         }
         if let Some(trusted_dns) = &self.trusted_dns {
             let validation_total = validation_candidates.len();
             let validation_started = Instant::now();
-            let mut validations = stream::iter(validation_candidates)
-                .map(|answer| async move {
-                    let fqdn = answer.fqdn.clone();
-                    let outcome = match trusted_dns.resolve_host_consensus_classified(&fqdn).await {
-                        DnsResolutionOutcome::Positive(mut consensus) => {
-                            consensus.authoritative_validation =
-                                trusted_dns.authoritative_confirms(&consensus.fqdn).await;
-                            DnsResolutionOutcome::Positive(consensus)
-                        }
-                        outcome => outcome,
-                    };
-                    (fqdn, outcome)
-                })
-                .buffer_unordered(trusted_dns.concurrency().clamp(1, 32));
-            let mut validated = Vec::new();
+            let validation_hosts = validation_candidates
+                .iter()
+                .map(|answer| answer.fqdn.clone())
+                .collect::<Vec<_>>();
             let mut validation_processed = 0_usize;
-            let mut validation_heartbeat = tokio::time::interval_at(
-                tokio::time::Instant::now() + Duration::from_millis(250),
-                Duration::from_millis(250),
-            );
-            validation_heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                tokio::select! {
-                    next = validations.next() => {
-                        let Some((fqdn, outcome)) = next else {
-                            break;
-                        };
-                        validation_processed += 1;
-                        match outcome {
-                            DnsResolutionOutcome::Positive(consensus) => validated.push(consensus),
-                            DnsResolutionOutcome::Negative { .. }
-                            | DnsResolutionOutcome::Indeterminate { .. } => {
-                                indeterminate.push(fqdn);
-                            }
-                        }
-                        if validation_processed == validation_total {
-                            self.emit(ProgressEvent::DnsProgress {
-                                phase: format!("{phase} trusted"),
-                                processed: validation_processed,
-                                total: validation_total,
-                                found: validated.len(),
-                                cache_hits: 0,
-                                rate: validation_processed as f64
-                                    / validation_started.elapsed().as_secs_f64().max(0.001),
-                                elapsed_ms: scan_started.elapsed().as_millis(),
-                            });
-                        }
+            let mut validation_found = 0_usize;
+            let mut last_validation_report = Instant::now();
+            let trusted_concurrency = trusted_dns.concurrency().clamp(1, 32);
+            let validation_dns = trusted_dns.clone();
+            let authoritative_dns = trusted_dns.clone();
+            let validation_batch = collect_dns_outcomes_until(
+                validation_hosts,
+                trusted_concurrency,
+                deadline,
+                move |fqdn| {
+                    let validation_dns = validation_dns.clone();
+                    async move {
+                        validation_dns
+                            .resolve_host_consensus_classified(&fqdn)
+                            .await
                     }
-                    _ = validation_heartbeat.tick(), if validation_processed < validation_total => {
+                },
+                |outcome| {
+                    validation_processed += 1;
+                    validation_found += usize::from(outcome.answer().is_some());
+                    if validation_processed == validation_total
+                        || last_validation_report.elapsed() >= Duration::from_millis(250)
+                    {
                         self.emit(ProgressEvent::DnsProgress {
                             phase: format!("{phase} trusted"),
                             processed: validation_processed,
                             total: validation_total,
-                            found: validated.len(),
+                            found: validation_found,
                             cache_hits: 0,
                             rate: validation_processed as f64
                                 / validation_started.elapsed().as_secs_f64().max(0.001),
                             elapsed_ms: scan_started.elapsed().as_millis(),
                         });
+                        last_validation_report = Instant::now();
                     }
+                },
+            )
+            .await;
+            deadline_exhausted |= validation_batch.deadline_exhausted;
+            let mut validated = Vec::new();
+            for outcome in validation_batch.completed {
+                match outcome {
+                    DnsResolutionOutcome::Positive(consensus) => validated.push(consensus),
+                    DnsResolutionOutcome::Negative { fqdn }
+                    | DnsResolutionOutcome::Indeterminate { fqdn } => indeterminate.push(fqdn),
                 }
             }
+            indeterminate.extend(validation_batch.cancelled);
+            indeterminate.extend(validation_batch.not_started);
             validated.sort_by(|left, right| left.fqdn.cmp(&right.fqdn));
-            wildcard_answers.extend(validated);
+            enrich_authoritative_answers(&authoritative_dns, &mut validated, deadline).await;
+            for answer in validated {
+                if self
+                    .finding_for_answer(
+                        &answer,
+                        sources,
+                        root_wildcard,
+                        parent_by_host,
+                        wildcard_by_parent,
+                    )
+                    .is_some()
+                {
+                    wildcard_answers.push(answer);
+                } else {
+                    suppressed_wildcard = suppressed_wildcard.saturating_add(1);
+                }
+            }
             wildcard_answers.sort_by(|left, right| left.fqdn.cmp(&right.fqdn));
             for answer in &wildcard_answers {
                 if let Some(finding) = self.finding_for_answer(
@@ -1985,6 +2450,8 @@ impl Scanner {
         }
         definitive_negative.sort();
         definitive_negative.dedup();
+        discovery_negative.sort();
+        discovery_negative.dedup();
         indeterminate.sort();
         indeterminate.dedup();
         if !indeterminate.is_empty() {
@@ -1993,10 +2460,12 @@ impl Scanner {
                 indeterminate.len()
             )));
         }
-        self.database.update_cache_outcomes(
-            Some(scan_id),
+        persist_routed_dns_outcomes(
+            &self.database,
+            scan_id,
             &network_answers,
             &definitive_negative,
+            &discovery_negative,
             &indeterminate,
             self.options.negative_ttl,
         )?;
@@ -2020,13 +2489,22 @@ impl Scanner {
             &incremental_findings,
             self.options.ttl_cap,
         )?;
-        Ok((answers, cache_hits, resolved_from_network))
+        Ok(BatchResolution {
+            answers,
+            cache_hits,
+            resolved_from_network,
+            deadline_exhausted,
+            indeterminate_hosts: indeterminate,
+            not_started_hosts: not_started,
+            started_hosts,
+        })
     }
 
     pub async fn scan(&self, target: &str) -> Result<ScanResult> {
         let domain = normalize_domain(target)?;
         let options_json = json!({
             "max_words": self.options.max_words,
+            "active_phase_timeout_seconds": self.options.active_phase_timeout.as_secs(),
             "passive": self.options.passive,
             "passive_sources": self.options.passive_sources,
             "automatic_source_selection": self.options.automatic_source_selection,
@@ -2078,6 +2556,7 @@ impl Scanner {
             "web_discovery": self.options.web_discovery,
             "web_max_hosts": self.options.web_max_hosts,
             "web_timeout_ms": self.options.web_timeout.as_millis(),
+            "web_phase_timeout_seconds": self.options.web_phase_timeout.as_secs(),
             "web_refresh_seconds": self.options.web_refresh.as_secs(),
             "web_concurrency": self.options.web_concurrency,
             "web_max_bytes": self.options.web_max_bytes,
@@ -2138,22 +2617,34 @@ impl Scanner {
         );
         let mut run_guard = ScanRunGuard::new(self.database.clone(), scan_id, started);
         let result = self.scan_inner(scan_id, &domain, started).await;
-        run_guard.disarm();
-        checkpoint_heartbeat.stop().await;
-        if let Err(error) = &result {
-            self.emit(ProgressEvent::Warning(format!(
-                "scan interrompu: {error:#}"
-            )));
-            let _ = self.database.finish_scan(
-                scan_id,
-                "failed",
-                0,
-                0,
-                0,
-                started.elapsed().as_millis(),
-                &[format!("{error:#}")],
-            );
+        match &result {
+            Ok(_) => {
+                // scan_inner has already committed either a completed or a
+                // resumable partial terminal state.
+                run_guard.disarm();
+            }
+            Err(error) => {
+                self.emit(ProgressEvent::Warning(format!(
+                    "scan interrompu: {error:#}"
+                )));
+                if self
+                    .database
+                    .finish_scan(
+                        scan_id,
+                        "failed",
+                        0,
+                        0,
+                        0,
+                        started.elapsed().as_millis(),
+                        &[format!("{error:#}")],
+                    )
+                    .is_ok()
+                {
+                    run_guard.disarm();
+                }
+            }
         }
+        checkpoint_heartbeat.stop().await;
         self.emit(ProgressEvent::Complete);
         result
     }
@@ -2161,12 +2652,21 @@ impl Scanner {
     async fn scan_inner(&self, scan_id: i64, domain: &str, started: Instant) -> Result<ScanResult> {
         let mut warnings = Vec::new();
         let mut pipeline_metrics = PipelineMetrics::default();
+        let mut phase_timings = Vec::new();
         let mut sources: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         let mut passive_budget_remaining = (!self.options.passive_phase_timeout.is_zero())
             .then_some(self.options.passive_phase_timeout);
         let mut nsec_budget_remaining =
             (!self.options.nsec_phase_timeout.is_zero()).then_some(self.options.nsec_phase_timeout);
         let mut nsec_budget_warning_emitted = false;
+        let mut web_budget_remaining =
+            (!self.options.web_phase_timeout.is_zero()).then_some(self.options.web_phase_timeout);
+        let mut web_budget_exhausted = false;
+        let initial_discovery_started = Instant::now();
+        let resume_from_discovery_checkpoint = self.options.resume.is_some()
+            && (self.database.scan_seed_candidate_count(scan_id)? > 0
+                || self.database.scan_candidate_count(scan_id)? > 0
+                || self.database.scan_recursive_has_more(scan_id)?);
 
         // These discovery families are independent network operations. Running
         // them together turns their cold-start wall time into the slowest one,
@@ -2238,16 +2738,21 @@ impl Scanner {
                         self.options.ct_max_logs, self.options.ct_entries_per_log,
                     ),
                 });
-                match monitor_ct_logs_bounded(
-                    &self.database,
-                    domain,
-                    self.options.ct_timeout,
-                    self.options.ct_max_logs,
-                    self.options.ct_entries_per_log,
-                    self.options.ct_initial_backfill,
-                    self.options.ct_phase_timeout,
-                )
-                .await
+                match self
+                    .await_with_phase_heartbeat(
+                        "CT incrémental",
+                        "lecture bornée des journaux publics",
+                        monitor_ct_logs_bounded(
+                            &self.database,
+                            domain,
+                            self.options.ct_timeout,
+                            self.options.ct_max_logs,
+                            self.options.ct_entries_per_log,
+                            self.options.ct_initial_backfill,
+                            self.options.ct_phase_timeout,
+                        ),
+                    )
+                    .await
                 {
                     Ok(result) => ct_monitor = result,
                     Err(error) => {
@@ -2287,8 +2792,13 @@ impl Scanner {
                 name: "AXFR".to_owned(),
                 detail: "résolution des NS et transfert TCP".to_owned(),
             });
-            let (attempts, axfr_warnings) =
-                attempt_axfr(&self.dns, domain, self.options.axfr_timeout).await;
+            let (attempts, axfr_warnings) = self
+                .await_with_phase_heartbeat(
+                    "AXFR",
+                    "essais bornés sur les serveurs autoritaires",
+                    attempt_axfr(&self.dns, domain, self.options.axfr_timeout),
+                )
+                .await;
             for warning in &axfr_warnings {
                 self.emit(ProgressEvent::Warning(warning.clone()));
             }
@@ -2298,11 +2808,61 @@ impl Scanner {
             (attempts, axfr_warnings)
         };
 
-        let (passive_result, ct_result, (axfr_attempts, axfr_warnings)) =
-            tokio::join!(passive_phase, ct_phase, axfr_phase);
-        let (passive_sources, passive_warnings, mut passive_zones_queried, passive_elapsed) =
-            passive_result?;
-        let (ct_monitor, ct_warnings) = ct_result?;
+        let (
+            passive_sources,
+            passive_warnings,
+            mut passive_zones_queried,
+            passive_elapsed,
+            ct_monitor,
+            ct_warnings,
+            axfr_attempts,
+            axfr_warnings,
+        ) = if resume_from_discovery_checkpoint {
+            drop(passive_phase);
+            drop(ct_phase);
+            drop(axfr_phase);
+            self.emit(ProgressEvent::Phase {
+                name: "reprise".to_owned(),
+                detail: "sources passives, CT et AXFR restaurées depuis le checkpoint".to_owned(),
+            });
+            let restored_sources = self
+                .database
+                .scan_seed_candidates_for_output(scan_id)?
+                .into_iter()
+                .collect::<BTreeMap<_, _>>();
+            let mut restored_zones = BTreeSet::from([domain.to_owned()]);
+            restored_zones.extend(self.inferred_passive_zones(
+                domain,
+                restored_sources.keys().cloned(),
+                self.options.recursive_hosts.min(20),
+            ));
+            (
+                restored_sources,
+                Vec::new(),
+                restored_zones,
+                Duration::ZERO,
+                CtMonitorResult::default(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )
+        } else {
+            let (passive_result, ct_result, (axfr_attempts, axfr_warnings)) =
+                tokio::join!(passive_phase, ct_phase, axfr_phase);
+            let (passive_sources, passive_warnings, passive_zones_queried, passive_elapsed) =
+                passive_result?;
+            let (ct_monitor, ct_warnings) = ct_result?;
+            (
+                passive_sources,
+                passive_warnings,
+                passive_zones_queried,
+                passive_elapsed,
+                ct_monitor,
+                ct_warnings,
+                axfr_attempts,
+                axfr_warnings,
+            )
+        };
         if self.options.passive {
             consume_phase_budget(&mut passive_budget_remaining, passive_elapsed);
         }
@@ -2330,7 +2890,12 @@ impl Scanner {
         }
         self.database.save_axfr_attempts(scan_id, &axfr_attempts)?;
         self.cap_seed_sources(domain, &mut sources, &mut warnings);
+        phase_timings.push(PhaseTiming {
+            phase: "initial_discovery".to_owned(),
+            duration_ms: initial_discovery_started.elapsed().as_millis(),
+        });
 
+        let candidate_dns_started = Instant::now();
         self.emit(ProgressEvent::Phase {
             name: "candidats".to_owned(),
             detail: "fusion du passif, AXFR, apprentissage et wordlist".to_owned(),
@@ -2351,6 +2916,26 @@ impl Scanner {
             &seed_payload,
             self.options.max_passive,
         )?;
+        let resumed_live_answers = if self.options.resume.is_some() {
+            self.database.live_scan_answers(scan_id)?
+        } else {
+            Vec::new()
+        };
+        for (answer, persisted_sources) in &resumed_live_answers {
+            sources
+                .entry(answer.fqdn.clone())
+                .or_default()
+                .extend(persisted_sources.iter().cloned());
+        }
+        let mut generated_candidates_enabled = !self.options.passive_only;
+        let mut active_budget_remaining = (!self.options.active_phase_timeout.is_zero())
+            .then_some(self.options.active_phase_timeout);
+        let mut recursive_budget_exhausted = false;
+        let mut candidate_expansion_stopped_naturally = false;
+        let mut active_budget_warning_emitted = false;
+        let mut resume_candidate_queue_draining = self.options.resume.is_some()
+            && self.database.pending_scan_candidate_count(scan_id)?.max(0) as usize > 0;
+        let mut conservative_candidate_retries = BTreeSet::<String>::new();
         let discovered_seed_count =
             self.database.scan_seed_candidate_count(scan_id)?.max(0) as usize;
         let first_batch_limit = if self.options.adaptive { 500 } else { 5_000 };
@@ -2372,9 +2957,21 @@ impl Scanner {
         let candidates = if self.options.passive_only {
             Vec::new()
         } else {
-            self.refill_candidate_queue(scan_id, domain, &sources, first_candidate_limit)?;
+            if !resume_candidate_queue_draining {
+                self.refill_candidate_queue(
+                    scan_id,
+                    domain,
+                    &sources,
+                    first_candidate_limit,
+                    generated_candidates_enabled,
+                )?;
+            }
             self.database
-                .pending_scan_candidates(scan_id, first_candidate_limit)?
+                .pending_scan_candidates_eligible(
+                    scan_id,
+                    first_candidate_limit,
+                    active_candidate_work_allowed(active_budget_remaining),
+                )?
                 .into_iter()
                 .map(|(relative_name, generator, score)| CandidateProposal {
                     relative_name,
@@ -2413,6 +3010,56 @@ impl Scanner {
             };
             add_candidates(&candidates, "dns")
         };
+        let known_first_candidate_hosts = self
+            .database
+            .known_discovery_names(&first_candidate_hosts)?;
+        let first_wordlist_hosts = candidates
+            .iter()
+            .filter(|candidate| candidate.generator == "wordlist")
+            .filter_map(|candidate| {
+                let fqdn = format!("{}.{domain}", candidate.relative_name);
+                (!first_seed_hosts.contains(&fqdn)).then_some(fqdn)
+            })
+            .collect::<Vec<_>>();
+        let first_generated_hosts = candidates
+            .iter()
+            .filter_map(|candidate| {
+                let fqdn = format!("{}.{domain}", candidate.relative_name);
+                (candidate_uses_discovery_fast_path(
+                    candidate,
+                    true,
+                    resume_candidate_queue_draining,
+                    false,
+                    known_first_candidate_hosts.contains(&fqdn),
+                ) && !first_seed_hosts.contains(&fqdn))
+                .then_some(fqdn)
+            })
+            .collect::<Vec<_>>();
+        let first_known_generated_hosts = candidates
+            .iter()
+            .filter_map(|candidate| {
+                let fqdn = format!("{}.{domain}", candidate.relative_name);
+                (candidate_uses_discovery_fast_path(
+                    candidate,
+                    true,
+                    resume_candidate_queue_draining,
+                    false,
+                    false,
+                ) && known_first_candidate_hosts.contains(&fqdn)
+                    && !first_seed_hosts.contains(&fqdn))
+                .then_some(fqdn)
+            })
+            .collect::<Vec<_>>();
+        let first_retry_hosts = candidates
+            .iter()
+            .filter(|candidate| {
+                resume_candidate_queue_draining && candidate.generator != "wordlist"
+            })
+            .filter_map(|candidate| {
+                let fqdn = format!("{}.{domain}", candidate.relative_name);
+                (!first_seed_hosts.contains(&fqdn)).then_some(fqdn)
+            })
+            .collect::<BTreeSet<_>>();
 
         let initial_hosts = first_seed_hosts
             .iter()
@@ -2421,24 +3068,47 @@ impl Scanner {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
+        let initial_wildcard_hosts = initial_hosts
+            .iter()
+            .cloned()
+            .chain(
+                resumed_live_answers
+                    .iter()
+                    .map(|(answer, _)| answer.fqdn.clone()),
+            )
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
         self.emit(ProgressEvent::Phase {
             name: "wildcard".to_owned(),
             detail: "sondes aléatoires sur la racine et les sous-zones observées".to_owned(),
         });
-        let root_wildcard = self
-            .wildcard_signature_cached(domain)
-            .await
-            .unwrap_or_else(indeterminate_wildcard_signature);
+        let wildcard_budget_started = Instant::now();
+        let wildcard_deadline = phase_deadline(active_budget_remaining);
+        let (root_wildcard, root_wildcard_timed_out) = self
+            .wildcard_signature_cached_bounded(domain, wildcard_deadline)
+            .await;
         let mut wildcard_by_parent = BTreeMap::from([(domain.to_owned(), root_wildcard.clone())]);
         let mut parent_by_host = HashMap::new();
-        self.register_wildcard_parents(
-            &initial_hosts,
-            domain,
-            &mut parent_by_host,
-            &mut wildcard_by_parent,
-            64,
-        )
-        .await;
+        let parent_wildcard_timed_out = self
+            .register_wildcard_parents_bounded(
+                &initial_wildcard_hosts,
+                domain,
+                &mut parent_by_host,
+                &mut wildcard_by_parent,
+                64,
+                wildcard_deadline,
+            )
+            .await;
+        consume_phase_budget(
+            &mut active_budget_remaining,
+            wildcard_budget_started.elapsed(),
+        );
+        if (root_wildcard_timed_out || parent_wildcard_timed_out)
+            && active_budget_remaining.is_some()
+        {
+            active_budget_remaining = Some(Duration::ZERO);
+        }
         let wildcard_parent_count = wildcard_by_parent
             .iter()
             .filter(|(zone, signature)| {
@@ -2451,16 +3121,10 @@ impl Scanner {
                 *zone != domain && wildcard_signature_is_indeterminate(signature)
             })
             .count();
-        let (reclassified, purged_wildcards) = self.reclassify_cached_wildcard_matches(
-            scan_id,
-            domain,
-            &root_wildcard,
-            &wildcard_by_parent,
-        )?;
         self.emit(ProgressEvent::Phase {
             name: "wildcard".to_owned(),
             detail: format!(
-                "racine {}, {} sous-zone(s) wildcard, {} indéterminée(s), {} reclassé(s), {} faux positif(s) purgé(s)",
+                "racine {}, {} sous-zone(s) wildcard, {} indéterminée(s)",
                 if wildcard_signature_is_indeterminate(&root_wildcard) {
                     "indéterminée"
                 } else if root_wildcard.is_empty() {
@@ -2469,28 +3133,179 @@ impl Scanner {
                     "wildcard"
                 },
                 wildcard_parent_count,
-                indeterminate_parent_count,
-                reclassified,
-                purged_wildcards
+                indeterminate_parent_count
             ),
         });
         self.emit(ProgressEvent::Phase {
             name: "DNS niveau 1".to_owned(),
             detail: format!("{} candidat(s) à valider", initial_hosts.len()),
         });
-        let (initial_answers, mut cache_hits, mut network_resolved) = self
-            .resolve_batch(
-                scan_id,
-                domain,
-                &initial_hosts,
-                "DNS niveau 1",
-                &started,
-                &sources,
-                &root_wildcard,
-                &parent_by_host,
-                &wildcard_by_parent,
-            )
-            .await?;
+        let mut initial_resolution = BatchResolution::default();
+        let first_seed_batch = first_seed_hosts.iter().cloned().collect::<Vec<_>>();
+        if !first_seed_batch.is_empty() {
+            let (answers, cache_hits, resolved_from_network) = self
+                .resolve_batch(
+                    scan_id,
+                    domain,
+                    &first_seed_batch,
+                    "DNS niveau 1 passif",
+                    &started,
+                    &sources,
+                    &root_wildcard,
+                    &parent_by_host,
+                    &wildcard_by_parent,
+                )
+                .await?;
+            initial_resolution.merge(BatchResolution {
+                answers,
+                cache_hits,
+                resolved_from_network,
+                deadline_exhausted: false,
+                indeterminate_hosts: Vec::new(),
+                not_started_hosts: Vec::new(),
+                started_hosts: Vec::new(),
+            });
+        }
+        if !first_wordlist_hosts.is_empty() {
+            let active_wordlist_started = Instant::now();
+            let conservative_resolution = self
+                .resolve_batch_with_deadline(
+                    scan_id,
+                    domain,
+                    &first_wordlist_hosts,
+                    "DNS niveau 1 wordlist",
+                    &started,
+                    &sources,
+                    &root_wildcard,
+                    &parent_by_host,
+                    &wildcard_by_parent,
+                    phase_deadline(active_budget_remaining),
+                    BatchDnsMode::Conservative,
+                )
+                .await?;
+            consume_phase_budget(
+                &mut active_budget_remaining,
+                active_wordlist_started.elapsed(),
+            );
+            if conservative_resolution.deadline_exhausted && active_budget_remaining.is_some() {
+                active_budget_remaining = Some(Duration::ZERO);
+            }
+            initial_resolution.merge(conservative_resolution);
+        }
+        if !first_retry_hosts.is_empty() {
+            let active_retry_started = Instant::now();
+            let retry_hosts = first_retry_hosts.iter().cloned().collect::<Vec<_>>();
+            let conservative_resolution = self
+                .resolve_batch_with_deadline(
+                    scan_id,
+                    domain,
+                    &retry_hosts,
+                    "DNS niveau 1 retry actif",
+                    &started,
+                    &sources,
+                    &root_wildcard,
+                    &parent_by_host,
+                    &wildcard_by_parent,
+                    phase_deadline(active_budget_remaining),
+                    BatchDnsMode::Conservative,
+                )
+                .await?;
+            consume_phase_budget(&mut active_budget_remaining, active_retry_started.elapsed());
+            if conservative_resolution.deadline_exhausted && active_budget_remaining.is_some() {
+                active_budget_remaining = Some(Duration::ZERO);
+            }
+            conservative_candidate_retries.extend(
+                conservative_resolution
+                    .indeterminate_hosts
+                    .iter()
+                    .filter(|host| first_retry_hosts.contains(*host))
+                    .cloned(),
+            );
+            initial_resolution.merge(conservative_resolution);
+        }
+        if !first_known_generated_hosts.is_empty() {
+            let active_wave_started = Instant::now();
+            let conservative_resolution = self
+                .resolve_batch_with_deadline(
+                    scan_id,
+                    domain,
+                    &first_known_generated_hosts,
+                    "DNS niveau 1 actif connu",
+                    &started,
+                    &sources,
+                    &root_wildcard,
+                    &parent_by_host,
+                    &wildcard_by_parent,
+                    phase_deadline(active_budget_remaining),
+                    BatchDnsMode::Conservative,
+                )
+                .await?;
+            consume_phase_budget(&mut active_budget_remaining, active_wave_started.elapsed());
+            if conservative_resolution.deadline_exhausted && active_budget_remaining.is_some() {
+                active_budget_remaining = Some(Duration::ZERO);
+            }
+            conservative_candidate_retries
+                .extend(conservative_resolution.indeterminate_hosts.iter().cloned());
+            initial_resolution.merge(conservative_resolution);
+        }
+        if !first_generated_hosts.is_empty() {
+            let active_wave_started = Instant::now();
+            let generated_resolution = self
+                .resolve_batch_with_deadline(
+                    scan_id,
+                    domain,
+                    &first_generated_hosts,
+                    "DNS niveau 1 actif",
+                    &started,
+                    &sources,
+                    &root_wildcard,
+                    &parent_by_host,
+                    &wildcard_by_parent,
+                    phase_deadline(active_budget_remaining),
+                    BatchDnsMode::GeneratedDiscovery,
+                )
+                .await?;
+            consume_phase_budget(&mut active_budget_remaining, active_wave_started.elapsed());
+            if generated_resolution.deadline_exhausted && active_budget_remaining.is_some() {
+                active_budget_remaining = Some(Duration::ZERO);
+            }
+            conservative_candidate_retries
+                .extend(generated_resolution.indeterminate_hosts.iter().cloned());
+            initial_resolution.merge(generated_resolution);
+        }
+        if (!first_known_generated_hosts.is_empty() || !first_generated_hosts.is_empty())
+            && active_candidate_budget_exhausted(active_budget_remaining)
+        {
+            generated_candidates_enabled = false;
+            if !active_budget_warning_emitted {
+                let detail = format!(
+                    "budget DNS actif de {}s atteint après {} candidat(s); expansion générée arrêtée, résultats terminés conservés et requêtes inachevées remises en file",
+                    self.options.active_phase_timeout.as_secs(),
+                    generator_attempts.values().sum::<usize>()
+                );
+                self.emit(ProgressEvent::Phase {
+                    name: "adaptation".to_owned(),
+                    detail: detail.clone(),
+                });
+                warnings.push(detail);
+                active_budget_warning_emitted = true;
+            }
+        }
+        conservative_candidate_retries.extend(
+            initial_resolution
+                .indeterminate_hosts
+                .iter()
+                .filter(|host| first_candidate_hosts.contains(*host))
+                .cloned(),
+        );
+        let BatchResolution {
+            answers: initial_answers,
+            mut cache_hits,
+            resolved_from_network: mut network_resolved,
+            not_started_hosts: initial_not_started,
+            ..
+        } = initial_resolution;
+        let initial_not_started_set = initial_not_started.iter().cloned().collect::<BTreeSet<_>>();
         let initial_answer_names = initial_answers
             .iter()
             .filter(|answer| {
@@ -2502,25 +3317,35 @@ impl Scanner {
             scan_id,
             &candidates
                 .iter()
-                .map(|candidate| {
+                .filter_map(|candidate| {
                     let fqdn = format!("{}.{domain}", candidate.relative_name);
-                    (
+                    (!initial_not_started_set.contains(&fqdn)).then_some((
                         fqdn.clone(),
                         candidate.relative_name.clone(),
                         candidate.generator.clone(),
                         initial_answer_names.contains(&fqdn),
-                    )
+                    ))
                 })
                 .collect::<Vec<_>>(),
         )?;
+        let initial_terminal_hosts = initial_hosts
+            .iter()
+            .filter(|host| !initial_not_started_set.contains(*host))
+            .cloned()
+            .collect::<Vec<_>>();
         self.database
-            .mark_scan_candidates_done(scan_id, &initial_hosts)?;
+            .mark_scan_candidates_done(scan_id, &initial_terminal_hosts)?;
+        self.database
+            .requeue_unstarted_scan_candidates(scan_id, &initial_not_started)?;
         self.database
             .mark_scan_seed_candidates_done(scan_id, &initial_hosts)?;
         let mut answers: BTreeMap<String, ResolvedHost> = initial_answers
             .into_iter()
             .map(|answer| (answer.fqdn.clone(), answer))
             .collect();
+        for (answer, _) in resumed_live_answers {
+            answers.entry(answer.fqdn.clone()).or_insert(answer);
+        }
         record_candidate_wave_results(&candidates, domain, &answers, &mut generator_successes);
         discard_failed_candidate_origins(&candidates, domain, &answers, &mut sources);
         let mut pipeline = DiscoveryPipeline::new(self.options.pipeline_budget);
@@ -2531,13 +3356,14 @@ impl Scanner {
         let mut web_processed = BTreeSet::new();
         let mut tls_processed = BTreeSet::new();
 
-        let mut previous_positive = first_candidate_hosts
+        let mut previous_positive = first_generated_hosts
             .iter()
             .filter_map(|host| answers.get(host))
             .filter(|answer| {
                 Self::is_strict_enrichment_seed(answer, &root_wildcard, &wildcard_by_parent)
             })
             .count();
+        let mut previous_attempted = first_generated_hosts.len();
         let passive_positive = first_seed_hosts
             .iter()
             .filter_map(|host| answers.get(host))
@@ -2546,14 +3372,51 @@ impl Scanner {
             })
             .count();
         let mut wave_number = 2;
-        let mut active_candidates_enabled = !self.options.passive_only;
         loop {
-            if active_candidates_enabled
+            if resume_candidate_queue_draining
+                && self
+                    .database
+                    .pending_scan_candidate_count_eligible(
+                        scan_id,
+                        active_candidate_work_allowed(active_budget_remaining),
+                    )?
+                    .max(0) as usize
+                    == 0
+            {
+                // No generated refill occurs while this flag is true, so zero
+                // here means every inherited row still eligible for this scan
+                // has been drained. Generated rows left by an exhausted active
+                // deadline remain queued for a future --resume.
+                resume_candidate_queue_draining = false;
+            }
+            let explicit_wordlist_pending = self.explicit_wordlist_has_more(scan_id)?;
+            let active_work_allowed = active_candidate_work_allowed(active_budget_remaining);
+            if generated_candidates_enabled
+                && active_candidate_budget_exhausted(active_budget_remaining)
+            {
+                generated_candidates_enabled = false;
+                if !active_budget_warning_emitted {
+                    let detail = format!(
+                        "budget DNS actif de {}s atteint après {} candidat(s); expansion générée arrêtée, résultats terminés conservés et requêtes inachevées remises en file",
+                        self.options.active_phase_timeout.as_secs(),
+                        generator_attempts.values().sum::<usize>()
+                    );
+                    self.emit(ProgressEvent::Phase {
+                        name: "adaptation".to_owned(),
+                        detail: detail.clone(),
+                    });
+                    warnings.push(detail);
+                    active_budget_warning_emitted = true;
+                }
+            }
+            if generated_candidates_enabled
                 && self.options.adaptive
-                && !self.explicit_wordlist_has_more(scan_id)?
+                && !explicit_wordlist_pending
+                && previous_attempted > 0
                 && !should_expand_adaptive_wave(
                     !wildcard_signature_is_indeterminate(&root_wildcard),
                     previous_positive,
+                    previous_attempted,
                     wave_number,
                     passive_positive,
                 )
@@ -2565,16 +3428,26 @@ impl Scanner {
                         generator_attempts.values().sum::<usize>()
                     ),
                 });
-                active_candidates_enabled = false;
+                generated_candidates_enabled = false;
+                candidate_expansion_stopped_naturally = true;
             }
             let wave_limit = if self.options.adaptive && wave_number == 2 {
                 1_500
             } else {
-                5_000
+                1_000
             };
+            let queued_candidate_work = self
+                .database
+                .pending_scan_candidate_count_eligible(scan_id, active_work_allowed)?
+                .max(0) as usize
+                > 0;
+            let candidate_work_enabled = active_work_allowed
+                && (generated_candidates_enabled
+                    || explicit_wordlist_pending
+                    || queued_candidate_work);
             let wave_seed_candidates = self.database.pending_scan_seed_candidates(
                 scan_id,
-                seed_share(wave_limit, active_candidates_enabled),
+                seed_share(wave_limit, candidate_work_enabled),
             )?;
             let wave_seed_hosts = wave_seed_candidates
                 .iter()
@@ -2591,11 +3464,24 @@ impl Scanner {
             let wave_candidates = if candidate_limit == 0 {
                 Vec::new()
             } else {
-                if active_candidates_enabled {
-                    self.refill_candidate_queue(scan_id, domain, &sources, candidate_limit)?;
+                if active_work_allowed
+                    && !resume_candidate_queue_draining
+                    && (generated_candidates_enabled || explicit_wordlist_pending)
+                {
+                    self.refill_candidate_queue(
+                        scan_id,
+                        domain,
+                        &sources,
+                        candidate_limit,
+                        generated_candidates_enabled,
+                    )?;
                 }
                 self.database
-                    .pending_scan_candidates(scan_id, candidate_limit)?
+                    .pending_scan_candidates_eligible(
+                        scan_id,
+                        candidate_limit,
+                        active_work_allowed,
+                    )?
                     .into_iter()
                     .map(|(relative_name, generator, score)| CandidateProposal {
                         relative_name,
@@ -2604,10 +3490,45 @@ impl Scanner {
                     })
                     .collect::<Vec<_>>()
             };
+            let wave_candidate_names = wave_candidates
+                .iter()
+                .map(|candidate| format!("{}.{domain}", candidate.relative_name))
+                .collect::<Vec<_>>();
+            let known_wave_candidate_hosts =
+                self.database.known_discovery_names(&wave_candidate_names)?;
             let mut wave_candidate_hosts = BTreeSet::new();
+            let mut wave_wordlist_hosts = Vec::new();
+            let mut wave_generated_hosts = Vec::new();
+            let mut wave_known_generated_hosts = Vec::new();
+            let mut wave_retry_hosts = Vec::new();
             for candidate in &wave_candidates {
                 let fqdn = format!("{}.{domain}", candidate.relative_name);
                 wave_candidate_hosts.insert(fqdn.clone());
+                if !wave_seed_hosts.contains(&fqdn) {
+                    if candidate.generator == "wordlist" {
+                        wave_wordlist_hosts.push(fqdn.clone());
+                    } else {
+                        let is_retry = conservative_candidate_retries.contains(&fqdn);
+                        if candidate_uses_discovery_fast_path(
+                            candidate,
+                            generated_candidates_enabled,
+                            resume_candidate_queue_draining,
+                            is_retry,
+                            false,
+                        ) {
+                            if known_wave_candidate_hosts.contains(&fqdn) {
+                                wave_known_generated_hosts.push(fqdn.clone());
+                            } else {
+                                wave_generated_hosts.push(fqdn.clone());
+                            }
+                        } else {
+                            // Resumed rows and transient retries use conservative
+                            // DNS, but remain inside the same active deadline as
+                            // the generated work that created them.
+                            wave_retry_hosts.push(fqdn.clone());
+                        }
+                    }
+                }
                 sources.entry(fqdn.clone()).or_default().extend([
                     format!("dns-wave-{wave_number}"),
                     format!("candidate:{}", candidate.generator),
@@ -2634,7 +3555,11 @@ impl Scanner {
                 .into_iter()
                 .collect::<Vec<_>>();
             if wave_hosts.is_empty() {
-                if active_candidates_enabled && self.candidate_feeds_have_more(scan_id)? {
+                if active_work_allowed
+                    && ((generated_candidates_enabled
+                        && self.candidate_feeds_have_more(scan_id)?)
+                        || self.explicit_wordlist_has_more(scan_id)?)
+                {
                     self.emit(ProgressEvent::Phase {
                         name: "candidats".to_owned(),
                         detail: "page sans nouveau nom; reprise au curseur suivant".to_owned(),
@@ -2650,33 +3575,192 @@ impl Scanner {
             self.emit(ProgressEvent::Phase {
                 name: format!("vague DNS {wave_number}"),
                 detail: format!(
-                    "{} passif(s), {} actif(s), {} passif(s) restant(s)",
+                    "{} passif(s), {} généré(s), {} wordlist/retry, {} passif(s) restant(s)",
                     wave_seed_hosts.len(),
-                    wave_candidate_hosts.len(),
+                    wave_generated_hosts.len() + wave_known_generated_hosts.len(),
+                    wave_wordlist_hosts.len() + wave_retry_hosts.len(),
                     remaining_seeds
                 ),
             });
-            self.register_wildcard_parents(
-                &wave_hosts,
-                domain,
-                &mut parent_by_host,
-                &mut wildcard_by_parent,
-                20,
-            )
-            .await;
-            let (wave_answers, wave_cache_hits, wave_network_resolved) = self
-                .resolve_batch(
-                    scan_id,
-                    domain,
+            let wave_wildcard_started = Instant::now();
+            let wave_wildcard_timed_out = self
+                .register_wildcard_parents_bounded(
                     &wave_hosts,
-                    &format!("DNS vague {wave_number}"),
-                    &started,
-                    &sources,
-                    &root_wildcard,
-                    &parent_by_host,
-                    &wildcard_by_parent,
+                    domain,
+                    &mut parent_by_host,
+                    &mut wildcard_by_parent,
+                    20,
+                    phase_deadline(active_budget_remaining),
                 )
-                .await?;
+                .await;
+            consume_phase_budget(
+                &mut active_budget_remaining,
+                wave_wildcard_started.elapsed(),
+            );
+            if wave_wildcard_timed_out && active_budget_remaining.is_some() {
+                active_budget_remaining = Some(Duration::ZERO);
+            }
+            let mut wave_resolution = BatchResolution::default();
+            let wave_seed_batch = wave_seed_hosts.iter().cloned().collect::<Vec<_>>();
+            if !wave_seed_batch.is_empty() {
+                let (answers, cache_hits, resolved_from_network) = self
+                    .resolve_batch(
+                        scan_id,
+                        domain,
+                        &wave_seed_batch,
+                        &format!("DNS vague {wave_number} passive"),
+                        &started,
+                        &sources,
+                        &root_wildcard,
+                        &parent_by_host,
+                        &wildcard_by_parent,
+                    )
+                    .await?;
+                wave_resolution.merge(BatchResolution {
+                    answers,
+                    cache_hits,
+                    resolved_from_network,
+                    deadline_exhausted: false,
+                    indeterminate_hosts: Vec::new(),
+                    not_started_hosts: Vec::new(),
+                    started_hosts: Vec::new(),
+                });
+            }
+            if !wave_wordlist_hosts.is_empty() {
+                let active_wordlist_started = Instant::now();
+                let conservative_resolution = self
+                    .resolve_batch_with_deadline(
+                        scan_id,
+                        domain,
+                        &wave_wordlist_hosts,
+                        &format!("DNS vague {wave_number} wordlist"),
+                        &started,
+                        &sources,
+                        &root_wildcard,
+                        &parent_by_host,
+                        &wildcard_by_parent,
+                        phase_deadline(active_budget_remaining),
+                        BatchDnsMode::Conservative,
+                    )
+                    .await?;
+                consume_phase_budget(
+                    &mut active_budget_remaining,
+                    active_wordlist_started.elapsed(),
+                );
+                if conservative_resolution.deadline_exhausted && active_budget_remaining.is_some() {
+                    active_budget_remaining = Some(Duration::ZERO);
+                }
+                wave_resolution.merge(conservative_resolution);
+            }
+            if !wave_retry_hosts.is_empty() {
+                for host in &wave_retry_hosts {
+                    conservative_candidate_retries.remove(host);
+                }
+                let active_retry_started = Instant::now();
+                let conservative_resolution = self
+                    .resolve_batch_with_deadline(
+                        scan_id,
+                        domain,
+                        &wave_retry_hosts,
+                        &format!("DNS vague {wave_number} retry actif"),
+                        &started,
+                        &sources,
+                        &root_wildcard,
+                        &parent_by_host,
+                        &wildcard_by_parent,
+                        phase_deadline(active_budget_remaining),
+                        BatchDnsMode::Conservative,
+                    )
+                    .await?;
+                consume_phase_budget(&mut active_budget_remaining, active_retry_started.elapsed());
+                if conservative_resolution.deadline_exhausted && active_budget_remaining.is_some() {
+                    active_budget_remaining = Some(Duration::ZERO);
+                }
+                conservative_candidate_retries.extend(
+                    conservative_resolution
+                        .indeterminate_hosts
+                        .iter()
+                        .filter(|host| wave_retry_hosts.contains(*host))
+                        .cloned(),
+                );
+                wave_resolution.merge(conservative_resolution);
+            }
+            if !wave_known_generated_hosts.is_empty() {
+                let active_wave_started = Instant::now();
+                let conservative_resolution = self
+                    .resolve_batch_with_deadline(
+                        scan_id,
+                        domain,
+                        &wave_known_generated_hosts,
+                        &format!("DNS vague {wave_number} active connue"),
+                        &started,
+                        &sources,
+                        &root_wildcard,
+                        &parent_by_host,
+                        &wildcard_by_parent,
+                        phase_deadline(active_budget_remaining),
+                        BatchDnsMode::Conservative,
+                    )
+                    .await?;
+                consume_phase_budget(&mut active_budget_remaining, active_wave_started.elapsed());
+                if conservative_resolution.deadline_exhausted && active_budget_remaining.is_some() {
+                    active_budget_remaining = Some(Duration::ZERO);
+                }
+                conservative_candidate_retries
+                    .extend(conservative_resolution.indeterminate_hosts.iter().cloned());
+                wave_resolution.merge(conservative_resolution);
+            }
+            if !wave_generated_hosts.is_empty() {
+                let active_wave_started = Instant::now();
+                let generated_resolution = self
+                    .resolve_batch_with_deadline(
+                        scan_id,
+                        domain,
+                        &wave_generated_hosts,
+                        &format!("DNS vague {wave_number} active"),
+                        &started,
+                        &sources,
+                        &root_wildcard,
+                        &parent_by_host,
+                        &wildcard_by_parent,
+                        phase_deadline(active_budget_remaining),
+                        BatchDnsMode::GeneratedDiscovery,
+                    )
+                    .await?;
+                consume_phase_budget(&mut active_budget_remaining, active_wave_started.elapsed());
+                if generated_resolution.deadline_exhausted && active_budget_remaining.is_some() {
+                    active_budget_remaining = Some(Duration::ZERO);
+                }
+                conservative_candidate_retries
+                    .extend(generated_resolution.indeterminate_hosts.iter().cloned());
+                wave_resolution.merge(generated_resolution);
+            }
+            if (!wave_known_generated_hosts.is_empty() || !wave_generated_hosts.is_empty())
+                && active_candidate_budget_exhausted(active_budget_remaining)
+            {
+                generated_candidates_enabled = false;
+                if !active_budget_warning_emitted {
+                    let detail = format!(
+                        "budget DNS actif de {}s atteint après {} candidat(s); expansion générée arrêtée, résultats terminés conservés et requêtes inachevées remises en file",
+                        self.options.active_phase_timeout.as_secs(),
+                        generator_attempts.values().sum::<usize>()
+                    );
+                    self.emit(ProgressEvent::Phase {
+                        name: "adaptation".to_owned(),
+                        detail: detail.clone(),
+                    });
+                    warnings.push(detail);
+                    active_budget_warning_emitted = true;
+                }
+            }
+            let BatchResolution {
+                answers: wave_answers,
+                cache_hits: wave_cache_hits,
+                resolved_from_network: wave_network_resolved,
+                not_started_hosts: wave_not_started,
+                ..
+            } = wave_resolution;
+            let wave_not_started_set = wave_not_started.iter().cloned().collect::<BTreeSet<_>>();
             let wave_answer_names = wave_answers
                 .iter()
                 .filter(|answer| {
@@ -2688,30 +3772,40 @@ impl Scanner {
                 scan_id,
                 &wave_candidates
                     .iter()
-                    .map(|candidate| {
+                    .filter_map(|candidate| {
                         let fqdn = format!("{}.{domain}", candidate.relative_name);
-                        (
+                        (!wave_not_started_set.contains(&fqdn)).then_some((
                             fqdn.clone(),
                             candidate.relative_name.clone(),
                             candidate.generator.clone(),
                             wave_answer_names.contains(&fqdn),
-                        )
+                        ))
                     })
                     .collect::<Vec<_>>(),
             )?;
+            let wave_terminal_hosts = wave_hosts
+                .iter()
+                .filter(|host| !wave_not_started_set.contains(*host))
+                .cloned()
+                .collect::<Vec<_>>();
             self.database
-                .mark_scan_candidates_done(scan_id, &wave_hosts)?;
+                .mark_scan_candidates_done(scan_id, &wave_terminal_hosts)?;
+            self.database
+                .requeue_unstarted_scan_candidates(scan_id, &wave_not_started)?;
             self.database
                 .mark_scan_seed_candidates_done(scan_id, &wave_hosts)?;
             cache_hits += wave_cache_hits;
             network_resolved += wave_network_resolved;
-            previous_positive = wave_answers
-                .iter()
-                .filter(|answer| wave_candidate_hosts.contains(&answer.fqdn))
-                .filter(|answer| {
-                    Self::is_strict_enrichment_seed(answer, &root_wildcard, &wildcard_by_parent)
-                })
-                .count();
+            if !wave_generated_hosts.is_empty() {
+                previous_positive = wave_answers
+                    .iter()
+                    .filter(|answer| wave_generated_hosts.contains(&answer.fqdn))
+                    .filter(|answer| {
+                        Self::is_strict_enrichment_seed(answer, &root_wildcard, &wildcard_by_parent)
+                    })
+                    .count();
+                previous_attempted = wave_generated_hosts.len();
+            }
             for answer in wave_answers {
                 answers.insert(answer.fqdn.clone(), answer);
             }
@@ -2724,7 +3818,12 @@ impl Scanner {
             discard_failed_candidate_origins(&wave_candidates, domain, &answers, &mut sources);
             wave_number += 1;
         }
+        phase_timings.push(PhaseTiming {
+            phase: "candidate_dns".to_owned(),
+            duration_ms: candidate_dns_started.elapsed().as_millis(),
+        });
 
+        let enrichment_started = Instant::now();
         let mut dns_edges = Vec::<DiscoveryEdge>::new();
         let mut child_zones = BTreeSet::new();
         let mut service_endpoints = Vec::<ServiceEndpoint>::new();
@@ -2848,12 +3947,13 @@ impl Scanner {
                 validation_rounds += 1;
                 pipeline_names_validated += graph_hosts.len();
             }
-            self.register_wildcard_parents(
+            self.register_wildcard_parents_with_budget(
                 &graph_hosts,
                 domain,
                 &mut parent_by_host,
                 &mut wildcard_by_parent,
                 20,
+                &mut active_budget_remaining,
             )
             .await;
             if !graph_hosts.is_empty() {
@@ -2902,12 +4002,13 @@ impl Scanner {
                 .into_iter()
                 .filter(|name| !answers.contains_key(name))
                 .collect::<Vec<_>>();
-            self.register_wildcard_parents(
+            self.register_wildcard_parents_with_budget(
                 &recursive_names,
                 domain,
                 &mut parent_by_host,
                 &mut wildcard_by_parent,
                 20,
+                &mut active_budget_remaining,
             )
             .await;
             if !recursive_names.is_empty() {
@@ -3015,12 +4116,13 @@ impl Scanner {
                 validation_rounds += 1;
                 pipeline_names_validated += nsec_hosts.len();
             }
-            self.register_wildcard_parents(
+            self.register_wildcard_parents_with_budget(
                 &nsec_hosts,
                 domain,
                 &mut parent_by_host,
                 &mut wildcard_by_parent,
                 20,
+                &mut active_budget_remaining,
             )
             .await;
             if !nsec_hosts.is_empty() {
@@ -3073,10 +4175,15 @@ impl Scanner {
             web_hosts.dedup();
             web_hosts.truncate(self.options.web_max_hosts);
             web_processed.extend(web_hosts.iter().cloned());
+            let web_phase_started = Instant::now();
+            let web_deadline = phase_deadline(web_budget_remaining);
+            let web_budget = web_budget_remaining
+                .map(|remaining| format!("{} s restantes", remaining.as_secs()))
+                .unwrap_or_else(|| "illimité".to_owned());
             self.emit(ProgressEvent::Phase {
                 name: "web/JavaScript".to_owned(),
                 detail: format!(
-                    "{} hôte(s), {} asset(s) maximum par hôte",
+                    "{} hôte(s), {} asset(s) maximum par hôte, budget {web_budget}",
                     web_hosts.len(),
                     self.options.web_assets_per_host
                 ),
@@ -3085,7 +4192,7 @@ impl Scanner {
                 .await_with_phase_heartbeat(
                     "web/JavaScript",
                     "collecte des pages et assets",
-                    discover_web(
+                    discover_web_bounded(
                         &self.database,
                         &self.dns,
                         domain,
@@ -3095,9 +4202,19 @@ impl Scanner {
                         self.options.web_concurrency,
                         self.options.web_max_bytes,
                         self.options.web_assets_per_host,
+                        web_deadline,
                     ),
                 )
                 .await?;
+            consume_phase_budget(&mut web_budget_remaining, web_phase_started.elapsed());
+            web_budget_exhausted = web.budget_exhausted
+                || web_budget_remaining.is_some_and(|remaining| remaining.is_zero());
+            if web_budget_exhausted {
+                let warning = "Web/JavaScript: budget cumulé atteint; résultats partiels conservés et travaux restants ignorés"
+                    .to_owned();
+                self.emit(ProgressEvent::Warning(warning.clone()));
+                warnings.push(warning);
+            }
             self.emit(ProgressEvent::WebDiscovery {
                 hosts: web_hosts.len(),
                 requests: web.network_requests,
@@ -3126,12 +4243,13 @@ impl Scanner {
                 validation_rounds += 1;
                 pipeline_names_validated += web_hosts_to_validate.len();
             }
-            self.register_wildcard_parents(
+            self.register_wildcard_parents_with_budget(
                 &web_hosts_to_validate,
                 domain,
                 &mut parent_by_host,
                 &mut wildcard_by_parent,
                 20,
+                &mut active_budget_remaining,
             )
             .await;
             if !web_hosts_to_validate.is_empty() {
@@ -3242,12 +4360,13 @@ impl Scanner {
                 validation_rounds += 1;
                 pipeline_names_validated += tls_hosts.len();
             }
-            self.register_wildcard_parents(
+            self.register_wildcard_parents_with_budget(
                 &tls_hosts,
                 domain,
                 &mut parent_by_host,
                 &mut wildcard_by_parent,
                 20,
+                &mut active_budget_remaining,
             )
             .await;
             if !tls_hosts.is_empty() {
@@ -3283,10 +4402,13 @@ impl Scanner {
                     .options
                     .graph_max_hosts
                     .saturating_sub(graph_processed.len());
-                let web_remaining = self
-                    .options
-                    .web_max_hosts
-                    .saturating_sub(web_processed.len());
+                let web_remaining = if self.options.web_discovery && !web_budget_exhausted {
+                    self.options
+                        .web_max_hosts
+                        .saturating_sub(web_processed.len())
+                } else {
+                    0
+                };
                 let tls_remaining = self
                     .options
                     .tls_max_hosts
@@ -3376,11 +4498,13 @@ impl Scanner {
 
                 if self.options.web_discovery && !web_hosts.is_empty() {
                     web_processed.extend(web_hosts.iter().cloned());
+                    let web_phase_started = Instant::now();
+                    let web_deadline = phase_deadline(web_budget_remaining);
                     let web = self
                         .await_with_phase_heartbeat(
                             format!("pipeline événementiel {round}"),
                             "collecte web/JavaScript",
-                            discover_web(
+                            discover_web_bounded(
                                 &self.database,
                                 &self.dns,
                                 domain,
@@ -3390,9 +4514,20 @@ impl Scanner {
                                 self.options.web_concurrency,
                                 self.options.web_max_bytes,
                                 self.options.web_assets_per_host,
+                                web_deadline,
                             ),
                         )
                         .await?;
+                    consume_phase_budget(&mut web_budget_remaining, web_phase_started.elapsed());
+                    if web.budget_exhausted
+                        || web_budget_remaining.is_some_and(|remaining| remaining.is_zero())
+                    {
+                        web_budget_exhausted = true;
+                        let warning = "Web/JavaScript: budget cumulé atteint pendant le pipeline; résultats partiels conservés et travaux restants ignorés"
+                            .to_owned();
+                        self.emit(ProgressEvent::Warning(warning.clone()));
+                        warnings.push(warning);
+                    }
                     self.emit(ProgressEvent::WebDiscovery {
                         hosts: web_hosts.len(),
                         requests: web.network_requests,
@@ -3489,12 +4624,13 @@ impl Scanner {
                 }
                 validation_rounds += 1;
                 pipeline_names_validated += new_hosts.len();
-                self.register_wildcard_parents(
+                self.register_wildcard_parents_with_budget(
                     &new_hosts,
                     domain,
                     &mut parent_by_host,
                     &mut wildcard_by_parent,
                     20,
+                    &mut active_budget_remaining,
                 )
                 .await;
                 let (new_answers, new_cache_hits, new_network_resolved) = self
@@ -3572,12 +4708,13 @@ impl Scanner {
                 if !hosts.is_empty() {
                     validation_rounds += 1;
                     pipeline_names_validated += hosts.len();
-                    self.register_wildcard_parents(
+                    self.register_wildcard_parents_with_budget(
                         &hosts,
                         domain,
                         &mut parent_by_host,
                         &mut wildcard_by_parent,
                         20,
+                        &mut active_budget_remaining,
                     )
                     .await;
                     let (resolved, extra_cache_hits, extra_network) = self
@@ -3607,6 +4744,10 @@ impl Scanner {
             if self.options.adaptive {
                 recursive_words.truncate(50);
             }
+            let recursive_words = self
+                .database
+                .ensure_scan_recursive_words(scan_id, &recursive_words)?;
+            let recursive_batch_limit = if self.options.adaptive { 1_000 } else { 5_000 };
             for depth in 2..=self.options.recursive_depth {
                 let mut parents = answers
                     .values()
@@ -3628,82 +4769,196 @@ impl Scanner {
                     self.options.recursive_hosts
                 };
                 parents.truncate(parent_limit);
-                if parents.is_empty() {
+                self.database
+                    .persist_scan_recursive_parents(scan_id, depth, &parents)?;
+                let persisted_parents = self.database.scan_recursive_parents(scan_id, depth)?;
+                if persisted_parents.is_empty() || recursive_words.is_empty() {
+                    break;
+                }
+                if active_candidate_budget_exhausted(active_budget_remaining) {
                     break;
                 }
                 self.emit(ProgressEvent::Phase {
                     name: format!("récursion niveau {depth}"),
                     detail: format!(
                         "{} parent(s), {} mot(s) par parent",
-                        parents.len(),
+                        persisted_parents.len(),
                         recursive_words.len()
                     ),
                 });
-                wildcard_by_parent.extend(self.wildcard_signatures_cached(parents.clone()).await);
-                let mut recursive_hosts = Vec::new();
-                for parent in parents {
-                    for word in &recursive_words {
-                        let fqdn = format!("{word}.{parent}");
-                        if sources.contains_key(&fqdn) {
+                let recursive_profiles_started = Instant::now();
+                let unprofiled_parents = persisted_parents
+                    .iter()
+                    .filter(|parent| !wildcard_by_parent.contains_key(*parent))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let (recursive_profiles, recursive_profiles_timed_out) = self
+                    .wildcard_signatures_cached_bounded(
+                        unprofiled_parents,
+                        phase_deadline(active_budget_remaining),
+                    )
+                    .await;
+                wildcard_by_parent.extend(recursive_profiles);
+                consume_phase_budget(
+                    &mut active_budget_remaining,
+                    recursive_profiles_started.elapsed(),
+                );
+                if recursive_profiles_timed_out && active_budget_remaining.is_some() {
+                    active_budget_remaining = Some(Duration::ZERO);
+                }
+                if active_candidate_budget_exhausted(active_budget_remaining) {
+                    break;
+                }
+                let mut depth_yield = 0_usize;
+                loop {
+                    if active_candidate_budget_exhausted(active_budget_remaining) {
+                        recursive_budget_exhausted = self
+                            .database
+                            .scan_recursive_depth_has_more(scan_id, depth)?;
+                        break;
+                    }
+                    let refill_started = Instant::now();
+                    self.database.refill_scan_recursive_candidates(
+                        scan_id,
+                        depth,
+                        recursive_batch_limit,
+                    )?;
+                    consume_phase_budget(&mut active_budget_remaining, refill_started.elapsed());
+                    if active_candidate_budget_exhausted(active_budget_remaining) {
+                        recursive_budget_exhausted = self
+                            .database
+                            .scan_recursive_depth_has_more(scan_id, depth)?;
+                        break;
+                    }
+                    let recursive_candidates = self.database.pending_scan_recursive_candidates(
+                        scan_id,
+                        depth,
+                        recursive_batch_limit,
+                    )?;
+                    if recursive_candidates.is_empty() {
+                        if self
+                            .database
+                            .scan_recursive_depth_has_more(scan_id, depth)?
+                        {
                             continue;
                         }
+                        break;
+                    }
+                    let mut recursive_hosts = Vec::with_capacity(recursive_candidates.len());
+                    let mut already_answered = Vec::new();
+                    for (fqdn, parent, _) in &recursive_candidates {
                         sources
                             .entry(fqdn.clone())
                             .or_default()
                             .insert("dns-recursive".to_owned());
                         parent_by_host.insert(fqdn.clone(), parent.clone());
-                        attempted_words.insert(word.clone());
-                        recursive_hosts.push(fqdn);
+                        if answers.contains_key(fqdn) {
+                            already_answered.push(fqdn.clone());
+                        } else {
+                            recursive_hosts.push(fqdn.clone());
+                        }
+                    }
+                    self.database
+                        .complete_scan_recursive_candidates(scan_id, &already_answered)?;
+                    if recursive_hosts.is_empty() {
+                        continue;
+                    }
+
+                    let phase = format!("DNS niveau {depth}");
+                    let recursive_dns_started = Instant::now();
+                    let round_resolution = self
+                        .resolve_batch_with_deadline(
+                            scan_id,
+                            domain,
+                            &recursive_hosts,
+                            &phase,
+                            &started,
+                            &sources,
+                            &root_wildcard,
+                            &parent_by_host,
+                            &wildcard_by_parent,
+                            phase_deadline(active_budget_remaining),
+                            BatchDnsMode::Conservative,
+                        )
+                        .await?;
+                    consume_phase_budget(
+                        &mut active_budget_remaining,
+                        recursive_dns_started.elapsed(),
+                    );
+                    if round_resolution.deadline_exhausted && active_budget_remaining.is_some() {
+                        active_budget_remaining = Some(Duration::ZERO);
+                    }
+                    let BatchResolution {
+                        answers: round_answers,
+                        cache_hits: round_cache_hits,
+                        resolved_from_network: round_network_resolved,
+                        not_started_hosts,
+                        started_hosts,
+                        ..
+                    } = round_resolution;
+                    self.database
+                        .mark_scan_recursive_candidates_started(scan_id, &started_hosts)?;
+                    let not_started = not_started_hosts.iter().cloned().collect::<BTreeSet<_>>();
+                    let terminal_hosts = recursive_hosts
+                        .iter()
+                        .filter(|host| !not_started.contains(*host))
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    self.database
+                        .mark_scan_recursive_candidates_done(scan_id, &terminal_hosts)?;
+                    self.database
+                        .requeue_unstarted_scan_recursive_candidates(scan_id, &not_started_hosts)?;
+                    cache_hits += round_cache_hits;
+                    network_resolved += round_network_resolved;
+                    depth_yield = depth_yield.saturating_add(round_answers.len());
+                    for answer in round_answers {
+                        answers.insert(answer.fqdn.clone(), answer);
+                    }
+                    if active_candidate_budget_exhausted(active_budget_remaining) {
+                        recursive_budget_exhausted = self
+                            .database
+                            .scan_recursive_depth_has_more(scan_id, depth)?;
+                        break;
                     }
                 }
-                let phase = format!("DNS niveau {depth}");
-                let (round_answers, round_cache_hits, round_network_resolved) = self
-                    .resolve_batch(
-                        scan_id,
-                        domain,
-                        &recursive_hosts,
-                        &phase,
-                        &started,
-                        &sources,
-                        &root_wildcard,
-                        &parent_by_host,
-                        &wildcard_by_parent,
-                    )
-                    .await?;
-                cache_hits += round_cache_hits;
-                network_resolved += round_network_resolved;
-                let round_yield = round_answers.len();
-                for answer in round_answers {
-                    answers.insert(answer.fqdn.clone(), answer);
+                if recursive_budget_exhausted {
+                    break;
                 }
-                if self.options.adaptive && round_yield < 2 {
+                if self.options.adaptive && depth_yield < 2 {
                     self.emit(ProgressEvent::Phase {
                         name: "adaptation".to_owned(),
                         detail: format!(
-                            "récursion arrêtée au niveau {depth}: rendement {round_yield}"
+                            "récursion arrêtée au niveau {depth}: rendement {depth_yield}"
                         ),
                     });
                     break;
                 }
             }
         }
-
-        // Later discovery phases can expose a child zone that was not present
-        // during the initial wildcard sampling. Re-run the persistent
-        // reclassification once all sampled zones are known.
-        let (final_reclassified, final_purged) = self.reclassify_cached_wildcard_matches(
-            scan_id,
-            domain,
-            &root_wildcard,
-            &wildcard_by_parent,
-        )?;
-        if final_reclassified > 0 || final_purged > 0 {
-            self.emit(ProgressEvent::Phase {
-                name: "wildcard final".to_owned(),
-                detail: format!(
-                    "{final_reclassified} ancien(s) résultat(s) reclassé(s), {final_purged} faux positif(s) purgé(s)"
-                ),
-            });
+        phase_timings.push(PhaseTiming {
+            phase: "enrichment".to_owned(),
+            duration_ms: enrichment_started.elapsed().as_millis(),
+        });
+        let finalization_started = Instant::now();
+        let pending_active_candidates =
+            self.database.pending_scan_candidate_count(scan_id)?.max(0) as usize;
+        let recursive_work_remaining = self.database.scan_recursive_has_more(scan_id)?;
+        let candidate_feed_remaining =
+            !candidate_expansion_stopped_naturally && self.candidate_feeds_have_more(scan_id)?;
+        let active_resume_required = active_resume_required(
+            active_budget_remaining,
+            pending_active_candidates,
+            candidate_feed_remaining,
+            recursive_work_remaining,
+        );
+        if active_resume_required {
+            let warning = format!(
+                "budget DNS actif atteint; {pending_active_candidates} candidat(s) en file et travail restant conservés pour --resume latest"
+            );
+            if !warnings.contains(&warning) {
+                self.emit(ProgressEvent::Warning(warning.clone()));
+                warnings.push(warning);
+            }
         }
 
         let mut findings = Vec::new();
@@ -3847,29 +5102,52 @@ impl Scanner {
         self.database.store_resolver_metrics(&resolver_metrics)?;
         self.database
             .store_pipeline_metrics(scan_id, &pipeline_metrics)?;
-        let duration_ms = started.elapsed().as_millis();
+        let duration_before_learning_ms = started.elapsed().as_millis();
         let candidate_count = discovered_seed_count.saturating_add(durable_candidate_attempts);
-        self.database.finalize_scan_with_learning(
-            scan_id,
-            domain,
-            &generator_attempts,
-            &generator_successes,
-            &attempted_words,
-            &successful_words,
-            &successful_patterns,
-            candidate_count,
-            findings.len(),
-            cache_hits,
-            duration_ms,
-            &warnings,
-        )?;
+        if active_resume_required {
+            self.database.pause_scan(
+                scan_id,
+                candidate_count,
+                findings.len(),
+                cache_hits,
+                duration_before_learning_ms,
+                &warnings,
+            )?;
+        } else {
+            self.database.finalize_scan_with_learning(
+                scan_id,
+                domain,
+                &generator_attempts,
+                &generator_successes,
+                &attempted_words,
+                &successful_words,
+                &successful_patterns,
+                candidate_count,
+                findings.len(),
+                cache_hits,
+                duration_before_learning_ms,
+                &warnings,
+            )?;
+        }
+        phase_timings.push(PhaseTiming {
+            phase: "finalization".to_owned(),
+            duration_ms: finalization_started.elapsed().as_millis(),
+        });
+        let duration_ms = started.elapsed().as_millis();
         Ok(ScanResult {
             scan_id,
             domain: domain.to_owned(),
+            status: if active_resume_required {
+                "partial".to_owned()
+            } else {
+                "completed".to_owned()
+            },
+            resumable: active_resume_required,
             candidates: candidate_count,
             resolved_from_network: network_resolved,
             cache_hits,
             duration_ms,
+            phase_timings,
             wildcard_detected: wildcard_signature_is_confirmed(&root_wildcard)
                 || wildcard_by_parent
                     .values()
@@ -4183,7 +5461,9 @@ pub async fn refresh_inventory_bounded(
     let domain = normalize_domain(target)?;
     let started = Instant::now();
     let global_deadline = refresh_deadline(options.max_runtime);
-    let total = database.known_subdomain_count(&domain, true)?;
+    let inventory_total = database.known_subdomain_count(&domain, true)?;
+    let cache_only_total = database.positive_cache_only_count(&domain)?;
+    let total = inventory_total.saturating_add(cache_only_total);
     let scan_id = database.create_scan(
         &domain,
         &json!({
@@ -4194,7 +5474,7 @@ pub async fn refresh_inventory_bounded(
         }),
     )?;
     let options_hash = domain_hash(&format!(
-        "refresh:v3:{ttl_cap}:{negative_ttl}:{}:{}:{}",
+        "refresh:v4:{ttl_cap}:{negative_ttl}:{}:{}:{}",
         options.max_runtime.as_secs(),
         options.wildcard_phase_timeout.as_secs(),
         options.batch_size.max(1)
@@ -4206,10 +5486,19 @@ pub async fn refresh_inventory_bounded(
     let mut run_guard = RefreshRunGuard::new(database.clone(), scan_id, started, total);
     let wildcard_deadline = capped_phase_deadline(global_deadline, options.wildcard_phase_timeout);
     let mut warnings = Vec::new();
+    let wildcard_dns = trusted_dns.unwrap_or(dns);
+    let require_wildcard_consensus = trusted_dns.is_some();
 
     let root_result = before_refresh_deadline(
         Some(wildcard_deadline),
-        wildcard_profile_observed(database, dns, &domain, Duration::from_secs(6 * 3_600), true),
+        wildcard_profile_observed(
+            database,
+            wildcard_dns,
+            &domain,
+            Duration::from_secs(6 * 3_600),
+            true,
+            require_wildcard_consensus,
+        ),
     )
     .await;
     let mut wildcard_phase_complete =
@@ -4305,10 +5594,11 @@ pub async fn refresh_inventory_bounded(
         .map(|parent| async move {
             let observation = wildcard_profile_observed(
                 database,
-                dns,
+                wildcard_dns,
                 &parent,
                 Duration::from_secs(6 * 3_600),
                 true,
+                require_wildcard_consensus,
             )
             .await;
             (parent, observation)
@@ -4333,6 +5623,10 @@ pub async fn refresh_inventory_bounded(
             }
         }
     }
+    // timeout_at cancels only the current `next()` future. Drop the buffered
+    // stream as well so unfinished wildcard probes release DNS/rate-limit
+    // resources before inventory validation starts.
+    drop(pending_profiles);
     let completed_parents = profiles.keys().cloned().collect::<BTreeSet<_>>();
     for parent in selected_parent_set.difference(&completed_parents) {
         profiles.insert(parent.clone(), indeterminate_wildcard_signature());
@@ -4344,7 +5638,8 @@ pub async fn refresh_inventory_bounded(
         ));
     }
     wildcard_by_parent.extend(profiles);
-    let wildcard_classification_reliable = !wildcard_signature_is_indeterminate(&root_wildcard)
+    let wildcard_classification_reliable = trusted_dns.is_some()
+        && !wildcard_signature_is_indeterminate(&root_wildcard)
         && wildcard_by_parent
             .values()
             .all(|signature| !wildcard_signature_is_indeterminate(signature));
@@ -4371,47 +5666,19 @@ pub async fn refresh_inventory_bounded(
         if batch.is_empty() {
             break;
         }
-        let classification_cache = database.fresh_cache(&batch)?;
-        let confirmed_wildcard_hosts = batch
-            .iter()
-            .filter(|host| {
-                let signature = Scanner::applicable_wildcard_signature(
-                    host,
-                    &root_wildcard,
-                    &wildcard_by_parent,
-                );
-                wildcard_signature_is_confirmed(signature)
-                    && classification_cache.get(*host).is_some_and(|cached| {
-                        matches!(cached, CachedAnswer::Positive(answer) if DnsEngine::matches_wildcard(answer, signature))
-                    })
-            })
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        let uncertain_wildcard_hosts = batch
-            .iter()
-            .filter(|host| {
-                wildcard_signature_is_indeterminate(Scanner::applicable_wildcard_signature(
-                    host,
-                    &root_wildcard,
-                    &wildcard_by_parent,
-                ))
-            })
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        let mut batch_purge_candidates = confirmed_wildcard_hosts.clone();
-        let Some(outcomes) = before_refresh_deadline(
-            global_deadline,
-            dns.resolve_many_classified_with_progress(batch.clone(), |_| {}),
-        )
-        .await
-        else {
-            timed_out = true;
-            break;
-        };
+        // Only current network answers can authorize wildcard quarantine.
+        // Cache contents are deliberately absent from this decision.
+        let mut batch_purge_candidates = BTreeSet::new();
+        let mut current_wildcard_matches = Vec::new();
+        let mut current_wildcard_ambiguities = Vec::new();
+        let mut wildcard_ambiguity_count = 0_usize;
+        let network_batch =
+            collect_refresh_dns_outcomes(dns, trusted_dns, batch.clone(), global_deadline).await;
+        let completed_count = network_batch.completed.len();
         let mut resolved = Vec::new();
         let mut inactive = Vec::new();
         let mut indeterminate = Vec::new();
-        for outcome in outcomes {
+        for outcome in network_batch.completed {
             match outcome {
                 DnsResolutionOutcome::Positive(answer)
                     if Scanner::answer_is_wildcard_ambiguous(
@@ -4420,73 +5687,44 @@ pub async fn refresh_inventory_bounded(
                         &wildcard_by_parent,
                     ) =>
                 {
-                    indeterminate.push(answer.fqdn);
+                    if Scanner::answer_matches_confirmed_wildcard(
+                        &answer,
+                        &root_wildcard,
+                        &wildcard_by_parent,
+                    ) {
+                        batch_purge_candidates.insert(answer.fqdn.clone());
+                        current_wildcard_matches.push(answer.clone());
+                    } else {
+                        current_wildcard_ambiguities.push(answer.clone());
+                    }
+                    wildcard_ambiguity_count = wildcard_ambiguity_count.saturating_add(1);
                 }
                 DnsResolutionOutcome::Positive(answer) => {
-                    batch_purge_candidates.remove(&answer.fqdn);
                     resolved.push(answer);
-                }
-                DnsResolutionOutcome::Negative { fqdn }
-                    if confirmed_wildcard_hosts.contains(&fqdn)
-                        || uncertain_wildcard_hosts.contains(&fqdn) =>
-                {
-                    indeterminate.push(fqdn);
                 }
                 DnsResolutionOutcome::Negative { fqdn } => inactive.push(fqdn),
                 DnsResolutionOutcome::Indeterminate { fqdn } => {
-                    batch_purge_candidates.remove(&fqdn);
                     indeterminate.push(fqdn);
                 }
             }
         }
-        if let Some(trusted_dns) = trusted_dns {
-            let validation = stream::iter(resolved)
-                .map(|answer| async move {
-                    let fqdn = answer.fqdn.clone();
-                    let outcome = match trusted_dns.resolve_host_consensus_classified(&fqdn).await {
-                        DnsResolutionOutcome::Positive(mut consensus) => {
-                            consensus.authoritative_validation =
-                                trusted_dns.authoritative_confirms(&consensus.fqdn).await;
-                            DnsResolutionOutcome::Positive(consensus)
-                        }
-                        outcome => outcome,
-                    };
-                    (fqdn, outcome)
-                })
-                .buffer_unordered(trusted_dns.concurrency().clamp(1, 32))
-                .collect::<Vec<_>>();
-            let Some(validations) = before_refresh_deadline(global_deadline, validation).await
-            else {
-                timed_out = true;
-                break;
-            };
-            resolved = Vec::new();
-            for (fqdn, outcome) in validations {
-                match outcome {
-                    DnsResolutionOutcome::Positive(answer)
-                        if Scanner::answer_is_wildcard_ambiguous(
-                            &answer,
-                            &root_wildcard,
-                            &wildcard_by_parent,
-                        ) =>
-                    {
-                        batch_purge_candidates.remove(&fqdn);
-                        indeterminate.push(fqdn);
-                    }
-                    DnsResolutionOutcome::Positive(answer) => resolved.push(answer),
-                    DnsResolutionOutcome::Negative { .. }
-                    | DnsResolutionOutcome::Indeterminate { .. } => {
-                        batch_purge_candidates.remove(&fqdn);
-                        indeterminate.push(fqdn);
-                    }
-                }
-            }
-        }
+        // A deadline-cancelled resolver is explicitly indeterminate. Hosts
+        // that never started are untouched and create no cache journal entry.
+        let cancelled_count = network_batch.cancelled.len();
+        indeterminate.extend(network_batch.cancelled);
+        let deadline_exhausted = network_batch.deadline_exhausted;
+        enrich_authoritative_answers(wildcard_dns, &mut resolved, global_deadline).await;
         resolved.sort_by(|left, right| left.fqdn.cmp(&right.fqdn));
         inactive.sort();
         inactive.dedup();
         indeterminate.sort();
         indeterminate.dedup();
+        database.record_current_wildcard_matches(scan_id, &current_wildcard_matches)?;
+        database.record_current_wildcard_ambiguities(
+            scan_id,
+            &domain,
+            &current_wildcard_ambiguities,
+        )?;
         database.update_cache_outcomes(
             Some(scan_id),
             &resolved,
@@ -4519,10 +5757,12 @@ pub async fn refresh_inventory_bounded(
             scan_id,
             &batch_purge_candidates.into_iter().collect::<Vec<_>>(),
         )?;
-        checked = checked.saturating_add(batch.len());
+        checked = checked.saturating_add(completed_count.saturating_add(cancelled_count));
         active = active.saturating_add(findings.len());
         inactive_count = inactive_count.saturating_add(inactive.len());
-        indeterminate_count = indeterminate_count.saturating_add(indeterminate.len());
+        indeterminate_count = indeterminate_count
+            .saturating_add(indeterminate.len())
+            .saturating_add(wildcard_ambiguity_count);
         run_guard.update(checked, active);
         if let Some(progress) = &progress {
             progress(RefreshProgress {
@@ -4534,8 +5774,135 @@ pub async fn refresh_inventory_bounded(
             });
         }
         inventory_cursor = batch.last().cloned();
+        if deadline_exhausted
+            || global_deadline.is_some_and(|deadline| deadline <= tokio::time::Instant::now())
+        {
+            timed_out = true;
+            break;
+        }
     }
 
+    if !timed_out && wildcard_phase_complete {
+        let mut cache_only_cursor = None::<String>;
+        loop {
+            if global_deadline.is_some_and(|deadline| deadline <= tokio::time::Instant::now()) {
+                timed_out = true;
+                break;
+            }
+            let page = database.positive_cache_only_names_page(
+                &domain,
+                cache_only_cursor.as_deref(),
+                REFRESH_PAGE_SIZE.min(batch_size),
+            )?;
+            if page.is_empty() {
+                break;
+            }
+            let current =
+                collect_refresh_dns_outcomes(dns, trusted_dns, page.clone(), global_deadline).await;
+            let deadline_exhausted = current.deadline_exhausted;
+            let completed_count = current.completed.len();
+            let cancelled_count = current.cancelled.len();
+            let mut resolved = Vec::new();
+            let mut negative = Vec::new();
+            let mut indeterminate = current.cancelled;
+            let mut current_wildcard_matches = Vec::new();
+            let mut current_wildcard_ambiguities = Vec::new();
+            let mut wildcard_ambiguity_count = 0_usize;
+            let mut staged_page = BTreeSet::new();
+            for outcome in current.completed {
+                match outcome {
+                    DnsResolutionOutcome::Positive(answer)
+                        if Scanner::answer_is_wildcard_ambiguous(
+                            &answer,
+                            &root_wildcard,
+                            &wildcard_by_parent,
+                        ) =>
+                    {
+                        if Scanner::answer_matches_confirmed_wildcard(
+                            &answer,
+                            &root_wildcard,
+                            &wildcard_by_parent,
+                        ) {
+                            staged_page.insert(answer.fqdn.clone());
+                            current_wildcard_matches.push(answer.clone());
+                        } else {
+                            current_wildcard_ambiguities.push(answer.clone());
+                        }
+                        wildcard_ambiguity_count = wildcard_ambiguity_count.saturating_add(1);
+                    }
+                    DnsResolutionOutcome::Positive(answer) => resolved.push(answer),
+                    DnsResolutionOutcome::Negative { fqdn } => negative.push(fqdn),
+                    DnsResolutionOutcome::Indeterminate { fqdn } => indeterminate.push(fqdn),
+                }
+            }
+            enrich_authoritative_answers(wildcard_dns, &mut resolved, global_deadline).await;
+            negative.sort();
+            negative.dedup();
+            indeterminate.sort();
+            indeterminate.dedup();
+            database.record_current_wildcard_matches(scan_id, &current_wildcard_matches)?;
+            database.record_current_wildcard_ambiguities(
+                scan_id,
+                &domain,
+                &current_wildcard_ambiguities,
+            )?;
+            database.update_cache_outcomes(
+                Some(scan_id),
+                &resolved,
+                &negative,
+                &indeterminate,
+                negative_ttl,
+            )?;
+            let findings = resolved
+                .iter()
+                .map(|answer| Finding {
+                    fqdn: answer.fqdn.clone(),
+                    records: answer.records.clone(),
+                    sources: BTreeSet::from(["refresh".to_owned()]),
+                    wildcard: false,
+                    from_cache: false,
+                    confidence: assess_confidence(
+                        &BTreeSet::from(["refresh".to_owned()]),
+                        false,
+                        crate::model::ObservationState::Live,
+                        true,
+                    ),
+                    state: crate::model::ObservationState::Live,
+                    last_verified_at: answer.last_verified_at,
+                    evidence_families: BTreeSet::from([crate::model::EvidenceFamily::LiveDns]),
+                    authoritative_validation: answer.authoritative_validation,
+                })
+                .collect::<Vec<_>>();
+            database.persist_findings(scan_id, &domain, &findings, ttl_cap)?;
+            database.stage_refresh_wildcard_candidates(
+                scan_id,
+                &staged_page.into_iter().collect::<Vec<_>>(),
+            )?;
+            checked = checked.saturating_add(completed_count.saturating_add(cancelled_count));
+            active = active.saturating_add(findings.len());
+            inactive_count = inactive_count.saturating_add(negative.len());
+            indeterminate_count = indeterminate_count
+                .saturating_add(indeterminate.len())
+                .saturating_add(wildcard_ambiguity_count);
+            run_guard.update(checked, active);
+            if let Some(progress) = &progress {
+                progress(RefreshProgress {
+                    checked,
+                    total,
+                    active,
+                    inactive: inactive_count,
+                    indeterminate: indeterminate_count,
+                });
+            }
+            cache_only_cursor = page.last().cloned();
+            if deadline_exhausted
+                || global_deadline.is_some_and(|deadline| deadline <= tokio::time::Instant::now())
+            {
+                timed_out = true;
+                break;
+            }
+        }
+    }
     let mut status = if timed_out || checked < total || !wildcard_phase_complete {
         "partial".to_owned()
     } else {
@@ -4550,45 +5917,6 @@ pub async fn refresh_inventory_bounded(
         warnings.push(format!(
             "{indeterminate_count} nom(s) indéterminé(s); état précédent préservé"
         ));
-    }
-    if refresh_allows_wildcard_purge(&status, wildcard_classification_reliable) {
-        let mut cache_only_cursor = None::<String>;
-        loop {
-            if global_deadline.is_some_and(|deadline| deadline <= tokio::time::Instant::now()) {
-                status = "partial".to_owned();
-                warnings.push(
-                    "budget global atteint pendant la classification paginée du cache positif; purge wildcard ignorée"
-                        .to_owned(),
-                );
-                break;
-            }
-            let page = database.positive_cache_only_names_page(
-                &domain,
-                cache_only_cursor.as_deref(),
-                REFRESH_PAGE_SIZE,
-            )?;
-            if page.is_empty() {
-                break;
-            }
-            let cached = database.fresh_cache(&page)?;
-            let mut staged_page = Vec::new();
-            for host in &page {
-                let signature = Scanner::applicable_wildcard_signature(
-                    host,
-                    &root_wildcard,
-                    &wildcard_by_parent,
-                );
-                if wildcard_signature_is_confirmed(signature)
-                    && cached.get(host).is_some_and(|entry| {
-                        matches!(entry, CachedAnswer::Positive(answer) if DnsEngine::matches_wildcard(answer, signature))
-                    })
-                {
-                    staged_page.push(host.clone());
-                }
-            }
-            database.stage_refresh_wildcard_candidates(scan_id, &staged_page)?;
-            cache_only_cursor = page.last().cloned();
-        }
     }
     let staged_wildcards = database.refresh_wildcard_candidate_count(scan_id)?;
     let (purged_wildcards, unverified_count) = if refresh_allows_wildcard_purge(
@@ -4658,20 +5986,28 @@ pub async fn refresh_inventory_bounded(
 #[cfg(test)]
 mod tests {
     use super::{
-        RefreshOptions, RefreshRunGuard, ScanRunGuard, Scanner,
+        BatchDnsMode, RefreshOptions, RefreshRunGuard, ScanRunGuard, Scanner,
+        active_candidate_budget_exhausted, active_candidate_work_allowed, active_resume_required,
         apply_completed_refresh_wildcard_cleanup, before_refresh_deadline,
-        cache_requires_revalidation, candidate_refill_capacity, capped_phase_deadline,
+        cache_requires_revalidation, candidate_refill_capacity, candidate_uses_active_budget,
+        candidate_uses_discovery_fast_path, capped_phase_deadline, collect_dns_outcomes_until,
         consume_phase_budget, external_pause_status, external_retry_after_seconds,
-        record_bounded_parent_candidate, refresh_allows_wildcard_purge,
-        refresh_parent_selection_is_complete, refresh_wildcard_observation_is_reliable,
-        refresh_wildcard_profile_is_reliable, should_expand_adaptive_wave,
-        should_retry_otx_after_key_added, wildcard_profile_after_probe, wildcard_profile_observed,
+        persist_routed_dns_outcomes, record_bounded_parent_candidate,
+        refresh_allows_wildcard_purge, refresh_parent_selection_is_complete,
+        refresh_wildcard_observation_is_reliable, refresh_wildcard_profile_is_reliable,
+        route_dns_outcomes, should_expand_adaptive_wave, should_retry_otx_after_key_added,
+        wildcard_profile_after_probe, wildcard_profile_observed,
     };
+    use crate::candidate::CandidateProposal;
     use crate::db::Database;
-    use crate::dns::{DnsEngine, WildcardProbeOutcome};
+    use crate::dns::{DnsEngine, DnsResolutionOutcome, WildcardProbeOutcome};
     use crate::model::{DnsRecord, Finding, ObservationState, ResolvedHost};
     use serde_json::json;
     use std::collections::{BTreeMap, BTreeSet, HashMap};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
     use std::time::{Duration, Instant};
 
     #[test]
@@ -4688,18 +6024,40 @@ mod tests {
             &answer,
             Duration::from_secs(101),
             1_100,
+            false,
         ));
         assert!(cache_requires_revalidation(
             &answer,
             Duration::from_secs(99),
             1_100,
+            false,
         ));
-        assert!(cache_requires_revalidation(&answer, Duration::ZERO, 1_000,));
+        assert!(cache_requires_revalidation(
+            &answer,
+            Duration::ZERO,
+            1_000,
+            false,
+        ));
         answer.last_verified_at = None;
         assert!(cache_requires_revalidation(
             &answer,
             Duration::from_secs(3_600),
             1_100,
+            false,
+        ));
+        answer.last_verified_at = Some(1_100);
+        assert!(cache_requires_revalidation(
+            &answer,
+            Duration::from_secs(3_600),
+            1_100,
+            true,
+        ));
+        answer.resolver_count = 2;
+        assert!(!cache_requires_revalidation(
+            &answer,
+            Duration::from_secs(3_600),
+            1_100,
+            true,
         ));
     }
 
@@ -4723,6 +6081,351 @@ mod tests {
         let mut unlimited = None;
         consume_phase_budget(&mut unlimited, Duration::from_secs(99));
         assert_eq!(unlimited, None);
+    }
+
+    #[test]
+    fn web_budget_is_shared_across_initial_and_pipeline_rounds() {
+        let mut remaining = Some(Duration::from_secs(45));
+        consume_phase_budget(&mut remaining, Duration::from_secs(30));
+        assert_eq!(remaining, Some(Duration::from_secs(15)));
+        consume_phase_budget(&mut remaining, Duration::from_secs(20));
+        assert_eq!(remaining, Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn explicit_active_budget_is_independent_of_adaptive_mode_and_includes_wordlists() {
+        // The scanner budget no longer receives an `adaptive` flag: an
+        // explicit non-zero --active-max-runtime therefore remains effective
+        // with --no-adaptive. A profile/default value of zero is represented
+        // as None and remains unlimited.
+        assert!(active_candidate_budget_exhausted(Some(Duration::ZERO)));
+        assert!(!active_candidate_budget_exhausted(None));
+        assert!(!active_candidate_work_allowed(Some(Duration::ZERO)));
+        assert!(active_candidate_work_allowed(None));
+
+        let generated = CandidateProposal {
+            relative_name: "api".to_owned(),
+            generator: "builtin".to_owned(),
+            score: 1,
+        };
+        let wordlist = CandidateProposal {
+            relative_name: "custom".to_owned(),
+            generator: "wordlist".to_owned(),
+            score: 1,
+        };
+        assert!(candidate_uses_active_budget(&generated));
+        assert!(candidate_uses_active_budget(&wordlist));
+        assert!(candidate_uses_discovery_fast_path(
+            &generated, true, false, false, false
+        ));
+        assert!(!candidate_uses_discovery_fast_path(
+            &wordlist, true, false, false, false
+        ));
+        assert!(!candidate_uses_discovery_fast_path(
+            &generated, true, false, true, false
+        ));
+        assert!(!candidate_uses_discovery_fast_path(
+            &generated, true, true, false, false
+        ));
+        assert!(!candidate_uses_discovery_fast_path(
+            &generated, true, false, false, true
+        ));
+        // Expansion state changes fast-path eligibility, not budget ownership:
+        // resumed/generated retries must remain under the active deadline.
+        assert!(candidate_uses_active_budget(&generated));
+        assert!(!candidate_uses_discovery_fast_path(
+            &generated, false, false, false, false
+        ));
+    }
+
+    #[test]
+    fn completed_last_recursive_depth_does_not_create_a_false_partial() {
+        assert!(!active_resume_required(
+            Some(Duration::ZERO),
+            0,
+            false,
+            false,
+        ));
+        assert!(active_resume_required(Some(Duration::ZERO), 0, false, true,));
+        assert!(active_resume_required(
+            Some(Duration::ZERO),
+            1,
+            false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn generated_fast_negatives_route_only_to_the_discovery_journal() {
+        let positive = ResolvedHost {
+            fqdn: "live.example.com".to_owned(),
+            records: vec![DnsRecord {
+                record_type: "A".to_owned(),
+                value: "192.0.2.10".to_owned(),
+                ttl: 60,
+            }],
+            from_cache: false,
+            last_verified_at: Some(1),
+            authoritative_validation: false,
+            resolver_count: 2,
+        };
+        let routed = route_dns_outcomes(
+            BatchDnsMode::GeneratedDiscovery,
+            [
+                DnsResolutionOutcome::Positive(positive.clone()),
+                DnsResolutionOutcome::Negative {
+                    fqdn: "missing.example.com".to_owned(),
+                },
+                DnsResolutionOutcome::Indeterminate {
+                    fqdn: "uncertain.example.com".to_owned(),
+                },
+            ],
+            ["deadline.example.com".to_owned()],
+        );
+        assert_eq!(routed.positives.len(), 1);
+        assert_eq!(routed.positives[0].fqdn, positive.fqdn);
+        assert_eq!(routed.positives[0].records, positive.records);
+        assert!(routed.cacheable_negatives.is_empty());
+        assert_eq!(
+            routed.discovery_negatives,
+            vec!["missing.example.com".to_owned()]
+        );
+        assert_eq!(
+            routed.indeterminate,
+            vec![
+                "deadline.example.com".to_owned(),
+                "uncertain.example.com".to_owned()
+            ]
+        );
+
+        let conservative = route_dns_outcomes(
+            BatchDnsMode::Conservative,
+            [DnsResolutionOutcome::Negative {
+                fqdn: "missing.example.com".to_owned(),
+            }],
+            [],
+        );
+        assert_eq!(
+            conservative.cacheable_negatives,
+            vec!["missing.example.com".to_owned()]
+        );
+        assert!(conservative.discovery_negatives.is_empty());
+    }
+
+    #[test]
+    fn discovery_negative_is_terminal_without_poisoning_an_existing_positive_cache() {
+        let database = Database::in_memory().unwrap();
+        let history_scan = database.create_scan("example.com", &json!({})).unwrap();
+        let fqdn = "api.example.com".to_owned();
+        let positive = ResolvedHost {
+            fqdn: fqdn.clone(),
+            records: vec![DnsRecord {
+                record_type: "A".to_owned(),
+                value: "192.0.2.44".to_owned(),
+                ttl: 60,
+            }],
+            from_cache: false,
+            last_verified_at: Some(1),
+            authoritative_validation: false,
+            resolver_count: 2,
+        };
+        database
+            .update_cache_outcomes(
+                Some(history_scan),
+                std::slice::from_ref(&positive),
+                &[],
+                &[],
+                300,
+            )
+            .unwrap();
+
+        let scan_id = database.create_scan("example.com", &json!({})).unwrap();
+        database
+            .persist_scan_candidates_bounded(
+                scan_id,
+                "example.com",
+                &[("api".to_owned(), "builtin".to_owned(), 1)],
+                1,
+            )
+            .unwrap();
+        assert_eq!(
+            database.pending_scan_candidates(scan_id, 1).unwrap().len(),
+            1
+        );
+
+        persist_routed_dns_outcomes(
+            &database,
+            scan_id,
+            &[],
+            &[],
+            std::slice::from_ref(&fqdn),
+            &[],
+            300,
+        )
+        .unwrap();
+        database
+            .mark_scan_candidates_done(scan_id, std::slice::from_ref(&fqdn))
+            .unwrap();
+
+        assert_eq!(database.pending_scan_candidate_count(scan_id).unwrap(), 0);
+        let cached = database.fresh_cache(std::slice::from_ref(&fqdn)).unwrap();
+        let Some(crate::db::CachedAnswer::Positive(answer)) = cached.get(&fqdn) else {
+            panic!("discovery-only negative replaced the positive cache");
+        };
+        assert_eq!(answer.records, positive.records);
+    }
+
+    #[tokio::test]
+    async fn active_deadline_persists_completed_outcomes_and_requeues_unfinished_work() {
+        let fast = "fast.example.com".to_owned();
+        let slow = "slow.example.com".to_owned();
+        let started = Instant::now();
+        let batch = collect_dns_outcomes_until(
+            vec![fast.clone(), slow.clone()],
+            2,
+            Some(tokio::time::Instant::now() + Duration::from_millis(60)),
+            |fqdn| async move {
+                if fqdn.starts_with("fast.") {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    DnsResolutionOutcome::Positive(ResolvedHost {
+                        fqdn,
+                        records: vec![DnsRecord {
+                            record_type: "A".to_owned(),
+                            value: "192.0.2.10".to_owned(),
+                            ttl: 60,
+                        }],
+                        from_cache: false,
+                        last_verified_at: Some(1),
+                        authoritative_validation: false,
+                        resolver_count: 2,
+                    })
+                } else {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    DnsResolutionOutcome::Negative { fqdn }
+                }
+            },
+            |_| {},
+        )
+        .await;
+
+        assert!(batch.deadline_exhausted);
+        assert!(started.elapsed() >= Duration::from_millis(40));
+        assert!(started.elapsed() < Duration::from_millis(250));
+        assert_eq!(batch.completed.len(), 1);
+        assert_eq!(batch.completed[0].fqdn(), fast);
+        assert_eq!(batch.cancelled, vec![slow.clone()]);
+        assert!(batch.not_started.is_empty());
+
+        let database = Database::in_memory().unwrap();
+        let scan_id = database.create_scan("example.com", &json!({})).unwrap();
+        database
+            .persist_scan_candidates_bounded(
+                scan_id,
+                "example.com",
+                &[
+                    ("fast".to_owned(), "builtin".to_owned(), 2),
+                    ("slow".to_owned(), "builtin".to_owned(), 1),
+                ],
+                2,
+            )
+            .unwrap();
+        assert_eq!(
+            database.pending_scan_candidates(scan_id, 2).unwrap().len(),
+            2
+        );
+
+        let completed = batch
+            .completed
+            .into_iter()
+            .filter_map(|outcome| match outcome {
+                DnsResolutionOutcome::Positive(answer) => Some(answer),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        database
+            .mark_scan_candidates_started(scan_id, &batch.started)
+            .unwrap();
+        database
+            .update_cache_outcomes(Some(scan_id), &completed, &[], &batch.cancelled, 300)
+            .unwrap();
+        database
+            .record_scan_candidate_results(
+                scan_id,
+                &[
+                    (fast.clone(), "fast".to_owned(), "builtin".to_owned(), true),
+                    (slow.clone(), "slow".to_owned(), "builtin".to_owned(), false),
+                ],
+            )
+            .unwrap();
+        database
+            .mark_scan_candidates_done(scan_id, &[fast.clone(), slow.clone()])
+            .unwrap();
+
+        let cache = database.fresh_cache(&[fast.clone(), slow.clone()]).unwrap();
+        assert!(matches!(
+            cache.get(&fast),
+            Some(crate::db::CachedAnswer::Positive(_))
+        ));
+        assert!(!cache.contains_key(&slow));
+        // The unfinished generated row remains durable, but an exhausted
+        // active budget cannot claim it again during this scan.
+        assert!(
+            database
+                .pending_scan_candidates_eligible(scan_id, 10, false)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(database.pending_scan_candidate_count(scan_id).unwrap(), 1);
+        let retry = database
+            .pending_scan_candidates_eligible(scan_id, 10, true)
+            .unwrap();
+        assert_eq!(retry.len(), 1);
+        assert_eq!(retry[0].0, "slow");
+    }
+
+    #[tokio::test]
+    async fn expired_deadline_never_starts_an_immediately_ready_backlog() {
+        let starts = Arc::new(AtomicUsize::new(0));
+        let hosts = (0..10_000)
+            .map(|index| format!("{index}.example.com"))
+            .collect::<Vec<_>>();
+        let counter = starts.clone();
+        let batch = collect_dns_outcomes_until(
+            hosts.clone(),
+            64,
+            Some(tokio::time::Instant::now() - Duration::from_millis(1)),
+            move |fqdn| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                async move { DnsResolutionOutcome::Negative { fqdn } }
+            },
+            |_| {},
+        )
+        .await;
+
+        assert!(batch.deadline_exhausted);
+        assert_eq!(starts.load(Ordering::SeqCst), 0);
+        assert!(batch.completed.is_empty());
+        assert!(batch.cancelled.is_empty());
+        assert_eq!(batch.not_started.len(), hosts.len());
+        assert!(batch.started.is_empty());
+
+        let database = Database::in_memory().unwrap();
+        let scan_id = database.create_scan("example.com", &json!({})).unwrap();
+        database
+            .persist_scan_candidates(
+                scan_id,
+                "example.com",
+                &[("never-sent".to_owned(), "builtin".to_owned(), 1)],
+            )
+            .unwrap();
+        database.pending_scan_candidates(scan_id, 1).unwrap();
+        database
+            .mark_scan_candidates_started(scan_id, &batch.started)
+            .unwrap();
+        database
+            .requeue_unstarted_scan_candidates(scan_id, &["never-sent.example.com".to_owned()])
+            .unwrap();
+        assert_eq!(database.pending_scan_candidate_count(scan_id).unwrap(), 1);
     }
 
     #[test]
@@ -4813,6 +6516,7 @@ mod tests {
                 "example.test",
                 Duration::from_secs(3_600),
                 true,
+                false,
             ),
         )
         .await
@@ -4868,12 +6572,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn completed_cleanup_demotes_independently_observed_wildcard_matches() {
+    async fn completed_cleanup_quarantines_exact_matches_with_passive_evidence() {
         let database = Database::in_memory().unwrap();
         let scan_id = database.create_scan("example.com", &json!({})).unwrap();
         let make = |fqdn: &str, source: &str| Finding {
             fqdn: fqdn.to_owned(),
-            records: Vec::new(),
+            records: vec![DnsRecord {
+                record_type: "A".to_owned(),
+                value: "192.0.2.44".to_owned(),
+                ttl: 60,
+            }],
             sources: BTreeSet::from([source.to_owned()]),
             wildcard: false,
             from_cache: false,
@@ -4901,6 +6609,26 @@ mod tests {
             )
             .unwrap();
         database
+            .record_current_wildcard_matches(
+                scan_id,
+                &[weak, corroborated]
+                    .into_iter()
+                    .map(|fqdn| ResolvedHost {
+                        fqdn: fqdn.to_owned(),
+                        records: vec![DnsRecord {
+                            record_type: "A".to_owned(),
+                            value: "192.0.2.44".to_owned(),
+                            ttl: 60,
+                        }],
+                        from_cache: false,
+                        last_verified_at: Some(1),
+                        authoritative_validation: false,
+                        resolver_count: 2,
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        database
             .stage_refresh_wildcard_candidates(scan_id, &[weak.to_owned(), corroborated.to_owned()])
             .unwrap();
         let (purged, retained) =
@@ -4908,11 +6636,15 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-        assert_eq!((purged, retained), (1, 1));
-        let inventory = database.inventory(Some("example.com"), false).unwrap();
-        assert_eq!(inventory.len(), 1);
-        assert_eq!(inventory[0].fqdn, corroborated);
-        assert_eq!(inventory[0].state, ObservationState::Unverified);
+        assert_eq!((purged, retained), (2, 0));
+        assert!(
+            database
+                .inventory(Some("example.com"), false)
+                .unwrap()
+                .is_empty()
+        );
+        let explanation = database.explain(corroborated).unwrap();
+        assert_eq!(explanation["quarantine"].as_array().unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -5081,11 +6813,13 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_waves_require_two_recent_hits_after_the_second_wave() {
-        assert!(should_expand_adaptive_wave(true, 0, 2, 5));
-        assert!(!should_expand_adaptive_wave(true, 1, 3, 10));
-        assert!(should_expand_adaptive_wave(true, 2, 3, 0));
-        assert!(!should_expand_adaptive_wave(false, 20, 2, 20));
+    fn adaptive_waves_require_a_minimum_yield_rate() {
+        assert!(should_expand_adaptive_wave(true, 0, 500, 2, 5));
+        assert!(!should_expand_adaptive_wave(true, 1, 500, 3, 10));
+        assert!(should_expand_adaptive_wave(true, 2, 1_000, 3, 0));
+        assert!(!should_expand_adaptive_wave(true, 2, 1_500, 3, 0));
+        assert!(should_expand_adaptive_wave(true, 3, 1_500, 3, 0));
+        assert!(!should_expand_adaptive_wave(false, 20, 500, 2, 20));
     }
 
     #[test]
