@@ -1,50 +1,56 @@
-# Journal des changements
+# Changelog
 
-Ce projet suit les principes de [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/).
-La disponibilité d'une version et de ses artefacts se vérifie sur la page
-GitHub Releases ; un numéro présent dans ce fichier ne prouve pas à lui seul
-qu'une publication a réussi.
+All notable changes to Fellaga are documented in this file. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+
+A version is available only when its artifacts appear on [GitHub Releases](https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases). A changelog entry or Git tag alone does not prove that publication succeeded.
+
+## [Unreleased]
+
+## [0.8.1] - 2026-07-16
+
+### Changed
+
+- rebuilt the public README as a concise English project entry point;
+- added dedicated English guides for installation, usage, discovery, sources, local data, and release verification;
+- translated contributor, security, benchmark, test-laboratory, fixture, and developer-script documentation to English;
+- translated and completed the built-in command help so every public option has an English description;
+- packaged the complete English guide set in both release archives and the Debian package, preserving relative documentation paths;
+- documented the actual passive-profile behavior, resource limits, wildcard refresh behavior, output states, and immutable release-verification process.
+
+### Fixed
+
+- made `--stream-jsonl --only-live` wait for each domain's final wildcard classification so stale, unverified, or wildcard findings cannot leak into the live-only stream;
+- corrected the wildcard refresh help text and shortened mutation-DSL help so terminal wrapping does not corrupt the placeholder list.
 
 ## [0.8.0] - 2026-07-16
 
-Première version publique préparée de Fellaga.
+Initial public release of Fellaga.
 
-### Ajouté
+### Added
 
-- moteur DNS Rust asynchrone avec UDP corrélé, EDNS0, repli TCP, limites de
-  débit et validation par résolveurs de confiance ;
-- inventaire SQLite permanent distinguant les états `live`, `historical` et
-  `unverified`, avec journal de validation, checkpoints et reprise ;
-- sources passives, Certificate Transparency incrémentale, AXFR strict, NSEC,
-  graphe DNS, Web/JavaScript, TLS/STARTTLS et mutations contextuelles ;
-- détection wildcard hiérarchique, familles de preuves et explication du score
-  de confiance ;
-- corpus SecLists dérivé, épinglé et compressé d'un million de candidats ;
-- sorties texte, JSON, JSONL/stream JSONL et commandes d'import, d'export,
-  d'explication et de contrôle des sources/résolveurs ;
-- banc concurrentiel, laboratoire DNS, tests de propriétés, cible de fuzzing et
-  workflows CI/release.
+- asynchronous Rust DNS engine with correlated UDP queries, EDNS0, TCP fallback, rate limiting, and trusted-resolver validation;
+- permanent SQLite inventory with `live`, `historical`, and `unverified` states, an append-only validation journal, checkpoints, and resume support;
+- passive sources, incremental Certificate Transparency, strict AXFR, NSEC, DNS graph, Web/JavaScript, TLS/STARTTLS, and contextual mutations;
+- hierarchical wildcard detection, evidence families, and explained confidence scores;
+- pinned and compressed one-million-candidate corpus derived from SecLists;
+- text, JSON, JSONL, streaming JSONL, import, export, explanation, source-health, and resolver-test interfaces;
+- reproducible competitor benchmark, controlled DNS laboratory, property tests, fuzz target, and CI/release workflows.
 
-### Sécurité et fiabilité
+### Security and reliability
 
-- limites prudentes par défaut pour la concurrence, le débit DNS, le nombre de
-  domaines actifs et la durée maximale ;
-- profil `deep` adaptatif par défaut, avec arrêt des vagues à faible rendement ;
-- timeouts absolus et budgets pour AXFR, TLS, NSEC, Web et sources externes ;
-- filtrage des destinations Web privées ou locales et validation des
-  redirections ;
-- permissions privées sous Unix pour la configuration, SQLite, WAL/SHM et les
-  sauvegardes de migration ;
-- purge des observations faibles correspondant à un wildcard, y compris les
-  réponses positives orphelines du cache, sans supprimer les preuves
-  indépendantes ;
-- conservation locale de l'apprentissage, sans télémétrie ni partage
-  automatique de la base.
+- conservative defaults for concurrency, DNS rate, active domains, and maximum runtime;
+- adaptive `deep` profile by default, including low-yield wave termination;
+- absolute timeouts and bounded work for AXFR, TLS, NSEC, Web, CT, and external providers;
+- private/local Web destination filtering and redirect validation;
+- private Unix permissions for configuration, SQLite, WAL/SHM, and migration backups;
+- purge of weak wildcard observations and orphaned positive cache records without deleting independent evidence;
+- local-only learning with no telemetry or automatic database sharing.
 
-### Documentation et distribution
+### Distribution
 
-- politique de sécurité, guide de contribution, notices tierces et provenance
-  vérifiable du corpus ;
-- workflow de release configuré pour produire archives Linux/Kali x86-64 et
-  ARM64, paquet Debian, SBOM, checksums, signature sans clé et attestations. Ces
-  artefacts ne sont considérés publiés qu'après réussite visible du workflow.
+- public MIT repository with security policy, contribution guide, third-party notices, and verifiable corpus provenance;
+- verifiable v0.8.0 release with x86-64 and ARM64 GNU/Linux archives, an amd64 Debian package, architecture SBOMs, checksums, a keyless Sigstore signature over the checksum manifest, and GitHub attestations.
+
+[Unreleased]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/compare/v0.8.1...HEAD
+[0.8.1]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/tag/v0.8.1
+[0.8.0]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/tag/v0.8.0

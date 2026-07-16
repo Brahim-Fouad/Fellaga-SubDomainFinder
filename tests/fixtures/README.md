@@ -1,3 +1,7 @@
-# Fixtures contractuelles
+# Connector fixtures
 
-Ces réponses sont volontairement minimales, sans secret ni donnée personnelle. Les tests vérifient le schéma, la pagination et le filtrage strict du périmètre. Les scénarios HTTP génériques `429`, `Retry-After`, corps partiel, erreur structurée et taille excessive sont couverts dans `passive.rs`; chaque nouveau connecteur doit ajouter ici une page normale, une page terminale et une réponse de schéma dégradé avant activation par défaut.
+This directory currently contains sanitized normal-response fixtures for WhoisXML and Netlas. They are intentionally minimal and contain no secret or personal data. The tests validate connector parsing, pagination fields represented by those fixtures, and strict in-scope name filtering.
+
+Generic HTTP handling for `429`, `Retry-After`, partial bodies, structured errors, excessive response size, and credential-safe pagination is tested in `src/passive.rs`.
+
+Before a new connector is enabled by default, add sanitized fixtures for a normal page, terminal pagination, and a degraded or changed schema when the upstream contract permits redistribution.

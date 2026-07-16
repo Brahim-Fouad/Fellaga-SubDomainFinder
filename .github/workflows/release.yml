@@ -223,10 +223,13 @@ jobs:
           package="fellaga-v${VERSION}-${TARGET}"
           stage="dist/stage/${package}"
           archive="dist/${package}.tar.gz"
-          mkdir -p "$stage"
+          mkdir -p "$stage/docs" "$stage/data"
           install -m 0755 "target/${TARGET}/release/fellaga" "$stage/fellaga"
-          install -m 0644 README.md LICENSE THIRD_PARTY_NOTICES.md \
-            data/CORPUS_LICENSE.md data/corpus-manifest.json "$stage/"
+          install -m 0644 README.md CHANGELOG.md CONTRIBUTING.md SECURITY.md \
+            LICENSE THIRD_PARTY_NOTICES.md "$stage/"
+          install -m 0644 docs/*.md "$stage/docs/"
+          install -m 0644 data/CORPUS_LICENSE.md data/corpus-manifest.json \
+            "$stage/data/"
 
           create_archive() {
             local output="$1"
@@ -250,6 +253,9 @@ jobs:
           mkdir -p dist/archive-check
           tar -xzf "$archive" -C dist/archive-check
           cmp "target/${TARGET}/release/fellaga" "dist/archive-check/${package}/fellaga"
+          test -f "dist/archive-check/${package}/docs/installation.md"
+          test -f "dist/archive-check/${package}/docs/release-verification.md"
+          test -f "dist/archive-check/${package}/data/CORPUS_LICENSE.md"
 
       - name: Smoke-test x86-64 in pinned Kali
         if: matrix.target == 'x86_64-unknown-linux-gnu'
@@ -295,12 +301,15 @@ jobs:
           metadata_root="$RUNNER_TEMP/fellaga-deb-metadata"
           deb="dist/fellaga_${VERSION}-1_amd64.deb"
           mkdir -p "$package_root/DEBIAN" "$package_root/usr/bin" \
-            "$package_root/usr/share/doc/fellaga" "$metadata_root/debian"
+            "$package_root/usr/share/doc/fellaga/docs" \
+            "$package_root/usr/share/doc/fellaga/data" "$metadata_root/debian"
 
           install -m 0755 "$binary" "$package_root/usr/bin/fellaga"
-          install -m 0644 README.md LICENSE THIRD_PARTY_NOTICES.md \
-            data/CORPUS_LICENSE.md data/corpus-manifest.json \
-            "$package_root/usr/share/doc/fellaga/"
+          install -m 0644 README.md CHANGELOG.md CONTRIBUTING.md SECURITY.md \
+            LICENSE THIRD_PARTY_NOTICES.md "$package_root/usr/share/doc/fellaga/"
+          install -m 0644 docs/*.md "$package_root/usr/share/doc/fellaga/docs/"
+          install -m 0644 data/CORPUS_LICENSE.md data/corpus-manifest.json \
+            "$package_root/usr/share/doc/fellaga/data/"
 
           cat > "$metadata_root/debian/control" <<EOF
           Source: fellaga
@@ -342,6 +351,8 @@ jobs:
           mkdir -p "$RUNNER_TEMP/deb-extract"
           dpkg-deb --extract "$deb" "$RUNNER_TEMP/deb-extract"
           cmp "$binary" "$RUNNER_TEMP/deb-extract/usr/bin/fellaga"
+          test -f "$RUNNER_TEMP/deb-extract/usr/share/doc/fellaga/docs/usage.md"
+          test -f "$RUNNER_TEMP/deb-extract/usr/share/doc/fellaga/data/CORPUS_LICENSE.md"
           dpkg-deb --info "$deb"
 
       - name: Install and smoke-test the Debian package in pinned Kali

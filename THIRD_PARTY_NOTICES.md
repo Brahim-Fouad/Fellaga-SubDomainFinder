@@ -2,8 +2,8 @@
 
 This file records third-party material redistributed by Fellaga and explicit
 upstream design attribution. Rust dependency versions are pinned in
-`Cargo.lock`; release SBOMs provide the corresponding machine-readable
-inventory.
+`Cargo.lock`. Release SBOMs identify each packaged architecture binary and its
+digest; they do not replace `Cargo.lock` as the dependency inventory.
 
 ## SecLists
 

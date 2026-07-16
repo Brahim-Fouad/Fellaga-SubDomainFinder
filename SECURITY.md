@@ -1,38 +1,23 @@
-# Politique de sécurité
+# Security policy
 
-Fellaga effectue des requêtes DNS, HTTP et TLS actives. Utilisez-le uniquement
-sur des domaines pour lesquels vous disposez d'une autorisation explicite.
+Fellaga performs active DNS, HTTP, and TLS operations. Use it only on domains for which you have explicit authorization.
 
-## Versions prises en charge
+## Supported versions
 
-Les correctifs de sécurité visent la dernière version publiée dans GitHub
-Releases. La branche `main` reçoit les correctifs destinés à la prochaine
-version, mais peut changer avant sa publication. Les versions plus anciennes ne
-bénéficient pas d'un support garanti.
+Security fixes target the latest version published on [GitHub Releases](https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases). The `main` branch receives fixes for the next release but may change before publication. Older releases do not receive guaranteed support.
 
-## Signaler une vulnérabilité
+## Report a vulnerability in Fellaga
 
-1. Utilisez **Security > Report a vulnerability** dans le dépôt GitHub si le
-   formulaire de signalement privé est disponible.
-2. S'il ne l'est pas, ouvrez une issue ne contenant que la demande d'un canal
-   privé. N'y publiez ni preuve d'exploitation, ni secret, ni donnée de cible.
-3. Indiquez dans le rapport privé la version ou le commit, le système, les
-   options concernées, l'impact attendu et une reproduction minimale.
+1. Open the repository's **Security** tab and choose **Report a vulnerability** to use GitHub private vulnerability reporting.
+2. If private reporting is unavailable, open a public issue that asks only for a private contact channel. Do not include exploit details, secrets, target data, or an unredacted proof of concept.
+3. In the private report, include the affected version or commit, operating system, relevant options, expected impact, and a minimal reproduction using controlled data.
 
-Les rapports sont traités au mieux des disponibilités du projet, sans délai de
-réponse contractuel. Une correction peut être préparée sous embargo avant la
-publication coordonnée d'un avis.
+Reports are handled on a best-effort basis without a contractual response time. A fix may be prepared under embargo before coordinated disclosure.
 
-## Données à ne jamais joindre
+## Never attach
 
-Ne transmettez pas de clé API, jeton, mot de passe, base SQLite réelle, fichier
-de configuration, résultat de scan non expurgé ou nom de cible confidentiel.
-Remplacez ces éléments par des valeurs factices et utilisez, si possible, une
-zone DNS de laboratoire que vous contrôlez.
+Do not send API keys, tokens, passwords, real SQLite databases, configuration files, unredacted scan output, or confidential target names. Replace sensitive values with placeholders and, whenever possible, reproduce the issue with a DNS laboratory zone you control.
 
-## Périmètre de cette politique
+## Scope of this policy
 
-Cette politique couvre le code et les artefacts de Fellaga. Elle ne couvre pas
-les vulnérabilités découvertes sur les domaines analysés, les indisponibilités
-des services tiers ni un scan lancé sans autorisation. Signalez une faille d'un
-tiers à son propriétaire selon son propre processus de divulgation.
+This policy covers vulnerabilities in Fellaga's code and published artifacts. It does not cover vulnerabilities discovered on scanned domains, outages of third-party providers, or consequences of an unauthorized scan. Report third-party vulnerabilities to their owners under the owners' disclosure process.
