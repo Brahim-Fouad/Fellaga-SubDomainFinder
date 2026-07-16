@@ -14,12 +14,101 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::OpenOptions;
 use std::io::{BufRead, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+    mpsc,
+};
 
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 const PERMANENT_EXPIRY: i64 = i64::MAX;
+
+fn wildcard_cleanup_evidence_is_independent(kind: &str, source: &str) -> bool {
+    matches!(
+        evidence_family(source),
+        Some(family) if family != EvidenceFamily::LiveDns
+    ) || matches!(kind, "passive" | "web" | "tls" | "dnssec" | "import")
+        || source == "import"
+        || source.starts_with("import:")
+}
+
+type WildcardCleanupEvidence = (
+    HashMap<String, BTreeSet<String>>,
+    HashMap<String, BTreeSet<String>>,
+);
+
+fn wildcard_cleanup_evidence_for_hosts(
+    transaction: &rusqlite::Transaction<'_>,
+    root_domain: &str,
+    hosts: &[String],
+) -> Result<WildcardCleanupEvidence> {
+    let mut stored_sources = HashMap::<String, BTreeSet<String>>::new();
+    let mut independent_sources = HashMap::<String, BTreeSet<String>>::new();
+    if hosts.is_empty() {
+        return Ok((stored_sources, independent_sources));
+    }
+
+    let placeholders = std::iter::repeat_n("?", hosts.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut values = Vec::<rusqlite::types::Value>::with_capacity(hosts.len() + 1);
+    values.push(root_domain.to_owned().into());
+    values.extend(hosts.iter().cloned().map(Into::into));
+
+    {
+        let sql = format!(
+            "SELECT fqdn, sources FROM subdomains WHERE root_domain=? AND fqdn IN ({placeholders})"
+        );
+        let mut statement = transaction.prepare(&sql)?;
+        let rows = statement.query_map(rusqlite::params_from_iter(values.iter()), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (fqdn, sources) = row?;
+            let all = sources
+                .split(',')
+                .filter(|source| !source.is_empty())
+                .map(ToOwned::to_owned)
+                .collect::<BTreeSet<_>>();
+            for source in &all {
+                if wildcard_cleanup_evidence_is_independent("", source) {
+                    independent_sources
+                        .entry(fqdn.clone())
+                        .or_default()
+                        .insert(source.clone());
+                }
+            }
+            stored_sources.insert(fqdn, all);
+        }
+    }
+
+    {
+        let sql = format!(
+            r#"SELECT names.fqdn, evidence.kind, evidence.source
+               FROM observation_evidence evidence
+               JOIN observed_names names ON names.id=evidence.name_id
+               WHERE evidence.root_domain=? AND names.fqdn IN ({placeholders})"#
+        );
+        let mut statement = transaction.prepare(&sql)?;
+        let rows = statement.query_map(rusqlite::params_from_iter(values.iter()), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (fqdn, kind, source) = row?;
+            if wildcard_cleanup_evidence_is_independent(&kind, &source) {
+                independent_sources.entry(fqdn).or_default().insert(source);
+            }
+        }
+    }
+
+    Ok((stored_sources, independent_sources))
+}
 
 #[cfg(unix)]
 fn sqlite_companion_path(path: &Path, suffix: &str) -> PathBuf {
@@ -247,6 +336,12 @@ pub struct WildcardCacheEntry {
     pub soa_serial: Option<u64>,
     pub expires_at: i64,
     pub algorithm_version: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WildcardCleanupResult {
+    pub purged: usize,
+    pub retained_unverified: usize,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -753,6 +848,18 @@ impl Database {
             );
             CREATE INDEX IF NOT EXISTS idx_scan_checkpoints_latest
                 ON scan_checkpoints(domain, completed, updated_at DESC);
+
+            CREATE TABLE IF NOT EXISTS refresh_wildcard_candidates (
+                scan_id INTEGER NOT NULL REFERENCES scans(id) ON DELETE CASCADE,
+                fqdn TEXT NOT NULL,
+                PRIMARY KEY(scan_id, fqdn)
+            ) WITHOUT ROWID;
+
+            CREATE TABLE IF NOT EXISTS refresh_wildcard_affected_scans (
+                refresh_scan_id INTEGER NOT NULL REFERENCES scans(id) ON DELETE CASCADE,
+                affected_scan_id INTEGER NOT NULL REFERENCES scans(id) ON DELETE CASCADE,
+                PRIMARY KEY(refresh_scan_id, affected_scan_id)
+            ) WITHOUT ROWID;
 
             CREATE TABLE IF NOT EXISTS scan_candidates (
                 scan_id INTEGER NOT NULL REFERENCES scans(id) ON DELETE CASCADE,
@@ -1580,7 +1687,9 @@ impl Database {
         let warning = serde_json::to_string(&vec![
             "scan interrompu sans fermeture; checkpoint conservé pour --resume".to_owned(),
         ])?;
-        let changed = self.lock()?.execute(
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        let changed = transaction.execute(
             r#"UPDATE scans
                SET status='interrupted', finished_at=?1, warnings_json=?2
                WHERE status='running' AND (
@@ -1601,6 +1710,17 @@ impl Database {
                )"#,
             params![now, warning, cutoff],
         )?;
+        transaction.execute(
+            r#"DELETE FROM refresh_wildcard_affected_scans
+               WHERE refresh_scan_id IN (SELECT id FROM scans WHERE status<>'running')"#,
+            [],
+        )?;
+        transaction.execute(
+            r#"DELETE FROM refresh_wildcard_candidates
+               WHERE scan_id IN (SELECT id FROM scans WHERE status<>'running')"#,
+            [],
+        )?;
+        transaction.commit()?;
         Ok(changed)
     }
 
@@ -2775,6 +2895,44 @@ impl Database {
         Ok(())
     }
 
+    /// Finalizes work that is intentionally non-resumable, such as inventory
+    /// refresh. Unlike `finish_scan`, this also closes the checkpoint so a
+    /// cancelled refresh can never be selected by `scan --resume`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn finalize_non_resumable_scan(
+        &self,
+        scan_id: i64,
+        status: &str,
+        candidates: usize,
+        found: usize,
+        cache_hits: usize,
+        duration_ms: u128,
+        warnings: &[String],
+    ) -> Result<()> {
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            r#"UPDATE scans SET finished_at=?1, status=?2, candidates=?3,
+               found=?4, cache_hits=?5, duration_ms=?6, warnings_json=?7 WHERE id=?8"#,
+            params![
+                now_epoch(),
+                status,
+                candidates as i64,
+                found as i64,
+                cache_hits as i64,
+                duration_ms.min(i64::MAX as u128) as i64,
+                serde_json::to_string(warnings)?,
+                scan_id
+            ],
+        )?;
+        transaction.execute(
+            "UPDATE scan_checkpoints SET stage='complete', updated_at=?1, completed=1 WHERE scan_id=?2",
+            params![now_epoch(), scan_id],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn fresh_cache(&self, hosts: &[String]) -> Result<HashMap<String, CachedAnswer>> {
         let now = now_epoch();
         let connection = self.lock()?;
@@ -3154,6 +3312,232 @@ impl Database {
         Ok(())
     }
 
+    pub fn stage_refresh_wildcard_candidates(
+        &self,
+        scan_id: i64,
+        hosts: &[String],
+    ) -> Result<usize> {
+        if hosts.is_empty() {
+            return Ok(0);
+        }
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        let mut inserted = 0_usize;
+        {
+            let mut statement = transaction.prepare(
+                r#"INSERT OR IGNORE INTO refresh_wildcard_candidates(scan_id, fqdn)
+                   VALUES (?1, ?2)"#,
+            )?;
+            for host in hosts {
+                inserted = inserted.saturating_add(statement.execute(params![scan_id, host])?);
+            }
+        }
+        transaction.commit()?;
+        Ok(inserted)
+    }
+
+    pub fn discard_refresh_wildcard_candidates(&self, scan_id: i64) -> Result<usize> {
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "DELETE FROM refresh_wildcard_affected_scans WHERE refresh_scan_id=?1",
+            [scan_id],
+        )?;
+        let removed = transaction.execute(
+            "DELETE FROM refresh_wildcard_candidates WHERE scan_id=?1",
+            [scan_id],
+        )?;
+        transaction.commit()?;
+        Ok(removed)
+    }
+
+    pub fn refresh_wildcard_candidate_count(&self, scan_id: i64) -> Result<usize> {
+        let count = self.lock()?.query_row(
+            "SELECT COUNT(*) FROM refresh_wildcard_candidates WHERE scan_id=?1",
+            [scan_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(count.max(0) as usize)
+    }
+
+    pub fn apply_staged_refresh_wildcard_cleanup(
+        &self,
+        scan_id: i64,
+        root_domain: &str,
+        page_size: usize,
+        cancelled: &AtomicBool,
+    ) -> Result<Option<WildcardCleanupResult>> {
+        self.apply_staged_refresh_wildcard_cleanup_with_cancel(
+            scan_id,
+            root_domain,
+            page_size,
+            |_: usize| cancelled.load(Ordering::Acquire),
+        )
+    }
+
+    fn apply_staged_refresh_wildcard_cleanup_with_cancel<F>(
+        &self,
+        scan_id: i64,
+        root_domain: &str,
+        page_size: usize,
+        mut should_cancel: F,
+    ) -> Result<Option<WildcardCleanupResult>>
+    where
+        F: FnMut(usize) -> bool,
+    {
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        let scan_domain = transaction
+            .query_row("SELECT domain FROM scans WHERE id=?1", [scan_id], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()?;
+        if scan_domain.as_deref() != Some(root_domain) {
+            bail!("la zone de purge wildcard ne correspond pas au scan {scan_id}");
+        }
+        let page_size = page_size.clamp(1, 400);
+        let now = now_epoch();
+        let details =
+            serde_json::to_string(&json!({ "reason": "refresh_confirmed_wildcard_match" }))?;
+        let root_suffix = format!(".{root_domain}");
+        let mut cursor = None::<String>;
+        let mut processed = 0_usize;
+        let mut purged = 0_usize;
+        let mut retained_unverified = 0_usize;
+
+        loop {
+            if should_cancel(processed) {
+                transaction.rollback()?;
+                return Ok(None);
+            }
+            let page = {
+                let mut statement = transaction.prepare(
+                    r#"SELECT fqdn FROM refresh_wildcard_candidates
+                       WHERE scan_id=?1 AND (?2 IS NULL OR fqdn>?2)
+                       ORDER BY fqdn LIMIT ?3"#,
+                )?;
+                statement
+                    .query_map(
+                        params![scan_id, cursor.as_deref(), page_size as i64],
+                        |row| row.get::<_, String>(0),
+                    )?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            if page.is_empty() {
+                break;
+            }
+            let (mut stored_sources, independent_sources) =
+                wildcard_cleanup_evidence_for_hosts(&transaction, root_domain, &page)?;
+
+            for host in &page {
+                if should_cancel(processed) {
+                    transaction.rollback()?;
+                    return Ok(None);
+                }
+                if host != root_domain && !host.ends_with(&root_suffix) {
+                    bail!("candidat wildcard hors zone refusé: {host}");
+                }
+                if let Some(independent) = independent_sources.get(host) {
+                    let merged = stored_sources.entry(host.clone()).or_default();
+                    merged.extend(independent.iter().cloned());
+                    transaction.execute(
+                        r#"UPDATE subdomains
+                           SET active=0, verification_state='unverified', sources=?1
+                           WHERE fqdn=?2 AND root_domain=?3"#,
+                        params![
+                            merged.iter().cloned().collect::<Vec<_>>().join(","),
+                            host,
+                            root_domain
+                        ],
+                    )?;
+                    transaction.execute("UPDATE dns_records SET active=0 WHERE fqdn=?1", [host])?;
+                    transaction.execute(
+                        r#"UPDATE scan_findings
+                           SET wildcard=1, state='unverified', last_verified_at=NULL
+                           WHERE fqdn=?1"#,
+                        [host],
+                    )?;
+                    transaction.execute(
+                        r#"INSERT INTO dns_verifications(
+                           scan_id, fqdn, checked_at, outcome, resolver_count,
+                           authoritative, records_hash, details_json
+                           ) VALUES (?1, ?2, ?3, 'unverified', 0, 0, NULL, ?4)"#,
+                        params![scan_id, host, now, details],
+                    )?;
+                    retained_unverified = retained_unverified.saturating_add(1);
+                } else {
+                    transaction.execute(
+                        r#"INSERT OR IGNORE INTO refresh_wildcard_affected_scans(
+                           refresh_scan_id, affected_scan_id
+                           ) SELECT ?1, scan_id FROM scan_findings WHERE fqdn=?2"#,
+                        params![scan_id, host],
+                    )?;
+                    transaction.execute("DELETE FROM scan_findings WHERE fqdn=?1", [host])?;
+                    transaction.execute("DELETE FROM dns_cache WHERE fqdn=?1", [host])?;
+                    transaction.execute("DELETE FROM dns_records WHERE fqdn=?1", [host])?;
+                    transaction.execute("DELETE FROM scan_candidates WHERE fqdn=?1", [host])?;
+                    transaction
+                        .execute("DELETE FROM scan_seed_candidates WHERE fqdn=?1", [host])?;
+                    transaction.execute(
+                        r#"DELETE FROM observation_evidence
+                           WHERE root_domain=?1 AND name_id=(
+                               SELECT id FROM observed_names WHERE fqdn=?2
+                           )"#,
+                        params![root_domain, host],
+                    )?;
+                    transaction.execute(
+                        r#"DELETE FROM observed_names WHERE fqdn=?1
+                           AND NOT EXISTS (
+                               SELECT 1 FROM observation_evidence
+                               WHERE observation_evidence.name_id=observed_names.id
+                           )"#,
+                        [host],
+                    )?;
+                    transaction.execute(
+                        "DELETE FROM subdomains WHERE fqdn=?1 AND root_domain=?2",
+                        params![host, root_domain],
+                    )?;
+                    if let Some(relative) = host.strip_suffix(&root_suffix) {
+                        transaction.execute(
+                            "DELETE FROM relative_patterns WHERE relative_name=?1 AND unique_domains<=1",
+                            [relative],
+                        )?;
+                    }
+                    purged = purged.saturating_add(1);
+                }
+                processed = processed.saturating_add(1);
+            }
+            cursor = page.last().cloned();
+        }
+
+        if should_cancel(processed) {
+            transaction.rollback()?;
+            return Ok(None);
+        }
+        transaction.execute(
+            r#"UPDATE scans SET found=(
+                   SELECT COUNT(*) FROM scan_findings WHERE scan_id=scans.id
+               ) WHERE id IN (
+                   SELECT affected_scan_id FROM refresh_wildcard_affected_scans
+                   WHERE refresh_scan_id=?1
+               )"#,
+            [scan_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM refresh_wildcard_affected_scans WHERE refresh_scan_id=?1",
+            [scan_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM refresh_wildcard_candidates WHERE scan_id=?1",
+            [scan_id],
+        )?;
+        transaction.commit()?;
+        Ok(Some(WildcardCleanupResult {
+            purged,
+            retained_unverified,
+        }))
+    }
+
     /// Supprime de l'inventaire les réponses créées uniquement par le moteur
     /// actif sous une zone wildcard confirmée. Les noms corroborés par une
     /// source indépendante (CT, passif, Web, TLS, autoritaire ou import) sont
@@ -3248,7 +3632,9 @@ impl Database {
                         .collect::<rusqlite::Result<Vec<_>>>()?,
                 );
             }
+            transaction.execute("DELETE FROM scan_findings WHERE fqdn=?1", [host])?;
             transaction.execute("DELETE FROM dns_cache WHERE fqdn=?1", [host])?;
+            transaction.execute("DELETE FROM dns_records WHERE fqdn=?1", [host])?;
             transaction.execute("DELETE FROM scan_candidates WHERE fqdn=?1", [host])?;
             transaction.execute(
                 r#"DELETE FROM observation_evidence
@@ -4471,6 +4857,82 @@ impl Database {
         Ok(result)
     }
 
+    pub fn known_subdomain_count(&self, domain: &str, all: bool) -> Result<usize> {
+        let connection = self.lock()?;
+        let count = if all {
+            connection.query_row(
+                "SELECT COUNT(*) FROM subdomains WHERE root_domain=?1",
+                [domain],
+                |row| row.get::<_, i64>(0),
+            )?
+        } else {
+            connection.query_row(
+                "SELECT COUNT(*) FROM subdomains WHERE root_domain=?1 AND active=1",
+                [domain],
+                |row| row.get::<_, i64>(0),
+            )?
+        };
+        Ok(count.max(0) as usize)
+    }
+
+    pub fn known_subdomains_page(
+        &self,
+        domain: &str,
+        all: bool,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<String>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let connection = self.lock()?;
+        let sql = if all {
+            r#"SELECT fqdn FROM subdomains
+               WHERE root_domain=?1 AND (?2 IS NULL OR fqdn>?2)
+               ORDER BY fqdn LIMIT ?3"#
+        } else {
+            r#"SELECT fqdn FROM subdomains
+               WHERE root_domain=?1 AND active=1 AND (?2 IS NULL OR fqdn>?2)
+               ORDER BY fqdn LIMIT ?3"#
+        };
+        let mut statement = connection.prepare(sql)?;
+        statement
+            .query_map(params![domain, after, limit as i64], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn positive_cache_only_names_page(
+        &self,
+        domain: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<String>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let suffix = format!("%.{domain}");
+        let connection = self.lock()?;
+        let mut statement = connection.prepare(
+            r#"SELECT cache.fqdn FROM dns_cache cache
+               WHERE cache.status='positive'
+                 AND (cache.fqdn=?1 OR cache.fqdn LIKE ?2)
+                 AND (?3 IS NULL OR cache.fqdn>?3)
+                 AND NOT EXISTS (
+                     SELECT 1 FROM subdomains inventory WHERE inventory.fqdn=cache.fqdn
+                 )
+               ORDER BY cache.fqdn LIMIT ?4"#,
+        )?;
+        statement
+            .query_map(params![domain, suffix, after, limit as i64], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
     pub fn inventory(&self, domain: Option<&str>, only_live: bool) -> Result<Vec<InventoryEntry>> {
         let connection = self.lock()?;
         let mut conditions = Vec::new();
@@ -5340,6 +5802,30 @@ mod tests {
             authoritative_validation: false,
             resolver_count: 2,
         };
+        let untouched = "untouched.example.com".to_owned();
+        let make_finding = |fqdn: String| Finding {
+            fqdn,
+            records: answer.records.clone(),
+            sources: BTreeSet::from(["refresh".to_owned()]),
+            wildcard: false,
+            from_cache: false,
+            confidence: crate::confidence::assess(
+                &BTreeSet::from(["refresh".to_owned()]),
+                false,
+                false,
+            ),
+            state: ObservationState::Live,
+            last_verified_at: answer.last_verified_at,
+            evidence_families: BTreeSet::from([crate::model::EvidenceFamily::LiveDns]),
+            authoritative_validation: false,
+        };
+        db.persist_findings(
+            scan_id,
+            "example.com",
+            &[make_finding(host.clone()), make_finding(untouched.clone())],
+            86_400,
+        )
+        .unwrap();
         db.update_cache_outcomes(Some(scan_id), &[answer], &[], &[], 300)
             .unwrap();
         db.update_cache_outcomes(Some(scan_id), &[], &[], std::slice::from_ref(&host), 300)
@@ -5349,6 +5835,14 @@ mod tests {
             db.fresh_cache(std::slice::from_ref(&host)).unwrap()[&host],
             CachedAnswer::Positive(_)
         ));
+        let states = db
+            .inventory(Some("example.com"), false)
+            .unwrap()
+            .into_iter()
+            .map(|entry| (entry.fqdn, entry.state))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(states[&host], ObservationState::Live);
+        assert_eq!(states[&untouched], ObservationState::Live);
         let connection = db.lock().unwrap();
         let rows = connection
             .prepare("SELECT scan_id, outcome FROM dns_verifications WHERE fqdn=?1 ORDER BY id")
@@ -5876,6 +6370,10 @@ mod tests {
         let fresh = db.create_scan("example.net", &json!({})).unwrap();
         db.upsert_checkpoint(fresh, "example.net", "running", "fresh-hash")
             .unwrap();
+        db.stage_refresh_wildcard_candidates(stale, &["old.example.com".to_owned()])
+            .unwrap();
+        db.stage_refresh_wildcard_candidates(fresh, &["new.example.net".to_owned()])
+            .unwrap();
         db.lock()
             .unwrap()
             .execute(
@@ -5909,6 +6407,8 @@ mod tests {
         );
         assert!(db.reopen_scan(fresh).is_err());
         assert!(db.reopen_scan(stale).is_ok());
+        assert_eq!(db.refresh_wildcard_candidate_count(stale).unwrap(), 0);
+        assert_eq!(db.refresh_wildcard_candidate_count(fresh).unwrap(), 1);
     }
 
     #[test]
@@ -6233,11 +6733,45 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        assert!(matches!(
+            db.fresh_cache(&[observed.to_owned()]).unwrap()[observed],
+            CachedAnswer::Positive(_)
+        ));
         let connection = db.lock().unwrap();
         assert_eq!(
             connection
                 .query_row(
                     "SELECT COUNT(*) FROM observed_names WHERE fqdn=?1",
+                    [generated],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM scan_findings WHERE scan_id=?1",
+                    [scan_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM scan_findings WHERE scan_id=?1 AND fqdn=?2",
+                    params![scan_id, generated],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM dns_records WHERE fqdn=?1",
                     [generated],
                     |row| row.get::<_, i64>(0),
                 )
@@ -6252,6 +6786,200 @@ mod tests {
                 .unwrap(),
             1
         );
+    }
+
+    #[test]
+    fn refresh_wildcard_staging_accepts_large_inventories_in_bounded_batches() {
+        let db = Database::in_memory().unwrap();
+        let scan_id = db
+            .create_scan("example.com", &json!({"mode": "refresh"}))
+            .unwrap();
+        let names = (0..20_000)
+            .map(|index| format!("candidate-{index:05}.example.com"))
+            .collect::<Vec<_>>();
+        for page in names.chunks(257) {
+            db.stage_refresh_wildcard_candidates(scan_id, page).unwrap();
+        }
+        assert_eq!(
+            db.refresh_wildcard_candidate_count(scan_id).unwrap(),
+            20_000
+        );
+        assert_eq!(
+            db.stage_refresh_wildcard_candidates(scan_id, &names[..500])
+                .unwrap(),
+            0,
+            "staging is idempotent across overlapping refresh pages"
+        );
+        assert_eq!(
+            db.discard_refresh_wildcard_candidates(scan_id).unwrap(),
+            20_000
+        );
+        assert_eq!(db.refresh_wildcard_candidate_count(scan_id).unwrap(), 0);
+    }
+
+    #[test]
+    fn cancelled_staged_wildcard_cleanup_rolls_back_every_destructive_change() {
+        let db = Database::in_memory().unwrap();
+        let original_scan = db.create_scan("example.com", &json!({})).unwrap();
+        let refresh_scan = db
+            .create_scan("example.com", &json!({"mode": "refresh"}))
+            .unwrap();
+        let make = |fqdn: &str, source: &str| Finding {
+            fqdn: fqdn.to_owned(),
+            records: vec![DnsRecord {
+                record_type: "A".to_owned(),
+                value: "192.0.2.44".to_owned(),
+                ttl: 60,
+            }],
+            sources: BTreeSet::from([source.to_owned()]),
+            wildcard: false,
+            from_cache: false,
+            confidence: crate::confidence::assess(
+                &BTreeSet::from([source.to_owned()]),
+                false,
+                false,
+            ),
+            state: ObservationState::Live,
+            last_verified_at: Some(now_epoch()),
+            evidence_families: BTreeSet::new(),
+            authoritative_validation: false,
+        };
+        let mut findings = vec![make("a-independent.example.com", "passive:crtsh")];
+        findings.extend(
+            (0..12).map(|index| make(&format!("weak-{index:02}.example.com"), "dns-wave-2")),
+        );
+        db.persist_findings(original_scan, "example.com", &findings, 86_400)
+            .unwrap();
+        db.finish_scan(
+            original_scan,
+            "completed",
+            findings.len(),
+            findings.len(),
+            0,
+            1,
+            &[],
+        )
+        .unwrap();
+        let names = findings
+            .iter()
+            .map(|finding| finding.fqdn.clone())
+            .collect::<Vec<_>>();
+        db.stage_refresh_wildcard_candidates(refresh_scan, &names)
+            .unwrap();
+
+        let result = db
+            .apply_staged_refresh_wildcard_cleanup_with_cancel(
+                refresh_scan,
+                "example.com",
+                2,
+                |processed| processed >= 3,
+            )
+            .unwrap();
+        assert!(result.is_none());
+        assert_eq!(
+            db.refresh_wildcard_candidate_count(refresh_scan).unwrap(),
+            findings.len(),
+            "a rolled-back transaction leaves staging available for explicit discard"
+        );
+        let inventory = db.inventory(Some("example.com"), false).unwrap();
+        assert_eq!(inventory.len(), findings.len());
+        assert!(
+            inventory
+                .iter()
+                .all(|entry| entry.state == ObservationState::Live)
+        );
+        let connection = db.lock().unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM scan_findings WHERE scan_id=?1",
+                    [original_scan],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            findings.len() as i64
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT found FROM scans WHERE id=?1",
+                    [original_scan],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            findings.len() as i64
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM dns_verifications WHERE scan_id=?1",
+                    [refresh_scan],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM dns_records WHERE fqdn LIKE '%.example.com'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            findings.len() as i64,
+            "record deactivation/deletion must roll back with inventory cleanup"
+        );
+        drop(connection);
+
+        let applied = db
+            .apply_staged_refresh_wildcard_cleanup(
+                refresh_scan,
+                "example.com",
+                2,
+                &AtomicBool::new(false),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            applied,
+            WildcardCleanupResult {
+                purged: 12,
+                retained_unverified: 1,
+            }
+        );
+        assert_eq!(
+            db.refresh_wildcard_candidate_count(refresh_scan).unwrap(),
+            0
+        );
+        let inventory = db.inventory(Some("example.com"), false).unwrap();
+        assert_eq!(inventory.len(), 1);
+        assert_eq!(inventory[0].fqdn, "a-independent.example.com");
+        assert_eq!(inventory[0].state, ObservationState::Unverified);
+        let connection = db.lock().unwrap();
+        let (finding_count, wildcard, state, found): (i64, i64, String, i64) = connection
+            .query_row(
+                r#"SELECT COUNT(*), finding.wildcard, finding.state, scans.found
+                   FROM scan_findings finding
+                   JOIN scans ON scans.id=finding.scan_id
+                   WHERE finding.scan_id=?1"#,
+                [original_scan],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (finding_count, wildcard, state.as_str(), found),
+            (1, 1, "unverified", 1)
+        );
+        let (records, active_records): (i64, i64) = connection
+            .query_row(
+                r#"SELECT COUNT(*), COALESCE(SUM(active), 0) FROM dns_records
+                   WHERE fqdn LIKE '%.example.com'"#,
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((records, active_records), (1, 0));
     }
 
     #[test]
@@ -6310,6 +7038,101 @@ mod tests {
                 )
                 .unwrap(),
             1
+        );
+    }
+
+    #[test]
+    fn non_resumable_refresh_finalization_closes_its_checkpoint() {
+        let db = Database::in_memory().unwrap();
+        let scan_id = db
+            .create_scan("example.com", &json!({"mode": "refresh"}))
+            .unwrap();
+        db.upsert_checkpoint(scan_id, "example.com", "running", "refresh-options")
+            .unwrap();
+        db.finalize_non_resumable_scan(
+            scan_id,
+            "interrupted",
+            12,
+            3,
+            0,
+            25,
+            &["interrupted safely".to_owned()],
+        )
+        .unwrap();
+
+        assert!(
+            db.resumable_checkpoint("example.com", "latest")
+                .unwrap()
+                .is_none()
+        );
+        let connection = db.lock().unwrap();
+        let (status, completed) = connection
+            .query_row(
+                r#"SELECT scans.status, checkpoint.completed
+                   FROM scans JOIN scan_checkpoints checkpoint ON checkpoint.scan_id=scans.id
+                   WHERE scans.id=?1"#,
+                [scan_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "interrupted");
+        assert_eq!(completed, 1);
+    }
+
+    #[test]
+    fn refresh_inventory_pages_are_stable_and_cache_only_pages_exclude_inventory() {
+        let db = Database::in_memory().unwrap();
+        let names = BTreeSet::from([
+            "a.example.com".to_owned(),
+            "b.example.com".to_owned(),
+            "c.example.com".to_owned(),
+            "d.example.com".to_owned(),
+            "e.example.com".to_owned(),
+        ]);
+        db.import_inventory("example.com", &names, "import:test")
+            .unwrap();
+        assert_eq!(db.known_subdomain_count("example.com", true).unwrap(), 5);
+
+        let first = db
+            .known_subdomains_page("example.com", true, None, 2)
+            .unwrap();
+        let second = db
+            .known_subdomains_page("example.com", true, first.last().map(String::as_str), 2)
+            .unwrap();
+        let third = db
+            .known_subdomains_page("example.com", true, second.last().map(String::as_str), 2)
+            .unwrap();
+        assert_eq!(
+            first
+                .into_iter()
+                .chain(second)
+                .chain(third)
+                .collect::<Vec<_>>(),
+            names.iter().cloned().collect::<Vec<_>>()
+        );
+
+        let cached_only = ResolvedHost {
+            fqdn: "cache-only.example.com".to_owned(),
+            records: vec![DnsRecord {
+                record_type: "A".to_owned(),
+                value: "192.0.2.55".to_owned(),
+                ttl: 60,
+            }],
+            from_cache: false,
+            last_verified_at: Some(now_epoch()),
+            authoritative_validation: false,
+            resolver_count: 1,
+        };
+        let inventory_answer = ResolvedHost {
+            fqdn: names.iter().next().unwrap().clone(),
+            ..cached_only.clone()
+        };
+        db.update_cache_outcomes(None, &[cached_only, inventory_answer], &[], &[], 300)
+            .unwrap();
+        assert_eq!(
+            db.positive_cache_only_names_page("example.com", None, 10)
+                .unwrap(),
+            vec!["cache-only.example.com"]
         );
     }
 

@@ -8,7 +8,9 @@ use openssl::nid::Nid;
 use openssl::x509::X509;
 use serde::Deserialize;
 use std::collections::{BTreeSet, HashMap};
+use std::future::Future;
 use std::time::{Duration, Instant};
+use tokio::time::Instant as TokioInstant;
 
 const CHROME_LOG_LIST: &str = "https://www.gstatic.com/ct/log_list/v3/log_list.json";
 
@@ -129,6 +131,18 @@ fn endpoint(log_url: &str, path: &str) -> String {
     format!("{}/{}", log_url.trim_end_matches('/'), path)
 }
 
+async fn before_ct_deadline<T, F>(deadline: Option<TokioInstant>, future: F) -> Result<T>
+where
+    F: Future<Output = Result<T>>,
+{
+    match deadline {
+        Some(deadline) => tokio::time::timeout_at(deadline, future)
+            .await
+            .context("budget de temps cumulé CT atteint")?,
+        None => future.await,
+    }
+}
+
 pub async fn monitor_ct_logs(
     database: &Database,
     domain: &str,
@@ -136,6 +150,50 @@ pub async fn monitor_ct_logs(
     max_logs: usize,
     entries_per_log: usize,
     initial_backfill: usize,
+) -> Result<CtMonitorResult> {
+    monitor_ct_logs_until(
+        database,
+        domain,
+        timeout,
+        max_logs,
+        entries_per_log,
+        initial_backfill,
+        None,
+    )
+    .await
+}
+
+pub async fn monitor_ct_logs_bounded(
+    database: &Database,
+    domain: &str,
+    timeout: Duration,
+    max_logs: usize,
+    entries_per_log: usize,
+    initial_backfill: usize,
+    phase_timeout: Duration,
+) -> Result<CtMonitorResult> {
+    let deadline = (!phase_timeout.is_zero()).then(|| TokioInstant::now() + phase_timeout);
+    monitor_ct_logs_until(
+        database,
+        domain,
+        timeout,
+        max_logs,
+        entries_per_log,
+        initial_backfill,
+        deadline,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn monitor_ct_logs_until(
+    database: &Database,
+    domain: &str,
+    timeout: Duration,
+    max_logs: usize,
+    entries_per_log: usize,
+    initial_backfill: usize,
+    deadline: Option<TokioInstant>,
 ) -> Result<CtMonitorResult> {
     let started = Instant::now();
     let client = reqwest::Client::builder()
@@ -145,16 +203,19 @@ pub async fn monitor_ct_logs(
             env!("CARGO_PKG_VERSION")
         ))
         .build()?;
-    let list = client
-        .get(CHROME_LOG_LIST)
-        .send()
-        .await
-        .context("connexion à la liste CT de Chrome")?
-        .error_for_status()
-        .context("réponse de la liste CT de Chrome")?
-        .json::<LogList>()
-        .await
-        .context("liste CT Chrome invalide")?;
+    let list = before_ct_deadline(deadline, async {
+        client
+            .get(CHROME_LOG_LIST)
+            .send()
+            .await
+            .context("connexion à la liste CT de Chrome")?
+            .error_for_status()
+            .context("réponse de la liste CT de Chrome")?
+            .json::<LogList>()
+            .await
+            .context("liste CT Chrome invalide")
+    })
+    .await?;
     let all_logs = list
         .operators
         .into_iter()
@@ -172,13 +233,16 @@ pub async fn monitor_ct_logs(
             let client = client.clone();
             let database = database.clone();
             async move {
-                let sth = client
-                    .get(endpoint(&log_url, "ct/v1/get-sth"))
-                    .send()
-                    .await?
-                    .error_for_status()?
-                    .json::<SignedTreeHead>()
-                    .await?;
+                let sth = before_ct_deadline(deadline, async {
+                    Ok(client
+                        .get(endpoint(&log_url, "ct/v1/get-sth"))
+                        .send()
+                        .await?
+                        .error_for_status()?
+                        .json::<SignedTreeHead>()
+                        .await?)
+                })
+                .await?;
                 if sth.tree_size == 0 {
                     if database.ct_global_cursor(&log_url)?.unwrap_or_default() > 0 {
                         bail!("le journal CT {log_url} annonce une taille nulle après indexation");
@@ -212,14 +276,17 @@ pub async fn monitor_ct_logs(
                     let end = start
                         .saturating_add(remaining.saturating_sub(1) as u64)
                         .min(sth.tree_size - 1);
-                    let response = client
-                        .get(endpoint(&log_url, "ct/v1/get-entries"))
-                        .query(&[("start", start), ("end", end)])
-                        .send()
-                        .await?
-                        .error_for_status()?
-                        .json::<EntriesResponse>()
-                        .await?;
+                    let response = before_ct_deadline(deadline, async {
+                        Ok(client
+                            .get(endpoint(&log_url, "ct/v1/get-entries"))
+                            .query(&[("start", start), ("end", end)])
+                            .send()
+                            .await?
+                            .error_for_status()?
+                            .json::<EntriesResponse>()
+                            .await?)
+                    })
+                    .await?;
                     let processed = response.entries.len();
                     let mut batch_names = BTreeSet::new();
                     for entry in &response.entries {
@@ -303,5 +370,16 @@ mod tests {
     fn parses_three_byte_lengths() {
         assert_eq!(read_u24(&[0x01, 0x02, 0x03], 0), Some(0x010203));
         assert_eq!(read_u24(&[0x01, 0x02], 0), None);
+    }
+
+    #[tokio::test]
+    async fn expired_ct_deadline_cancels_without_network() {
+        let error = before_ct_deadline(
+            Some(TokioInstant::now()),
+            std::future::pending::<Result<()>>(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("budget de temps cumulé CT"));
     }
 }

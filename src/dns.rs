@@ -2,7 +2,7 @@ use crate::model::{
     DnsBenchmarkResult, DnsRecord, ResolvedHost, ResolverMetric, ResolverTestResult,
 };
 use anyhow::{Context, Result, bail};
-use futures_util::{StreamExt, stream};
+use futures_util::{Stream, StreamExt, stream};
 use hickory_net::proto::op::{Edns, Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_net::proto::rr::{DNSClass, Name, RData, Record};
 use hickory_net::runtime::TokioRuntimeProvider;
@@ -153,7 +153,7 @@ impl RecordCompat for Record {
     }
 }
 
-fn bind_buffered_udp(address: SocketAddr) -> Result<UdpSocket> {
+pub(crate) fn bind_buffered_udp(address: SocketAddr) -> Result<UdpSocket> {
     let domain = if address.is_ipv4() {
         socket2::Domain::IPV4
     } else {
@@ -209,6 +209,128 @@ enum RecordLookupOutcome {
     Positive(Vec<DnsRecord>),
     Negative,
     Indeterminate,
+}
+
+fn positive_consensus(fqdn: &str, positives: Vec<Vec<DnsRecord>>) -> DnsResolutionOutcome {
+    let resolver_count = positives.len().min(u16::MAX as usize) as u16;
+    let mut records = positives.into_iter().flatten().collect::<Vec<_>>();
+    records.sort_by(|left, right| {
+        (&left.record_type, &left.value).cmp(&(&right.record_type, &right.value))
+    });
+    records
+        .dedup_by(|left, right| left.record_type == right.record_type && left.value == right.value);
+    DnsResolutionOutcome::Positive(ResolvedHost {
+        fqdn: fqdn.to_owned(),
+        records,
+        from_cache: false,
+        last_verified_at: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .map(|duration| duration.as_secs().min(i64::MAX as u64) as i64),
+        authoritative_validation: false,
+        resolver_count,
+    })
+}
+
+async fn collect_consensus_results<S>(
+    fqdn: &str,
+    required: usize,
+    results: S,
+) -> DnsResolutionOutcome
+where
+    S: Stream<Item = RecordLookupOutcome>,
+{
+    tokio::pin!(results);
+    let mut positives = Vec::new();
+    let mut negatives = 0_usize;
+    let mut indeterminate = 0_usize;
+    while let Some(result) = results.next().await {
+        match result {
+            RecordLookupOutcome::Positive(records) => {
+                positives.push(records);
+                if positives.len() >= required {
+                    // Dropping the stream cancels slower resolver queries once a
+                    // positive quorum has already established a live answer.
+                    return positive_consensus(fqdn, positives);
+                }
+            }
+            RecordLookupOutcome::Negative => negatives += 1,
+            RecordLookupOutcome::Indeterminate => indeterminate += 1,
+        }
+    }
+    if positives.is_empty() && negatives >= required && indeterminate == 0 {
+        DnsResolutionOutcome::Negative {
+            fqdn: fqdn.to_owned(),
+        }
+    } else {
+        DnsResolutionOutcome::Indeterminate {
+            fqdn: fqdn.to_owned(),
+        }
+    }
+}
+
+fn classify_host_lookups(
+    fqdn: &str,
+    a: RecordLookupOutcome,
+    aaaa: RecordLookupOutcome,
+) -> DnsResolutionOutcome {
+    let both_negative = matches!(&a, RecordLookupOutcome::Negative)
+        && matches!(&aaaa, RecordLookupOutcome::Negative);
+    let mut records = match a {
+        RecordLookupOutcome::Positive(records) => records,
+        RecordLookupOutcome::Negative | RecordLookupOutcome::Indeterminate => Vec::new(),
+    };
+    if let RecordLookupOutcome::Positive(aaaa) = aaaa {
+        records.extend(aaaa);
+    }
+    records.sort_by(|left, right| {
+        (&left.record_type, &left.value).cmp(&(&right.record_type, &right.value))
+    });
+    records
+        .dedup_by(|left, right| left.record_type == right.record_type && left.value == right.value);
+    if records.is_empty() {
+        if both_negative {
+            DnsResolutionOutcome::Negative {
+                fqdn: fqdn.to_owned(),
+            }
+        } else {
+            DnsResolutionOutcome::Indeterminate {
+                fqdn: fqdn.to_owned(),
+            }
+        }
+    } else {
+        DnsResolutionOutcome::Positive(ResolvedHost {
+            fqdn: fqdn.to_owned(),
+            records,
+            from_cache: false,
+            last_verified_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .ok()
+                .map(|duration| duration.as_secs().min(i64::MAX as u64) as i64),
+            authoritative_validation: false,
+            resolver_count: 1,
+        })
+    }
+}
+
+async fn authoritative_servers_cached<F, Fut>(
+    cache: &tokio::sync::Mutex<HashMap<String, AuthoritativeServerCell>>,
+    domain: &str,
+    loader: F,
+) -> Result<AuthoritativeServers>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = Result<AuthoritativeServers>>,
+{
+    let key = domain.trim_end_matches('.').to_ascii_lowercase();
+    let cell = {
+        let mut cache = cache.lock().await;
+        cache
+            .entry(key.clone())
+            .or_insert_with(|| Arc::new(OnceCell::new()))
+            .clone()
+    };
+    cell.get_or_try_init(|| loader(key)).await.cloned()
 }
 
 fn classify_wildcard_samples(
@@ -699,6 +821,64 @@ impl DnsEngine {
         })
     }
 
+    /// Build a resolver from explicit socket addresses. This remains crate
+    /// internal so production CLI resolver configuration stays IP-only, while
+    /// controlled laboratories and benchmarks can use an unprivileged
+    /// loopback port without sending any packet to an external resolver.
+    pub(crate) fn new_with_socket_addresses(
+        concurrency: usize,
+        timeout: Duration,
+        nameservers: &[SocketAddr],
+        rate_limit: u64,
+    ) -> Result<Self> {
+        if nameservers.is_empty() {
+            bail!("at least one DNS endpoint is required");
+        }
+        let mut resolvers = Vec::new();
+        let mut fast_resolvers = Vec::new();
+        for address in nameservers.iter().copied().collect::<BTreeSet<_>>() {
+            let mut udp = ConnectionConfig::udp();
+            udp.port = address.port();
+            let mut tcp = ConnectionConfig::tcp();
+            tcp.port = address.port();
+            let config = ResolverConfig::from_parts(
+                None,
+                Vec::new(),
+                vec![NameServerConfig::new(address.ip(), true, vec![udp, tcp])],
+            );
+            let mut resolver_builder =
+                TokioResolver::builder_with_config(config, TokioRuntimeProvider::default());
+            resolver_builder.options_mut().timeout = timeout;
+            resolver_builder.options_mut().attempts = 1;
+            resolver_builder.options_mut().cache_size = 0;
+            resolvers.push(ResolverNode {
+                label: address.to_string(),
+                resolver: Arc::new(
+                    resolver_builder
+                        .build()
+                        .with_context(|| format!("initializing resolver {address}"))?,
+                ),
+                state: Mutex::new(ResolverState::default()),
+                inflight: AtomicUsize::new(0),
+            });
+            fast_resolvers.push(FastResolver {
+                address,
+                transport: OnceCell::new(),
+            });
+        }
+        Ok(Self {
+            resolvers: Arc::new(resolvers),
+            fast_resolvers: Arc::new(fast_resolvers),
+            concurrency: concurrency.max(1),
+            timeout,
+            rate_limit,
+            next_query_at: Arc::new(tokio::sync::Mutex::new(Instant::now())),
+            selection_counter: Arc::new(AtomicU64::new(0)),
+            authoritative_resolvers: Arc::new(Mutex::new(HashMap::new())),
+            authoritative_server_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        })
+    }
+
     /// Partage le même cadenceur avec un second moteur (par exemple le
     /// consensus trusted) afin que la limite CLI soit réellement commune.
     pub fn share_rate_limit_with(mut self, other: &Self) -> Self {
@@ -722,6 +902,34 @@ impl DnsEngine {
             tokio::time::sleep(*next - now).await;
         }
         *next = Instant::now() + spacing;
+    }
+
+    /// Acquire the shared global DNS cadence slot without waiting beyond a
+    /// caller-owned phase deadline. Direct DNS transports such as the NSEC TCP
+    /// walker use this hook because they do not pass through the resolver
+    /// lookup helpers that normally acquire the same limiter.
+    pub(crate) async fn wait_for_rate_slot_before(&self, deadline: tokio::time::Instant) -> bool {
+        if deadline <= tokio::time::Instant::now() {
+            return false;
+        }
+        if self.rate_limit == 0 {
+            return true;
+        }
+        let spacing = Duration::from_secs_f64(1.0 / self.rate_limit as f64);
+        let Ok(mut next) = tokio::time::timeout_at(deadline, self.next_query_at.lock()).await
+        else {
+            return false;
+        };
+        let now = Instant::now();
+        if *next > now
+            && tokio::time::timeout_at(deadline, tokio::time::sleep(*next - now))
+                .await
+                .is_err()
+        {
+            return false;
+        }
+        *next = Instant::now() + spacing;
+        true
     }
 
     pub fn seed_metrics(&self, history: &HashMap<String, ResolverMetric>) {
@@ -909,49 +1117,12 @@ impl DnsEngine {
                     RecordLookupOutcome::Indeterminate
                 }
             })
-            .buffer_unordered(self.fast_resolvers.len().max(1))
-            .collect::<Vec<_>>()
-            .await;
-        let mut positives = Vec::new();
-        let mut negatives = 0_usize;
-        let mut indeterminate = 0_usize;
-        for result in results {
-            match result {
-                RecordLookupOutcome::Positive(records) => positives.push(records),
-                RecordLookupOutcome::Negative => negatives += 1,
-                RecordLookupOutcome::Indeterminate => indeterminate += 1,
-            }
-        }
-        if positives.len() < required {
-            return if positives.is_empty() && negatives >= required && indeterminate == 0 {
-                DnsResolutionOutcome::Negative {
-                    fqdn: fqdn.to_owned(),
-                }
-            } else {
-                DnsResolutionOutcome::Indeterminate {
-                    fqdn: fqdn.to_owned(),
-                }
-            };
-        }
-        let resolver_count = positives.len().min(u16::MAX as usize) as u16;
-        let mut records = positives.into_iter().flatten().collect::<Vec<_>>();
-        records.sort_by(|left, right| {
-            (&left.record_type, &left.value).cmp(&(&right.record_type, &right.value))
-        });
-        records.dedup_by(|left, right| {
-            left.record_type == right.record_type && left.value == right.value
-        });
-        DnsResolutionOutcome::Positive(ResolvedHost {
-            fqdn: fqdn.to_owned(),
-            records,
-            from_cache: false,
-            last_verified_at: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .ok()
-                .map(|duration| duration.as_secs().min(i64::MAX as u64) as i64),
-            authoritative_validation: false,
-            resolver_count,
-        })
+            .buffer_unordered(self.fast_resolvers.len().max(1));
+        // Each UDP/TCP/Hickory operation has its own network timeout. Do not
+        // wrap the whole host in another wall-clock timeout: time spent waiting
+        // for the deliberate global rate limit is not a network stall and must
+        // not turn an otherwise valid answer into an indeterminate result.
+        collect_consensus_results(fqdn, required, results).await
     }
 
     pub async fn resolve_host_consensus(&self, fqdn: &str) -> Option<ResolvedHost> {
@@ -1183,7 +1354,11 @@ impl DnsEngine {
                     _ => None,
                 }
             });
-            let result = if fast_result.is_none() {
+            let fast_timed_out = matches!(
+                &fast_response,
+                Some(Err(error)) if error.is::<tokio::time::error::Elapsed>()
+            );
+            let result = if fast_result.is_none() && !fast_timed_out {
                 if fast_response.is_some() {
                     // Le repli Hickory produit une seconde sortie réseau.
                     self.wait_for_rate_slot().await;
@@ -1196,6 +1371,11 @@ impl DnsEngine {
             let duration_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
             let classified = if let Some(result) = fast_result {
                 result
+            } else if fast_timed_out {
+                // Retrying the same unresponsive endpoint through Hickory
+                // would spend a second timeout window before the next resolver
+                // gets a chance. Keep the timeout indeterminate and move on.
+                RecordLookupOutcome::Indeterminate
             } else {
                 match result.expect("le résultat hickory existe sans résultat UDP") {
                     Ok(lookup) => {
@@ -1305,10 +1485,13 @@ impl DnsEngine {
         addresses: Vec<IpAddr>,
     ) -> BTreeMap<IpAddr, BTreeSet<String>> {
         let resolver = self.resolvers[self.resolver_order()[0]].resolver.clone();
+        let engine = self.clone();
         stream::iter(addresses.into_iter().collect::<BTreeSet<_>>())
             .map(move |address| {
                 let resolver = resolver.clone();
+                let engine = engine.clone();
                 async move {
+                    engine.wait_for_rate_slot().await;
                     let names = resolver
                         .reverse_lookup(address)
                         .await
@@ -1334,48 +1517,14 @@ impl DnsEngine {
     }
 
     pub async fn resolve_host_classified(&self, fqdn: &str) -> DnsResolutionOutcome {
+        // The individual resolver operations are bounded by `self.timeout`.
+        // The queue imposed by `--dns-rate-limit` is intentionally excluded:
+        // callers retain cancellation through their phase/global deadline.
         let (a, aaaa) = tokio::join!(
             self.lookup_records_classified(fqdn, RecordType::A),
             self.lookup_records_classified(fqdn, RecordType::AAAA),
         );
-        let both_negative = matches!(&a, RecordLookupOutcome::Negative)
-            && matches!(&aaaa, RecordLookupOutcome::Negative);
-        let mut records = match a {
-            RecordLookupOutcome::Positive(records) => records,
-            RecordLookupOutcome::Negative | RecordLookupOutcome::Indeterminate => Vec::new(),
-        };
-        if let RecordLookupOutcome::Positive(aaaa) = aaaa {
-            records.extend(aaaa);
-        }
-        records.sort_by(|left, right| {
-            (&left.record_type, &left.value).cmp(&(&right.record_type, &right.value))
-        });
-        records.dedup_by(|left, right| {
-            left.record_type == right.record_type && left.value == right.value
-        });
-        if records.is_empty() {
-            if both_negative {
-                DnsResolutionOutcome::Negative {
-                    fqdn: fqdn.to_owned(),
-                }
-            } else {
-                DnsResolutionOutcome::Indeterminate {
-                    fqdn: fqdn.to_owned(),
-                }
-            }
-        } else {
-            DnsResolutionOutcome::Positive(ResolvedHost {
-                fqdn: fqdn.to_owned(),
-                records,
-                from_cache: false,
-                last_verified_at: SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .ok()
-                    .map(|duration| duration.as_secs().min(i64::MAX as u64) as i64),
-                authoritative_validation: false,
-                resolver_count: 1,
-            })
-        }
+        classify_host_lookups(fqdn, a, aaaa)
     }
 
     pub async fn resolve_host(&self, fqdn: &str) -> Option<ResolvedHost> {
@@ -1511,23 +1660,25 @@ impl DnsEngine {
     }
 
     pub async fn authoritative_servers(&self, domain: &str) -> Result<AuthoritativeServers> {
-        let key = domain.trim_end_matches('.').to_ascii_lowercase();
-        let cell = {
-            let mut cache = self.authoritative_server_cache.lock().await;
-            cache
-                .entry(key.clone())
-                .or_insert_with(|| Arc::new(OnceCell::new()))
-                .clone()
-        };
-        cell.get_or_try_init(|| self.load_authoritative_servers(&key))
-            .await
-            .cloned()
+        authoritative_servers_cached(&self.authoritative_server_cache, domain, |key| async move {
+            self.load_authoritative_servers(&key).await
+        })
+        .await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hickory_net::proto::rr::rdata::A;
+
+    fn positive_records(value: &str) -> Vec<DnsRecord> {
+        vec![DnsRecord {
+            record_type: "A".to_owned(),
+            value: value.to_owned(),
+            ttl: 60,
+        }]
+    }
 
     async fn nxdomain_resolver() -> (SocketAddr, tokio::task::JoinHandle<()>) {
         let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -1569,6 +1720,281 @@ mod tests {
             authoritative_resolvers: Arc::new(Mutex::new(HashMap::new())),
             authoritative_server_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         }
+    }
+
+    fn resolver_node_at(address: SocketAddr, timeout: Duration) -> ResolverNode {
+        let mut connection = ConnectionConfig::udp();
+        connection.port = address.port();
+        let config = ResolverConfig::from_parts(
+            None,
+            Vec::new(),
+            vec![NameServerConfig::new(address.ip(), true, vec![connection])],
+        );
+        let mut builder =
+            TokioResolver::builder_with_config(config, TokioRuntimeProvider::default());
+        builder.options_mut().timeout = timeout;
+        builder.options_mut().attempts = 1;
+        builder.options_mut().cache_size = 0;
+        ResolverNode {
+            label: address.to_string(),
+            resolver: Arc::new(builder.build().unwrap()),
+            state: Mutex::new(ResolverState::default()),
+            inflight: AtomicUsize::new(0),
+        }
+    }
+
+    #[tokio::test]
+    async fn consensus_returns_as_soon_as_a_positive_quorum_is_ready() {
+        let results = stream::iter(vec![
+            Box::pin(async { RecordLookupOutcome::Positive(positive_records("192.0.2.10")) })
+                as futures_util::future::BoxFuture<'static, RecordLookupOutcome>,
+            Box::pin(async { RecordLookupOutcome::Positive(positive_records("192.0.2.10")) }),
+            Box::pin(async { std::future::pending::<RecordLookupOutcome>().await }),
+        ])
+        .buffer_unordered(3);
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(250),
+            collect_consensus_results("api.example.test", 2, results),
+        )
+        .await
+        .expect("a ready positive quorum must cancel the slow tail");
+        let DnsResolutionOutcome::Positive(answer) = outcome else {
+            panic!("positive quorum was not accepted");
+        };
+        assert_eq!(answer.resolver_count, 2);
+        assert_eq!(answer.records, positive_records("192.0.2.10"));
+    }
+
+    #[tokio::test]
+    async fn consensus_keeps_negative_and_partial_results_conservative() {
+        let negative = collect_consensus_results(
+            "missing.example.test",
+            2,
+            stream::iter([RecordLookupOutcome::Negative, RecordLookupOutcome::Negative]),
+        )
+        .await;
+        assert!(matches!(negative, DnsResolutionOutcome::Negative { .. }));
+
+        let unavailable = collect_consensus_results(
+            "unknown.example.test",
+            2,
+            stream::iter([
+                RecordLookupOutcome::Negative,
+                RecordLookupOutcome::Negative,
+                RecordLookupOutcome::Indeterminate,
+            ]),
+        )
+        .await;
+        assert!(matches!(
+            unavailable,
+            DnsResolutionOutcome::Indeterminate { .. }
+        ));
+
+        let split_vote = collect_consensus_results(
+            "split.example.test",
+            2,
+            stream::iter([
+                RecordLookupOutcome::Positive(positive_records("192.0.2.20")),
+                RecordLookupOutcome::Negative,
+                RecordLookupOutcome::Negative,
+            ]),
+        )
+        .await;
+        assert!(matches!(
+            split_vote,
+            DnsResolutionOutcome::Indeterminate { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn intentional_rate_queue_does_not_consume_the_network_timeout() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = server.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            for _ in 0..2 {
+                let mut buffer = [0_u8; 2_048];
+                let (length, peer) = server.recv_from(&mut buffer).await.unwrap();
+                let mut response = Message::from_vec(&buffer[..length]).unwrap();
+                response
+                    .set_message_type(MessageType::Response)
+                    .set_response_code(ResponseCode::NoError);
+                if response.queries()[0].query_type() == RecordType::A {
+                    response.add_answer(Record::from_rdata(
+                        response.queries()[0].name().clone(),
+                        60,
+                        RData::A(A("192.0.2.30".parse().unwrap())),
+                    ));
+                }
+                server
+                    .send_to(&response.to_vec().unwrap(), peer)
+                    .await
+                    .unwrap();
+            }
+        });
+        // The A and AAAA lookups need two 200 ms rate slots. Their network
+        // timeout is intentionally much shorter: an outer 3x timeout would
+        // expire in the queue before the second packet could be sent.
+        let engine =
+            DnsEngine::new_with_socket_addresses(8, Duration::from_millis(20), &[address], 5)
+                .unwrap();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(2),
+            engine.resolve_host_classified("rate-limited.example.test"),
+        )
+        .await
+        .expect("the caller's global cancellation bound remains effective");
+        server_task.await.unwrap();
+        let DnsResolutionOutcome::Positive(answer) = outcome else {
+            panic!("the intentional rate-limit queue incorrectly consumed the network timeout");
+        };
+        assert_eq!(answer.records, positive_records("192.0.2.30"));
+    }
+
+    #[tokio::test]
+    async fn dead_primary_does_not_hide_a_live_secondary_before_the_host_deadline() {
+        let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let live = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let silent_address = silent.local_addr().unwrap();
+        let live_address = live.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let mut buffer = [0_u8; 2_048];
+                let (length, peer) = live.recv_from(&mut buffer).await.unwrap();
+                let mut response = Message::from_vec(&buffer[..length]).unwrap();
+                response
+                    .set_message_type(MessageType::Response)
+                    .set_response_code(ResponseCode::NoError);
+                if response.queries()[0].query_type() == RecordType::A {
+                    response.add_answer(Record::from_rdata(
+                        response.queries()[0].name().clone(),
+                        60,
+                        RData::A(A("192.0.2.31".parse().unwrap())),
+                    ));
+                }
+                live.send_to(&response.to_vec().unwrap(), peer)
+                    .await
+                    .unwrap();
+            }
+        });
+        let timeout = Duration::from_millis(50);
+        let engine = DnsEngine {
+            resolvers: Arc::new(vec![
+                resolver_node_at(silent_address, timeout),
+                resolver_node_at(live_address, timeout),
+            ]),
+            fast_resolvers: Arc::new(vec![
+                FastResolver {
+                    address: silent_address,
+                    transport: OnceCell::new(),
+                },
+                FastResolver {
+                    address: live_address,
+                    transport: OnceCell::new(),
+                },
+            ]),
+            concurrency: 8,
+            timeout,
+            rate_limit: 0,
+            next_query_at: Arc::new(tokio::sync::Mutex::new(Instant::now())),
+            selection_counter: Arc::new(AtomicU64::new(0)),
+            authoritative_resolvers: Arc::new(Mutex::new(HashMap::new())),
+            authoritative_server_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        };
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(1),
+            engine.resolve_host_classified("secondary.example.test"),
+        )
+        .await
+        .expect("bounded resolver operations did not terminate");
+        // The positive A answer can complete the host before the concurrently
+        // issued AAAA branch reaches the mock server. Do not make teardown
+        // depend on a packet that cancellation is explicitly allowed to skip.
+        server.abort();
+        let _ = server.await;
+        let DnsResolutionOutcome::Positive(answer) = outcome else {
+            panic!("the healthy secondary resolver was not reached");
+        };
+        assert!(
+            answer
+                .records
+                .iter()
+                .any(|record| record.value == "192.0.2.31")
+        );
+        drop(silent);
+    }
+
+    #[tokio::test]
+    async fn authoritative_cache_is_single_flight_and_normalizes_keys() {
+        let cache = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let first_calls = calls.clone();
+        let second_calls = calls.clone();
+        let first_cache = cache.clone();
+        let second_cache = cache.clone();
+        let first =
+            authoritative_servers_cached(&first_cache, "Example.TEST.", move |_| async move {
+                first_calls.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                Ok(vec![(
+                    "ns1.example.test".to_owned(),
+                    vec!["192.0.2.53".parse().unwrap()],
+                )])
+            });
+        let second =
+            authoritative_servers_cached(&second_cache, "example.test", move |_| async move {
+                second_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(vec![(
+                    "should-not-run.example.test".to_owned(),
+                    vec!["192.0.2.54".parse().unwrap()],
+                )])
+            });
+        let (first, second) = tokio::join!(first, second);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(first.unwrap(), second.unwrap());
+    }
+
+    #[tokio::test]
+    async fn authoritative_cache_keeps_empty_successes_but_retries_errors() {
+        let empty_cache = tokio::sync::Mutex::new(HashMap::new());
+        let empty_calls = Arc::new(AtomicUsize::new(0));
+        let calls = empty_calls.clone();
+        let first = authoritative_servers_cached(&empty_cache, "empty.test", move |_| async move {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Vec::new())
+        })
+        .await
+        .unwrap();
+        let calls = empty_calls.clone();
+        let second =
+            authoritative_servers_cached(&empty_cache, "empty.test.", move |_| async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(vec![("unexpected.empty.test".to_owned(), Vec::new())])
+            })
+            .await
+            .unwrap();
+        assert!(first.is_empty());
+        assert!(second.is_empty());
+        assert_eq!(empty_calls.load(Ordering::SeqCst), 1);
+
+        let retry_cache = tokio::sync::Mutex::new(HashMap::new());
+        let retry_calls = Arc::new(AtomicUsize::new(0));
+        let calls = retry_calls.clone();
+        let first = authoritative_servers_cached(&retry_cache, "retry.test", move |_| async move {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err(anyhow::anyhow!("temporary failure"))
+        })
+        .await;
+        assert!(first.is_err());
+        let calls = retry_calls.clone();
+        let second =
+            authoritative_servers_cached(&retry_cache, "retry.test", move |_| async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(vec![("ns.retry.test".to_owned(), Vec::new())])
+            })
+            .await
+            .unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(retry_calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

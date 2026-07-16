@@ -29,8 +29,8 @@ Fellaga is a fast, adaptive subdomain enumerator written in Rust for Kali Linux 
 Download the release package and install it with APT. Checksums, a Sigstore-signed manifest, and GitHub attestations are available for independent verification:
 
 ```bash
-curl -fLO https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/download/v0.8.2/fellaga_0.8.2-1_amd64.deb
-sudo apt install ./fellaga_0.8.2-1_amd64.deb
+curl -fLO https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/download/v0.8.3/fellaga_0.8.3-1_amd64.deb
+sudo apt install ./fellaga_0.8.3-1_amd64.deb
 fellaga --version
 ```
 
@@ -67,9 +67,9 @@ fellaga scan your-domain.example --stream-jsonl > findings.jsonl
 fellaga scan your-domain.example --resume latest
 ```
 
-The default scan processes one domain at a time, caps DNS traffic at 100 queries per second, uses at most 128 concurrent DNS requests, and stops after 1,800 seconds per domain. Adaptive waves stop low-yield generated candidates early, but do not silently abandon an unfinished user wordlist or the bounded passive seed queue. Transient candidate-resolution failures receive at most three total attempts. These safeguards can be changed explicitly, but disabling them may saturate the local connection, public resolvers, or the target.
+The default scan processes one domain at a time, caps DNS traffic at 100 queries per second, uses at most 128 concurrent DNS requests, and stops after 1,800 seconds per domain. Adaptive stopping applies only to low-yield generated candidates; explicit wordlists and bounded passive seeds continue until completed or another hard limit stops the scan. Transient candidate-resolution failures receive at most three total attempts. These safeguards can be changed explicitly, but disabling them may saturate the local connection, public resolvers, or the target.
 
-Long-running phases emit periodic progress on standard error. Initial passive collection, direct CT monitoring, and AXFR run concurrently, while passive work has a separate profile-specific active-time budget so waiting in unrelated phases does not consume it. Names returned on completed connector pages are retained even if a later page times out; the affected source is reported as partial rather than silently discarded.
+Long-running phases emit periodic progress on standard error. Initial passive collection, direct CT monitoring, and AXFR run concurrently, while passive work has a separate profile-specific active-time budget so waiting in unrelated phases does not consume it. Completed connector pages are retained after a later page times out, and the affected source is reported as partial.
 
 Fellaga displays all retained states by default:
 
@@ -124,7 +124,7 @@ Run `fellaga <command> --help` for the complete option list.
 
 The default database is `~/.local/share/fellaga/fellaga.db`; the default API-key configuration is `~/.config/fellaga/config.json`. Fellaga creates its dedicated Unix directories with mode `0700` and its configuration, SQLite database, WAL/SHM files, and migration backups with mode `0600`.
 
-API keys are stored as plain JSON, not encrypted. Protect the user account and disk, never commit the configuration or database, and redact target data before sharing diagnostic output. Passive providers receive the queried domain, while resolvers and target services can observe active DNS, HTTP, and TLS traffic. “No telemetry” does not make reconnaissance anonymous.
+API keys are stored as plain JSON, not encrypted. Protect the user account and disk, never commit the configuration or database, and redact target data before sharing diagnostic output. Passive providers receive the queried domain. Active DNS, HTTP, and TLS traffic remains visible to resolvers and target services even though Fellaga sends no telemetry.
 
 ## License
 

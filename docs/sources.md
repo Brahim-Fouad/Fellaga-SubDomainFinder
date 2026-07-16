@@ -88,7 +88,7 @@ fellaga scan your-domain.example --exclude-sources hackertarget,urlscan
 fellaga scan your-domain.example --all-sources
 ```
 
-An explicitly selected source bypasses its adaptive pause. `--all-sources` does not invent credentials; providers with missing required keys fail with a configuration error.
+An explicitly selected source bypasses its adaptive pause. `--all-sources` attempts every connector; providers without required credentials return a configuration error.
 
 ## Caching, retries, and provider protection
 
@@ -96,4 +96,4 @@ Passive observations are merged permanently. A later empty or partial provider r
 
 The shared HTTP layer reuses connections, limits requests per provider, caps response bodies, validates sensitive pagination destinations, and retries selected transient statuses with exponential backoff and jitter. `Retry-After` is respected without blocking unrelated providers.
 
-Three consecutive failures place an automatically selected source in a 24-hour adaptive pause. Its retained observations remain available, and a later success resets the failure streak. Check the current decision with `fellaga sources` instead of assuming that an upstream provider is permanently broken.
+Three consecutive failures place an automatically selected source in a 24-hour adaptive pause. Its retained observations remain available, and a later success resets the failure streak. Use `fellaga sources` to view the current source state and retry eligibility.

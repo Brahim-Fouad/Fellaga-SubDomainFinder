@@ -1,5 +1,6 @@
 use crate::db::{Database, WebCacheEntry, WebCacheMetadata};
-use crate::model::WebObservation;
+use crate::dns::{DnsEngine, DnsResolutionOutcome};
+use crate::model::{ResolvedHost, WebObservation};
 use crate::util::{extract_observed_names, is_subdomain};
 use anyhow::{Context, Result, bail};
 use futures_util::{StreamExt, stream};
@@ -131,28 +132,53 @@ fn is_public_web_ip(address: IpAddr) -> bool {
     }
 }
 
-async fn resolve_public_web_hosts(hosts: BTreeSet<String>) -> BTreeMap<String, Vec<SocketAddr>> {
-    stream::iter(hosts)
-        .map(|host| async move {
-            let addresses = tokio::net::lookup_host((host.as_str(), 0))
-                .await
-                .map(|addresses| {
-                    addresses
-                        .filter(|address| is_public_web_ip(address.ip()))
-                        .map(|address| SocketAddr::new(address.ip(), 0))
-                        .collect::<BTreeSet<_>>()
-                        .into_iter()
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            (host, addresses)
+async fn resolve_public_web_hosts(
+    dns: &DnsEngine,
+    hosts: BTreeSet<String>,
+    timeout: Duration,
+) -> Result<BTreeMap<String, Vec<SocketAddr>>> {
+    if hosts.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let dns = dns.clone();
+    Ok(stream::iter(hosts)
+        .map(|host| {
+            let dns = dns.clone();
+            async move {
+                let deadline = tokio::time::Instant::now() + timeout;
+                let addresses =
+                    tokio::time::timeout_at(deadline, dns.resolve_host_classified(host.as_str()))
+                        .await
+                        .ok()
+                        .and_then(|outcome| match outcome {
+                            DnsResolutionOutcome::Positive(answer) => Some(answer),
+                            DnsResolutionOutcome::Negative { .. }
+                            | DnsResolutionOutcome::Indeterminate { .. } => None,
+                        })
+                        .map(|answer| public_socket_addresses(&answer))
+                        .unwrap_or_default();
+                (host, addresses)
+            }
         })
         .buffer_unordered(32)
         .filter_map(|(host, addresses)| async move {
             (!addresses.is_empty()).then_some((host, addresses))
         })
         .collect()
-        .await
+        .await)
+}
+
+fn public_socket_addresses(answer: &ResolvedHost) -> Vec<SocketAddr> {
+    answer
+        .records
+        .iter()
+        .filter(|record| matches!(record.record_type.as_str(), "A" | "AAAA"))
+        .filter_map(|record| record.value.parse().ok())
+        .filter(|address| is_public_web_ip(*address))
+        .map(|address| SocketAddr::new(address, 0))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 fn approved_asset_url(value: &str, domain: &str, approved_hosts: &BTreeSet<String>) -> bool {
@@ -374,6 +400,7 @@ async fn fetch_url(
 #[allow(clippy::too_many_arguments)]
 pub async fn discover_web(
     database: &Database,
+    dns: &DnsEngine,
     domain: &str,
     hosts: Vec<String>,
     timeout: Duration,
@@ -383,7 +410,7 @@ pub async fn discover_web(
     assets_per_host: usize,
 ) -> Result<WebDiscovery> {
     let started = Instant::now();
-    let pinned_hosts = resolve_public_web_hosts(hosts.into_iter().collect()).await;
+    let pinned_hosts = resolve_public_web_hosts(dns, hosts.into_iter().collect(), timeout).await?;
     if pinned_hosts.is_empty() {
         return Ok(WebDiscovery {
             duration_ms: started.elapsed().as_millis(),
@@ -515,6 +542,7 @@ pub async fn discover_web(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::DnsRecord;
 
     #[test]
     fn extracts_only_useful_in_scope_assets() {
@@ -583,6 +611,30 @@ mod tests {
         assert!(is_public_web_ip("1.1.1.1".parse().unwrap()));
         assert!(is_public_web_ip("2606:4700:4700::1111".parse().unwrap()));
 
+        let resolved = ResolvedHost {
+            fqdn: "www.example.com".to_owned(),
+            records: vec![
+                DnsRecord {
+                    record_type: "A".to_owned(),
+                    value: "10.0.0.1".to_owned(),
+                    ttl: 60,
+                },
+                DnsRecord {
+                    record_type: "A".to_owned(),
+                    value: "1.1.1.1".to_owned(),
+                    ttl: 60,
+                },
+            ],
+            from_cache: false,
+            last_verified_at: Some(1),
+            authoritative_validation: false,
+            resolver_count: 1,
+        };
+        assert_eq!(
+            public_socket_addresses(&resolved),
+            vec!["1.1.1.1:0".parse().unwrap()]
+        );
+
         let approved = BTreeSet::from(["www.example.com".to_owned()]);
         assert!(approved_asset_url(
             "https://www.example.com/app.js",
@@ -599,6 +651,22 @@ mod tests {
             "example.com",
             &approved
         ));
+    }
+
+    #[test]
+    fn web_resolution_uses_only_the_shared_dns_engine() {
+        let source = include_str!("web_discovery.rs");
+        for forbidden in [
+            ["Tokio", "Resolver"].concat(),
+            ["lookup", "_host"].concat(),
+            ["ToSocket", "Addrs"].concat(),
+        ] {
+            assert!(
+                !source.contains(&forbidden),
+                "forbidden resolver: {forbidden}"
+            );
+        }
+        assert!(source.contains("dns: &DnsEngine"));
     }
 
     #[test]

@@ -51,7 +51,9 @@ The native Rust transport correlates parallel UDP requests, uses EDNS0, retries 
 
 By default, Fellaga uses `1.1.1.1`, `8.8.8.8`, and `9.9.9.9` for both pools and shares the global DNS rate limit across validation work. Trusted-resolver consensus and authoritative checks reduce false live results caused by poisoned caches, inconsistent resolvers, or wildcard DNS.
 
-Primary and trusted validation are started in parallel for a candidate batch. Long validation batches emit progress heartbeats independently from individual resolver completion, so delayed responses remain visible without changing their timeout semantics.
+Trusted validation uses bounded concurrency after the primary batch, and both stages share the configured DNS rate limit. Long validation batches emit progress heartbeats independently from individual resolver completion, so delayed responses remain visible without changing their timeout semantics.
+
+TLS and Web hostname pinning reuse the same configured DNS engine and shared rate limiter. They do not start a separate system resolver or bypass `--resolvers`; Web targets are still filtered to public IP addresses before requests are sent.
 
 ## Wildcard detection and cleanup
 
@@ -110,6 +112,6 @@ Several independent limits prevent an intensive scan from running forever or exh
 
 The passive budget advances only while passive work is running; time spent waiting for concurrent CT/AXFR completion or later non-passive phases is not charged to it. A connector that times out after returning one or more complete pages contributes those names as a partial result and is reported as degraded. Periodic heartbeats cover passive collection, DNS validation, and long enrichment phases.
 
-Scan completion and learning are committed atomically. Prepared SQLite statements are reused for large word and pattern updates, queue-selection indexes support bounded claims, and cleanup of completed or superseded queue rows is best-effort after the completion transaction. A maintenance delete therefore cannot turn an otherwise completed scan into a failed one.
+Scan completion and learning are committed atomically. Prepared SQLite statements are reused for large word and pattern updates, and queue-selection indexes support bounded claims. Queue cleanup runs after the completion transaction on a best-effort basis and leaves the committed scan status unchanged.
 
-`--no-adaptive`, `--dns-rate-limit 0`, and `--max-runtime 0` deliberately remove important safeguards. They are not required for the default deep scan.
+`--no-adaptive`, `--dns-rate-limit 0`, and `--max-runtime 0` disable important safeguards. The default deep profile keeps all three enabled.

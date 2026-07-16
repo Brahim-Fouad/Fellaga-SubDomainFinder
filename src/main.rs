@@ -1,5 +1,6 @@
 use anyhow::{Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use fellaga_core::benchmark::{CandidatePipelineOptions, run_candidate_pipeline};
 use fellaga_core::candidate::{default_mutation_rules, load_mutation_rules};
 use fellaga_core::db::Database;
 use fellaga_core::dns::DnsEngine;
@@ -7,7 +8,10 @@ use fellaga_core::model::{AxfrStatus, Finding, ObservationState, ScanResult};
 use fellaga_core::passive::{
     ApiKeyStore, automatic_sources_for_profile, source_statuses, validate_sources,
 };
-use fellaga_core::scanner::{ProgressEvent, ScanOptions, Scanner, refresh_inventory_with_trusted};
+use fellaga_core::scanner::{
+    ProgressEvent, RefreshOptions, RefreshProgressCallback, ScanOptions, Scanner,
+    refresh_inventory_bounded,
+};
 use fellaga_core::{passive, scanner, util};
 use futures_util::{StreamExt, stream};
 use std::collections::BTreeSet;
@@ -63,6 +67,11 @@ enum Command {
     Sources(SourcesArgs),
     /// Explain why a name is known and when it was last validated.
     Explain(ExplainArgs),
+    /// Run controlled local performance benchmarks.
+    Benchmark {
+        #[command(subcommand)]
+        action: BenchmarkAction,
+    },
     /// Test DNS resolvers or benchmark the local DNS transport.
     Resolvers {
         #[command(subcommand)]
@@ -134,6 +143,23 @@ const fn is_strict_live(state: ObservationState, wildcard: bool) -> bool {
     matches!(state, ObservationState::Live) && !wildcard
 }
 
+const MAX_DOMAIN_CONCURRENCY: usize = 4;
+const MAX_WEB_CONCURRENCY: usize = 16;
+const MAX_TLS_CONCURRENCY: usize = 32;
+
+fn validate_scan_concurrency(domain: usize, web: usize, tls: usize) -> Result<()> {
+    if !(1..=MAX_DOMAIN_CONCURRENCY).contains(&domain) {
+        bail!("--domain-concurrency doit être compris entre 1 et {MAX_DOMAIN_CONCURRENCY}");
+    }
+    if !(1..=MAX_WEB_CONCURRENCY).contains(&web) {
+        bail!("--web-concurrency doit être compris entre 1 et {MAX_WEB_CONCURRENCY}");
+    }
+    if !(1..=MAX_TLS_CONCURRENCY).contains(&tls) {
+        bail!("--tls-concurrency doit être compris entre 1 et {MAX_TLS_CONCURRENCY}");
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ProfileDefaults {
     max_words: usize,
@@ -147,9 +173,11 @@ struct ProfileDefaults {
     graph_hosts: usize,
     ptr_ips: usize,
     nsec_max_names: usize,
+    nsec_max_runtime: u64,
     ct_logs: usize,
     ct_entries: usize,
     ct_backfill: usize,
+    ct_max_runtime: u64,
     web_hosts: usize,
     web_assets: usize,
     passive_max_runtime: u64,
@@ -171,9 +199,11 @@ impl ScanProfile {
                 graph_hosts: 1_000,
                 ptr_ips: 512,
                 nsec_max_names: 10_000,
+                nsec_max_runtime: 180,
                 ct_logs: 8,
                 ct_entries: 4_096,
                 ct_backfill: 4_096,
+                ct_max_runtime: 90,
                 web_hosts: 100,
                 web_assets: 8,
                 passive_max_runtime: 75,
@@ -191,9 +221,11 @@ impl ScanProfile {
                 graph_hosts: 250,
                 ptr_ips: 64,
                 nsec_max_names: 10_000,
+                nsec_max_runtime: 90,
                 ct_logs: 2,
                 ct_entries: 256,
                 ct_backfill: 256,
+                ct_max_runtime: 30,
                 web_hosts: 30,
                 web_assets: 5,
                 passive_max_runtime: 45,
@@ -211,9 +243,11 @@ impl ScanProfile {
                 graph_hosts: 1,
                 ptr_ips: 1,
                 nsec_max_names: 1,
+                nsec_max_runtime: 1,
                 ct_logs: 8,
                 ct_entries: 4_096,
                 ct_backfill: 4_096,
+                ct_max_runtime: 90,
                 web_hosts: 1,
                 web_assets: 1,
                 passive_max_runtime: 90,
@@ -231,9 +265,11 @@ impl ScanProfile {
                 graph_hosts: 500,
                 ptr_ips: 128,
                 nsec_max_names: 10_000,
+                nsec_max_runtime: 60,
                 ct_logs: 2,
                 ct_entries: 512,
                 ct_backfill: 512,
+                ct_max_runtime: 20,
                 web_hosts: 50,
                 web_assets: 5,
                 passive_max_runtime: 30,
@@ -254,7 +290,7 @@ struct ScanArgs {
     #[arg(
         long,
         default_value_t = 1,
-        help = "Target domains processed in parallel"
+        help = "Target domains processed in parallel (1-4)"
     )]
     domain_concurrency: usize,
     #[command(flatten)]
@@ -298,7 +334,7 @@ struct ScanArgs {
     passive_refresh_hours: u64,
     #[arg(
         long,
-        help = "Wall-clock budget for each passive phase in seconds; 0 disables the safeguard"
+        help = "Cumulative passive-source budget per target in seconds; 0 disables the safeguard"
     )]
     passive_max_runtime: Option<u64>,
     #[arg(
@@ -399,7 +435,7 @@ struct ScanArgs {
     tls_refresh_hours: u64,
     #[arg(long, help = "Maximum TLS endpoints inspected")]
     tls_hosts: Option<usize>,
-    #[arg(long, default_value_t = 16, help = "Concurrent TLS handshakes")]
+    #[arg(long, default_value_t = 16, help = "Concurrent TLS handshakes (1-32)")]
     tls_concurrency: usize,
     #[arg(long, help = "Disable the MX/NS/SOA/TXT/CAA/SRV/HTTPS/SVCB DNS graph")]
     no_dns_graph: bool,
@@ -429,11 +465,21 @@ struct ScanArgs {
     nsec_max_names: Option<usize>,
     #[arg(
         long,
+        help = "Cumulative NSEC budget per target in seconds; 0 disables the safeguard"
+    )]
+    nsec_max_runtime: Option<u64>,
+    #[arg(
+        long,
         help = "Disable direct incremental Certificate Transparency monitoring"
     )]
     no_ct_monitor: bool,
     #[arg(long, default_value_t = 8.0, help = "CT API timeout in seconds")]
     ct_timeout: f64,
+    #[arg(
+        long,
+        help = "Certificate Transparency phase budget per target in seconds; 0 disables the safeguard"
+    )]
+    ct_max_runtime: Option<u64>,
     #[arg(long, help = "Maximum CT logs inspected per scan")]
     ct_logs: Option<usize>,
     #[arg(long, help = "New entries read per CT log")]
@@ -459,7 +505,11 @@ struct ScanArgs {
         help = "Web cache refresh interval in hours"
     )]
     web_refresh_hours: u64,
-    #[arg(long, default_value_t = 8, help = "Web hosts inspected concurrently")]
+    #[arg(
+        long,
+        default_value_t = 8,
+        help = "Web hosts inspected concurrently (1-16)"
+    )]
     web_concurrency: usize,
     #[arg(
         long,
@@ -549,6 +599,25 @@ struct RefreshArgs {
         help = "Requested negative-cache lifetime in seconds"
     )]
     negative_ttl: u32,
+    #[arg(
+        long,
+        default_value_t = 300,
+        help = "Global refresh limit in seconds; 0 disables the safeguard"
+    )]
+    max_runtime: u64,
+    #[arg(
+        long,
+        default_value_t = 256,
+        help = "Inventory names resolved and persisted per batch (1-4096)"
+    )]
+    batch_size: usize,
+    #[arg(
+        short,
+        long,
+        visible_alias = "silent",
+        help = "Suppress refresh progress on stderr"
+    )]
+    quiet: bool,
 }
 
 #[derive(Debug, Args)]
@@ -599,6 +668,49 @@ struct ExplainArgs {
     fqdn: String,
     #[arg(long, help = "Write pretty JSON")]
     json: bool,
+}
+
+#[derive(Debug, Subcommand)]
+enum BenchmarkAction {
+    /// Exercise candidate generation, SQLite, scheduling, and loopback DNS.
+    CandidatePipeline(CandidatePipelineBenchmarkArgs),
+}
+
+#[derive(Debug, Args)]
+struct CandidatePipelineBenchmarkArgs {
+    #[arg(
+        long,
+        help = "Fresh path where Rust generates the deterministic candidate fixture"
+    )]
+    wordlist: PathBuf,
+    #[arg(
+        long,
+        default_value_t = 10_000_000,
+        help = "Number of unique candidates to generate and process (1-10000000)"
+    )]
+    candidates: usize,
+    #[arg(
+        long,
+        default_value_t = 4_096,
+        help = "Maximum candidates persisted and scheduled per wave (1-50000)"
+    )]
+    batch_size: usize,
+    #[arg(
+        long,
+        default_value_t = 128,
+        help = "Concurrent candidate DNS classifications (1-60000)"
+    )]
+    concurrency: usize,
+    #[arg(
+        long,
+        default_value_t = 2.0,
+        help = "Per-query loopback DNS timeout in seconds (maximum 60)"
+    )]
+    timeout: f64,
+    #[arg(long, help = "Fresh campaign identifier recorded in the result")]
+    campaign_id: String,
+    #[arg(long, help = "Fresh path for the atomically published JSON result")]
+    output: PathBuf,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1217,6 +1329,7 @@ fn csv_field(value: &str) -> String {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    let database_explicit = cli.db.is_some();
     let database_path = cli.db.unwrap_or_else(default_database_path);
     let config_path = cli.config.unwrap_or_else(passive::default_config_path);
     let api_keys = ApiKeyStore::load_or_create(&config_path)?;
@@ -1249,9 +1362,11 @@ async fn main() -> Result<()> {
             let graph_hosts = args.graph_hosts.unwrap_or(defaults.graph_hosts);
             let ptr_ips = args.ptr_ips.unwrap_or(defaults.ptr_ips);
             let nsec_max_names = args.nsec_max_names.unwrap_or(defaults.nsec_max_names);
+            let nsec_max_runtime = args.nsec_max_runtime.unwrap_or(defaults.nsec_max_runtime);
             let ct_logs = args.ct_logs.unwrap_or(defaults.ct_logs);
             let ct_entries = args.ct_entries.unwrap_or(defaults.ct_entries);
             let ct_backfill = args.ct_backfill.unwrap_or(defaults.ct_backfill);
+            let ct_max_runtime = args.ct_max_runtime.unwrap_or(defaults.ct_max_runtime);
             let web_hosts = args.web_hosts.unwrap_or(defaults.web_hosts);
             let web_assets = args.web_assets.unwrap_or(defaults.web_assets);
             let passive_max_runtime = args
@@ -1305,9 +1420,11 @@ async fn main() -> Result<()> {
             if pipeline_budget > 1_000_000 {
                 bail!("--pipeline-budget ne peut pas dépasser 1000000");
             }
-            if args.domain_concurrency == 0 {
-                bail!("--domain-concurrency doit être supérieur à zéro");
-            }
+            validate_scan_concurrency(
+                args.domain_concurrency,
+                args.web_concurrency,
+                args.tls_concurrency,
+            )?;
             if args.axfr_timeout <= 0.0 || !args.axfr_timeout.is_finite() {
                 bail!("--axfr-timeout doit être un nombre positif");
             }
@@ -1317,8 +1434,8 @@ async fn main() -> Result<()> {
             if args.tls_port == 0 {
                 bail!("--tls-port doit être supérieur à zéro");
             }
-            if tls_hosts == 0 || args.tls_concurrency == 0 {
-                bail!("--tls-hosts et --tls-concurrency doivent être supérieurs à zéro");
+            if tls_hosts == 0 {
+                bail!("--tls-hosts doit être supérieur à zéro");
             }
             if graph_hosts == 0 {
                 bail!("--graph-hosts doit être supérieur à zéro");
@@ -1341,10 +1458,8 @@ async fn main() -> Result<()> {
             if args.ct_timeout <= 0.0 || !args.ct_timeout.is_finite() {
                 bail!("--ct-timeout doit être un nombre positif");
             }
-            if web_hosts == 0 || args.web_concurrency == 0 || args.web_max_bytes == 0 {
-                bail!(
-                    "--web-hosts, --web-concurrency et --web-max-bytes doivent être supérieurs à zéro"
-                );
+            if web_hosts == 0 || args.web_max_bytes == 0 {
+                bail!("--web-hosts et --web-max-bytes doivent être supérieurs à zéro");
             }
             if args.web_timeout <= 0.0 || !args.web_timeout.is_finite() {
                 bail!("--web-timeout doit être un nombre positif");
@@ -1458,8 +1573,10 @@ async fn main() -> Result<()> {
                 nsec_timeout: Duration::from_secs_f64(args.nsec_timeout),
                 nsec_refresh: Duration::from_secs(args.nsec_refresh_hours.saturating_mul(3_600)),
                 nsec_max_names,
+                nsec_phase_timeout: Duration::from_secs(nsec_max_runtime),
                 ct_monitor: !args.no_ct_monitor,
                 ct_timeout: Duration::from_secs_f64(args.ct_timeout),
+                ct_phase_timeout: Duration::from_secs(ct_max_runtime),
                 ct_max_logs: ct_logs,
                 ct_entries_per_log: ct_entries,
                 ct_initial_backfill: ct_backfill,
@@ -1627,6 +1744,9 @@ async fn main() -> Result<()> {
             }
         }
         Command::Refresh(args) => {
+            if !(1..=4_096).contains(&args.batch_size) {
+                bail!("--batch-size doit être compris entre 1 et 4096");
+            }
             let database = Database::open(&database_path)?;
             let dns = make_dns(&args.dns)?;
             dns.seed_metrics(&database.resolver_history()?);
@@ -1638,15 +1758,54 @@ async fn main() -> Result<()> {
             )?
             .share_rate_limit_with(&dns);
             trusted_dns.seed_metrics(&database.resolver_history()?);
-            let result = refresh_inventory_with_trusted(
+            let progress: Option<RefreshProgressCallback> = (!args.quiet).then(|| {
+                Arc::new(|progress: fellaga_core::scanner::RefreshProgress| {
+                    eprintln!(
+                        "[refresh] {}/{} checked, {} live, {} historical, {} indeterminate",
+                        progress.checked,
+                        progress.total,
+                        progress.active,
+                        progress.inactive,
+                        progress.indeterminate
+                    );
+                }) as RefreshProgressCallback
+            });
+            if !args.quiet {
+                eprintln!(
+                    "[refresh] starting {} with {}s limit and {}-name batches",
+                    args.target, args.max_runtime, args.batch_size
+                );
+            }
+            let refresh = refresh_inventory_bounded(
                 &database,
                 &dns,
                 Some(&trusted_dns),
                 &args.target,
                 args.ttl_cap,
                 args.negative_ttl,
-            )
-            .await?;
+                RefreshOptions {
+                    max_runtime: Duration::from_secs(args.max_runtime),
+                    wildcard_phase_timeout: Duration::from_secs(30),
+                    batch_size: args.batch_size,
+                },
+                progress,
+            );
+            tokio::pin!(refresh);
+            let result = tokio::select! {
+                result = &mut refresh => result?,
+                signal = tokio::signal::ctrl_c() => {
+                    match signal {
+                        Ok(()) => bail!("actualisation interrompue; résultats déjà persistés conservés sans purge wildcard"),
+                        Err(error) => bail!("écoute de Ctrl+C impossible: {error}"),
+                    }
+                }
+            };
+            if !args.quiet {
+                eprintln!(
+                    "[refresh] {}: {}/{} checked in {} ms",
+                    result.status, result.checked, result.total, result.duration_ms
+                );
+            }
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
         Command::History(args) => {
@@ -1864,6 +2023,34 @@ async fn main() -> Result<()> {
                 }
             }
         }
+        Command::Benchmark { action } => match action {
+            BenchmarkAction::CandidatePipeline(args) => {
+                if !database_explicit {
+                    bail!("candidate-pipeline requires an explicit fresh --db path");
+                }
+                if args.timeout <= 0.0 || !args.timeout.is_finite() || args.timeout > 60.0 {
+                    bail!("--timeout must be greater than zero and at most 60 seconds");
+                }
+                let result = run_candidate_pipeline(CandidatePipelineOptions {
+                    database: database_path,
+                    wordlist: args.wordlist,
+                    output: args.output.clone(),
+                    candidates: args.candidates,
+                    batch_size: args.batch_size,
+                    concurrency: args.concurrency,
+                    timeout: Duration::from_secs_f64(args.timeout),
+                    campaign_id: args.campaign_id,
+                })
+                .await?;
+                println!(
+                    "Candidate pipeline completed: {} candidates, {} DNS queries, {} ms; JSON: {}",
+                    result.processed_candidates,
+                    result.dns_queries,
+                    result.duration_ms,
+                    args.output.display()
+                );
+            }
+        },
         Command::Resolvers { action } => match action {
             ResolverAction::Test(args) => {
                 if args.timeout <= 0.0 || !args.timeout.is_finite() {
@@ -2018,5 +2205,31 @@ mod tests {
         assert!(!is_strict_live(ObservationState::Unverified, false));
         assert!(!is_strict_live(ObservationState::Unverified, true));
         assert!(!is_strict_live(ObservationState::Live, true));
+    }
+
+    #[test]
+    fn scan_concurrency_caps_bound_cross_target_network_fanout() {
+        assert!(validate_scan_concurrency(1, 8, 16).is_ok());
+        assert!(
+            validate_scan_concurrency(
+                MAX_DOMAIN_CONCURRENCY,
+                MAX_WEB_CONCURRENCY,
+                MAX_TLS_CONCURRENCY
+            )
+            .is_ok()
+        );
+        assert!(validate_scan_concurrency(0, 8, 16).is_err());
+        assert!(validate_scan_concurrency(MAX_DOMAIN_CONCURRENCY + 1, 8, 16).is_err());
+        assert!(validate_scan_concurrency(1, MAX_WEB_CONCURRENCY + 1, 16).is_err());
+        assert!(validate_scan_concurrency(1, 8, MAX_TLS_CONCURRENCY + 1).is_err());
+    }
+
+    #[test]
+    fn active_profiles_have_finite_nsec_and_ct_phase_budgets() {
+        for profile in [ScanProfile::Deep, ScanProfile::Balanced, ScanProfile::Turbo] {
+            let defaults = profile.defaults();
+            assert!(defaults.nsec_max_runtime > 0);
+            assert!(defaults.ct_max_runtime > 0);
+        }
     }
 }
