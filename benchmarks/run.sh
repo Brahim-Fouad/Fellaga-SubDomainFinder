@@ -12,25 +12,25 @@ BENCH_RESOLVER_QUERIES="${FELLAGA_BENCH_RESOLVER_QUERIES:-100000}"
 BENCH_RESOLVER_CONCURRENCY="${FELLAGA_BENCH_RESOLVER_CONCURRENCY:-128}"
 
 if [[ "$MODE" != "no-key" && "$MODE" != "equal-keys" ]]; then
-  echo "usage: $0 no-key|equal-keys FICHIER_DOMAINES" >&2
+  echo "usage: $0 no-key|equal-keys DOMAINS_FILE" >&2
   exit 2
 fi
 [[ "${FELLAGA_BENCH_AUTHORIZED:-}" == "YES" ]] || {
-  echo "Définissez FELLAGA_BENCH_AUTHORIZED=YES après vérification écrite du périmètre." >&2
+  echo "Set FELLAGA_BENCH_AUTHORIZED=YES only after written scope verification." >&2
   exit 3
 }
-[[ -f "$DOMAINS_FILE" ]] || { echo "fichier de domaines absent" >&2; exit 2; }
+[[ -f "$DOMAINS_FILE" ]] || { echo "domains file not found" >&2; exit 2; }
 
 for command in fellaga subfinder amass bbot puredns dnsx jq zstd python3; do
-  command -v "$command" >/dev/null || { echo "prérequis absent: $command" >&2; exit 4; }
+  command -v "$command" >/dev/null || { echo "missing prerequisite: $command" >&2; exit 4; }
 done
 
 if [[ "$MODE" == "equal-keys" ]]; then
   manifest="${KEYS_MANIFEST:-}"
-  [[ -f "$manifest" ]] || { echo "KEYS_MANIFEST est obligatoire en mode equal-keys" >&2; exit 5; }
+  [[ -f "$manifest" ]] || { echo "KEYS_MANIFEST is required in equal-keys mode" >&2; exit 5; }
   while IFS=$'\t' read -r variable configured; do
-    [[ "$configured" == "true" ]] || { echo "$variable non configurée chez tous les concurrents" >&2; exit 5; }
-    [[ -n "${!variable:-}" ]] || { echo "variable absente: $variable" >&2; exit 5; }
+    [[ "$configured" == "true" ]] || { echo "$variable is not configured for every competitor" >&2; exit 5; }
+    [[ -n "${!variable:-}" ]] || { echo "missing variable: $variable" >&2; exit 5; }
   done < <(jq -r '.providers[] | [.fellaga_env, (.competitors_configured|tostring)] | @tsv' "$manifest")
 fi
 
@@ -119,14 +119,21 @@ run_tool() {
     >> "$OUT/summary.jsonl"
 }
 
+authorized_domains=0
 while IFS= read -r domain; do
   domain="${domain%%#*}"
   domain="$(echo "$domain" | xargs | tr '[:upper:]' '[:lower:]')"
   [[ "$domain" =~ ^[a-z0-9.-]+\.[a-z]{2,}$ ]] || continue
+  authorized_domains=$((authorized_domains + 1))
   for tool in fellaga subfinder amass bbot puredns; do
     run_tool "$domain" "$tool"
   done
 done < "$DOMAINS_FILE"
+
+if (( authorized_domains == 0 )); then
+  echo "no authorized domain was provided" >&2
+  exit 2
+fi
 
 python3 "$ROOT/benchmarks/timed.py" "$OUT/dns-engine.time" \
   fellaga resolvers benchmark --queries "$BENCH_RESOLVER_QUERIES" \

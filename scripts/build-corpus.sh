@@ -15,14 +15,14 @@ readonly corpus_archive_sha256=cde7d80ff87e21ef2c6d3021b09931a469e4ca965f2bc7816
 
 for command in awk sha256sum wc zstd; do
   if ! command -v "$command" >/dev/null 2>&1; then
-    echo "Commande requise introuvable: $command" >&2
+    echo "Required command not found: $command" >&2
     exit 1
   fi
 done
 
 for source in "$top" "$bitquark"; do
   if [[ ! -f "$source" ]]; then
-    echo "Source SecLists introuvable: $source" >&2
+    echo "SecLists source not found: $source" >&2
     exit 1
   fi
 done
@@ -33,10 +33,10 @@ verify_sha256() {
   local actual
   actual=$(sha256sum "$path" | awk '{print $1}')
   if [[ "$actual" != "$expected" ]]; then
-    echo "Empreinte inattendue pour $path" >&2
-    echo "Attendue: $expected" >&2
-    echo "Obtenue:  $actual" >&2
-    echo "Utilisez SecLists $seclists_revision sans modification locale." >&2
+    echo "Unexpected fingerprint for $path" >&2
+    echo "Expected: $expected" >&2
+    echo "Actual:   $actual" >&2
+    echo "Use SecLists $seclists_revision without local changes." >&2
     exit 1
   fi
 }
@@ -83,7 +83,7 @@ awk '!seen[$0]++ { print; if (++count == 1000000) exit }' \
   "$tmp/candidates.txt" > "$tmp/candidates-1m.txt"
 count=$(wc -l < "$tmp/candidates-1m.txt")
 if [[ "$count" -ne 1000000 ]]; then
-  echo "Le corpus généré contient $count entrées au lieu de 1000000" >&2
+  echo "The generated corpus contains $count entries instead of 1000000" >&2
   exit 1
 fi
 
@@ -94,5 +94,5 @@ zstd -q -19 --threads=0 --force "$tmp/candidates-1m.txt" -o "$output"
 verify_sha256 "$output" "$corpus_archive_sha256"
 
 echo "SecLists: $seclists_revision"
-echo "$corpus_text_sha256  candidates-1m.txt (contenu canonique)"
+echo "$corpus_text_sha256  candidates-1m.txt (canonical content)"
 echo "$corpus_archive_sha256  $output"

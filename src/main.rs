@@ -3,7 +3,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use fellaga_core::candidate::{default_mutation_rules, load_mutation_rules};
 use fellaga_core::db::Database;
 use fellaga_core::dns::DnsEngine;
-use fellaga_core::model::{AxfrStatus, Finding, ScanResult};
+use fellaga_core::model::{AxfrStatus, Finding, ObservationState, ScanResult};
 use fellaga_core::passive::{
     ApiKeyStore, automatic_sources_for_profile, source_statuses, validate_sources,
 };
@@ -21,19 +21,19 @@ use std::time::Duration;
 #[command(
     name = "fellaga",
     version,
-    about = "Énumérateur de sous-domaines Rust, rapide et auto-apprenant"
+    about = "Fast, adaptive Rust subdomain enumerator"
 )]
 struct Cli {
     #[arg(
         long,
         global = true,
-        help = "Base SQLite (sinon FELLAGA_DB ou XDG_DATA_HOME)"
+        help = "SQLite database path (otherwise FELLAGA_DB or XDG_DATA_HOME)"
     )]
     db: Option<PathBuf>,
     #[arg(
         long,
         global = true,
-        help = "Configuration JSON des clés API (sinon FELLAGA_CONFIG ou XDG_CONFIG_HOME)"
+        help = "API-key JSON configuration (otherwise FELLAGA_CONFIG or XDG_CONFIG_HOME)"
     )]
     config: Option<PathBuf>,
     #[command(subcommand)]
@@ -42,62 +42,67 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Énumère les sous-domaines et tente automatiquement AXFR.
+    /// Enumerate subdomains and attempt AXFR automatically.
     Scan(Box<ScanArgs>),
-    /// Liste l'inventaire conservé dans SQLite.
+    /// List the permanent SQLite inventory.
     List(ListArgs),
-    /// Revalide tous les sous-domaines connus et rafraîchit le cache.
+    /// Revalidate known subdomains and refresh DNS state.
     Refresh(RefreshArgs),
-    /// Affiche l'historique des scans.
+    /// Show scan history.
     History(HistoryArgs),
-    /// Affiche les statistiques d'apprentissage et de cache.
+    /// Show local learning and cache statistics.
     Stats,
-    /// Entretien du cache SQLite.
+    /// Maintain the SQLite cache.
     Cache {
         #[command(subcommand)]
         action: CacheAction,
     },
-    /// Affiche la base de connaissance permanente locale.
+    /// Show the permanent local knowledge base.
     Knowledge(KnowledgeArgs),
-    /// Liste toutes les sources et leur état d'activation automatique.
+    /// List passive sources and their automatic-activation status.
     Sources(SourcesArgs),
-    /// Explique pourquoi un nom est connu et quand il a été validé.
+    /// Explain why a name is known and when it was last validated.
     Explain(ExplainArgs),
-    /// Teste et classe les résolveurs DNS avant un scan intensif.
+    /// Test DNS resolvers or benchmark the local DNS transport.
     Resolvers {
         #[command(subcommand)]
         action: ResolverAction,
     },
-    /// Importe des noms produits par d'autres énumérateurs sans les déclarer live.
+    /// Import names from other enumerators without marking them live.
     Import(ImportArgs),
-    /// Exporte l'inventaire local permanent.
+    /// Export the permanent local inventory.
     Export(ExportArgs),
 }
 
 #[derive(Debug, Args)]
 struct DnsArgs {
-    #[arg(short = 'c', long, default_value_t = 128)]
+    #[arg(
+        short = 'c',
+        long,
+        default_value_t = 128,
+        help = "Maximum concurrent DNS requests"
+    )]
     concurrency: usize,
-    #[arg(long, default_value_t = 2.0)]
+    #[arg(long, default_value_t = 2.0, help = "DNS query timeout in seconds")]
     timeout: f64,
     #[arg(
         long,
         value_delimiter = ',',
         default_value = "1.1.1.1,8.8.8.8,9.9.9.9",
-        help = "Résolveurs DNS, ex. 1.1.1.1,8.8.8.8"
+        help = "DNS resolvers, for example 1.1.1.1,8.8.8.8"
     )]
     resolvers: Vec<IpAddr>,
     #[arg(
         long,
         default_value_t = 100,
-        help = "Limite DNS globale en requêtes/s; 0 désactive volontairement la protection"
+        help = "Global DNS requests-per-second limit; 0 deliberately disables the safeguard"
     )]
     dns_rate_limit: u64,
     #[arg(
         long,
         value_delimiter = ',',
         default_value = "1.1.1.1,8.8.8.8,9.9.9.9",
-        help = "Résolveurs indépendants utilisés pour le consensus final"
+        help = "Independent resolvers used for final consensus validation"
     )]
     trusted_resolvers: Vec<IpAddr>,
 }
@@ -108,6 +113,25 @@ enum ScanProfile {
     Balanced,
     Passive,
     Turbo,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamJsonlMode {
+    Disabled,
+    Realtime,
+    FinalOnly,
+}
+
+const fn stream_jsonl_mode(enabled: bool, only_live: bool) -> StreamJsonlMode {
+    match (enabled, only_live) {
+        (false, _) => StreamJsonlMode::Disabled,
+        (true, false) => StreamJsonlMode::Realtime,
+        (true, true) => StreamJsonlMode::FinalOnly,
+    }
+}
+
+const fn is_strict_live(state: ObservationState, wildcard: bool) -> bool {
+    matches!(state, ObservationState::Live) && !wildcard
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -211,329 +235,390 @@ impl ScanProfile {
 
 #[derive(Debug, Args)]
 struct ScanArgs {
-    #[arg(value_name = "TARGET")]
+    #[arg(value_name = "TARGET", help = "Authorized target domain")]
     targets: Vec<String>,
-    #[arg(short = 'l', long, help = "Fichier de domaines, un par ligne")]
+    #[arg(short = 'l', long, help = "Target file with one domain per line")]
     targets_file: Option<PathBuf>,
-    #[arg(long, value_enum, default_value_t = ScanProfile::Deep)]
+    #[arg(long, value_enum, default_value_t = ScanProfile::Deep, help = "Scan coverage profile")]
     profile: ScanProfile,
-    #[arg(long, default_value_t = 1, help = "Domaines traités en parallèle")]
+    #[arg(
+        long,
+        default_value_t = 1,
+        help = "Target domains processed in parallel"
+    )]
     domain_concurrency: usize,
     #[command(flatten)]
     dns: DnsArgs,
-    #[arg(short = 'w', long)]
+    #[arg(short = 'w', long, help = "Additional candidate wordlist")]
     wordlist: Option<PathBuf>,
     #[arg(
         long,
-        help = "DSL de mutations: score:nom:pattern avec {{word}}, {{parent}}, {{env}}, {{region}}, {{cloud}}, {{n}}"
+        help = "Mutation DSL: score:name:pattern; variables word,parent,env,region,cloud,n"
     )]
     mutations: Option<PathBuf>,
-    #[arg(long)]
+    #[arg(
+        long,
+        help = "Maximum brute-force candidates from configured generators"
+    )]
     max_words: Option<usize>,
-    #[arg(long)]
+    #[arg(long, help = "Disable passive-provider discovery")]
     no_passive: bool,
     #[arg(
         long,
         value_delimiter = ',',
-        help = "Sources passives à utiliser; vide = sélection automatique"
+        help = "Comma-separated passive-source allowlist; empty selects automatically"
     )]
     passive_sources: Vec<String>,
-    #[arg(long, value_delimiter = ',', help = "Sources à exclure")]
+    #[arg(
+        long,
+        value_delimiter = ',',
+        help = "Comma-separated passive sources to exclude"
+    )]
     exclude_sources: Vec<String>,
-    #[arg(long, help = "Tente aussi les sources dont la clé API est absente")]
+    #[arg(
+        long,
+        help = "Attempt every connector, including sources with missing API keys"
+    )]
     all_sources: bool,
-    #[arg(long, default_value_t = 24)]
+    #[arg(
+        long,
+        default_value_t = 24,
+        help = "Passive-source refresh interval in hours"
+    )]
     passive_refresh_hours: u64,
-    #[arg(long)]
+    #[arg(long, help = "Maximum passive names accepted per target")]
     max_passive: Option<usize>,
-    #[arg(long)]
+    #[arg(
+        long,
+        help = "Skip brute-force generation; active enrichment may still run"
+    )]
     passive_only: bool,
-    #[arg(long, help = "Désactive la tentative AXFR automatique")]
+    #[arg(long, help = "Disable automatic AXFR attempts")]
     no_axfr: bool,
-    #[arg(long, default_value_t = 8.0)]
+    #[arg(
+        long,
+        default_value_t = 8.0,
+        help = "AXFR timeout per nameserver in seconds"
+    )]
     axfr_timeout: f64,
-    #[arg(long, help = "Ignore le cache même s'il est encore frais")]
+    #[arg(long, help = "Bypass cached answers even when they are fresh")]
     refresh_cache: bool,
     #[arg(
         long,
         default_value_t = 24,
-        help = "Âge maximal en heures pour considérer une validation en cache comme live"
+        help = "Maximum cached-validation age in hours for a finding to remain live"
     )]
     verification_max_age: u64,
-    #[arg(
-        long,
-        help = "N'affiche que les noms dont la validation DNS est encore live"
-    )]
+    #[arg(long, help = "Output only names whose final DNS state is live")]
     only_live: bool,
     #[arg(
         long,
         default_value_t = 86_400,
-        help = "Conservé pour compatibilité; les réponses positives sont permanentes"
+        help = "Compatibility option; positive answers are retained permanently"
     )]
     ttl_cap: u32,
-    #[arg(long, default_value_t = 300)]
+    #[arg(
+        long,
+        default_value_t = 300,
+        help = "Requested negative-cache lifetime in seconds"
+    )]
     negative_ttl: u32,
-    #[arg(long)]
+    #[arg(long, help = "Include weak candidates that match a wildcard profile")]
     include_wildcard: bool,
     #[arg(
         long,
         default_value_t = 6,
-        help = "Délai de rafraîchissement du profil wildcard; SOA évite les nouvelles sondes"
+        help = "Wildcard-profile refresh interval in hours; expired entries trigger SOA and new probes"
     )]
     wildcard_refresh_hours: u64,
-    #[arg(long, help = "Profondeur DNS active maximale, de 1 à 5")]
+    #[arg(long, help = "Maximum active DNS depth from 1 to 5")]
     depth: Option<usize>,
-    #[arg(long)]
+    #[arg(long, help = "Candidate words considered below validated parents")]
     recursive_words: Option<usize>,
-    #[arg(long)]
+    #[arg(
+        long,
+        help = "Validated parent hosts considered for recursive discovery"
+    )]
     recursive_hosts: Option<usize>,
-    #[arg(long, help = "Désactive les vagues et arrêts adaptatifs")]
+    #[arg(long, help = "Disable adaptive candidate waves and low-yield stopping")]
     no_adaptive: bool,
-    #[arg(long, help = "Désactive les boucles d'enrichissement événementielles")]
+    #[arg(long, help = "Disable event-driven enrichment rounds")]
     no_pipeline: bool,
-    #[arg(long, help = "Tours maximum du pipeline événementiel")]
+    #[arg(long, help = "Maximum event-pipeline rounds")]
     pipeline_rounds: Option<usize>,
-    #[arg(long, help = "Budget global de nouveaux événements")]
+    #[arg(long, help = "Global budget for new pipeline events")]
     pipeline_budget: Option<usize>,
     #[arg(
         long,
-        help = "Désactive l'extraction des noms depuis les certificats TLS"
+        help = "Disable hostname extraction from presented TLS certificates"
     )]
     no_tls: bool,
     #[arg(
         long,
         default_value_t = 443,
-        help = "Port utilisé pour l'inspection TLS"
+        help = "Default port used for TLS inspection"
     )]
     tls_port: u16,
     #[arg(
         long,
         default_value_t = 3.0,
-        help = "Timeout TLS par endpoint en secondes"
+        help = "TLS timeout per endpoint in seconds"
     )]
     tls_timeout: f64,
     #[arg(
         long,
         default_value_t = 24,
-        help = "Délai avant une nouvelle inspection TLS; les anciens noms restent conservés"
+        help = "TLS refresh interval in hours; old certificate names remain retained"
     )]
     tls_refresh_hours: u64,
-    #[arg(long, help = "Nombre maximal d'endpoints TLS inspectés")]
+    #[arg(long, help = "Maximum TLS endpoints inspected")]
     tls_hosts: Option<usize>,
-    #[arg(long, default_value_t = 16, help = "Handshakes TLS simultanés")]
+    #[arg(long, default_value_t = 16, help = "Concurrent TLS handshakes")]
     tls_concurrency: usize,
-    #[arg(
-        long,
-        help = "Désactive le graphe DNS MX/NS/SOA/TXT/CAA/SRV/HTTPS/SVCB"
-    )]
+    #[arg(long, help = "Disable the MX/NS/SOA/TXT/CAA/SRV/HTTPS/SVCB DNS graph")]
     no_dns_graph: bool,
-    #[arg(long, help = "Hôtes confirmés enrichis dans le graphe DNS")]
+    #[arg(long, help = "Maximum confirmed hosts enriched through the DNS graph")]
     graph_hosts: Option<usize>,
-    #[arg(long, help = "Désactive les requêtes de découverte SRV")]
+    #[arg(long, help = "Disable SRV service-discovery queries")]
     no_service_discovery: bool,
-    #[arg(long, help = "Désactive les pivots PTR sur les IP déjà confirmées")]
+    #[arg(long, help = "Disable PTR pivots for already confirmed IP addresses")]
     no_ptr: bool,
-    #[arg(long, help = "Nombre maximal d'IP interrogées en PTR")]
+    #[arg(long, help = "Maximum confirmed IP addresses queried with PTR")]
     ptr_ips: Option<usize>,
-    #[arg(long, help = "Désactive la détection et le parcours DNSSEC NSEC")]
+    #[arg(long, help = "Disable DNSSEC NSEC detection and bounded walking")]
     no_nsec: bool,
     #[arg(
         long,
         default_value_t = 3.0,
-        help = "Timeout par requête NSEC en secondes"
+        help = "Timeout per NSEC query in seconds"
     )]
     nsec_timeout: f64,
     #[arg(
         long,
         default_value_t = 24,
-        help = "Délai de rafraîchissement du cache NSEC"
+        help = "NSEC cache refresh interval in hours"
     )]
     nsec_refresh_hours: u64,
-    #[arg(long, help = "Noms NSEC maximum par zone")]
+    #[arg(long, help = "Maximum NSEC names accepted per zone")]
     nsec_max_names: Option<usize>,
     #[arg(
         long,
-        help = "Désactive la surveillance incrémentale directe des journaux CT"
+        help = "Disable direct incremental Certificate Transparency monitoring"
     )]
     no_ct_monitor: bool,
-    #[arg(long, default_value_t = 8.0, help = "Timeout des API CT en secondes")]
+    #[arg(long, default_value_t = 8.0, help = "CT API timeout in seconds")]
     ct_timeout: f64,
-    #[arg(long, help = "Journaux CT inspectés par scan")]
+    #[arg(long, help = "Maximum CT logs inspected per scan")]
     ct_logs: Option<usize>,
-    #[arg(long, help = "Entrées nouvelles lues par journal CT")]
+    #[arg(long, help = "New entries read per CT log")]
     ct_entries: Option<usize>,
-    #[arg(long, help = "Entrées CT reprises au premier passage")]
+    #[arg(long, help = "Historical CT entries read on the first pass")]
     ct_backfill: Option<usize>,
     #[arg(
         long,
-        help = "Désactive l'extraction HTTP, HTML, JavaScript et source maps"
+        help = "Disable HTTP, HTML, JavaScript, and source-map extraction"
     )]
     no_web: bool,
-    #[arg(long, help = "Nombre maximal d'hôtes web inspectés")]
+    #[arg(long, help = "Maximum Web hosts inspected")]
     web_hosts: Option<usize>,
     #[arg(
         long,
         default_value_t = 5.0,
-        help = "Timeout HTTP par requête en secondes"
+        help = "HTTP timeout per request in seconds"
     )]
     web_timeout: f64,
     #[arg(
         long,
         default_value_t = 24,
-        help = "Délai de rafraîchissement du cache web"
+        help = "Web cache refresh interval in hours"
     )]
     web_refresh_hours: u64,
-    #[arg(long, default_value_t = 8, help = "Hôtes web inspectés simultanément")]
+    #[arg(long, default_value_t = 8, help = "Web hosts inspected concurrently")]
     web_concurrency: usize,
     #[arg(
         long,
         default_value_t = 262_144,
-        help = "Octets lus au maximum par ressource web"
+        help = "Maximum bytes read from each Web resource"
     )]
     web_max_bytes: usize,
-    #[arg(long, help = "Assets JS/JSON/source map suivis par hôte")]
+    #[arg(
+        long,
+        help = "Maximum JS, JSON, or source-map assets followed per host"
+    )]
     web_assets: Option<usize>,
     #[arg(
         long,
         default_value_t = 1_800,
-        help = "Durée globale maximale par domaine en secondes; 0 désactive volontairement la limite"
+        help = "Maximum runtime per domain in seconds; 0 deliberately disables the limit"
     )]
     max_runtime: u64,
     #[arg(
         long,
         default_value_t = 30,
-        help = "Intervalle des checkpoints persistants en secondes"
+        help = "Persistent checkpoint interval in seconds"
     )]
     checkpoint_every: u64,
     #[arg(
         long,
         num_args = 0..=1,
         default_missing_value = "latest",
-        help = "Reprend un scan; sans valeur utilise le dernier checkpoint"
+        help = "Resume a scan; without a value, use the latest checkpoint"
     )]
     resume: Option<String>,
+    #[arg(long, help = "Disable final trusted-resolver consensus")]
+    no_trusted_validation: bool,
+    #[arg(long, help = "Write one final pretty JSON document")]
+    json: bool,
+    #[arg(long, help = "Write one compact final JSON object per domain")]
+    jsonl: bool,
     #[arg(
         long,
-        help = "Désactive le consensus final des résolveurs de confiance"
+        help = "Stream each finding as JSONL; --only-live defers until final classification"
     )]
-    no_trusted_validation: bool,
-    #[arg(long)]
-    json: bool,
-    #[arg(long, help = "Un objet JSON compact par domaine")]
-    jsonl: bool,
-    #[arg(long, help = "Émet chaque finding en JSONL dès sa validation")]
     stream_jsonl: bool,
-    #[arg(short = 'o', long)]
+    #[arg(short = 'o', long, help = "Write final scan results to a file")]
     output: Option<PathBuf>,
-    #[arg(long, help = "Un fichier de résultat par domaine")]
+    #[arg(long, help = "Write one final result file per domain")]
     output_dir: Option<PathBuf>,
-    #[arg(short, long, visible_alias = "silent")]
+    #[arg(
+        short,
+        long,
+        visible_alias = "silent",
+        help = "Suppress human progress and summary output"
+    )]
     quiet: bool,
 }
 
 #[derive(Debug, Args)]
 struct ListArgs {
-    #[arg(long)]
+    #[arg(long, help = "Restrict inventory to one domain")]
     domain: Option<String>,
     #[arg(
         long,
         hide = true,
-        help = "Compatibilité: tous les états sont déjà inclus"
+        help = "Compatibility option; every state is already included"
     )]
     all: bool,
-    #[arg(long, help = "Limite l'inventaire aux validations live")]
+    #[arg(long, help = "Restrict inventory to live validations")]
     only_live: bool,
-    #[arg(long)]
+    #[arg(long, help = "Write pretty JSON")]
     json: bool,
 }
 
 #[derive(Debug, Args)]
 struct RefreshArgs {
+    #[arg(help = "Authorized target domain")]
     target: String,
     #[command(flatten)]
     dns: DnsArgs,
     #[arg(
         long,
         default_value_t = 86_400,
-        help = "Conservé pour compatibilité; les réponses positives sont permanentes"
+        help = "Compatibility option; positive answers are retained permanently"
     )]
     ttl_cap: u32,
-    #[arg(long, default_value_t = 300)]
+    #[arg(
+        long,
+        default_value_t = 300,
+        help = "Requested negative-cache lifetime in seconds"
+    )]
     negative_ttl: u32,
 }
 
 #[derive(Debug, Args)]
 struct HistoryArgs {
-    #[arg(long, default_value_t = 20)]
+    #[arg(long, default_value_t = 20, help = "Maximum scan records to display")]
     limit: usize,
 }
 
 #[derive(Debug, Subcommand)]
 enum CacheAction {
-    /// Supprime uniquement les entrées expirées.
+    /// Remove only expired cache entries.
     Prune,
 }
 
 #[derive(Debug, Args)]
 struct KnowledgeArgs {
-    #[arg(long, default_value_t = 100)]
+    #[arg(
+        long,
+        default_value_t = 100,
+        help = "Maximum learned entries to display"
+    )]
     limit: usize,
 }
 
 #[derive(Debug, Args)]
 struct SourcesArgs {
-    #[arg(long)]
+    #[arg(long, help = "Write pretty JSON")]
     json: bool,
-    #[arg(
-        long,
-        help = "Teste les contrats HTTP et l'accessibilité des connecteurs"
-    )]
+    #[arg(long, help = "Perform live connector contract and reachability checks")]
     check: bool,
     #[arg(
         long,
-        default_value = "example.com",
-        help = "Domaine utilisé par --check"
+        default_value = "your-domain.example",
+        help = "Authorized domain used by --check"
     )]
     target: String,
-    #[arg(long, default_value_t = 20.0, help = "Timeout par connecteur")]
+    #[arg(
+        long,
+        default_value_t = 20.0,
+        help = "Timeout per connector in seconds"
+    )]
     timeout: f64,
 }
 
 #[derive(Debug, Args)]
 struct ExplainArgs {
+    #[arg(help = "Fully qualified domain name to explain")]
     fqdn: String,
-    #[arg(long)]
+    #[arg(long, help = "Write pretty JSON")]
     json: bool,
 }
 
 #[derive(Debug, Subcommand)]
 enum ResolverAction {
+    /// Test resolver correctness and consistency.
     Test(ResolverTestArgs),
-    /// Mesure le transport DNS natif contre un serveur local contrôlé.
+    /// Benchmark the native DNS transport against a controlled loopback server.
     Benchmark(ResolverBenchmarkArgs),
 }
 
 #[derive(Debug, Args)]
 struct ResolverTestArgs {
-    #[arg(value_delimiter = ',', help = "IP des résolveurs à tester")]
+    #[arg(
+        value_delimiter = ',',
+        help = "Comma-separated resolver IP addresses to test"
+    )]
     resolvers: Vec<IpAddr>,
-    #[arg(long, default_value_t = 3.0)]
+    #[arg(
+        long,
+        default_value_t = 3.0,
+        help = "Timeout per resolver test in seconds"
+    )]
     timeout: f64,
-    #[arg(long)]
+    #[arg(long, help = "Write pretty JSON")]
     json: bool,
 }
 
 #[derive(Debug, Args)]
 struct ResolverBenchmarkArgs {
-    #[arg(long, default_value_t = 100_000)]
+    #[arg(
+        long,
+        default_value_t = 100_000,
+        help = "Number of loopback DNS queries"
+    )]
     queries: usize,
-    #[arg(long, default_value_t = 2_000)]
+    #[arg(
+        long,
+        default_value_t = 2_000,
+        help = "Concurrent loopback DNS queries"
+    )]
     concurrency: usize,
-    #[arg(long, default_value_t = 2.0)]
+    #[arg(long, default_value_t = 2.0, help = "Benchmark timeout in seconds")]
     timeout: f64,
-    #[arg(long)]
+    #[arg(long, help = "Write pretty JSON")]
     json: bool,
-    #[arg(short = 'o', long)]
+    #[arg(short = 'o', long, help = "Write the benchmark report to a file")]
     output: Option<PathBuf>,
 }
 
@@ -548,9 +633,11 @@ enum ImportFormat {
 
 #[derive(Debug, Args)]
 struct ImportArgs {
+    #[arg(help = "Domain that owns the imported names")]
     domain: String,
+    #[arg(help = "Input file, or - for standard input")]
     input: PathBuf,
-    #[arg(long, value_enum, default_value_t = ImportFormat::Auto)]
+    #[arg(long, value_enum, default_value_t = ImportFormat::Auto, help = "Input format")]
     format: ImportFormat,
 }
 
@@ -562,13 +649,17 @@ enum ExportFormat {
 
 #[derive(Debug, Args)]
 struct ExportArgs {
-    #[arg(long)]
+    #[arg(long, help = "Restrict export to one domain")]
     domain: Option<String>,
-    #[arg(long)]
+    #[arg(long, help = "Export only live validations")]
     only_live: bool,
-    #[arg(long, value_enum, default_value_t = ExportFormat::Jsonl)]
+    #[arg(long, value_enum, default_value_t = ExportFormat::Jsonl, help = "Export format")]
     format: ExportFormat,
-    #[arg(short = 'o', long)]
+    #[arg(
+        short = 'o',
+        long,
+        help = "Write output to a file instead of standard output"
+    )]
     output: Option<PathBuf>,
 }
 
@@ -679,6 +770,10 @@ fn finding_line(finding: &Finding) -> String {
         "[+] {:<45} {:<42} [{} {} | {}] ({sources}{cache}{wildcard})",
         finding.fqdn, records, finding.confidence.label, finding.confidence.score, finding.state
     )
+}
+
+fn stream_finding_line(finding: &Finding) -> String {
+    serde_json::json!({"type": "finding", "finding": finding}).to_string()
 }
 
 struct ConsoleProgress {
@@ -1335,18 +1430,17 @@ async fn main() -> Result<()> {
                 web_max_bytes: args.web_max_bytes,
                 web_assets_per_host: web_assets,
             };
+            let stream_mode = stream_jsonl_mode(args.stream_jsonl, args.only_live);
             let callback: Option<scanner::ProgressCallback> = if !args.quiet || args.stream_jsonl {
                 let printer = Arc::new(Mutex::new(ConsoleProgress::new(
                     args.json || args.jsonl || args.stream_jsonl,
                 )));
                 let quiet = args.quiet;
-                let stream_jsonl = args.stream_jsonl;
                 Some(Arc::new(move |event| {
-                    if stream_jsonl && let ProgressEvent::Finding(finding) = &event {
-                        println!(
-                            "{}",
-                            serde_json::json!({"type": "finding", "finding": finding})
-                        );
+                    if stream_mode == StreamJsonlMode::Realtime
+                        && let ProgressEvent::Finding(finding) = &event
+                    {
+                        println!("{}", stream_finding_line(finding));
                         let _ = std::io::stdout().flush();
                     }
                     if !quiet && let Ok(mut printer) = printer.lock() {
@@ -1406,7 +1500,19 @@ async fn main() -> Result<()> {
                     break;
                 };
                 match result {
-                    Ok(result) => results.push(result),
+                    Ok(result) => {
+                        if stream_mode == StreamJsonlMode::FinalOnly {
+                            for finding in result
+                                .findings
+                                .iter()
+                                .filter(|finding| is_strict_live(finding.state, finding.wildcard))
+                            {
+                                println!("{}", stream_finding_line(finding));
+                            }
+                            std::io::stdout().flush()?;
+                        }
+                        results.push(result);
+                    }
                     Err(error) => {
                         if first_error.is_none() {
                             first_error = Some(error);
@@ -1416,7 +1522,9 @@ async fn main() -> Result<()> {
             }
             results.sort_by(|left, right| left.domain.cmp(&right.domain));
             if args.stream_jsonl {
-                // Les findings ont déjà été émis par le callback temps réel.
+                // Realtime events were emitted by the callback. With --only-live,
+                // final findings were emitted after each domain completed wildcard
+                // classification and final state filtering.
             } else if args.jsonl {
                 for result in &results {
                     println!("{}", serde_json::to_string(result)?);
@@ -1822,4 +1930,26 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stream_jsonl_mode_defers_only_live_findings_until_final_classification() {
+        assert_eq!(stream_jsonl_mode(false, false), StreamJsonlMode::Disabled);
+        assert_eq!(stream_jsonl_mode(false, true), StreamJsonlMode::Disabled);
+        assert_eq!(stream_jsonl_mode(true, false), StreamJsonlMode::Realtime);
+        assert_eq!(stream_jsonl_mode(true, true), StreamJsonlMode::FinalOnly);
+    }
+
+    #[test]
+    fn strict_live_stream_rejects_stale_unverified_and_wildcard_findings() {
+        assert!(is_strict_live(ObservationState::Live, false));
+        assert!(!is_strict_live(ObservationState::Historical, false));
+        assert!(!is_strict_live(ObservationState::Unverified, false));
+        assert!(!is_strict_live(ObservationState::Unverified, true));
+        assert!(!is_strict_live(ObservationState::Live, true));
+    }
 }

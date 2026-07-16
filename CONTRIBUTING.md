@@ -1,31 +1,25 @@
-# Contribuer à Fellaga
+# Contributing to Fellaga
 
-Merci de contribuer. Les changements doivent préserver trois propriétés : des
-résultats traçables, une charge réseau bornée par défaut et aucune transmission
-automatique de la base locale.
+Thank you for contributing. Changes must preserve three core properties: traceable findings, bounded network load by default, and no automatic transmission of the local database.
 
-## Avant de commencer
+## Before you start
 
-- utilisez uniquement une zone DNS que vous contrôlez ou êtes autorisé à
-  tester ;
-- recherchez une issue existante avant d'en ouvrir une nouvelle ;
-- ne joignez jamais de clé API, de base SQLite réelle ou de résultat de cible
-  confidentiel ;
-- gardez les connecteurs non documentés isolés, bornés et marqués
-  `experimental` ; aucun contournement d'authentification ou de CAPTCHA n'est
-  accepté.
+- Use only a DNS zone that you control or are explicitly authorized to test.
+- Search existing issues before opening a new one.
+- Never attach API keys, a real SQLite database, confidential targets, or unredacted scan output.
+- Keep undocumented connectors isolated, bounded, and marked `experimental`.
+- Do not add authentication or CAPTCHA bypasses.
+- Keep discussions respectful and support technical claims with reproducible evidence.
 
-Les échanges doivent rester respectueux et centrés sur des faits
-reproductibles.
+Security vulnerabilities in Fellaga must follow [SECURITY.md](SECURITY.md), not a public issue.
 
-## Environnement de développement
+## Development environment
 
-Le paquet Cargo s'appelle `fellaga-subdomainfinder`. Il construit le binaire
-`fellaga` et la cible de bibliothèque Rust `fellaga_core`. Le MSRV déclaré est
-Rust 1.95.
+The Cargo package is `fellaga-subdomainfinder`. It builds the `fellaga` binary and the `fellaga_core` library target. The minimum supported Rust version is 1.95.
 
-Sous Kali ou Debian, installez au minimum Rust/Cargo, `pkg-config`, les en-têtes
-OpenSSL et `zstd`, puis exécutez :
+On Kali or Debian, install Rust/Cargo, a C toolchain, OpenSSL development headers, `pkg-config`, Zstandard, Docker, and DNS utilities. Docker and `dig` are required only for the controlled DNS laboratory.
+
+Run the same core checks as CI:
 
 ```bash
 cargo fmt --all -- --check
@@ -35,31 +29,23 @@ cargo build --release --locked
 tests/dns-lab/verify.sh
 ```
 
-Le laboratoire DNS est la préférence pour tester les wildcards, AXFR, NSEC,
-troncatures et réponses incohérentes. Un test contre un domaine public ne
-remplace pas un test reproductible et ne doit jamais devenir une fixture.
+The DNS laboratory is the preferred way to test rotating and multilevel wildcards, AXFR classification, NSEC/NSEC3, NXDOMAIN rewriting, truncation, and TCP fallback. A public-domain scan is not a reproducible fixture and must never replace the laboratory.
 
-## Préparer un changement
+## Prepare a change
 
-1. Limitez chaque proposition à un problème cohérent.
-2. Ajoutez un test qui échoue avant la correction lorsqu'il s'agit d'un bug.
-3. Préservez la compatibilité des champs JSON publics ou documentez clairement
-   la rupture envisagée.
-4. Bornez toute nouvelle boucle réseau par un timeout, une limite de réponses,
-   un budget et une annulation.
-5. Expliquez la provenance de chaque nouvelle preuve et sa famille afin de ne
-   pas compter deux fois une même source sous-jacente.
-6. Mettez à jour `README.md` et `CHANGELOG.md` lorsque le comportement visible
-   change.
+1. Keep each pull request focused on one coherent problem.
+2. Add a regression test that fails before a bug fix whenever practical.
+3. Preserve compatibility of public JSON fields, or document and justify the intended break.
+4. Bound every new network loop with a timeout, response limit, work budget, and cancellation path.
+5. Record evidence provenance and the correct evidence family so correlated providers are not counted twice.
+6. Update the README, detailed guide, and changelog when user-visible behavior changes.
+7. Do not claim a coverage or performance improvement without a reproducible corpus, configuration, and measurements.
 
-Une pull request doit décrire le risque, la méthode de vérification et les
-commandes de test exécutées. N'affirmez pas un gain de couverture ou de débit
-sans corpus, paramètres et mesures reproductibles.
+A pull request should describe its risk, verification method, and the exact tests that were run.
 
-## Corpus embarqué
+## Embedded corpus
 
-Le corpus distribué dérive d'une révision épinglée de SecLists. Consultez
-`data/CORPUS_LICENSE.md` avant toute modification. Pour le reconstruire :
+The distributed corpus is derived from a pinned SecLists revision. Read [data/CORPUS_LICENSE.md](data/CORPUS_LICENSE.md) before modifying it.
 
 ```bash
 git clone https://github.com/danielmiessler/SecLists.git
@@ -67,19 +53,17 @@ git -C SecLists checkout 8a7c5daa498962e240a52c9b29164174478ffe78
 SECLISTS_ROOT="$PWD/SecLists" ./scripts/build-corpus.sh
 ```
 
-Le script vérifie les empreintes des deux sources, le contenu canonique et
-l'archive produite. Une mise à jour de SecLists doit modifier ensemble le
-script, le manifeste, les notices de licence et l'artefact compressé, avec une
-explication du changement de couverture.
+The generator verifies both source fingerprints, canonical content, and the compressed artifact. A SecLists update must change the generator, manifest, notices, and archive together, with an explanation of the coverage impact.
 
-## Dépendances et licences
+## Dependencies and licenses
 
-Conservez `Cargo.lock` avec les changements de dépendances. Vérifiez la licence
-et la provenance de tout contenu redistribué, puis complétez
-`THIRD_PARTY_NOTICES.md` si nécessaire. Le SBOM d'une release est un inventaire
-complémentaire ; il ne remplace pas cette vérification.
+Commit `Cargo.lock` with dependency changes. Review the license and provenance of redistributed material, and update [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) when required. A release SBOM complements this review; it does not replace it.
 
-## Vulnérabilités de Fellaga
+## Pull-request checklist
 
-N'ouvrez pas d'issue publique contenant une faille exploitable. Suivez plutôt
-la procédure de `SECURITY.md`.
+- [ ] The target and test data are controlled or explicitly authorized.
+- [ ] Formatting, Clippy, tests, and relevant laboratories pass.
+- [ ] New network work is bounded and cancellable.
+- [ ] No secret, target database, or confidential finding is included.
+- [ ] Public behavior and compatibility impact are documented.
+- [ ] Claims are supported by reproducible evidence.
