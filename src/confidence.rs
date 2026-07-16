@@ -23,6 +23,7 @@ pub fn evidence_family(source: &str) -> Option<EvidenceFamily> {
         || source.starts_with("passive:certspotter")
         || source.starts_with("passive:ct-direct")
         || source.starts_with("passive:google-ct")
+        || source.starts_with("passive:merklemap")
     {
         return Some(EvidenceFamily::CertificateTransparency);
     }
@@ -32,6 +33,7 @@ pub fn evidence_family(source: &str) -> Option<EvidenceFamily> {
     if source.starts_with("web:")
         || source.starts_with("passive:commoncrawl")
         || source.starts_with("passive:urlscan")
+        || source.starts_with("passive:brave")
     {
         return Some(EvidenceFamily::WebCrawl);
     }
@@ -51,6 +53,7 @@ pub fn evidence_family(source: &str) -> Option<EvidenceFamily> {
         "leakix",
         "whoisxml",
         "netlas",
+        "binaryedge",
     ]
     .iter()
     .any(|name| source.starts_with(&format!("passive:{name}")))
@@ -201,6 +204,22 @@ mod tests {
         assert!(
             assess_with_state(&diverse, false, ObservationState::Live).score
                 > assess_with_state(&ct, false, ObservationState::Live).score
+        );
+    }
+
+    #[test]
+    fn targeted_connectors_use_independent_evidence_families() {
+        assert_eq!(
+            evidence_family("passive:binaryedge"),
+            Some(EvidenceFamily::PassiveDns)
+        );
+        assert_eq!(
+            evidence_family("passive:merklemap"),
+            Some(EvidenceFamily::CertificateTransparency)
+        );
+        assert_eq!(
+            evidence_family("passive:brave"),
+            Some(EvidenceFamily::WebCrawl)
         );
     }
 

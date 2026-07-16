@@ -390,7 +390,11 @@ where
 fn classify_wildcard_samples(
     non_empty: Vec<BTreeSet<String>>,
     negatives: usize,
+    total_samples: usize,
 ) -> WildcardProbeOutcome {
+    if !non_empty.is_empty() && negatives > 0 {
+        return WildcardProbeOutcome::Indeterminate;
+    }
     if non_empty.len() >= 3 {
         let mut samples = non_empty.into_iter();
         let mut signature = samples.next().unwrap_or_default();
@@ -402,10 +406,26 @@ fn classify_wildcard_samples(
         } else {
             WildcardProbeOutcome::Wildcard(signature)
         }
-    } else if non_empty.is_empty() && negatives >= 3 {
+    } else if non_empty.is_empty() && negatives >= 3 && negatives == total_samples {
         WildcardProbeOutcome::Normal
     } else {
         WildcardProbeOutcome::Indeterminate
+    }
+}
+
+/// Return a result only when the samples already satisfy the strict wildcard
+/// classifier. An indeterminate first stage must collect more evidence: it can
+/// represent timeouts, a rotating wildcard, or a mix of positive and negative
+/// answers, and must never be shortened into a normal zone.
+fn conclusive_wildcard_outcome(
+    non_empty: &[BTreeSet<String>],
+    negatives: usize,
+) -> Option<WildcardProbeOutcome> {
+    match classify_wildcard_samples(non_empty.to_vec(), negatives, 3) {
+        outcome @ (WildcardProbeOutcome::Wildcard(_) | WildcardProbeOutcome::Normal) => {
+            Some(outcome)
+        }
+        WildcardProbeOutcome::Indeterminate => None,
     }
 }
 
@@ -1804,27 +1824,37 @@ impl DnsEngine {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let mut probes = stream::iter(0..5)
-            .map(|_| async move {
-                let counter = PROBE_COUNTER.fetch_add(1, Ordering::Relaxed);
-                let host = format!("fellaga-{seed:x}-{counter:x}.{domain}");
-                if require_positive_consensus {
-                    self.resolve_host_consensus_classified(&host).await
-                } else {
-                    self.resolve_host_classified(&host).await
-                }
-            })
-            .buffer_unordered(5);
         let mut non_empty = Vec::new();
         let mut negatives = 0_usize;
-        while let Some(outcome) = probes.next().await {
-            match outcome {
-                DnsResolutionOutcome::Positive(answer) => non_empty.push(answer.signature()),
-                DnsResolutionOutcome::Negative { .. } => negatives += 1,
-                DnsResolutionOutcome::Indeterminate { .. } => {}
+
+        for probe_count in [3_usize, 2] {
+            let mut probes = stream::iter(0..probe_count)
+                .map(|_| async move {
+                    let counter = PROBE_COUNTER.fetch_add(1, Ordering::Relaxed);
+                    let host = format!("fellaga-{seed:x}-{counter:x}.{domain}");
+                    if require_positive_consensus {
+                        self.resolve_host_consensus_classified(&host).await
+                    } else {
+                        self.resolve_host_classified(&host).await
+                    }
+                })
+                .buffer_unordered(probe_count);
+            while let Some(outcome) = probes.next().await {
+                match outcome {
+                    DnsResolutionOutcome::Positive(answer) => non_empty.push(answer.signature()),
+                    DnsResolutionOutcome::Negative { .. } => negatives += 1,
+                    DnsResolutionOutcome::Indeterminate { .. } => {}
+                }
+            }
+
+            if probe_count == 3
+                && let Some(outcome) = conclusive_wildcard_outcome(&non_empty, negatives)
+            {
+                return outcome;
             }
         }
-        classify_wildcard_samples(non_empty, negatives)
+
+        classify_wildcard_samples(non_empty, negatives, 5)
     }
 
     pub async fn wildcard_probe(&self, domain: &str) -> WildcardProbeOutcome {
@@ -3312,16 +3342,21 @@ mod tests {
     #[test]
     fn wildcard_probe_never_treats_timeouts_or_conflicts_as_a_normal_zone() {
         assert_eq!(
-            classify_wildcard_samples(Vec::new(), 2),
+            classify_wildcard_samples(Vec::new(), 2, 3),
             WildcardProbeOutcome::Indeterminate
         );
         assert_eq!(
-            classify_wildcard_samples(vec![BTreeSet::from(["A:192.0.2.10".to_owned()])], 4,),
+            classify_wildcard_samples(vec![BTreeSet::from(["A:192.0.2.10".to_owned()])], 4, 5,),
             WildcardProbeOutcome::Indeterminate
         );
         assert_eq!(
-            classify_wildcard_samples(Vec::new(), 3),
+            classify_wildcard_samples(Vec::new(), 3, 3),
             WildcardProbeOutcome::Normal
+        );
+        assert_eq!(
+            classify_wildcard_samples(Vec::new(), 3, 5),
+            WildcardProbeOutcome::Indeterminate,
+            "three NXDOMAIN answers plus two timeouts are incomplete evidence"
         );
         assert_eq!(
             classify_wildcard_samples(
@@ -3340,6 +3375,7 @@ mod tests {
                     ]),
                 ],
                 0,
+                3,
             ),
             WildcardProbeOutcome::Wildcard(BTreeSet::from(["CNAME:wild.example.com".to_owned()]))
         );
@@ -3351,8 +3387,97 @@ mod tests {
                     BTreeSet::from(["A:192.0.2.12".to_owned()]),
                 ],
                 0,
+                3,
             ),
             WildcardProbeOutcome::Indeterminate
+        );
+    }
+
+    #[test]
+    fn wildcard_probe_first_stage_finishes_only_for_conclusive_samples() {
+        assert_eq!(
+            conclusive_wildcard_outcome(&[], 3),
+            Some(WildcardProbeOutcome::Normal)
+        );
+
+        let stable_alias = vec![
+            BTreeSet::from([
+                "A:192.0.2.10".to_owned(),
+                "CNAME:wild.example.com".to_owned(),
+            ]),
+            BTreeSet::from([
+                "A:192.0.2.11".to_owned(),
+                "CNAME:wild.example.com".to_owned(),
+            ]),
+            BTreeSet::from([
+                "A:192.0.2.12".to_owned(),
+                "CNAME:wild.example.com".to_owned(),
+            ]),
+        ];
+        assert_eq!(
+            conclusive_wildcard_outcome(&stable_alias, 0),
+            Some(WildcardProbeOutcome::Wildcard(BTreeSet::from([
+                "CNAME:wild.example.com".to_owned()
+            ])))
+        );
+
+        let rotating_addresses = vec![
+            BTreeSet::from(["A:192.0.2.10".to_owned()]),
+            BTreeSet::from(["A:192.0.2.11".to_owned()]),
+            BTreeSet::from(["A:192.0.2.12".to_owned()]),
+        ];
+        assert_eq!(
+            conclusive_wildcard_outcome(&rotating_addresses, 0),
+            None,
+            "a rotating wildcard must receive the second probe stage"
+        );
+        assert_eq!(
+            conclusive_wildcard_outcome(&[BTreeSet::from(["A:192.0.2.10".to_owned()])], 1,),
+            None,
+            "mixed or incomplete evidence must never become normal"
+        );
+    }
+
+    #[test]
+    fn wildcard_probe_second_stage_keeps_rotating_and_mixed_answers_indeterminate() {
+        assert_eq!(
+            classify_wildcard_samples(
+                vec![
+                    BTreeSet::from(["A:192.0.2.10".to_owned()]),
+                    BTreeSet::from(["A:192.0.2.11".to_owned()]),
+                    BTreeSet::from(["A:192.0.2.12".to_owned()]),
+                    BTreeSet::from(["A:192.0.2.13".to_owned()]),
+                    BTreeSet::from(["A:192.0.2.14".to_owned()]),
+                ],
+                0,
+                5,
+            ),
+            WildcardProbeOutcome::Indeterminate
+        );
+        assert_eq!(
+            classify_wildcard_samples(
+                vec![
+                    BTreeSet::from(["A:192.0.2.10".to_owned()]),
+                    BTreeSet::from(["A:192.0.2.10".to_owned()]),
+                ],
+                3,
+                5,
+            ),
+            WildcardProbeOutcome::Indeterminate,
+            "mixed positive and negative samples must not become a normal zone"
+        );
+        assert_eq!(
+            classify_wildcard_samples(
+                vec![
+                    BTreeSet::from(["A:192.0.2.10".to_owned()]),
+                    BTreeSet::from(["A:192.0.2.10".to_owned()]),
+                    BTreeSet::from(["A:192.0.2.10".to_owned()]),
+                ],
+                2,
+                5,
+            ),
+            WildcardProbeOutcome::Indeterminate,
+            "mixed evidence must never authorize wildcard quarantine"
         );
     }
 

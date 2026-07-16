@@ -1,0 +1,15 @@
+{
+  "count": 125,
+  "results": [
+    {
+      "hostname": "api.example.com",
+      "subject_common_name": "*.dev.example.com",
+      "first_seen": "2026-01-01T00:00:00Z"
+    },
+    {
+      "hostname": "example.com",
+      "subject_common_name": "outside.test",
+      "first_seen": "2026-01-02T00:00:00Z"
+    }
+  ]
+}

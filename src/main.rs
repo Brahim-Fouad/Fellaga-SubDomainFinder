@@ -103,7 +103,7 @@ struct DnsArgs {
     resolvers: Vec<IpAddr>,
     #[arg(
         long,
-        default_value_t = 100,
+        default_value_t = 250,
         help = "Global DNS requests-per-second limit; 0 deliberately disables the safeguard"
     )]
     dns_rate_limit: u64,
@@ -224,11 +224,11 @@ impl ScanProfile {
                 ct_logs: 8,
                 ct_entries: 4_096,
                 ct_backfill: 4_096,
-                ct_max_runtime: 90,
+                ct_max_runtime: 30,
                 web_hosts: 100,
                 web_max_runtime: 90,
                 web_assets: 8,
-                passive_max_runtime: 75,
+                passive_max_runtime: 45,
                 passive_zone_concurrency: 4,
             },
             Self::Balanced => ProfileDefaults {
@@ -249,11 +249,11 @@ impl ScanProfile {
                 ct_logs: 2,
                 ct_entries: 256,
                 ct_backfill: 256,
-                ct_max_runtime: 30,
+                ct_max_runtime: 10,
                 web_hosts: 30,
                 web_max_runtime: 45,
                 web_assets: 5,
-                passive_max_runtime: 45,
+                passive_max_runtime: 25,
                 passive_zone_concurrency: 4,
             },
             Self::Passive => ProfileDefaults {
@@ -274,11 +274,11 @@ impl ScanProfile {
                 ct_logs: 8,
                 ct_entries: 4_096,
                 ct_backfill: 4_096,
-                ct_max_runtime: 90,
+                ct_max_runtime: 30,
                 web_hosts: 1,
                 web_max_runtime: 0,
                 web_assets: 1,
-                passive_max_runtime: 90,
+                passive_max_runtime: 60,
                 passive_zone_concurrency: 6,
             },
             Self::Turbo => ProfileDefaults {
@@ -299,11 +299,11 @@ impl ScanProfile {
                 ct_logs: 2,
                 ct_entries: 512,
                 ct_backfill: 512,
-                ct_max_runtime: 20,
+                ct_max_runtime: 5,
                 web_hosts: 50,
                 web_max_runtime: 45,
                 web_assets: 5,
-                passive_max_runtime: 30,
+                passive_max_runtime: 15,
                 passive_zone_concurrency: 8,
             },
         }
@@ -395,7 +395,7 @@ struct ScanArgs {
     no_axfr: bool,
     #[arg(
         long,
-        default_value_t = 8.0,
+        default_value_t = 4.0,
         help = "AXFR timeout per nameserver in seconds"
     )]
     axfr_timeout: f64,
@@ -2374,6 +2374,14 @@ mod tests {
         assert_eq!(ScanProfile::Passive.defaults().max_runtime, 180);
         assert_eq!(ScanProfile::Turbo.defaults().max_runtime, 300);
         assert_eq!(ScanProfile::Passive.defaults().active_max_runtime, 0);
+        assert_eq!(ScanProfile::Deep.defaults().ct_max_runtime, 30);
+        assert_eq!(ScanProfile::Balanced.defaults().ct_max_runtime, 10);
+        assert_eq!(ScanProfile::Passive.defaults().ct_max_runtime, 30);
+        assert_eq!(ScanProfile::Turbo.defaults().ct_max_runtime, 5);
+        assert_eq!(ScanProfile::Deep.defaults().passive_max_runtime, 45);
+        assert_eq!(ScanProfile::Balanced.defaults().passive_max_runtime, 25);
+        assert_eq!(ScanProfile::Passive.defaults().passive_max_runtime, 60);
+        assert_eq!(ScanProfile::Turbo.defaults().passive_max_runtime, 15);
         assert_eq!(ScanProfile::Deep.defaults().web_max_runtime, 90);
         assert_eq!(ScanProfile::Balanced.defaults().web_max_runtime, 45);
         assert_eq!(ScanProfile::Passive.defaults().web_max_runtime, 0);

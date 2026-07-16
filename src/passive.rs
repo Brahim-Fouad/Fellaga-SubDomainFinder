@@ -103,6 +103,18 @@ const SOURCE_DEFINITIONS: &[SourceDefinition] = &[
         automatic: true,
     },
     SourceDefinition {
+        name: "binaryedge",
+        requires_key: true,
+        key_environment: Some("BINARYEDGE_API_KEY"),
+        automatic: true,
+    },
+    SourceDefinition {
+        name: "brave",
+        requires_key: true,
+        key_environment: Some("BRAVE_SEARCH_API_KEY"),
+        automatic: true,
+    },
+    SourceDefinition {
         name: "builtwith",
         requires_key: true,
         key_environment: Some("BUILTWITH_API_KEY"),
@@ -190,6 +202,12 @@ const SOURCE_DEFINITIONS: &[SourceDefinition] = &[
         name: "leakix",
         requires_key: true,
         key_environment: Some("LEAKIX_API_KEY"),
+        automatic: true,
+    },
+    SourceDefinition {
+        name: "merklemap",
+        requires_key: true,
+        key_environment: Some("MERKLEMAP_API_TOKEN"),
         automatic: true,
     },
     SourceDefinition {
@@ -715,6 +733,8 @@ fn definition(source: &str) -> Option<SourceDefinition> {
 fn environment_names(source: &str) -> &'static [&'static str] {
     match source {
         "bevigil" => &["BEVIGIL_API_KEY"],
+        "binaryedge" => &["BINARYEDGE_API_KEY"],
+        "brave" => &["BRAVE_SEARCH_API_KEY"],
         "builtwith" => &["BUILTWITH_API_KEY"],
         "censys" => &["CENSYS_API_KEY"],
         "circl" => &["CIRCL_PDNS_CREDENTIALS"],
@@ -725,6 +745,7 @@ fn environment_names(source: &str) -> &'static [&'static str] {
         "gitlab" => &["GITLAB_TOKEN"],
         "intelx" => &["INTELX_API_KEY"],
         "leakix" => &["LEAKIX_API_KEY"],
+        "merklemap" => &["MERKLEMAP_API_TOKEN"],
         "netlas" => &["NETLAS_API_KEY"],
         "otx" => &["OTX_API_KEY", "X_OTX_API_KEY"],
         "securitytrails" => &["SECURITYTRAILS_API_KEY"],
@@ -769,7 +790,8 @@ pub fn source_metadata(name: &str) -> SourceMetadata {
     };
     let cost = match name {
         "commoncrawl" | "wayback" | "github" | "gitlab" | "urlscan" | "netlas" => "high",
-        "crtsh" | "certspotter" | "virustotal" | "shodan" | "censys" | "whoisxml" => "medium",
+        "crtsh" | "certspotter" | "virustotal" | "shodan" | "censys" | "whoisxml"
+        | "binaryedge" | "brave" | "merklemap" => "medium",
         _ => "low",
     };
     let rate_limit_per_minute = match name {
@@ -778,13 +800,22 @@ pub fn source_metadata(name: &str) -> SourceMetadata {
         "hackertarget" => 5,
         "commoncrawl" | "wayback" => 10,
         "urlscan" => 12,
+        "binaryedge" | "brave" | "merklemap" => 20,
         _ if requires_key => 30,
         _ => 20,
     };
     SourceMetadata {
         name: name.to_owned(),
         evidence_family,
-        recursive_children: !matches!(name, "builtwith" | "certificatedetails"),
+        // Most connectors already search an entire suffix (for example CT,
+        // archives, search engines, and `*.domain` APIs). Re-running them on
+        // every inferred child only duplicates traffic. VirusTotal exposes a
+        // direct domain -> subdomains relationship, so querying a discovered
+        // child can reveal the next level without repeating a subtree query.
+        // Parent lookup remains available to evidence families that can cover
+        // a target which is itself a delegated sub-zone; scanner-side scope
+        // filtering discards sibling names.
+        recursive_children: name == "virustotal",
         recursive_parents: matches!(
             evidence_family,
             EvidenceFamily::CertificateTransparency
@@ -950,6 +981,12 @@ pub fn source_policy(source: &str) -> SourcePolicy {
             total_timeout: Duration::from_secs(25),
             attempts: 2,
             base_backoff: Duration::from_secs(1),
+        },
+        "binaryedge" | "brave" | "merklemap" => SourcePolicy {
+            timeout: Duration::from_secs(10),
+            total_timeout: Duration::from_secs(20),
+            attempts: 2,
+            base_backoff: Duration::from_millis(500),
         },
         "certspotter" | "urlscan" | "virustotal" | "shodan" | "censys" | "github" | "gitlab" => {
             SourcePolicy {
@@ -1117,11 +1154,29 @@ fn client(timeout: Duration) -> Result<reqwest::Client> {
         .connect_timeout(timeout.min(Duration::from_secs(10)))
         .pool_idle_timeout(Duration::from_secs(30))
         .tcp_keepalive(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            let Some(previous) = attempt.previous().last() else {
+                return attempt.error("redirect without an origin request");
+            };
+            if attempt.previous().len() >= 5 {
+                attempt.error("too many external redirects")
+            } else if same_http_origin(previous, attempt.url()) {
+                attempt.follow()
+            } else {
+                attempt.error("cross-origin external redirect rejected")
+            }
+        }))
         .user_agent(concat!(
             "Fellaga-SubDomainFinder/",
             env!("CARGO_PKG_VERSION")
         ))
         .build()?)
+}
+
+fn same_http_origin(previous: &Url, next: &Url) -> bool {
+    previous.scheme() == next.scheme()
+        && previous.host_str() == next.host_str()
+        && previous.port_or_known_default() == next.port_or_known_default()
 }
 
 fn retry_after_delay(value: &str) -> Option<Duration> {
@@ -1164,6 +1219,9 @@ fn host_minimum_gap(host: &str) -> Duration {
         "crt.sh" | "web.archive.org" => Duration::from_secs(1),
         "urlscan.io" | "api.urlscan.io" => Duration::from_millis(500),
         "api.certspotter.com" => Duration::from_millis(250),
+        "api.binaryedge.io" | "api.search.brave.com" | "api.merklemap.com" => {
+            Duration::from_secs(3)
+        }
         _ => Duration::from_millis(100),
     }
 }
@@ -1392,14 +1450,14 @@ where
         )
         .await;
     match result {
-        Err(error) if error.downcast_ref::<SourceBudgetExceeded>().is_some() => {
+        Err(error) => {
             let partial = checkpoint.snapshot();
             if partial.is_empty() {
                 Err(error)
             } else {
                 Ok(PassiveFetchResult {
                     names: partial,
-                    partial_warning: Some(error.to_string()),
+                    partial_warning: Some(format!("{error:#}")),
                 })
             }
         }
@@ -1407,7 +1465,6 @@ where
             names,
             partial_warning: None,
         }),
-        Err(error) => Err(error),
     }
 }
 
@@ -1432,6 +1489,8 @@ async fn fetch_detailed_with_total_budget(
             "whoisxml" => whoisxml(domain, timeout, keys).await,
             "securitytrails" => securitytrails(domain, timeout, keys).await,
             "bevigil" => extra::bevigil(domain, timeout, keys).await,
+            "binaryedge" => extra::binaryedge(domain, timeout, keys).await,
+            "brave" => extra::brave(domain, timeout, keys).await,
             "builtwith" => extra::builtwith(domain, timeout, keys).await,
             "censys" => extra::censys(domain, timeout, keys).await,
             "circl" => extra::circl(domain, timeout, keys).await,
@@ -1443,6 +1502,7 @@ async fn fetch_detailed_with_total_budget(
             "gitlab" => extra::gitlab(domain, timeout, keys).await,
             "intelx" => extra::intelx(domain, timeout, keys).await,
             "leakix" => extra::leakix(domain, timeout, keys).await,
+            "merklemap" => extra::merklemap(domain, timeout, keys).await,
             "netlas" => netlas(domain, timeout, keys).await,
             "otx" => extra::otx(domain, timeout, keys).await,
             "shodan" => extra::shodan(domain, timeout, keys).await,
@@ -1451,7 +1511,18 @@ async fn fetch_detailed_with_total_budget(
         }
     };
     let result = enforce_source_budget_preserving_partial(source, total_budget, request).await;
-    result.map_err(|error| anyhow::Error::msg(sanitize_external_error(&format!("{error:#}"), keys)))
+    match result {
+        Ok(mut fetch) => {
+            if let Some(warning) = fetch.partial_warning.as_mut() {
+                *warning = sanitize_external_error(warning, keys);
+            }
+            Ok(fetch)
+        }
+        Err(error) => Err(anyhow::Error::msg(sanitize_external_error(
+            &format!("{error:#}"),
+            keys,
+        ))),
+    }
 }
 
 pub async fn fetch_detailed(
@@ -1551,11 +1622,9 @@ async fn certspotter(
             Ok(response) => {
                 match response_json::<Vec<CertSpotterIssuance>>(response, "Cert Spotter").await {
                     Ok(page) => page,
-                    Err(_) if !names.is_empty() => break,
                     Err(error) => return Err(error),
                 }
             }
-            Err(_) if !names.is_empty() => break,
             Err(error) => return Err(error).context("connexion à Cert Spotter"),
         };
         if page.is_empty() {
@@ -1843,10 +1912,8 @@ async fn urlscan(domain: &str, timeout: Duration, keys: &ApiKeyStore) -> Result<
         let response = match send_external("urlscan", request, domain).await {
             Ok(response) => match response_json::<UrlscanResponse>(response, "urlscan").await {
                 Ok(response) => response,
-                Err(_) if !names.is_empty() => break,
                 Err(error) => return Err(error),
             },
-            Err(_) if !names.is_empty() => break,
             Err(error) => return Err(error).context("connexion à urlscan"),
         };
         let page_len = response.results.len();
@@ -1951,11 +2018,9 @@ async fn virustotal(
             Ok(response) => {
                 match response_json::<VirusTotalResponse>(response, "VirusTotal").await {
                     Ok(response) => response,
-                    Err(_) if !names.is_empty() => break,
                     Err(error) => return Err(error),
                 }
             }
-            Err(_) if !names.is_empty() => break,
             Err(error) => return Err(error).context("connexion à VirusTotal"),
         };
         let page_names = response
@@ -2251,6 +2316,67 @@ mod tests {
     }
 
     #[test]
+    fn targeted_connectors_are_key_gated_and_strictly_bounded() {
+        let keys = key_store(&[
+            ("binaryedge", &["binaryedge-key"]),
+            ("brave", &["brave-key"]),
+            ("merklemap", &["merklemap-token"]),
+        ]);
+        let automatic = automatic_sources(&keys);
+        for (source, environment, family, recursive_parent) in [
+            (
+                "binaryedge",
+                "BINARYEDGE_API_KEY",
+                EvidenceFamily::PassiveDns,
+                true,
+            ),
+            (
+                "brave",
+                "BRAVE_SEARCH_API_KEY",
+                EvidenceFamily::WebCrawl,
+                false,
+            ),
+            (
+                "merklemap",
+                "MERKLEMAP_API_TOKEN",
+                EvidenceFamily::CertificateTransparency,
+                true,
+            ),
+        ] {
+            assert!(automatic.contains(&source.to_owned()));
+            let status = source_statuses(&keys)
+                .into_iter()
+                .find(|status| status.name == source)
+                .unwrap();
+            assert_eq!(status.key_environment.as_deref(), Some(environment));
+            assert!(status.configured);
+            assert!(status.automatic);
+            assert_eq!(status.metadata.evidence_family, family);
+            assert_eq!(status.metadata.cost, "medium");
+            assert_eq!(status.metadata.authentication, "required");
+            assert!(!status.metadata.experimental);
+            assert!(!status.metadata.recursive_children);
+            assert_eq!(status.metadata.recursive_parents, recursive_parent);
+            assert_eq!(source_policy(source).timeout, Duration::from_secs(10));
+            assert_eq!(source_policy(source).total_timeout, Duration::from_secs(20));
+        }
+    }
+
+    #[test]
+    fn subtree_connectors_are_not_repeated_on_inferred_children() {
+        for source in [
+            "crtsh",
+            "certspotter",
+            "commoncrawl",
+            "wayback",
+            "merklemap",
+            "brave",
+        ] {
+            assert!(!source_metadata(source).recursive_children, "{source}");
+        }
+    }
+
+    #[test]
     fn archived_urls_are_reduced_to_in_scope_hosts() {
         assert_eq!(
             hostname_from_url("https://deep.api.example.com/path", "example.com").as_deref(),
@@ -2292,6 +2418,18 @@ mod tests {
         assert!(source_policy("subdomaincenter").total_timeout <= Duration::from_secs(30));
         assert_eq!(source_policy("crtsh").attempts, 3);
         assert_eq!(source_policy("commoncrawl").attempts, 3);
+        assert_eq!(
+            host_minimum_gap("api.binaryedge.io"),
+            Duration::from_secs(3)
+        );
+        assert_eq!(
+            host_minimum_gap("api.search.brave.com"),
+            Duration::from_secs(3)
+        );
+        assert_eq!(
+            host_minimum_gap("api.merklemap.com"),
+            Duration::from_secs(3)
+        );
         assert!(retryable_status(reqwest::StatusCode::REQUEST_TIMEOUT));
         assert!(retryable_status(reqwest::StatusCode::TOO_EARLY));
         assert!(retryable_status(reqwest::StatusCode::INTERNAL_SERVER_ERROR));
@@ -2341,6 +2479,32 @@ mod tests {
             BTreeSet::from(["api.example.com".to_owned(), "mail.example.com".to_owned(),])
         );
         assert!(result.partial_warning.is_some());
+    }
+
+    #[tokio::test]
+    async fn connector_returns_committed_pages_when_a_later_page_fails() {
+        let result = enforce_source_budget_preserving_partial(
+            "paginated-test",
+            Duration::from_secs(1),
+            async {
+                let mut accumulated = BTreeSet::new();
+                commit_result_page(
+                    &mut accumulated,
+                    BTreeSet::from(["api.example.com".to_owned()]),
+                );
+                Err(anyhow::anyhow!("page 2 returned invalid JSON"))
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.names, BTreeSet::from(["api.example.com".to_owned()]));
+        assert!(
+            result
+                .partial_warning
+                .as_deref()
+                .is_some_and(|warning| warning.contains("page 2"))
+        );
     }
 
     #[tokio::test]
@@ -2404,6 +2568,39 @@ mod tests {
             "https://www.virustotal.com@evil.test/api/v3/domains/example.com/subdomains",
             "www.virustotal.com",
             "/api/v3/domains/"
+        ));
+    }
+
+    #[tokio::test]
+    async fn custom_api_headers_never_follow_a_cross_origin_redirect() {
+        let redirect_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let redirect_address = redirect_listener.local_addr().unwrap();
+        let target_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let target_address = target_listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = redirect_listener.accept().unwrap();
+            let mut request = [0_u8; 2_048];
+            let _ = socket.read(&mut request);
+            let response = format!(
+                "HTTP/1.1 302 Found\r\nLocation: http://{target_address}/sink\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            socket.write_all(response.as_bytes()).unwrap();
+        });
+
+        let result = client(Duration::from_secs(2))
+            .unwrap()
+            .get(format!("http://{redirect_address}/source"))
+            .header("X-Key", "binaryedge-secret")
+            .header("X-Subscription-Token", "brave-secret")
+            .send()
+            .await;
+        assert!(result.is_err());
+        server.join().unwrap();
+
+        target_listener.set_nonblocking(true).unwrap();
+        assert!(matches!(
+            target_listener.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
         ));
     }
 

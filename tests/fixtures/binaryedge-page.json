@@ -1,0 +1,12 @@
+{
+  "query": "example.com",
+  "page": 1,
+  "pagesize": 100,
+  "total": 250,
+  "events": [
+    "api.example.com",
+    "*.edge.example.com",
+    "example.com",
+    "outside.test"
+  ]
+}

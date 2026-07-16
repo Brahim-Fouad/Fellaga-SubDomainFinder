@@ -16,7 +16,7 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, timeout_at};
 
-const AXFR_CONCURRENCY: usize = 2;
+const AXFR_CONCURRENCY: usize = 4;
 const AXFR_MAX_TARGETS: usize = 8;
 const AXFR_MAX_RECORDS: usize = 250_000;
 const AXFR_MAX_BYTES: usize = 64 * 1024 * 1024;

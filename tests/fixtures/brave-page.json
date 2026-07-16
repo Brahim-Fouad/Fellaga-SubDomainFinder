@@ -1,0 +1,25 @@
+{
+  "type": "search",
+  "query": {
+    "original": "site:example.com",
+    "more_results_available": true
+  },
+  "web": {
+    "type": "search",
+    "results": [
+      {
+        "title": "Status at status.example.com",
+        "url": "https://portal.example.com/login",
+        "description": "The API is available from api.example.com; ignore outside.test.",
+        "extra_snippets": [
+          "Static files are served by cdn.assets.example.com."
+        ]
+      },
+      {
+        "title": "Root site",
+        "url": "https://example.com/",
+        "description": "No additional hostname here."
+      }
+    ]
+  }
+}
