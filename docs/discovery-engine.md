@@ -5,21 +5,36 @@ Fellaga separates discovery from validation. A provider response, certificate na
 ## Discovery stages
 
 1. Load permanent local observations and learned candidate priorities.
-2. Query selected passive providers and incrementally read Certificate Transparency data.
+2. Query selected passive providers and incrementally read Certificate Transparency data while strict AXFR checks run independently.
 3. Detect wildcard behavior for the target and relevant child zones.
-4. Validate prioritized candidates in persistent SQLite-backed waves.
-5. Attempt strict AXFR, inspect the DNS graph, and detect walkable NSEC zones.
+4. Persist high-value discovery seeds and active generated candidates in separate SQLite queues, then validate them in interleaved bounded waves.
+5. Inspect the DNS graph and detect walkable NSEC zones.
 6. Extract in-scope names from Web content, JavaScript, source maps, archives, TLS certificates, and STARTTLS endpoints.
 7. Feed new evidence back into the bounded event pipeline for recursive validation and enrichment.
 8. Store normalized evidence, validation events, graph edges, source health, and learning statistics locally.
 
 The `passive` profile disables stages that directly contact target application services or authoritative servers for enrichment, but passive-provider requests, CT collection, wildcard probes, and DNS validation still use the network.
 
+Initial passive collection, direct CT monitoring, and AXFR are independent futures and run concurrently. Their results are merged only after each bounded phase finishes, so a slow provider does not serialize unrelated CT or zone-transfer work.
+
+## Persistent candidate scheduler
+
+Fellaga has two durable per-scan queues:
+
+- the **seed queue** stores names discovered through passive providers, CT, AXFR, retained observations, and other high-value evidence together with merged source provenance and a priority;
+- the **active queue** stores relative names emitted by the user wordlist, mutation rules, local learning, and the embedded corpus together with their generator and score.
+
+The scheduler claims small batches atomically, marks them as processing, and records the number of attempts. The first adaptive batch contains up to 500 names, the second up to 1,500, and subsequent batches up to 5,000. When both queues have work, seed candidates receive most of each wave while active discovery continues alongside them. Queue rows and generator feed cursors remain in SQLite across an interruption.
+
+A transient DNS error requeues a claimed name until it reaches three total attempts. Definitive negative and validated positive outcomes are terminal. `--resume` also requeues rows that were left in the processing state by an interrupted process. Attempt and success counters are persisted independently from disposable queue rows so final learning remains accurate and is applied once.
+
+Active generation is lazy: the one-million-name corpus is traversed with a durable priority cursor instead of being materialized before DNS begins. A user wordlist uses a durable byte cursor and bounded pages of at most 1,024 lines or 4 MiB. Non-UTF-8 input and oversized lines cannot create an unbounded read. Adaptive low-yield stopping can stop generated corpus expansion, but it does not abandon an unfinished explicit wordlist, pending seed work, or bounded retries.
+
 ## Discovery methods
 
 | Method | Behavior |
 | --- | --- |
-| Passive connectors | Queries a registry of public and credentialed services with per-provider rate limits, bounded responses, retry policy, and permanent merged observations. |
+| Passive connectors | Queries a registry of public and credentialed services with per-provider rate limits, bounded responses, retry policy, partial-page retention, and permanent merged observations. |
 | Certificate Transparency | Combines provider results with direct incremental CT-log monitoring and extracts in-scope SAN/CN names. |
 | DNS brute force | Processes an embedded one-million-candidate corpus, user wordlists, mutations, and locally learned patterns in prioritized waves. |
 | Recursive discovery | Tests high-yield labels below validated parents up to the selected profile depth. |
@@ -36,13 +51,17 @@ The native Rust transport correlates parallel UDP requests, uses EDNS0, retries 
 
 By default, Fellaga uses `1.1.1.1`, `8.8.8.8`, and `9.9.9.9` for both pools and shares the global DNS rate limit across validation work. Trusted-resolver consensus and authoritative checks reduce false live results caused by poisoned caches, inconsistent resolvers, or wildcard DNS.
 
+Primary and trusted validation are started in parallel for a candidate batch. Long validation batches emit progress heartbeats independently from individual resolver completion, so delayed responses remain visible without changing their timeout semantics.
+
 ## Wildcard detection and cleanup
 
 Fellaga tests five randomized labels per relevant zone. Three or more positive probes classify the zone as wildcard; three or more definitive NXDOMAIN responses with no positive probe classify it as normal; mixed or incomplete evidence remains indeterminate. The wildcard signature is the union of record values returned by the positive probes, allowing later candidates to be matched against rotating answer pools.
 
 Wildcard profiles are reused for six hours by default. After that window, Fellaga revalidates the zone, including a SOA query and a new set of randomized probes. Set `--wildcard-refresh-hours 0` to force refresh on every scan.
 
-A candidate that matches the wildcard signature is removed when it is supported only by weak DNS observations. Strong independent evidence, such as a complete AXFR, authoritative DNSSEC evidence, CT or presented-certificate evidence, can retain the name while marking it as wildcard-related. The cleanup path also removes orphaned positive cache records created solely by rejected wildcard observations; unrelated historical evidence is preserved.
+A candidate whose answer exactly matches the applicable wildcard signature is excluded from default scan output, even when CT, passive, Web, or TLS discovery also supplied the name. This avoids presenting a discovered label as live when DNS cannot distinguish it from a synthesized wildcard response. A positive answer with records distinct from the wildcard pool remains eligible for validation and enrichment.
+
+For permanent storage, Fellaga purges weak wildcard-only observations and their orphaned positive cache records. Independent evidence is not destroyed: the name remains in the local inventory with wildcard context and is not emitted as a normal live result. Indeterminate wildcard zones are handled conservatively as unverified unless independent rules can establish an authoritative result.
 
 Use `--include-wildcard` only when downstream analysis explicitly needs weak wildcard matches.
 
@@ -82,9 +101,15 @@ Several independent limits prevent an intensive scan from running forever or exh
 - 128 concurrent DNS requests;
 - a 1,800-second limit per target;
 - bounded response sizes and per-provider timeouts;
+- a profile-specific passive active-time budget shared across root and recursive passive phases;
+- a global passive connector semaphore shared by root and child zones;
 - bounded AXFR, CT, NSEC, Web, TLS, graph, PTR, and pipeline work;
 - adaptive candidate waves that stop after insufficient yield;
-- SQLite-backed batches so millions of candidates do not need to remain in memory;
+- persistent lazy SQLite-backed seed and active batches so millions of candidates do not need to remain in memory or be inserted before validation begins;
 - a persistent checkpoint every 30 seconds.
+
+The passive budget advances only while passive work is running; time spent waiting for concurrent CT/AXFR completion or later non-passive phases is not charged to it. A connector that times out after returning one or more complete pages contributes those names as a partial result and is reported as degraded. Periodic heartbeats cover passive collection, DNS validation, and long enrichment phases.
+
+Scan completion and learning are committed atomically. Prepared SQLite statements are reused for large word and pattern updates, queue-selection indexes support bounded claims, and cleanup of completed or superseded queue rows is best-effort after the completion transaction. A maintenance delete therefore cannot turn an otherwise completed scan into a failed one.
 
 `--no-adaptive`, `--dns-rate-limit 0`, and `--max-runtime 0` deliberately remove important safeguards. They are not required for the default deep scan.

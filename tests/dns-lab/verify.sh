@@ -4,6 +4,7 @@ set -euo pipefail
 root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 image="fellaga-dns-lab:local"
 container="fellaga-dns-lab-$RANDOM"
+fellaga_bin="${FELLAGA_BIN:-}"
 cleanup() {
   local status=$?
   trap - EXIT
@@ -32,7 +33,27 @@ require_regex() {
 }
 
 docker build -q -t "$image" "$root" >/dev/null
-docker run -d --name "$container" -p 127.0.0.1:53535:5353/udp -p 127.0.0.1:53535:5353/tcp "$image" >/dev/null
+ports=(
+  -p 127.0.0.1:53535:5353/udp
+  -p 127.0.0.1:53535:5353/tcp
+)
+if [[ -n "$fellaga_bin" ]]; then
+  if [[ "$fellaga_bin" != /* ]]; then
+    fellaga_bin="$PWD/$fellaga_bin"
+  fi
+  if [[ ! -x "$fellaga_bin" ]]; then
+    echo "FELLAGA_BIN is not an executable file: $fellaga_bin" >&2
+    exit 1
+  fi
+  # Fellaga currently accepts resolver IPs, not custom resolver ports. Keep
+  # this mapping loopback-only so the CLI integration never reaches an
+  # external DNS server.
+  ports+=(
+    -p 127.0.0.1:53:5353/udp
+    -p 127.0.0.1:53:5353/tcp
+  )
+fi
+docker run -d --name "$container" "${ports[@]}" "$image" >/dev/null
 ready=0
 for _ in $(seq 1 30); do
   if dig @127.0.0.1 -p 53535 lab.test SOA +short | grep -E '.' >/dev/null; then
@@ -77,3 +98,7 @@ dig @127.0.0.1 -p 53535 random.hijack.test A +short |
   require_fixed "NXDOMAIN rewriting" "198.51.100.66"
 
 echo "DNS lab: wildcard, multilevel wildcard, hijack, dangling CNAME, delegation, NSEC, NSEC3, TCP, and AXFR validated"
+
+if [[ -n "$fellaga_bin" ]]; then
+  bash "$root/verify-fellaga.sh" "$fellaga_bin"
+fi

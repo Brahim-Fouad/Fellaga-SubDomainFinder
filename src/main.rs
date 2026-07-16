@@ -152,6 +152,8 @@ struct ProfileDefaults {
     ct_backfill: usize,
     web_hosts: usize,
     web_assets: usize,
+    passive_max_runtime: u64,
+    passive_zone_concurrency: usize,
 }
 
 impl ScanProfile {
@@ -174,6 +176,8 @@ impl ScanProfile {
                 ct_backfill: 4_096,
                 web_hosts: 100,
                 web_assets: 8,
+                passive_max_runtime: 75,
+                passive_zone_concurrency: 4,
             },
             Self::Balanced => ProfileDefaults {
                 max_words: 5_000,
@@ -192,6 +196,8 @@ impl ScanProfile {
                 ct_backfill: 256,
                 web_hosts: 30,
                 web_assets: 5,
+                passive_max_runtime: 45,
+                passive_zone_concurrency: 4,
             },
             Self::Passive => ProfileDefaults {
                 max_words: 0,
@@ -210,6 +216,8 @@ impl ScanProfile {
                 ct_backfill: 4_096,
                 web_hosts: 1,
                 web_assets: 1,
+                passive_max_runtime: 90,
+                passive_zone_concurrency: 6,
             },
             Self::Turbo => ProfileDefaults {
                 max_words: 1_000_000,
@@ -228,6 +236,8 @@ impl ScanProfile {
                 ct_backfill: 512,
                 web_hosts: 50,
                 web_assets: 5,
+                passive_max_runtime: 30,
+                passive_zone_concurrency: 8,
             },
         }
     }
@@ -286,6 +296,22 @@ struct ScanArgs {
         help = "Passive-source refresh interval in hours"
     )]
     passive_refresh_hours: u64,
+    #[arg(
+        long,
+        help = "Wall-clock budget for each passive phase in seconds; 0 disables the safeguard"
+    )]
+    passive_max_runtime: Option<u64>,
+    #[arg(
+        long,
+        help = "Child zones queried concurrently during recursive passive discovery"
+    )]
+    passive_zone_concurrency: Option<usize>,
+    #[arg(
+        long,
+        default_value_t = 8,
+        help = "Global passive connector concurrency shared by root and child zones"
+    )]
+    passive_concurrency: usize,
     #[arg(long, help = "Maximum passive names accepted per target")]
     max_passive: Option<usize>,
     #[arg(
@@ -533,7 +559,7 @@ struct HistoryArgs {
 
 #[derive(Debug, Subcommand)]
 enum CacheAction {
-    /// Remove only expired cache entries.
+    /// Remove expired negatives and abandoned temporary candidate queues.
     Prune,
 }
 
@@ -1228,6 +1254,12 @@ async fn main() -> Result<()> {
             let ct_backfill = args.ct_backfill.unwrap_or(defaults.ct_backfill);
             let web_hosts = args.web_hosts.unwrap_or(defaults.web_hosts);
             let web_assets = args.web_assets.unwrap_or(defaults.web_assets);
+            let passive_max_runtime = args
+                .passive_max_runtime
+                .unwrap_or(defaults.passive_max_runtime);
+            let passive_zone_concurrency = args
+                .passive_zone_concurrency
+                .unwrap_or(defaults.passive_zone_concurrency);
             let profile_passive = args.profile == ScanProfile::Passive;
             let passive_only = args.passive_only || profile_passive;
 
@@ -1242,6 +1274,12 @@ async fn main() -> Result<()> {
             }
             if max_passive == 0 {
                 bail!("--max-passive doit être supérieur à zéro");
+            }
+            if passive_zone_concurrency == 0 || passive_zone_concurrency > 32 {
+                bail!("--passive-zone-concurrency doit être compris entre 1 et 32");
+            }
+            if args.passive_concurrency == 0 || args.passive_concurrency > 32 {
+                bail!("--passive-concurrency doit être compris entre 1 et 32");
             }
             if max_words > 10_000_000 {
                 bail!("--max-words ne peut pas dépasser 10000000");
@@ -1377,6 +1415,9 @@ async fn main() -> Result<()> {
                 passive_refresh: Duration::from_secs(
                     args.passive_refresh_hours.saturating_mul(3_600),
                 ),
+                passive_phase_timeout: Duration::from_secs(passive_max_runtime),
+                passive_zone_concurrency,
+                passive_concurrency: args.passive_concurrency,
                 max_passive,
                 passive_only,
                 axfr: !args.no_axfr && !profile_passive,
@@ -1623,7 +1664,24 @@ async fn main() -> Result<()> {
             let database = Database::open(&database_path)?;
             match action {
                 CacheAction::Prune => {
-                    println!("{} entrées expirées supprimées", database.prune_cache()?);
+                    let expired = database.prune_cache()?;
+                    let mut temporary = 0_usize;
+                    const PRUNE_BATCH: usize = 25_000;
+                    loop {
+                        let removed = database.prune_superseded_candidate_queues(PRUNE_BATCH)?;
+                        temporary = temporary.saturating_add(removed);
+                        if removed > 0 {
+                            eprintln!(
+                                "cache prune: {temporary} candidat(s) temporaire(s) abandonné(s) supprimé(s)"
+                            );
+                        }
+                        if removed < PRUNE_BATCH {
+                            break;
+                        }
+                    }
+                    println!(
+                        "{expired} entrée(s) négative(s) expirée(s), {temporary} candidat(s) temporaire(s) abandonné(s) supprimé(s)"
+                    );
                 }
             }
         }
@@ -1657,12 +1715,21 @@ async fn main() -> Result<()> {
                                 });
                             }
                             let started = std::time::Instant::now();
-                            match passive::fetch(&source.name, &target, timeout, &api_keys).await {
-                                Ok(names) => serde_json::json!({
+                            match passive::fetch_detailed(&source.name, &target, timeout, &api_keys)
+                                .await
+                            {
+                                Ok(result) => serde_json::json!({
                                     "name": source.name,
-                                    "status": if names.is_empty() { "empty" } else { "success" },
-                                    "names": names.len(),
+                                    "status": if result.partial_warning.is_some() {
+                                        "partial"
+                                    } else if result.names.is_empty() {
+                                        "empty"
+                                    } else {
+                                        "success"
+                                    },
+                                    "names": result.names.len(),
                                     "duration_ms": started.elapsed().as_millis(),
+                                    "warning": result.partial_warning,
                                     "metadata": source.metadata
                                 }),
                                 Err(error) => serde_json::json!({

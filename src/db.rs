@@ -12,7 +12,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::OpenOptions;
-use std::io::BufRead;
+use std::io::{BufRead, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
 
@@ -188,6 +188,14 @@ pub struct ScanCheckpoint {
     pub stage: String,
     pub options_hash: String,
     pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ScanCandidateLearning {
+    pub generator_attempts: HashMap<String, usize>,
+    pub generator_successes: HashMap<String, usize>,
+    pub attempted_words: BTreeSet<String>,
+    pub total_attempts: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -636,9 +644,10 @@ impl Database {
             secure_existing_sqlite_files(&path)?;
         }
         let migrating_to_v8 = starting_version < 8;
-        if migrating_to_v8 {
-            connection.execute_batch("BEGIN IMMEDIATE")?;
-        }
+        // Version upgrades and same-version additive repairs are one atomic
+        // unit. A failed compatible migration must never leave half-created
+        // tables or indexes behind for the next launch.
+        connection.execute_batch("BEGIN IMMEDIATE")?;
         connection.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS scans (
@@ -652,7 +661,8 @@ impl Database {
                 cache_hits INTEGER NOT NULL DEFAULT 0,
                 duration_ms INTEGER NOT NULL DEFAULT 0,
                 options_json TEXT NOT NULL,
-                warnings_json TEXT NOT NULL DEFAULT '[]'
+                warnings_json TEXT NOT NULL DEFAULT '[]',
+                learning_applied INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS subdomains (
@@ -750,6 +760,8 @@ impl Database {
                 relative_name TEXT NOT NULL,
                 priority INTEGER NOT NULL,
                 generator TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                learning_recorded INTEGER NOT NULL DEFAULT 0,
                 status TEXT NOT NULL DEFAULT 'queued'
                     CHECK(status IN ('queued', 'processing', 'done')),
                 PRIMARY KEY(scan_id, fqdn)
@@ -758,6 +770,44 @@ impl Database {
                 ON scan_candidates(scan_id, status, priority DESC, fqdn);
             CREATE INDEX IF NOT EXISTS idx_scan_candidates_relative
                 ON scan_candidates(scan_id, relative_name);
+
+            CREATE TABLE IF NOT EXISTS scan_seed_candidates (
+                scan_id INTEGER NOT NULL REFERENCES scans(id) ON DELETE CASCADE,
+                fqdn TEXT NOT NULL,
+                priority INTEGER NOT NULL,
+                sources_json TEXT NOT NULL DEFAULT '[]',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'queued'
+                    CHECK(status IN ('queued', 'processing', 'done')),
+                PRIMARY KEY(scan_id, fqdn)
+            );
+            CREATE INDEX IF NOT EXISTS idx_scan_seed_candidates_pending
+                ON scan_seed_candidates(scan_id, status, priority DESC, fqdn);
+            CREATE INDEX IF NOT EXISTS idx_scan_seed_candidates_priority
+                ON scan_seed_candidates(scan_id, priority, fqdn DESC);
+
+            CREATE TABLE IF NOT EXISTS scan_candidate_feeds (
+                scan_id INTEGER NOT NULL REFERENCES scans(id) ON DELETE CASCADE,
+                source TEXT NOT NULL,
+                cursor INTEGER NOT NULL DEFAULT 0,
+                cursor_text TEXT NOT NULL DEFAULT '',
+                exhausted INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(scan_id, source)
+            );
+
+            CREATE TABLE IF NOT EXISTS scan_generator_stats (
+                scan_id INTEGER NOT NULL REFERENCES scans(id) ON DELETE CASCADE,
+                generator TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                successes INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(scan_id, generator)
+            );
+
+            CREATE TABLE IF NOT EXISTS scan_attempted_words (
+                scan_id INTEGER NOT NULL REFERENCES scans(id) ON DELETE CASCADE,
+                word TEXT NOT NULL,
+                PRIMARY KEY(scan_id, word)
+            );
 
             CREATE TABLE IF NOT EXISTS word_stats (
                 word TEXT PRIMARY KEY,
@@ -1128,11 +1178,44 @@ impl Database {
                 "algorithm_version",
                 "algorithm_version INTEGER NOT NULL DEFAULT 1",
             ),
+            (
+                "scan_candidate_feeds",
+                "cursor_text",
+                "cursor_text TEXT NOT NULL DEFAULT ''",
+            ),
+            (
+                "scan_candidates",
+                "attempts",
+                "attempts INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "scan_candidates",
+                "learning_recorded",
+                "learning_recorded INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "scan_seed_candidates",
+                "attempts",
+                "attempts INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "scans",
+                "learning_applied",
+                "learning_applied INTEGER NOT NULL DEFAULT 0",
+            ),
         ] {
             if !table_has_column(table, column)? {
                 connection.execute(&format!("ALTER TABLE {table} ADD COLUMN {definition}"), [])?;
             }
         }
+        // Existing v8 databases can already contain scan_candidates while
+        // missing columns introduced by a later compatible release. Create
+        // dependent indexes only after the additive column repair above.
+        connection.execute(
+            r#"CREATE INDEX IF NOT EXISTS idx_scan_candidates_unrecorded
+               ON scan_candidates(scan_id) WHERE learning_recorded=0"#,
+            [],
+        )?;
         if migrating_to_v8 {
             connection.execute(
                 "UPDATE dns_cache SET expires_at=?1 WHERE status='positive' AND expires_at<>?1",
@@ -1173,27 +1256,23 @@ impl Database {
             )?;
             connection.pragma_update(None, "user_version", 8)?;
         } else {
-            let transaction = connection.transaction()?;
-            transaction.execute(
+            connection.execute(
                 r#"UPDATE subdomains
                    SET verification_state=CASE WHEN active=1 THEN 'live' ELSE 'historical' END
                    WHERE verification_state IS NULL
                       OR verification_state NOT IN ('live', 'historical', 'unverified')"#,
                 [],
             )?;
-            transaction.execute(
+            connection.execute(
                 r#"UPDATE subdomains SET last_verified_at=last_seen
                    WHERE verification_state IN ('live', 'historical')
                      AND last_verified_at IS NULL"#,
                 [],
             )?;
-            transaction.pragma_update(None, "user_version", 8)?;
-            transaction.commit()?;
+            connection.pragma_update(None, "user_version", 8)?;
         }
-        migrate_legacy_observations(&mut connection, migrating_to_v8)?;
-        if migrating_to_v8 {
-            connection.execute_batch("COMMIT")?;
-        }
+        migrate_legacy_observations(&mut connection, true)?;
+        connection.execute_batch("COMMIT")?;
         let writer = if path == Path::new(":memory:") {
             None
         } else {
@@ -1636,14 +1715,134 @@ impl Database {
             "UPDATE scan_checkpoints SET stage='running', updated_at=?1 WHERE scan_id=?2 AND completed=0",
             params![now, scan_id],
         )?;
-        // Rejouer tous les candidats est intentionnel : un arrêt peut survenir
-        // après leur validation/cache, mais avant la persistance du snapshot.
+        // A claimed candidate without a terminal DNS outcome is safe to retry.
+        // Completed rows are deliberately left terminal: replaying them made a
+        // resume start the brute-force phase from the beginning.
         transaction.execute(
-            "UPDATE scan_candidates SET status='queued' WHERE scan_id=?1",
+            "UPDATE scan_candidates SET status='queued' WHERE scan_id=?1 AND status='processing'",
+            [scan_id],
+        )?;
+        transaction.execute(
+            "UPDATE scan_seed_candidates SET status='queued' WHERE scan_id=?1 AND status='processing'",
             [scan_id],
         )?;
         transaction.commit()?;
         Ok(())
+    }
+
+    /// Supersede abandoned candidate queues for a domain after a new scan has
+    /// acquired its checkpoint. A scan with a fresh running lease is excluded
+    /// so two live processes cannot silently delete each other's work.
+    pub fn supersede_incomplete_candidate_queues(
+        &self,
+        domain: &str,
+        keep_scan_id: i64,
+        active_lease: std::time::Duration,
+    ) -> Result<usize> {
+        let now = now_epoch();
+        let cutoff = now.saturating_sub(active_lease.as_secs().min(i64::MAX as u64) as i64);
+        let warning = serde_json::to_string(&vec![format!(
+            "file de candidats remplacée par le scan #{keep_scan_id}"
+        )])?;
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+
+        transaction.execute_batch(
+            r#"CREATE TEMP TABLE IF NOT EXISTS fellaga_superseded_scans(
+                   scan_id INTEGER PRIMARY KEY
+               );
+               DELETE FROM fellaga_superseded_scans;"#,
+        )?;
+        transaction.execute(
+            r#"INSERT INTO fellaga_superseded_scans(scan_id)
+               SELECT scan.id
+               FROM scans AS scan
+               WHERE scan.domain=?1
+                 AND scan.id<>?2
+                 AND scan.id<?2
+                 AND scan.status NOT IN ('completed', 'superseded')
+                 AND NOT EXISTS (
+                     SELECT 1 FROM scan_checkpoints AS completed
+                     WHERE completed.scan_id=scan.id AND completed.completed=1
+                 )
+                 AND NOT (
+                     scan.status='running'
+                     AND (
+                         scan.started_at>=?3
+                         OR EXISTS (
+                             SELECT 1 FROM scan_checkpoints AS lease
+                             WHERE lease.scan_id=scan.id
+                               AND lease.completed=0
+                               AND lease.updated_at>=?3
+                         )
+                     )
+                 )"#,
+            params![domain, keep_scan_id, cutoff],
+        )?;
+        transaction.execute(
+            r#"DELETE FROM scan_candidate_feeds
+               WHERE scan_id IN (SELECT scan_id FROM fellaga_superseded_scans)"#,
+            [],
+        )?;
+        transaction.execute(
+            r#"DELETE FROM scan_seed_candidates
+               WHERE scan_id IN (SELECT scan_id FROM fellaga_superseded_scans)"#,
+            [],
+        )?;
+        transaction.execute(
+            r#"DELETE FROM scan_generator_stats
+               WHERE scan_id IN (SELECT scan_id FROM fellaga_superseded_scans)"#,
+            [],
+        )?;
+        transaction.execute(
+            r#"DELETE FROM scan_attempted_words
+               WHERE scan_id IN (SELECT scan_id FROM fellaga_superseded_scans)"#,
+            [],
+        )?;
+        transaction.execute(
+            r#"UPDATE scan_checkpoints
+               SET stage='superseded', updated_at=?1, completed=1
+               WHERE scan_id IN (SELECT scan_id FROM fellaga_superseded_scans)"#,
+            [now],
+        )?;
+        transaction.execute(
+            r#"UPDATE scans
+               SET status='superseded', finished_at=?1, warnings_json=?2
+               WHERE id IN (SELECT scan_id FROM fellaga_superseded_scans)"#,
+            params![now, warning],
+        )?;
+        transaction.execute("DELETE FROM fellaga_superseded_scans", [])?;
+        transaction.commit()?;
+        drop(connection);
+
+        // Never make a new scan wait while SQLite removes millions of rows
+        // from abandoned queues.  A small page is reclaimed here; the rest is
+        // eligible for incremental maintenance through `cache prune`.
+        Ok(self
+            .prune_superseded_candidate_queues(2_000)
+            .unwrap_or_default())
+    }
+
+    /// Reclaim at most one page of temporary candidates belonging to scans
+    /// that are completed or superseded. Permanent observations, DNS cache
+    /// entries and learning tables are deliberately outside this operation.
+    pub fn prune_superseded_candidate_queues(&self, limit: usize) -> Result<usize> {
+        if limit == 0 {
+            return Ok(0);
+        }
+        let connection = self.lock()?;
+        Ok(connection.execute(
+            r#"DELETE FROM scan_candidates
+               WHERE rowid IN (
+                   SELECT rowid
+                   FROM scan_candidates
+                   WHERE scan_id IN (
+                       SELECT id FROM scans WHERE status IN ('completed', 'superseded')
+                   )
+                   LIMIT ?1
+               )"#,
+            [limit.min(i64::MAX as usize) as i64],
+        )?)
     }
 
     pub fn persist_scan_candidates(
@@ -1651,64 +1850,247 @@ impl Database {
         scan_id: i64,
         domain: &str,
         candidates: &[(String, String, i64)],
-    ) -> Result<()> {
+    ) -> Result<usize> {
+        self.persist_scan_candidates_bounded(scan_id, domain, candidates, candidates.len())
+    }
+
+    /// Persist externally discovered names before DNS validation.  Keeping
+    /// this queue separate from brute-force candidates means passive coverage
+    /// does not consume `max_words`, while each bounded wave remains durable
+    /// and resumable.
+    pub fn persist_scan_seed_candidates(
+        &self,
+        scan_id: i64,
+        candidates: &[(String, BTreeSet<String>, i64)],
+        max_total: usize,
+    ) -> Result<usize> {
+        if candidates.is_empty() || max_total == 0 {
+            return Ok(0);
+        }
         let mut connection = self.lock()?;
         let transaction = connection.transaction()?;
-        let mut statement = transaction.prepare(
-            r#"INSERT OR IGNORE INTO scan_candidates(
-               scan_id, fqdn, relative_name, priority, generator, status
-               ) VALUES (?1, ?2, ?3, ?4, ?5, 'queued')"#,
-        )?;
-        for (relative_name, generator, priority) in candidates {
-            statement.execute(params![
-                scan_id,
-                format!("{relative_name}.{domain}"),
-                relative_name,
-                priority,
-                generator
-            ])?;
+        let mut total = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM scan_seed_candidates WHERE scan_id=?1",
+                [scan_id],
+                |row| row.get::<_, i64>(0),
+            )?
+            .max(0) as usize;
+        let mut inserted = 0_usize;
+        {
+            // A passive-only scan may persist hundreds of thousands of names.
+            // Compile each hot statement once so this phase scales with rows,
+            // rather than with rows multiplied by SQLite parser work.
+            let mut select_existing = transaction.prepare(
+                r#"SELECT sources_json, priority
+                       FROM scan_seed_candidates WHERE scan_id=?1 AND fqdn=?2"#,
+            )?;
+            let mut update_existing = transaction.prepare(
+                r#"UPDATE scan_seed_candidates
+                   SET sources_json=?3, priority=?4
+                   WHERE scan_id=?1 AND fqdn=?2"#,
+            )?;
+            let mut select_lowest = transaction.prepare(
+                r#"SELECT fqdn, priority FROM scan_seed_candidates
+                   WHERE scan_id=?1 AND status='queued' AND attempts=0
+                   ORDER BY priority, fqdn DESC LIMIT 1"#,
+            )?;
+            let mut delete_seed = transaction
+                .prepare("DELETE FROM scan_seed_candidates WHERE scan_id=?1 AND fqdn=?2")?;
+            let mut insert_seed = transaction.prepare(
+                r#"INSERT INTO scan_seed_candidates(
+                       scan_id, fqdn, priority, sources_json, status
+                   ) VALUES (?1, ?2, ?3, ?4, 'queued')"#,
+            )?;
+            for (fqdn, sources, priority) in candidates {
+                let existing = select_existing
+                    .query_row(params![scan_id, fqdn], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                    })
+                    .optional()?;
+                if let Some((sources_json, existing_priority)) = existing {
+                    let mut merged = serde_json::from_str::<BTreeSet<String>>(&sources_json)
+                        .context("provenance de candidat passif SQLite invalide")?;
+                    merged.extend(sources.iter().cloned());
+                    update_existing.execute(params![
+                        scan_id,
+                        fqdn,
+                        serde_json::to_string(&merged)?,
+                        existing_priority.max(*priority)
+                    ])?;
+                    continue;
+                }
+
+                if total >= max_total {
+                    let lowest = select_lowest
+                        .query_row([scan_id], |row| {
+                            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                        })
+                        .optional()?;
+                    let Some((lowest_fqdn, lowest_priority)) = lowest else {
+                        continue;
+                    };
+                    if *priority <= lowest_priority {
+                        continue;
+                    }
+                    delete_seed.execute(params![scan_id, lowest_fqdn])?;
+                    total = total.saturating_sub(1);
+                }
+
+                inserted += insert_seed.execute(params![
+                    scan_id,
+                    fqdn,
+                    priority,
+                    serde_json::to_string(sources)?
+                ])?;
+                total = total.saturating_add(1);
+            }
         }
-        drop(statement);
+        transaction.execute(
+            r#"DELETE FROM scan_candidates
+               WHERE scan_id=?1
+                 AND EXISTS (
+                     SELECT 1 FROM scan_seed_candidates seed
+                     WHERE seed.scan_id=scan_candidates.scan_id
+                       AND seed.fqdn=scan_candidates.fqdn
+                 )"#,
+            [scan_id],
+        )?;
+        transaction.commit()?;
+        Ok(inserted)
+    }
+
+    /// Atomically claim the next bounded page of passive/authoritative seeds.
+    pub fn pending_scan_seed_candidates(
+        &self,
+        scan_id: i64,
+        limit: usize,
+    ) -> Result<Vec<(String, BTreeSet<String>, i64)>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        let mut rows = {
+            let mut statement = transaction.prepare(
+                r#"UPDATE scan_seed_candidates
+                   SET status='processing', attempts=attempts+1
+                   WHERE rowid IN (
+                       SELECT rowid FROM scan_seed_candidates
+                       WHERE scan_id=?1 AND status='queued'
+                       ORDER BY priority DESC, fqdn
+                       LIMIT ?2
+                   )
+                     AND scan_id=?1 AND status='queued'
+                   RETURNING fqdn, sources_json, priority"#,
+            )?;
+            statement
+                .query_map(
+                    params![scan_id, limit.min(i64::MAX as usize) as i64],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)?,
+                        ))
+                    },
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        rows.sort_by(|left, right| right.2.cmp(&left.2).then_with(|| left.0.cmp(&right.0)));
+        transaction.commit()?;
+        rows.into_iter()
+            .map(|(fqdn, sources_json, priority)| {
+                Ok((
+                    fqdn,
+                    serde_json::from_str::<BTreeSet<String>>(&sources_json)
+                        .context("provenance de candidat passif SQLite invalide")?,
+                    priority,
+                ))
+            })
+            .collect()
+    }
+
+    pub fn pending_scan_seed_candidate_count(&self, scan_id: i64) -> Result<i64> {
+        Ok(self.lock()?.query_row(
+            "SELECT COUNT(*) FROM scan_seed_candidates WHERE scan_id=?1 AND status='queued'",
+            [scan_id],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub fn scan_seed_candidate_count(&self, scan_id: i64) -> Result<i64> {
+        Ok(self.lock()?.query_row(
+            "SELECT COUNT(*) FROM scan_seed_candidates WHERE scan_id=?1",
+            [scan_id],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub fn mark_scan_seed_candidates_done(&self, scan_id: i64, hosts: &[String]) -> Result<()> {
+        if hosts.is_empty() {
+            return Ok(());
+        }
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        for chunk in hosts.chunks(500) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                r#"UPDATE scan_seed_candidates SET status=CASE
+                       WHEN COALESCE((
+                         SELECT verification.outcome
+                         FROM dns_verifications verification
+                         WHERE verification.scan_id=?
+                           AND verification.fqdn=scan_seed_candidates.fqdn
+                         ORDER BY verification.checked_at DESC, verification.id DESC
+                         LIMIT 1
+                       ), '')='error' AND attempts<3 THEN 'queued'
+                       ELSE 'done'
+                   END
+                   WHERE scan_id=?
+                      AND fqdn IN ({placeholders})"#
+            );
+            let mut values = Vec::<rusqlite::types::Value>::with_capacity(chunk.len() + 2);
+            values.push(scan_id.into());
+            values.push(scan_id.into());
+            values.extend(chunk.iter().cloned().map(Into::into));
+            transaction.execute(&sql, rusqlite::params_from_iter(values))?;
+        }
         transaction.commit()?;
         Ok(())
     }
 
-    pub fn persist_wordlist_candidates(
+    pub fn persist_scan_candidates_bounded(
         &self,
         scan_id: i64,
         domain: &str,
-        path: &Path,
+        candidates: &[(String, String, i64)],
         limit: usize,
     ) -> Result<usize> {
         if limit == 0 {
             return Ok(0);
         }
-        let file = std::fs::File::open(path)
-            .with_context(|| format!("ouverture de la wordlist {}", path.display()))?;
         let mut connection = self.lock()?;
         let transaction = connection.transaction()?;
         let mut statement = transaction.prepare(
             r#"INSERT OR IGNORE INTO scan_candidates(
                scan_id, fqdn, relative_name, priority, generator, status
-               ) VALUES (?1, ?2, ?3, ?4, 'wordlist', 'queued')"#,
+               ) SELECT ?1, ?2, ?3, ?4, ?5, 'queued'
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM scan_seed_candidates
+                     WHERE scan_id=?1 AND fqdn=?2
+                 )"#,
         )?;
         let mut inserted = 0_usize;
-        for (rank, line) in std::io::BufReader::new(file).lines().enumerate() {
-            let raw = line?;
-            let candidate = raw
-                .split('#')
-                .next()
-                .unwrap_or_default()
-                .trim()
-                .to_ascii_lowercase();
-            if !valid_relative_name(&candidate) {
-                continue;
-            }
+        for (relative_name, generator, priority) in candidates {
             inserted += statement.execute(params![
                 scan_id,
-                format!("{candidate}.{domain}"),
-                candidate,
-                2_000_000_000_i64.saturating_sub(rank as i64),
+                format!("{relative_name}.{domain}"),
+                relative_name,
+                priority,
+                generator
             ])?;
             if inserted >= limit {
                 break;
@@ -1719,34 +2101,331 @@ impl Database {
         Ok(inserted)
     }
 
+    pub fn persist_wordlist_candidates(
+        &self,
+        scan_id: i64,
+        domain: &str,
+        path: &Path,
+        limit: usize,
+    ) -> Result<usize> {
+        Ok(self
+            .refill_wordlist_candidates(scan_id, domain, path, limit)?
+            .0)
+    }
+
+    /// Read only the next wordlist page. File I/O is performed without holding
+    /// the SQLite mutex, then the byte cursor and inserted rows are committed
+    /// together, making large custom lists both bounded and resumable.
+    pub fn refill_wordlist_candidates(
+        &self,
+        scan_id: i64,
+        domain: &str,
+        path: &Path,
+        limit: usize,
+    ) -> Result<(usize, bool)> {
+        if limit == 0 {
+            return Ok((0, false));
+        }
+        let starting_feed = {
+            let connection = self.lock()?;
+            connection
+                .query_row(
+                    r#"SELECT cursor, cursor_text, exhausted FROM scan_candidate_feeds
+                       WHERE scan_id=?1 AND source='wordlist'"#,
+                    [scan_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)? != 0,
+                        ))
+                    },
+                )
+                .optional()?
+        };
+        let (cursor, cursor_text, already_exhausted) =
+            starting_feed.clone().unwrap_or((0, String::new(), false));
+        if already_exhausted {
+            return Ok((0, true));
+        }
+        let mut file = std::fs::File::open(path)
+            .with_context(|| format!("ouverture de la wordlist {}", path.display()))?;
+        let file_size = file.metadata()?.len();
+        let cursor = cursor.max(0) as u64;
+        file.seek(SeekFrom::Start(cursor))?;
+        let mut reader = std::io::BufReader::new(file);
+        let mut next_cursor = cursor;
+        let mut rank = 0_u64;
+        let mut examined_lines = 0_usize;
+        let mut examined_bytes = 0_usize;
+        const MAX_WORDLIST_PAGE_LINES: usize = 1_024;
+        const MAX_WORDLIST_PAGE_BYTES: usize = 4 * 1024 * 1024;
+        let mut exhausted = false;
+        let mut discarding_oversized_line = cursor_text == "discard";
+        let mut raw = Vec::new();
+        let mut candidates = Vec::new();
+        while examined_lines < MAX_WORDLIST_PAGE_LINES && examined_bytes < MAX_WORDLIST_PAGE_BYTES {
+            let remaining_bytes = MAX_WORDLIST_PAGE_BYTES.saturating_sub(examined_bytes);
+            if discarding_oversized_line {
+                raw.clear();
+                let bytes = Read::by_ref(&mut reader)
+                    .take(remaining_bytes as u64)
+                    .read_until(b'\n', &mut raw)?;
+                if bytes == 0 {
+                    exhausted = true;
+                    discarding_oversized_line = false;
+                    break;
+                }
+                next_cursor = next_cursor.saturating_add(bytes as u64);
+                examined_bytes = examined_bytes.saturating_add(bytes);
+                if raw.ends_with(b"\n") || next_cursor >= file_size {
+                    discarding_oversized_line = false;
+                    exhausted = next_cursor >= file_size;
+                }
+                continue;
+            }
+            raw.clear();
+            let bytes = Read::by_ref(&mut reader)
+                .take(remaining_bytes as u64)
+                .read_until(b'\n', &mut raw)?;
+            if bytes == 0 {
+                exhausted = true;
+                break;
+            }
+            next_cursor = next_cursor.saturating_add(bytes as u64);
+            examined_lines = examined_lines.saturating_add(1);
+            examined_bytes = examined_bytes.saturating_add(bytes);
+            if !raw.ends_with(b"\n") && next_cursor < file_size {
+                discarding_oversized_line = true;
+                continue;
+            }
+            let candidate = String::from_utf8_lossy(&raw)
+                .split('#')
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase();
+            if !valid_relative_name(&candidate) {
+                continue;
+            }
+            candidates.push((
+                candidate,
+                next_cursor,
+                2_000_000_000_i64
+                    .saturating_sub(cursor.saturating_add(rank).min(i64::MAX as u64) as i64),
+            ));
+            rank = rank.saturating_add(1);
+        }
+        exhausted |= next_cursor >= file_size && !discarding_oversized_line;
+
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        let current_feed = transaction
+            .query_row(
+                r#"SELECT cursor, cursor_text, exhausted FROM scan_candidate_feeds
+                   WHERE scan_id=?1 AND source='wordlist'"#,
+                [scan_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)? != 0,
+                    ))
+                },
+            )
+            .optional()?;
+        if current_feed != starting_feed {
+            let current_exhausted = current_feed.is_some_and(|(_, _, exhausted)| exhausted);
+            transaction.commit()?;
+            return Ok((0, current_exhausted));
+        }
+
+        let mut statement = transaction.prepare(
+            r#"INSERT OR IGNORE INTO scan_candidates(
+               scan_id, fqdn, relative_name, priority, generator, status
+               ) SELECT ?1, ?2, ?3, ?4, 'wordlist', 'queued'
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM scan_seed_candidates
+                     WHERE scan_id=?1 AND fqdn=?2
+                 )"#,
+        )?;
+        let mut inserted = 0_usize;
+        let mut committed_cursor = next_cursor;
+        let mut committed_discard = discarding_oversized_line;
+        let mut committed_exhausted = exhausted;
+        for (candidate, candidate_cursor, priority) in candidates {
+            inserted += statement.execute(params![
+                scan_id,
+                format!("{candidate}.{domain}"),
+                candidate,
+                priority,
+            ])?;
+            if inserted >= limit {
+                committed_cursor = candidate_cursor;
+                committed_discard = false;
+                committed_exhausted = candidate_cursor >= file_size;
+                break;
+            }
+        }
+        drop(statement);
+        transaction.execute(
+            r#"INSERT INTO scan_candidate_feeds(
+                   scan_id, source, cursor, cursor_text, exhausted
+               ) VALUES (?1, 'wordlist', ?2, ?3, ?4)
+               ON CONFLICT(scan_id, source) DO UPDATE SET
+                   cursor=excluded.cursor, cursor_text=excluded.cursor_text,
+                   exhausted=excluded.exhausted"#,
+            params![
+                scan_id,
+                committed_cursor.min(i64::MAX as u64) as i64,
+                if committed_discard { "discard" } else { "" },
+                i64::from(committed_exhausted)
+            ],
+        )?;
+        transaction.commit()?;
+        Ok((inserted, committed_exhausted))
+    }
+
+    pub fn scan_candidate_feed_exhausted(&self, scan_id: i64, source: &str) -> Result<bool> {
+        Ok(self
+            .lock()?
+            .query_row(
+                "SELECT exhausted FROM scan_candidate_feeds WHERE scan_id=?1 AND source=?2",
+                params![scan_id, source],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some_and(|exhausted| exhausted != 0))
+    }
+
+    pub fn mark_scan_candidate_feed_exhausted(&self, scan_id: i64, source: &str) -> Result<()> {
+        self.lock()?.execute(
+            r#"INSERT INTO scan_candidate_feeds(scan_id, source, cursor, exhausted)
+               VALUES (?1, ?2, 0, 1)
+               ON CONFLICT(scan_id, source) DO UPDATE SET exhausted=1"#,
+            params![scan_id, source],
+        )?;
+        Ok(())
+    }
+
     pub fn persist_prior_candidates_to_scan(
         &self,
         scan_id: i64,
         domain: &str,
         limit: usize,
     ) -> Result<usize> {
+        Ok(self
+            .refill_prior_candidates_to_scan(scan_id, domain, limit)?
+            .0)
+    }
+
+    /// Feed the embedded corpus with a durable priority cursor. This avoids a
+    /// correlated `NOT EXISTS` walk over every earlier corpus row on every DNS
+    /// wave while keeping the queue bounded and resumable.
+    pub fn refill_prior_candidates_to_scan(
+        &self,
+        scan_id: i64,
+        domain: &str,
+        limit: usize,
+    ) -> Result<(usize, bool)> {
         if limit == 0 {
-            return Ok(0);
+            return Ok((0, false));
         }
-        let connection = self.lock()?;
-        let inserted = connection.execute(
-            r#"INSERT OR IGNORE INTO scan_candidates(
-                   scan_id, fqdn, relative_name, priority, generator, status
-               )
-               SELECT ?1, candidate.relative_name || '.' || ?2,
-                      candidate.relative_name, candidate.priority - 1000000000,
-                      'builtin', 'queued'
-               FROM candidate_priors AS candidate
-               WHERE NOT EXISTS (
-                   SELECT 1 FROM scan_candidates AS queued
-                   WHERE queued.scan_id=?1
-                     AND queued.relative_name=candidate.relative_name
-               )
-               ORDER BY candidate.priority DESC, candidate.relative_name
-               LIMIT ?3"#,
-            params![scan_id, domain, limit.min(i64::MAX as usize) as i64],
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        let (stored_cursor, stored_cursor_text, already_exhausted) = transaction
+            .query_row(
+                r#"SELECT cursor, cursor_text, exhausted FROM scan_candidate_feeds
+                   WHERE scan_id=?1 AND source='builtin'"#,
+                [scan_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)? != 0,
+                    ))
+                },
+            )
+            .optional()?
+            .unwrap_or((0, String::new(), false));
+        if already_exhausted {
+            transaction.commit()?;
+            return Ok((0, true));
+        }
+
+        let mut cursor = if stored_cursor > 0 {
+            stored_cursor
+        } else {
+            i64::MAX
+        };
+        let mut cursor_text = stored_cursor_text;
+        let mut inserted = 0_usize;
+        let mut examined = 0_usize;
+        let max_examined = limit.saturating_mul(8).clamp(5_000, 50_000);
+        let mut exhausted = false;
+        while inserted < limit && examined < max_examined {
+            let page_size = limit
+                .saturating_sub(inserted)
+                .min(max_examined.saturating_sub(examined))
+                .min(5_000);
+            let rows = {
+                let mut statement = transaction.prepare(
+                    r#"SELECT relative_name, priority
+                       FROM candidate_priors
+                       WHERE priority < ?2
+                          OR (priority=?2 AND relative_name>?3)
+                       ORDER BY priority DESC, relative_name
+                       LIMIT ?1"#,
+                )?;
+                statement
+                    .query_map(
+                        params![page_size.min(i64::MAX as usize) as i64, cursor, cursor_text],
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                    )?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            if rows.is_empty() {
+                exhausted = true;
+                break;
+            }
+            let row_count = rows.len();
+            examined = examined.saturating_add(row_count);
+            let mut insert = transaction.prepare(
+                r#"INSERT OR IGNORE INTO scan_candidates(
+                       scan_id, fqdn, relative_name, priority, generator, status
+                   ) SELECT ?1, ?2, ?3, ?4, 'builtin', 'queued'
+                     WHERE NOT EXISTS (
+                         SELECT 1 FROM scan_seed_candidates
+                         WHERE scan_id=?1 AND fqdn=?2
+                     )"#,
+            )?;
+            for (relative_name, priority) in rows {
+                cursor = priority;
+                cursor_text.clone_from(&relative_name);
+                inserted += insert.execute(params![
+                    scan_id,
+                    format!("{relative_name}.{domain}"),
+                    relative_name,
+                    priority.saturating_sub(1_000_000_000),
+                ])?;
+            }
+            drop(insert);
+            if row_count < page_size {
+                exhausted = true;
+                break;
+            }
+        }
+        transaction.execute(
+            r#"INSERT INTO scan_candidate_feeds(
+                   scan_id, source, cursor, cursor_text, exhausted
+               ) VALUES (?1, 'builtin', ?2, ?3, ?4)
+               ON CONFLICT(scan_id, source) DO UPDATE SET
+                   cursor=excluded.cursor, cursor_text=excluded.cursor_text,
+                   exhausted=excluded.exhausted"#,
+            params![scan_id, cursor, cursor_text, i64::from(exhausted)],
         )?;
-        Ok(inserted)
+        transaction.commit()?;
+        Ok((inserted, exhausted))
     }
 
     pub fn pending_scan_candidates(
@@ -1759,11 +2438,18 @@ impl Database {
         }
         let mut connection = self.lock()?;
         let transaction = connection.transaction()?;
-        let candidates = {
+        let mut candidates = {
             let mut statement = transaction.prepare(
-                r#"SELECT fqdn, relative_name, generator, priority FROM scan_candidates
-               WHERE scan_id=?1 AND status='queued'
-               ORDER BY priority DESC, fqdn LIMIT ?2"#,
+                r#"UPDATE scan_candidates
+                   SET status='processing', attempts=attempts+1
+                   WHERE rowid IN (
+                       SELECT rowid FROM scan_candidates
+                       WHERE scan_id=?1 AND status='queued'
+                       ORDER BY priority DESC, fqdn
+                       LIMIT ?2
+                   )
+                     AND scan_id=?1 AND status='queued'
+                   RETURNING fqdn, relative_name, generator, priority"#,
             )?;
             statement
                 .query_map(
@@ -1779,12 +2465,7 @@ impl Database {
                 )?
                 .collect::<rusqlite::Result<Vec<_>>>()?
         };
-        for (fqdn, _, _, _) in &candidates {
-            transaction.execute(
-                "UPDATE scan_candidates SET status='processing' WHERE scan_id=?1 AND fqdn=?2 AND status='queued'",
-                params![scan_id, fqdn],
-            )?;
-        }
+        candidates.sort_by(|left, right| right.3.cmp(&left.3).then_with(|| left.0.cmp(&right.0)));
         transaction.commit()?;
         Ok(candidates
             .into_iter()
@@ -1803,6 +2484,20 @@ impl Database {
     pub fn scan_candidate_count(&self, scan_id: i64) -> Result<i64> {
         Ok(self.lock()?.query_row(
             "SELECT COUNT(*) FROM scan_candidates WHERE scan_id=?1",
+            [scan_id],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Cumulative active-enumeration budget. Terminal rows may be removed or
+    /// promoted to passive seeds, so physical queue length alone is not a safe
+    /// `--max-words` counter across resume.
+    pub fn scan_candidate_budget_count(&self, scan_id: i64) -> Result<i64> {
+        Ok(self.lock()?.query_row(
+            r#"SELECT
+                   COALESCE((SELECT SUM(attempts) FROM scan_generator_stats WHERE scan_id=?1), 0)
+                 + COALESCE((SELECT COUNT(*) FROM scan_candidates
+                             WHERE scan_id=?1 AND learning_recorded=0), 0)"#,
             [scan_id],
             |row| row.get(0),
         )?)
@@ -1827,7 +2522,7 @@ impl Database {
                            AND verification.fqdn=scan_candidates.fqdn
                          ORDER BY verification.checked_at DESC, verification.id DESC
                          LIMIT 1
-                       ), '')='error' THEN 'processing'
+                       ), '')='error' AND attempts<3 THEN 'queued'
                        ELSE 'done'
                    END
                    WHERE scan_id=?
@@ -1843,9 +2538,169 @@ impl Database {
         Ok(())
     }
 
+    /// Record candidate learning exactly once before a queue row becomes
+    /// terminal.  The per-row flag makes the operation idempotent across a
+    /// crash followed by `--resume`, while compact aggregate tables avoid a
+    /// permanent million-row event journal.
+    pub fn record_scan_candidate_results(
+        &self,
+        scan_id: i64,
+        results: &[(String, String, String, bool)],
+    ) -> Result<()> {
+        if results.is_empty() {
+            return Ok(());
+        }
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        let mut stored_words = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM scan_attempted_words WHERE scan_id=?1",
+                [scan_id],
+                |row| row.get::<_, i64>(0),
+            )?
+            .max(0) as usize;
+        for (fqdn, relative_name, generator, success) in results {
+            let recorded = transaction.execute(
+                r#"UPDATE scan_candidates SET learning_recorded=1
+                   WHERE scan_id=?1 AND fqdn=?2 AND learning_recorded=0
+                     AND (
+                         attempts>=3
+                         OR COALESCE((
+                             SELECT verification.outcome
+                             FROM dns_verifications verification
+                             WHERE verification.scan_id=?1
+                               AND verification.fqdn=scan_candidates.fqdn
+                             ORDER BY verification.checked_at DESC, verification.id DESC
+                             LIMIT 1
+                         ), '')<>'error'
+                     )"#,
+                params![scan_id, fqdn],
+            )?;
+            if recorded == 0 {
+                continue;
+            }
+            transaction.execute(
+                r#"INSERT INTO scan_generator_stats(scan_id, generator, attempts, successes)
+                   VALUES (?1, ?2, 1, ?3)
+                   ON CONFLICT(scan_id, generator) DO UPDATE SET
+                       attempts=attempts+1,
+                       successes=successes+excluded.successes"#,
+                params![scan_id, generator, i64::from(*success)],
+            )?;
+            if generator != "builtin" && stored_words < 100_000 {
+                for word in relative_name
+                    .split('.')
+                    .filter(|label| learnable_label(label))
+                {
+                    let added = transaction.execute(
+                        "INSERT OR IGNORE INTO scan_attempted_words(scan_id, word) VALUES (?1, ?2)",
+                        params![scan_id, word],
+                    )?;
+                    stored_words = stored_words.saturating_add(added);
+                    if stored_words >= 100_000 {
+                        break;
+                    }
+                }
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn scan_candidate_learning(&self, scan_id: i64) -> Result<ScanCandidateLearning> {
+        let connection = self.lock()?;
+        let mut attempts = HashMap::new();
+        let mut successes = HashMap::new();
+        let mut total = 0_usize;
+        {
+            let mut statement = connection.prepare(
+                "SELECT generator, attempts, successes FROM scan_generator_stats WHERE scan_id=?1",
+            )?;
+            for row in statement.query_map([scan_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })? {
+                let (generator, generator_attempts, generator_successes) = row?;
+                let generator_attempts = generator_attempts.max(0) as usize;
+                attempts.insert(generator.clone(), generator_attempts);
+                successes.insert(generator, generator_successes.max(0) as usize);
+                total = total.saturating_add(generator_attempts);
+            }
+        }
+        let words = {
+            let mut statement = connection
+                .prepare("SELECT word FROM scan_attempted_words WHERE scan_id=?1 ORDER BY word")?;
+            statement
+                .query_map([scan_id], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<BTreeSet<_>>>()?
+        };
+        Ok(ScanCandidateLearning {
+            generator_attempts: attempts,
+            generator_successes: successes,
+            attempted_words: words,
+            total_attempts: total,
+        })
+    }
+
+    pub fn scan_seed_candidates_for_output(
+        &self,
+        scan_id: i64,
+    ) -> Result<Vec<(String, BTreeSet<String>)>> {
+        let connection = self.lock()?;
+        let mut statement = connection.prepare(
+            r#"SELECT fqdn, sources_json FROM scan_seed_candidates
+               WHERE scan_id=?1 ORDER BY fqdn"#,
+        )?;
+        statement
+            .query_map([scan_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .map(|row| {
+                let (fqdn, sources_json) = row?;
+                Ok((
+                    fqdn,
+                    serde_json::from_str::<BTreeSet<String>>(&sources_json)
+                        .context("provenance de candidat passif SQLite invalide")?,
+                ))
+            })
+            .collect()
+    }
+
+    pub fn live_scan_finding_names(&self, scan_id: i64) -> Result<BTreeSet<String>> {
+        let connection = self.lock()?;
+        let mut statement = connection.prepare(
+            "SELECT fqdn FROM scan_findings WHERE scan_id=?1 AND state='live' AND wildcard=0 ORDER BY fqdn",
+        )?;
+        statement
+            .query_map([scan_id], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<BTreeSet<_>>>()
+            .map_err(Into::into)
+    }
+
     pub fn clear_scan_candidates(&self, scan_id: i64) -> Result<()> {
-        self.lock()?
-            .execute("DELETE FROM scan_candidates WHERE scan_id=?1", [scan_id])?;
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        transaction.execute("DELETE FROM scan_candidates WHERE scan_id=?1", [scan_id])?;
+        transaction.execute(
+            "DELETE FROM scan_candidate_feeds WHERE scan_id=?1",
+            [scan_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM scan_seed_candidates WHERE scan_id=?1",
+            [scan_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM scan_generator_stats WHERE scan_id=?1",
+            [scan_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM scan_attempted_words WHERE scan_id=?1",
+            [scan_id],
+        )?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -1906,8 +2761,17 @@ impl Database {
             "UPDATE scan_checkpoints SET stage='complete', updated_at=?1, completed=1 WHERE scan_id=?2",
             params![now_epoch(), scan_id],
         )?;
-        transaction.execute("DELETE FROM scan_candidates WHERE scan_id=?1", [scan_id])?;
+        transaction.execute(
+            "DELETE FROM scan_candidate_feeds WHERE scan_id=?1",
+            [scan_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM scan_seed_candidates WHERE scan_id=?1",
+            [scan_id],
+        )?;
         transaction.commit()?;
+        drop(connection);
+        let _ = self.prune_superseded_candidate_queues(2_000);
         Ok(())
     }
 
@@ -2145,7 +3009,9 @@ impl Database {
                    sources, verification_state, last_verified_at
                    ) VALUES (?1, ?2, ?3, ?3, ?4, 1, ?5, ?6, ?7, ?8)
                    ON CONFLICT(fqdn) DO UPDATE SET last_seen=excluded.last_seen,
-                   last_scan_id=excluded.last_scan_id, times_seen=times_seen+1,
+                   last_scan_id=excluded.last_scan_id,
+                   times_seen=times_seen + CASE
+                       WHEN subdomains.last_scan_id<>excluded.last_scan_id THEN 1 ELSE 0 END,
                    active=excluded.active, sources=excluded.sources,
                    verification_state=excluded.verification_state,
                    last_verified_at=COALESCE(excluded.last_verified_at, subdomains.last_verified_at)"#,
@@ -2918,6 +3784,204 @@ impl Database {
             }
         }
         transaction.commit()?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn finalize_scan_with_learning(
+        &self,
+        scan_id: i64,
+        domain: &str,
+        generator_attempts: &HashMap<String, usize>,
+        generator_successes: &HashMap<String, usize>,
+        attempted_words: &BTreeSet<String>,
+        successful_words: &BTreeSet<String>,
+        successful_patterns: &BTreeSet<String>,
+        candidates: usize,
+        found: usize,
+        cache_hits: usize,
+        duration_ms: u128,
+        warnings: &[String],
+    ) -> Result<()> {
+        let now = now_epoch();
+        let registrable = registrable_domain(domain).unwrap_or_else(|| domain.to_ascii_lowercase());
+        let hashed_domain = domain_hash(&registrable);
+        let generator_context = format!(
+            "suffix:{}",
+            public_suffix(domain).unwrap_or_else(|| domain.to_owned())
+        );
+        let mut connection = self.lock()?;
+        let bandit_contexts = candidate_contexts(&connection, domain)?;
+        let transaction = connection.transaction()?;
+        let claimed = transaction.execute(
+            "UPDATE scans SET learning_applied=1 WHERE id=?1 AND learning_applied=0",
+            [scan_id],
+        )?;
+        if claimed == 0 {
+            bail!("l'apprentissage du scan #{scan_id} a déjà été finalisé");
+        }
+
+        for (generator, attempt_count) in generator_attempts {
+            let success_count = generator_successes
+                .get(generator)
+                .copied()
+                .unwrap_or_default();
+            transaction.execute(
+                r#"INSERT INTO generator_stats(
+                   generator, attempts, successes, unique_domains, first_seen, last_seen
+                   ) VALUES (?1, ?2, ?3, 0, ?4, ?4)
+                   ON CONFLICT(generator) DO UPDATE SET
+                   attempts=generator_stats.attempts+excluded.attempts,
+                   successes=generator_stats.successes+excluded.successes,
+                   last_seen=excluded.last_seen"#,
+                params![generator, *attempt_count as i64, success_count as i64, now],
+            )?;
+            let failures = attempt_count.saturating_sub(success_count);
+            for bandit_context in &bandit_contexts {
+                transaction.execute(
+                    r#"INSERT INTO generator_bandits(
+                       context, generator, alpha, beta, pulls, rewards, last_seen
+                       ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                       ON CONFLICT(context, generator) DO UPDATE SET
+                       alpha=generator_bandits.alpha+excluded.alpha-1.0,
+                       beta=generator_bandits.beta+excluded.beta-1.0,
+                       pulls=generator_bandits.pulls+excluded.pulls,
+                       rewards=generator_bandits.rewards+excluded.rewards,
+                       last_seen=excluded.last_seen"#,
+                    params![
+                        bandit_context,
+                        generator,
+                        1.0 + success_count as f64,
+                        1.0 + failures as f64,
+                        *attempt_count as i64,
+                        success_count as i64,
+                        now
+                    ],
+                )?;
+            }
+            transaction.execute(
+                r#"INSERT INTO generator_context_stats(
+                   context, generator, attempts, successes, last_seen
+                   ) VALUES (?1, ?2, ?3, ?4, ?5)
+                   ON CONFLICT(context, generator) DO UPDATE SET
+                   attempts=generator_context_stats.attempts+excluded.attempts,
+                   successes=generator_context_stats.successes+excluded.successes,
+                   last_seen=excluded.last_seen"#,
+                params![
+                    generator_context,
+                    generator,
+                    *attempt_count as i64,
+                    success_count as i64,
+                    now
+                ],
+            )?;
+            if success_count > 0 {
+                let inserted = transaction.execute(
+                    r#"INSERT OR IGNORE INTO generator_domains(
+                       generator, domain_hash, first_seen
+                       ) VALUES (?1, ?2, ?3)"#,
+                    params![generator, hashed_domain, now],
+                )?;
+                if inserted > 0 {
+                    transaction.execute(
+                        "UPDATE generator_stats SET unique_domains=unique_domains+1 WHERE generator=?1",
+                        [generator],
+                    )?;
+                }
+            }
+        }
+
+        let all_words = attempted_words
+            .iter()
+            .chain(successful_words.iter())
+            .collect::<BTreeSet<_>>();
+        // A deep scan can contribute up to 100k words. Reuse the compiled
+        // statements instead of asking SQLite to prepare the same SQL several
+        // hundred thousand times while the user waits for finalization.
+        {
+            let mut upsert_word = transaction.prepare(
+                r#"INSERT INTO word_stats(
+                   word, attempts, successes, unique_domains, first_seen, last_seen
+                   ) VALUES (?1, ?2, ?3, 0, ?4, ?4)
+                   ON CONFLICT(word) DO UPDATE SET attempts=attempts+excluded.attempts,
+                   successes=successes+excluded.successes, last_seen=excluded.last_seen"#,
+            )?;
+            let mut insert_word_domain = transaction.prepare(
+                "INSERT OR IGNORE INTO word_domains(word, domain_hash, first_seen) VALUES (?1, ?2, ?3)",
+            )?;
+            let mut increment_word_domains = transaction
+                .prepare("UPDATE word_stats SET unique_domains=unique_domains+1 WHERE word=?1")?;
+            for word in all_words {
+                let attempts = i64::from(attempted_words.contains(word));
+                let successes = i64::from(successful_words.contains(word));
+                upsert_word.execute(params![word, attempts, successes, now])?;
+                if successes > 0
+                    && insert_word_domain.execute(params![word, hashed_domain, now])? > 0
+                {
+                    increment_word_domains.execute([word])?;
+                }
+            }
+        }
+
+        {
+            let mut upsert_pattern = transaction.prepare(
+                r#"INSERT INTO relative_patterns(
+                   relative_name, successes, unique_domains, first_seen, last_seen
+                   ) VALUES (?1, 1, 0, ?2, ?2)
+                   ON CONFLICT(relative_name) DO UPDATE SET
+                   successes=successes+1, last_seen=excluded.last_seen"#,
+            )?;
+            let mut insert_pattern_domain = transaction.prepare(
+                r#"INSERT OR IGNORE INTO pattern_domains(relative_name, domain_hash, first_seen)
+                   VALUES (?1, ?2, ?3)"#,
+            )?;
+            let mut increment_pattern_domains = transaction.prepare(
+                "UPDATE relative_patterns SET unique_domains=unique_domains+1 WHERE relative_name=?1",
+            )?;
+            for pattern in successful_patterns {
+                upsert_pattern.execute(params![pattern, now])?;
+                if insert_pattern_domain.execute(params![pattern, hashed_domain, now])? > 0 {
+                    increment_pattern_domains.execute([pattern])?;
+                }
+            }
+        }
+
+        transaction.execute(
+            "DELETE FROM scan_generator_stats WHERE scan_id=?1",
+            [scan_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM scan_attempted_words WHERE scan_id=?1",
+            [scan_id],
+        )?;
+        transaction.execute(
+            r#"UPDATE scans SET finished_at=?1, status='completed', candidates=?2,
+               found=?3, cache_hits=?4, duration_ms=?5, warnings_json=?6 WHERE id=?7"#,
+            params![
+                now_epoch(),
+                candidates as i64,
+                found as i64,
+                cache_hits as i64,
+                duration_ms.min(i64::MAX as u128) as i64,
+                serde_json::to_string(warnings)?,
+                scan_id
+            ],
+        )?;
+        transaction.execute(
+            "UPDATE scan_checkpoints SET stage='complete', updated_at=?1, completed=1 WHERE scan_id=?2",
+            params![now_epoch(), scan_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM scan_candidate_feeds WHERE scan_id=?1",
+            [scan_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM scan_seed_candidates WHERE scan_id=?1",
+            [scan_id],
+        )?;
+        transaction.commit()?;
+        drop(connection);
+        let _ = self.prune_superseded_candidate_queues(2_000);
         Ok(())
     }
 
@@ -4373,6 +5437,8 @@ mod tests {
         };
         db.persist_findings(first_scan, "example.com", &[finding.clone()], 60)
             .unwrap();
+        db.persist_findings(first_scan, "example.com", &[finding.clone()], 60)
+            .unwrap();
 
         let second_scan = db.create_scan("example.com", &json!({})).unwrap();
         finding.sources = BTreeSet::from(["web:second".to_owned()]);
@@ -4383,32 +5449,34 @@ mod tests {
             .unwrap();
 
         let connection = db.lock().unwrap();
-        let (sources, last_verified_at): (String, Option<i64>) = connection
+        let (sources, last_verified_at, times_seen): (String, Option<i64>, i64) = connection
             .query_row(
-                "SELECT sources,last_verified_at FROM subdomains WHERE fqdn='api.example.com'",
+                "SELECT sources,last_verified_at,times_seen FROM subdomains WHERE fqdn='api.example.com'",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap();
         assert_eq!(sources, "passive:first,web:second");
         assert_eq!(last_verified_at, Some(100));
+        assert_eq!(times_seen, 2, "one scan must increment inventory only once");
     }
 
     #[test]
-    fn candidate_merge_indexes_cover_priority_and_relative_name() {
+    fn candidate_indexes_cover_priority_relative_name_and_budget_counts() {
         let db = Database::in_memory().unwrap();
         let connection = db.lock().unwrap();
         let count: i64 = connection
             .query_row(
                 r#"SELECT COUNT(*) FROM sqlite_master
-                   WHERE type='index' AND name IN (
-                       'idx_scan_candidates_relative', 'idx_candidate_priors_priority'
-                   )"#,
+                    WHERE type='index' AND name IN (
+                       'idx_scan_candidates_relative', 'idx_candidate_priors_priority',
+                       'idx_scan_candidates_unrecorded'
+                    )"#,
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(count, 2);
+        assert_eq!(count, 3);
     }
 
     #[test]
@@ -4475,6 +5543,331 @@ mod tests {
     }
 
     #[test]
+    fn passive_seed_queue_is_prioritized_durable_and_resumable() {
+        let db = Database::in_memory().unwrap();
+        let scan_id = db.create_scan("example.com", &json!({})).unwrap();
+        db.upsert_checkpoint(scan_id, "example.com", "running", "options")
+            .unwrap();
+        let axfr_sources = BTreeSet::from(["axfr:ns1.example.com".to_owned()]);
+        let multi_sources =
+            BTreeSet::from(["passive:crtsh".to_owned(), "passive:wayback".to_owned()]);
+        let stale_sources = BTreeSet::from(["passive:otx:stale".to_owned()]);
+        db.persist_scan_seed_candidates(
+            scan_id,
+            &[
+                ("old.example.com".to_owned(), stale_sources.clone(), 10),
+                ("api.example.com".to_owned(), multi_sources.clone(), 20),
+                ("zone.example.com".to_owned(), axfr_sources.clone(), 30),
+            ],
+            3,
+        )
+        .unwrap();
+
+        let first = db.pending_scan_seed_candidates(scan_id, 2).unwrap();
+        assert_eq!(
+            first.iter().map(|row| row.0.as_str()).collect::<Vec<_>>(),
+            vec!["zone.example.com", "api.example.com"]
+        );
+        assert_eq!(first[0].1, axfr_sources);
+        assert_eq!(first[1].1, multi_sources);
+        db.mark_scan_seed_candidates_done(scan_id, &[first[0].0.clone()])
+            .unwrap();
+
+        db.lock()
+            .unwrap()
+            .execute(
+                "UPDATE scans SET status='interrupted' WHERE id=?1",
+                [scan_id],
+            )
+            .unwrap();
+        db.reopen_scan(scan_id).unwrap();
+        let resumed = db.pending_scan_seed_candidates(scan_id, 10).unwrap();
+        assert_eq!(
+            resumed.iter().map(|row| row.0.as_str()).collect::<Vec<_>>(),
+            vec!["api.example.com", "old.example.com"]
+        );
+        assert_eq!(resumed[1].1, stale_sources);
+        assert_eq!(db.scan_seed_candidate_count(scan_id).unwrap(), 3);
+
+        db.clear_scan_candidates(scan_id).unwrap();
+        assert_eq!(db.scan_seed_candidate_count(scan_id).unwrap(), 0);
+    }
+
+    #[test]
+    fn passive_seed_errors_retry_three_times_then_remain_terminal_on_resume() {
+        let db = Database::in_memory().unwrap();
+        let scan_id = db.create_scan("example.com", &json!({})).unwrap();
+        db.upsert_checkpoint(scan_id, "example.com", "running", "options")
+            .unwrap();
+        let host = "api.example.com".to_owned();
+        db.persist_scan_seed_candidates(
+            scan_id,
+            &[(
+                host.clone(),
+                BTreeSet::from(["passive:test".to_owned()]),
+                10,
+            )],
+            1,
+        )
+        .unwrap();
+
+        for attempt in 1..=3 {
+            assert_eq!(
+                db.pending_scan_seed_candidates(scan_id, 1).unwrap()[0].0,
+                host
+            );
+            db.update_cache_outcomes(Some(scan_id), &[], &[], std::slice::from_ref(&host), 300)
+                .unwrap();
+            db.mark_scan_seed_candidates_done(scan_id, std::slice::from_ref(&host))
+                .unwrap();
+            assert_eq!(
+                db.pending_scan_seed_candidate_count(scan_id).unwrap(),
+                i64::from(attempt < 3)
+            );
+        }
+
+        db.finish_scan(scan_id, "interrupted", 1, 0, 0, 1, &[])
+            .unwrap();
+        db.reopen_scan(scan_id).unwrap();
+        assert!(
+            db.pending_scan_seed_candidates(scan_id, 1)
+                .unwrap()
+                .is_empty()
+        );
+        let (status, attempts): (String, i64) = db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT status,attempts FROM scan_seed_candidates WHERE scan_id=?1 AND fqdn=?2",
+                params![scan_id, host],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((status.as_str(), attempts), ("done", 3));
+    }
+
+    #[test]
+    fn promoting_a_terminal_active_candidate_to_a_seed_does_not_reopen_word_budget() {
+        let db = Database::in_memory().unwrap();
+        let scan_id = db.create_scan("example.com", &json!({})).unwrap();
+        let host = "api.example.com".to_owned();
+        db.persist_scan_candidates(
+            scan_id,
+            "example.com",
+            &[("api".to_owned(), "mutation".to_owned(), 10)],
+        )
+        .unwrap();
+        db.pending_scan_candidates(scan_id, 1).unwrap();
+        db.update_cache_outcomes(Some(scan_id), &[], std::slice::from_ref(&host), &[], 300)
+            .unwrap();
+        db.record_scan_candidate_results(
+            scan_id,
+            &[(host.clone(), "api".to_owned(), "mutation".to_owned(), false)],
+        )
+        .unwrap();
+        db.mark_scan_candidates_done(scan_id, std::slice::from_ref(&host))
+            .unwrap();
+        assert_eq!(db.scan_candidate_budget_count(scan_id).unwrap(), 1);
+
+        db.persist_scan_seed_candidates(
+            scan_id,
+            &[(host, BTreeSet::from(["passive:test".to_owned()]), 20)],
+            1,
+        )
+        .unwrap();
+        assert_eq!(db.scan_candidate_count(scan_id).unwrap(), 0);
+        assert_eq!(db.scan_candidate_budget_count(scan_id).unwrap(), 1);
+    }
+
+    #[test]
+    fn a_full_seed_queue_merges_provenance_and_replaces_only_unattempted_low_priority_rows() {
+        let db = Database::in_memory().unwrap();
+        let scan_id = db.create_scan("example.com", &json!({})).unwrap();
+        let original = BTreeSet::from(["passive:first".to_owned()]);
+        db.persist_scan_seed_candidates(
+            scan_id,
+            &[
+                ("attempted.example.com".to_owned(), original.clone(), 10),
+                ("low.example.com".to_owned(), original.clone(), 5),
+            ],
+            2,
+        )
+        .unwrap();
+        assert_eq!(
+            db.pending_scan_seed_candidates(scan_id, 1).unwrap()[0].0,
+            "attempted.example.com"
+        );
+        db.persist_scan_seed_candidates(
+            scan_id,
+            &[
+                (
+                    "attempted.example.com".to_owned(),
+                    BTreeSet::from(["passive:second".to_owned()]),
+                    30,
+                ),
+                (
+                    "high.example.com".to_owned(),
+                    BTreeSet::from(["axfr:ns1.example.com".to_owned()]),
+                    20,
+                ),
+            ],
+            2,
+        )
+        .unwrap();
+
+        let rows = db.scan_seed_candidates_for_output(scan_id).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().any(|(fqdn, sources)| {
+            fqdn == "attempted.example.com"
+                && sources
+                    == &BTreeSet::from(["passive:first".to_owned(), "passive:second".to_owned()])
+        }));
+        assert!(rows.iter().any(|(fqdn, _)| fqdn == "high.example.com"));
+        assert!(!rows.iter().any(|(fqdn, _)| fqdn == "low.example.com"));
+    }
+
+    #[test]
+    fn scan_finalization_applies_learning_exactly_once() {
+        let db = Database::in_memory().unwrap();
+        let scan_id = db.create_scan("example.com", &json!({})).unwrap();
+        db.upsert_checkpoint(scan_id, "example.com", "running", "options")
+            .unwrap();
+        let attempts = HashMap::from([("mutation".to_owned(), 2_usize)]);
+        let successes = HashMap::from([("mutation".to_owned(), 1_usize)]);
+        let attempted_words = BTreeSet::from(["api".to_owned(), "dev".to_owned()]);
+        let successful_words = BTreeSet::from(["api".to_owned()]);
+        let successful_patterns = BTreeSet::from(["api".to_owned()]);
+
+        db.finalize_scan_with_learning(
+            scan_id,
+            "example.com",
+            &attempts,
+            &successes,
+            &attempted_words,
+            &successful_words,
+            &successful_patterns,
+            2,
+            1,
+            0,
+            10,
+            &[],
+        )
+        .unwrap();
+        assert!(
+            db.finalize_scan_with_learning(
+                scan_id,
+                "example.com",
+                &attempts,
+                &successes,
+                &attempted_words,
+                &successful_words,
+                &successful_patterns,
+                2,
+                1,
+                0,
+                10,
+                &[],
+            )
+            .is_err()
+        );
+
+        let connection = db.lock().unwrap();
+        let scan: (String, i64) = connection
+            .query_row(
+                "SELECT status,learning_applied FROM scans WHERE id=?1",
+                [scan_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(scan, ("completed".to_owned(), 1));
+        let word: (i64, i64, i64) = connection
+            .query_row(
+                "SELECT attempts,successes,unique_domains FROM word_stats WHERE word='api'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(word, (1, 1, 1));
+        let generator: (i64, i64) = connection
+            .query_row(
+                "SELECT attempts,successes FROM generator_stats WHERE generator='mutation'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(generator, (2, 1));
+    }
+
+    #[test]
+    fn builtin_corpus_feed_resumes_from_its_durable_cursor() {
+        let db = Database::in_memory().unwrap();
+        let expected = db.prior_candidates(4).unwrap();
+        assert_eq!(expected.len(), 4);
+        let scan_id = db.create_scan("example.com", &json!({})).unwrap();
+
+        assert_eq!(
+            db.refill_prior_candidates_to_scan(scan_id, "example.com", 2)
+                .unwrap()
+                .0,
+            2
+        );
+        let first = db.pending_scan_candidates(scan_id, 2).unwrap();
+        assert_eq!(
+            first.iter().map(|row| row.0.clone()).collect::<Vec<_>>(),
+            expected[..2]
+        );
+        db.mark_scan_candidates_done(
+            scan_id,
+            &first
+                .iter()
+                .map(|row| format!("{}.example.com", row.0))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            db.refill_prior_candidates_to_scan(scan_id, "example.com", 2)
+                .unwrap()
+                .0,
+            2
+        );
+        let second = db.pending_scan_candidates(scan_id, 2).unwrap();
+        assert_eq!(
+            second.iter().map(|row| row.0.clone()).collect::<Vec<_>>(),
+            expected[2..]
+        );
+        let cursor: i64 = db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT cursor FROM scan_candidate_feeds WHERE scan_id=?1 AND source='builtin'",
+                [scan_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let expected_cursor: i64 = db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT priority FROM candidate_priors WHERE relative_name=?1",
+                [&expected[3]],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cursor, expected_cursor);
+        let cursor_text: String = db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT cursor_text FROM scan_candidate_feeds WHERE scan_id=?1 AND source='builtin'",
+                [scan_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cursor_text, expected[3]);
+    }
+
+    #[test]
     fn stale_running_scans_are_reconciled_but_fresh_leases_are_preserved() {
         let db = Database::in_memory().unwrap();
         let stale = db.create_scan("example.com", &json!({})).unwrap();
@@ -4519,7 +5912,7 @@ mod tests {
     }
 
     #[test]
-    fn indeterminate_scan_candidates_are_deferred_until_resume() {
+    fn indeterminate_scan_candidates_retry_three_times_then_become_terminal() {
         let db = Database::in_memory().unwrap();
         let scan_id = db.create_scan("example.com", &json!({})).unwrap();
         db.persist_scan_candidates(
@@ -4549,20 +5942,201 @@ mod tests {
         )
         .unwrap();
 
-        assert!(db.pending_scan_candidates(scan_id, 10).unwrap().is_empty());
-        db.upsert_checkpoint(scan_id, "example.com", "running", "options")
-            .unwrap();
-        db.finish_scan(scan_id, "interrupted", 2, 0, 0, 1, &[])
-            .unwrap();
-        db.reopen_scan(scan_id).unwrap();
         assert_eq!(
             db.pending_scan_candidates(scan_id, 10)
                 .unwrap()
                 .into_iter()
                 .map(|(name, _, _)| name)
                 .collect::<Vec<_>>(),
-            vec!["deferred", "negative"]
+            vec!["deferred"]
         );
+        db.update_cache_outcomes(
+            Some(scan_id),
+            &[],
+            &[],
+            &["deferred.example.com".to_owned()],
+            300,
+        )
+        .unwrap();
+        db.mark_scan_candidates_done(scan_id, &["deferred.example.com".to_owned()])
+            .unwrap();
+        assert_eq!(
+            db.pending_scan_candidates(scan_id, 10)
+                .unwrap()
+                .into_iter()
+                .map(|(name, _, _)| name)
+                .collect::<Vec<_>>(),
+            vec!["deferred"]
+        );
+        db.update_cache_outcomes(
+            Some(scan_id),
+            &[],
+            &[],
+            &["deferred.example.com".to_owned()],
+            300,
+        )
+        .unwrap();
+        db.mark_scan_candidates_done(scan_id, &["deferred.example.com".to_owned()])
+            .unwrap();
+        assert!(db.pending_scan_candidates(scan_id, 10).unwrap().is_empty());
+        let negative_status: String = db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT status FROM scan_candidates WHERE scan_id=?1 AND relative_name='negative'",
+                [scan_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(negative_status, "done");
+        let (deferred_status, attempts): (String, i64) = db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT status,attempts FROM scan_candidates WHERE scan_id=?1 AND relative_name='deferred'",
+                [scan_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(deferred_status, "done");
+        assert_eq!(attempts, 3);
+    }
+
+    #[test]
+    fn a_new_scan_supersedes_only_abandoned_queues_and_preserves_inventory() {
+        let db = Database::in_memory().unwrap();
+        db.import_inventory(
+            "example.com",
+            &BTreeSet::from(["api.example.com".to_owned()]),
+            "import:test",
+        )
+        .unwrap();
+
+        let abandoned = db.create_scan("example.com", &json!({})).unwrap();
+        db.upsert_checkpoint(abandoned, "example.com", "running", "old")
+            .unwrap();
+        db.persist_scan_candidates(
+            abandoned,
+            "example.com",
+            &[("old".to_owned(), "test".to_owned(), 1)],
+        )
+        .unwrap();
+        db.mark_scan_candidate_feed_exhausted(abandoned, "high-value")
+            .unwrap();
+        db.finish_scan(abandoned, "interrupted", 1, 0, 0, 1, &[])
+            .unwrap();
+
+        let active = db.create_scan("example.com", &json!({})).unwrap();
+        db.upsert_checkpoint(active, "example.com", "running", "active")
+            .unwrap();
+        db.persist_scan_candidates(
+            active,
+            "example.com",
+            &[("active".to_owned(), "test".to_owned(), 1)],
+        )
+        .unwrap();
+
+        let newest = db.create_scan("example.com", &json!({})).unwrap();
+        db.upsert_checkpoint(newest, "example.com", "running", "new")
+            .unwrap();
+        assert_eq!(
+            db.supersede_incomplete_candidate_queues(
+                "example.com",
+                newest,
+                std::time::Duration::from_secs(120),
+            )
+            .unwrap(),
+            1
+        );
+
+        let connection = db.lock().unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM scan_candidates WHERE scan_id=?1",
+                    [abandoned],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM scan_candidates WHERE scan_id=?1",
+                    [active],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        let abandoned_state: (String, String, i64) = connection
+            .query_row(
+                r#"SELECT scan.status, checkpoint.stage, checkpoint.completed
+                   FROM scans AS scan
+                   JOIN scan_checkpoints AS checkpoint ON checkpoint.scan_id=scan.id
+                   WHERE scan.id=?1"#,
+                [abandoned],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            abandoned_state,
+            ("superseded".to_owned(), "superseded".to_owned(), 1)
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT completed FROM scan_checkpoints WHERE scan_id=?1",
+                    [newest],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM subdomains WHERE fqdn='api.example.com'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn superseded_queue_cleanup_is_bounded_and_resumable() {
+        let db = Database::in_memory().unwrap();
+        let abandoned = db.create_scan("example.com", &json!({})).unwrap();
+        db.upsert_checkpoint(abandoned, "example.com", "running", "old")
+            .unwrap();
+        let candidates = (0..2_505)
+            .map(|index| (format!("old-{index}"), "test".to_owned(), 1))
+            .collect::<Vec<_>>();
+        db.persist_scan_candidates(abandoned, "example.com", &candidates)
+            .unwrap();
+        db.finish_scan(abandoned, "interrupted", candidates.len(), 0, 0, 1, &[])
+            .unwrap();
+
+        let newest = db.create_scan("example.com", &json!({})).unwrap();
+        db.upsert_checkpoint(newest, "example.com", "running", "new")
+            .unwrap();
+        assert_eq!(
+            db.supersede_incomplete_candidate_queues(
+                "example.com",
+                newest,
+                std::time::Duration::from_secs(120),
+            )
+            .unwrap(),
+            2_000
+        );
+        assert_eq!(db.scan_candidate_count(abandoned).unwrap(), 505);
+        assert_eq!(db.prune_superseded_candidate_queues(500).unwrap(), 500);
+        assert_eq!(db.scan_candidate_count(abandoned).unwrap(), 5);
+        assert_eq!(db.prune_superseded_candidate_queues(100).unwrap(), 5);
+        assert_eq!(db.scan_candidate_count(abandoned).unwrap(), 0);
     }
 
     #[test]
@@ -4746,12 +6320,13 @@ mod tests {
         std::fs::write(&wordlist, "www\napi\nwww\ninvalid name\nadmin\n").unwrap();
         let db = Database::open(&directory.path().join("fellaga.db")).unwrap();
         let scan_id = db.create_scan("example.com", &json!({})).unwrap();
-        assert_eq!(
-            db.persist_wordlist_candidates(scan_id, "example.com", &wordlist, 2)
-                .unwrap(),
-            2
-        );
-        let candidates = db.pending_scan_candidates(scan_id, 10).unwrap();
+        let (inserted, exhausted) = db
+            .refill_wordlist_candidates(scan_id, "example.com", &wordlist, 2)
+            .unwrap();
+        assert_eq!(inserted, 2);
+        assert!(!exhausted);
+        assert_eq!(db.pending_scan_candidate_count(scan_id).unwrap(), 2);
+        let candidates = db.pending_scan_candidates(scan_id, 2).unwrap();
         assert_eq!(
             candidates
                 .into_iter()
@@ -4759,6 +6334,215 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["www", "api"]
         );
+        db.mark_scan_candidates_done(
+            scan_id,
+            &["www.example.com".to_owned(), "api.example.com".to_owned()],
+        )
+        .unwrap();
+        let (inserted, exhausted) = db
+            .refill_wordlist_candidates(scan_id, "example.com", &wordlist, 2)
+            .unwrap();
+        assert_eq!(inserted, 1);
+        assert!(exhausted);
+        assert_eq!(
+            db.pending_scan_candidate_count(scan_id).unwrap(),
+            1,
+            "only the requested page may be queued"
+        );
+        assert_eq!(db.scan_candidate_count(scan_id).unwrap(), 3);
+    }
+
+    #[test]
+    fn non_utf8_wordlist_lines_are_skipped_without_aborting_the_page() {
+        let directory = tempfile::tempdir().unwrap();
+        let wordlist = directory.path().join("binary-words.txt");
+        std::fs::write(&wordlist, b"www\ninvalid-\xff-name\napi\r\n").unwrap();
+        let db = Database::open(&directory.path().join("fellaga.db")).unwrap();
+        let scan_id = db.create_scan("example.com", &json!({})).unwrap();
+
+        assert_eq!(
+            db.refill_wordlist_candidates(scan_id, "example.com", &wordlist, 10)
+                .unwrap(),
+            (2, true)
+        );
+        assert_eq!(
+            db.pending_scan_candidates(scan_id, 10)
+                .unwrap()
+                .into_iter()
+                .map(|(name, _, _)| name)
+                .collect::<Vec<_>>(),
+            vec!["www", "api"]
+        );
+    }
+
+    #[test]
+    fn invalid_heavy_wordlist_pages_have_a_hard_read_budget() {
+        let directory = tempfile::tempdir().unwrap();
+        let wordlist = directory.path().join("mostly-invalid.txt");
+        let mut content = "invalid name\n".repeat(1_500);
+        content.push_str("api\n");
+        std::fs::write(&wordlist, content).unwrap();
+        let file_size = std::fs::metadata(&wordlist).unwrap().len() as i64;
+        let db = Database::open(&directory.path().join("fellaga.db")).unwrap();
+        let scan_id = db.create_scan("example.com", &json!({})).unwrap();
+
+        let first = db
+            .refill_wordlist_candidates(scan_id, "example.com", &wordlist, 1)
+            .unwrap();
+        assert_eq!(first, (0, false));
+        let first_cursor: i64 = db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT cursor FROM scan_candidate_feeds WHERE scan_id=?1 AND source='wordlist'",
+                [scan_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(first_cursor > 0);
+        assert!(
+            first_cursor < file_size,
+            "one refill must not scan the whole file"
+        );
+
+        assert_eq!(
+            db.refill_wordlist_candidates(scan_id, "example.com", &wordlist, 1)
+                .unwrap(),
+            (1, true)
+        );
+        assert_eq!(
+            db.refill_wordlist_candidates(scan_id, "example.com", &wordlist, 1)
+                .unwrap(),
+            (0, true)
+        );
+    }
+
+    #[test]
+    fn a_single_oversized_wordlist_line_is_discarded_in_bounded_pages() {
+        let directory = tempfile::tempdir().unwrap();
+        let wordlist = directory.path().join("oversized-line.txt");
+        let mut content = vec![b'a'; 4 * 1024 * 1024 + 128];
+        content.extend_from_slice(b"\napi\n");
+        std::fs::write(&wordlist, content).unwrap();
+        let db = Database::open(&directory.path().join("fellaga.db")).unwrap();
+        let scan_id = db.create_scan("example.com", &json!({})).unwrap();
+
+        assert_eq!(
+            db.refill_wordlist_candidates(scan_id, "example.com", &wordlist, 1)
+                .unwrap(),
+            (0, false)
+        );
+        let (cursor, state): (i64, String) = db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT cursor,cursor_text FROM scan_candidate_feeds WHERE scan_id=?1 AND source='wordlist'",
+                [scan_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(cursor, 4 * 1024 * 1024);
+        assert_eq!(state, "discard");
+        assert_eq!(
+            db.refill_wordlist_candidates(scan_id, "example.com", &wordlist, 1)
+                .unwrap(),
+            (1, true)
+        );
+        assert_eq!(db.scan_candidate_count(scan_id).unwrap(), 1);
+        assert_eq!(db.pending_scan_candidates(scan_id, 1).unwrap()[0].0, "api");
+    }
+
+    #[test]
+    fn opening_an_existing_v8_database_repairs_columns_before_dependent_indexes() {
+        let temporary = tempfile::NamedTempFile::new().unwrap();
+        let connection = Connection::open(temporary.path()).unwrap();
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE scan_candidates (
+                    scan_id INTEGER NOT NULL,
+                    fqdn TEXT NOT NULL,
+                    relative_name TEXT NOT NULL,
+                    priority INTEGER NOT NULL,
+                    generator TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'queued',
+                    PRIMARY KEY(scan_id, fqdn)
+                );
+                PRAGMA user_version=8;
+                "#,
+            )
+            .unwrap();
+        drop(connection);
+
+        let db = Database::open(temporary.path()).unwrap();
+        let connection = db.lock().unwrap();
+        let repaired_columns: i64 = connection
+            .query_row(
+                r#"SELECT COUNT(*) FROM pragma_table_info('scan_candidates')
+                   WHERE name IN ('attempts', 'learning_recorded')"#,
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(repaired_columns, 2);
+        let objects: i64 = connection
+            .query_row(
+                r#"SELECT COUNT(*) FROM sqlite_master WHERE
+                   (type='table' AND name='scan_candidate_feeds') OR
+                   (type='index' AND name='idx_scan_candidates_unrecorded')"#,
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(objects, 2);
+    }
+
+    #[test]
+    fn a_failed_same_version_schema_repair_rolls_back_every_additive_change() {
+        let temporary = tempfile::NamedTempFile::new().unwrap();
+        let connection = Connection::open(temporary.path()).unwrap();
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE scan_candidates (
+                    scan_id INTEGER NOT NULL,
+                    fqdn TEXT NOT NULL,
+                    relative_name TEXT NOT NULL,
+                    priority INTEGER NOT NULL,
+                    generator TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'queued',
+                    PRIMARY KEY(scan_id, fqdn)
+                );
+                CREATE TABLE migration_state(name TEXT PRIMARY KEY);
+                PRAGMA user_version=8;
+                "#,
+            )
+            .unwrap();
+        drop(connection);
+
+        assert!(Database::open(temporary.path()).is_err());
+        let connection = Connection::open(temporary.path()).unwrap();
+        let repaired_columns: i64 = connection
+            .query_row(
+                r#"SELECT COUNT(*) FROM pragma_table_info('scan_candidates')
+                   WHERE name IN ('attempts', 'learning_recorded')"#,
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(repaired_columns, 0);
+        let leaked_tables: i64 = connection
+            .query_row(
+                r#"SELECT COUNT(*) FROM sqlite_master
+                   WHERE type='table' AND name IN (
+                       'scan_candidate_feeds', 'scan_seed_candidates',
+                       'scan_generator_stats', 'scan_attempted_words'
+                   )"#,
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(leaked_tables, 0);
     }
 
     #[test]
