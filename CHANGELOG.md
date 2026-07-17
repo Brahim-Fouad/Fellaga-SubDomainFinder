@@ -6,6 +6,12 @@ Published releases and downloadable artifacts are available on [GitHub Releases]
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-07-17
+
+### Added
+
+- add `scan --show` for final raw FQDN output that is silent, sorted, deduplicated, wildcard-finalized, and compatible with `--only-live`.
+
 ## [0.9.1] - 2026-07-17
 
 ### Changed
@@ -235,7 +241,8 @@ Initial public release of Fellaga.
 - public MIT repository with security policy, contribution guide, third-party notices, and verifiable corpus provenance;
 - verifiable v0.8.0 release with x86-64 and ARM64 GNU/Linux archives, an amd64 Debian package, architecture SBOMs, checksums, a keyless Sigstore signature over the checksum manifest, and GitHub attestations.
 
-[Unreleased]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/compare/v0.9.1...HEAD
+[Unreleased]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/compare/v0.9.2...HEAD
+[0.9.2]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/tag/v0.9.2
 [0.9.1]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/tag/v0.9.1
 [0.9.0]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/tag/v0.9.0
 [0.8.6]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/tag/v0.8.6

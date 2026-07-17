@@ -169,6 +169,10 @@ const fn stream_jsonl_mode(enabled: bool, only_live: bool) -> StreamJsonlMode {
     }
 }
 
+const fn scan_progress_enabled(quiet: bool, show: bool, stream_jsonl: bool) -> bool {
+    (!quiet && !show) || stream_jsonl
+}
+
 fn metadata_discovery_enabled(
     mode: MetadataDiscoveryArg,
     passive_profile: bool,
@@ -702,6 +706,12 @@ struct ScanArgs {
         help = "Stream each finding as JSONL; --only-live defers until final classification"
     )]
     stream_jsonl: bool,
+    #[arg(
+        long,
+        conflicts_with_all = ["json", "jsonl", "stream_jsonl"],
+        help = "Write only final discovered FQDNs, one sorted name per line"
+    )]
+    show: bool,
     #[arg(short = 'o', long, help = "Write final scan results to a file")]
     output: Option<PathBuf>,
     #[arg(long, help = "Write one final result file per domain")]
@@ -1429,12 +1439,7 @@ fn write_scan(path: &PathBuf, result: &ScanResult, json_output: bool) -> Result<
     {
         std::fs::write(path, serde_json::to_string_pretty(result)? + "\n")?;
     } else {
-        let text = result
-            .findings
-            .iter()
-            .map(|finding| finding.fqdn.as_str())
-            .collect::<Vec<_>>()
-            .join("\n");
+        let text = raw_name_list(result.findings.iter().map(|finding| finding.fqdn.as_str()));
         std::fs::write(
             path,
             text + if result.findings.is_empty() { "" } else { "\n" },
@@ -1468,16 +1473,39 @@ fn write_scan_results(
     {
         serde_json::to_string_pretty(results)?
     } else {
-        results
-            .iter()
-            .flat_map(|result| result.findings.iter().map(|finding| finding.fqdn.clone()))
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>()
-            .join("\n")
+        raw_scan_list(results)
     };
     let newline = if text.is_empty() { "" } else { "\n" };
     std::fs::write(path, text + newline)?;
+    Ok(())
+}
+
+fn raw_name_list<'a>(names: impl IntoIterator<Item = &'a str>) -> String {
+    names
+        .into_iter()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn raw_scan_list(results: &[ScanResult]) -> String {
+    raw_name_list(
+        results
+            .iter()
+            .flat_map(|result| result.findings.iter().map(|finding| finding.fqdn.as_str())),
+    )
+}
+
+fn write_raw_scan_list(results: &[ScanResult]) -> Result<()> {
+    let text = raw_scan_list(results);
+    if text.is_empty() {
+        return Ok(());
+    }
+    let stdout = std::io::stdout();
+    let mut stdout = stdout.lock();
+    writeln!(stdout, "{text}")?;
+    stdout.flush()?;
     Ok(())
 }
 
@@ -1696,13 +1724,13 @@ async fn main() -> Result<()> {
             if args.web_timeout <= 0.0 || !args.web_timeout.is_finite() {
                 bail!("--web-timeout doit être un nombre positif");
             }
-            if [args.json, args.jsonl, args.stream_jsonl]
+            if [args.json, args.jsonl, args.stream_jsonl, args.show]
                 .into_iter()
                 .filter(|enabled| *enabled)
                 .count()
                 > 1
             {
-                bail!("--json, --jsonl et --stream-jsonl sont mutuellement exclusifs");
+                bail!("--show, --json, --jsonl et --stream-jsonl sont mutuellement exclusifs");
             }
             if args.no_passive && passive_only {
                 bail!("--no-passive et --passive-only sont incompatibles");
@@ -1853,7 +1881,8 @@ async fn main() -> Result<()> {
                 web_assets_per_host: web_assets,
             };
             let stream_mode = stream_jsonl_mode(args.stream_jsonl, args.only_live);
-            let callback: Option<scanner::ProgressCallback> = if !args.quiet || args.stream_jsonl {
+            let progress_enabled = scan_progress_enabled(args.quiet, args.show, args.stream_jsonl);
+            let callback: Option<scanner::ProgressCallback> = if progress_enabled {
                 let printer = Arc::new(Mutex::new(ConsoleProgress::new(
                     args.json || args.jsonl || args.stream_jsonl,
                 )));
@@ -1959,6 +1988,8 @@ async fn main() -> Result<()> {
                 } else {
                     println!("{}", serde_json::to_string_pretty(&results)?);
                 }
+            } else if args.show {
+                write_raw_scan_list(&results)?;
             } else if !args.quiet {
                 for result in &results {
                     print_scan_summary(result);
@@ -2543,6 +2574,40 @@ mod tests {
         assert_eq!(stream_jsonl_mode(false, true), StreamJsonlMode::Disabled);
         assert_eq!(stream_jsonl_mode(true, false), StreamJsonlMode::Realtime);
         assert_eq!(stream_jsonl_mode(true, true), StreamJsonlMode::FinalOnly);
+    }
+
+    #[test]
+    fn show_disables_progress_without_requiring_quiet() {
+        assert!(scan_progress_enabled(false, false, false));
+        assert!(!scan_progress_enabled(false, true, false));
+        assert!(!scan_progress_enabled(true, false, false));
+        assert!(scan_progress_enabled(true, false, true));
+    }
+
+    #[test]
+    fn show_parses_as_a_final_raw_output_mode_and_conflicts_with_structured_output() {
+        let parsed = Cli::try_parse_from(["fellaga", "scan", "example.com", "--show"]).unwrap();
+        let Command::Scan(parsed) = parsed.command else {
+            panic!("scan command expected");
+        };
+        assert!(parsed.show);
+
+        for structured in ["--json", "--jsonl", "--stream-jsonl"] {
+            assert!(
+                Cli::try_parse_from(["fellaga", "scan", "example.com", "--show", structured])
+                    .is_err(),
+                "--show unexpectedly accepted {structured}"
+            );
+        }
+    }
+
+    #[test]
+    fn raw_name_output_is_sorted_deduplicated_and_empty_safe() {
+        assert_eq!(
+            raw_name_list(["www.example.com", "api.example.com", "www.example.com"]),
+            "api.example.com\nwww.example.com"
+        );
+        assert_eq!(raw_name_list(std::iter::empty()), "");
     }
 
     #[test]

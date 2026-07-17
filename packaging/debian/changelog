@@ -1,3 +1,11 @@
+fellaga (0.9.2-1) unstable; urgency=medium
+
+  * Add final raw FQDN output with scan --show.
+  * Keep raw output sorted, deduplicated, silent, and compatible with
+    final live-only wildcard filtering.
+
+ -- Brahim-Fouad GUIA <170998597+Brahim-Fouad@users.noreply.github.com>  Fri, 17 Jul 2026 00:00:00 -0400
+
 fellaga (0.9.1-1) unstable; urgency=medium
 
   * Bound DNS admission, retries, CT workers, and scan cancellation.
