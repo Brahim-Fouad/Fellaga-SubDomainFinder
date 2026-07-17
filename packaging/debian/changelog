@@ -1,3 +1,13 @@
+fellaga (0.9.1-1) unstable; urgency=medium
+
+  * Bound DNS admission, retries, CT workers, and scan cancellation.
+  * Purge consensus-confirmed wildcard cache entries while preserving weak or
+    indeterminate historical state.
+  * Harden CT endpoints and commits, provider pagination, bounded mutation
+    induction, SQLite retry ceilings, resume, and migrations.
+
+ -- Brahim-Fouad GUIA <170998597+Brahim-Fouad@users.noreply.github.com>  Fri, 17 Jul 2026 00:00:00 -0400
+
 fellaga (0.9.0-1) unstable; urgency=medium
 
   * Add bounded target-local grammar, protocol-aware DNS discovery, and

@@ -9,6 +9,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 
 const MAX_EXPANSION_RATIO: usize = 25;
+const MAX_VALUES_PER_SLOT: usize = 256;
+const MAX_BEAM_WIDTH: usize = 10_000;
 
 const ENVIRONMENTS: &[&str] = &[
     "beta",
@@ -518,7 +520,7 @@ pub fn induce_local_grammar(
                 }
 
                 values.sort_by(compare_grammar_values);
-                values.truncate(config.max_values_per_slot.max(1));
+                values.truncate(config.max_values_per_slot.clamp(1, MAX_VALUES_PER_SLOT));
                 slots.push(TemplateSlot {
                     index: *index,
                     kind: *kind,
@@ -581,6 +583,7 @@ pub fn generate_candidates(
     if hard_cap == 0 || config.beam_width == 0 {
         return Vec::new();
     }
+    let beam_width = config.beam_width.min(MAX_BEAM_WIDTH);
 
     let observed = grammar
         .templates
@@ -622,9 +625,7 @@ pub fn generate_candidates(
                         break;
                     };
                     let mut expanded = Vec::with_capacity(
-                        beam.len()
-                            .saturating_mul(slot.values.len())
-                            .min(config.beam_width),
+                        beam.len().saturating_mul(slot.values.len()).min(beam_width),
                     );
                     for state in &beam {
                         for value in &slot.values {
@@ -652,7 +653,7 @@ pub fn generate_candidates(
                             .then_with(|| left.label.cmp(&right.label))
                     });
                     expanded.dedup_by(|left, right| left.label == right.label);
-                    expanded.truncate(config.beam_width);
+                    expanded.truncate(beam_width);
                     beam = expanded;
                 }
             }
@@ -821,7 +822,7 @@ fn temporal_score(
     if observed_at >= reference_time || half_life_secs <= 0 {
         return 1_000;
     }
-    let age = (reference_time - observed_at) as f64;
+    let age = reference_time.saturating_sub(observed_at) as f64;
     let score = 1_000.0 * 2f64.powf(-age / half_life_secs as f64);
     score.round().clamp(0.0, 1_000.0) as u16
 }
@@ -836,7 +837,8 @@ fn compare_grammar_values(left: &GrammarValue, right: &GrammarValue) -> std::cmp
 }
 
 fn extend_numeric_values(values: &mut Vec<GrammarValue>, config: &IntelligenceConfig) {
-    let mut remaining = config.max_values_per_slot.saturating_sub(values.len());
+    let value_limit = config.max_values_per_slot.min(MAX_VALUES_PER_SLOT);
+    let mut remaining = value_limit.saturating_sub(values.len());
     if remaining == 0 {
         return;
     }
@@ -893,14 +895,14 @@ fn template_score(template: &NameTemplate) -> i64 {
 }
 
 fn value_score(value: &GrammarValue) -> i64 {
-    let local_bonus = if value.observed_in_template {
+    let local_bonus: i64 = if value.observed_in_template {
         20_000
     } else {
         0
     };
     local_bonus
-        + (value.observations.min(i64::MAX as usize) as i64).saturating_mul(5_000)
-        + i64::from(value.temporal_score_milli) * 10
+        .saturating_add((value.observations.min(i64::MAX as usize) as i64).saturating_mul(5_000))
+        .saturating_add(i64::from(value.temporal_score_milli).saturating_mul(10))
 }
 
 fn assemble_fqdn(label: &str, parent_relative: &str, root: &str) -> String {
@@ -918,6 +920,49 @@ mod tests {
 
     fn observation(name: &str, observed_at: i64) -> NameObservation {
         NameObservation::new(name, Some(observed_at))
+    }
+
+    #[test]
+    fn grammar_value_score_saturates_for_extreme_persisted_counts() {
+        let value = GrammarValue {
+            value: "api".to_owned(),
+            observations: usize::MAX,
+            latest_observed_at: Some(i64::MAX),
+            observed_in_template: true,
+            temporal_score_milli: u16::MAX,
+        };
+        assert_eq!(value_score(&value), i64::MAX);
+    }
+
+    #[test]
+    fn temporal_scoring_and_numeric_expansion_are_bounded_for_extreme_library_inputs() {
+        assert_eq!(temporal_score(Some(i64::MIN), Some(i64::MAX), 1), 0);
+
+        let mut values = vec![
+            GrammarValue {
+                value: "0".to_owned(),
+                observations: 1,
+                latest_observed_at: None,
+                observed_in_template: true,
+                temporal_score_milli: 0,
+            },
+            GrammarValue {
+                value: "1".to_owned(),
+                observations: 1,
+                latest_observed_at: None,
+                observed_in_template: true,
+                temporal_score_milli: 0,
+            },
+        ];
+        let config = IntelligenceConfig {
+            max_values_per_slot: usize::MAX,
+            numeric_radius: u32::MAX,
+            max_numeric_span: u32::MAX,
+            beam_width: usize::MAX,
+            ..IntelligenceConfig::default()
+        };
+        extend_numeric_values(&mut values, &config);
+        assert_eq!(values.len(), MAX_VALUES_PER_SLOT);
     }
 
     #[test]

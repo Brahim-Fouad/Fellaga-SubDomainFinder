@@ -30,6 +30,11 @@ use tokio::sync::{OnceCell, oneshot};
 
 static PROBE_COUNTER: AtomicU64 = AtomicU64::new(0);
 const UDP_SOCKET_BUFFER_BYTES: usize = 16 * 1024 * 1024;
+const MAX_AUTHORITATIVE_SERVER_CACHE_ENTRIES: usize = 4_096;
+const MAX_AUTHORITATIVE_TRANSPORTS: usize = 64;
+const MAX_AUTHORITATIVE_ZONE_CANDIDATES: usize = 5;
+const MAX_NAMESERVERS_PER_ZONE: usize = 8;
+const MAX_ADDRESSES_PER_NAMESERVER: usize = 8;
 type AuthoritativeServers = Vec<(String, Vec<IpAddr>)>;
 type AuthoritativeServerCell = Arc<OnceCell<AuthoritativeServers>>;
 
@@ -386,6 +391,24 @@ where
     let key = domain.trim_end_matches('.').to_ascii_lowercase();
     let cell = {
         let mut cache = cache.lock().await;
+        if !cache.contains_key(&key) && cache.len() >= MAX_AUTHORITATIVE_SERVER_CACHE_ENTRIES {
+            // This cache is an optimization, not persistent evidence. Keeping
+            // one cell for every speculative child zone lets a hostile/deep
+            // candidate set consume memory for the whole scan. Prefer evicting
+            // a completed empty lookup, otherwise evict one arbitrary old cell;
+            // any in-flight user retains its own Arc safely.
+            let evicted = cache
+                .iter()
+                .find_map(|(cached_key, cell)| {
+                    cell.get()
+                        .is_some_and(AuthoritativeServers::is_empty)
+                        .then(|| cached_key.clone())
+                })
+                .or_else(|| cache.keys().next().cloned());
+            if let Some(evicted) = evicted {
+                cache.remove(&evicted);
+            }
+        }
         cache
             .entry(key.clone())
             .or_insert_with(|| Arc::new(OnceCell::new()))
@@ -434,6 +457,26 @@ fn conclusive_wildcard_outcome(
         }
         WildcardProbeOutcome::Indeterminate => None,
     }
+}
+
+fn authoritative_zone_candidates(fqdn: &str, root_domain: &str) -> Vec<String> {
+    let labels = fqdn.trim_end_matches('.').split('.').collect::<Vec<_>>();
+    let root_labels = root_domain.trim_end_matches('.').split('.').count();
+    if root_labels == 0 || labels.len() < root_labels {
+        return Vec::new();
+    }
+    let first_parent = usize::from(labels.len() > root_labels);
+    let root_start = labels.len() - root_labels;
+    let mut starts = (first_parent..=root_start)
+        .take(MAX_AUTHORITATIVE_ZONE_CANDIDATES.saturating_sub(1))
+        .collect::<Vec<_>>();
+    if !starts.contains(&root_start) {
+        starts.push(root_start);
+    }
+    starts
+        .into_iter()
+        .map(|start| labels[start..].join("."))
+        .collect()
 }
 
 fn normalized_dns_name(value: &str) -> String {
@@ -728,8 +771,7 @@ impl FastUdpTransport {
                         && question.query_type() == request.record_type
                         && question.query_class() == request.dns_class
                 });
-                if correlated {
-                    let request = pending.remove(&id).expect("requête DNS présente");
+                if correlated && let Some(request) = pending.remove(&id) {
                     drop(pending);
                     let _ = request.sender.send(buffer[..length].to_vec());
                 }
@@ -751,11 +793,22 @@ impl FastUdpTransport {
         recursion_desired: bool,
         timeout_duration: Duration,
     ) -> Result<Message> {
-        let _slot = self
-            .slots
-            .clone()
-            .acquire_owned()
+        self.query_with_signal(fqdn, record_type, recursion_desired, timeout_duration, None)
             .await
+    }
+
+    async fn query_with_signal(
+        &self,
+        fqdn: &str,
+        record_type: RecordType,
+        recursion_desired: bool,
+        timeout_duration: Duration,
+        send_signal: Option<&DnsSendSignal>,
+    ) -> Result<Message> {
+        let started = Instant::now();
+        let _slot = tokio::time::timeout(timeout_duration, self.slots.clone().acquire_owned())
+            .await
+            .context("délai de file DNS UDP dépassé")?
             .context("transport DNS UDP fermé")?;
         let id = loop {
             let candidate = self.next_id.fetch_add(1, Ordering::Relaxed);
@@ -794,14 +847,22 @@ impl FastUdpTransport {
             id,
             pending: self.pending.clone(),
         };
-        if let Err(error) = self.socket.send(&payload).await {
-            return Err(error.into());
+        let remaining = timeout_duration.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            bail!("délai DNS UDP dépassé avant l'envoi");
         }
-        let response = match tokio::time::timeout(timeout_duration, receiver).await {
-            Ok(Ok(response)) => response,
-            Ok(Err(error)) => return Err(error.into()),
-            Err(error) => return Err(error.into()),
-        };
+        let response = tokio::time::timeout(remaining, async {
+            let sent = self.socket.send(&payload).await?;
+            if sent != payload.len() {
+                bail!("envoi DNS UDP partiel");
+            }
+            if let Some(send_signal) = send_signal {
+                send_signal.mark_sent();
+            }
+            Ok::<_, anyhow::Error>(receiver.await?)
+        })
+        .await
+        .context("délai DNS UDP dépassé")??;
         let response = Message::from_vec(&response)?;
         if response.id() != id
             || response.message_type() != MessageType::Response
@@ -830,11 +891,25 @@ async fn query_tcp(
     recursion_desired: bool,
     timeout_duration: Duration,
 ) -> Result<Message> {
-    let _tcp_slot = dns_tcp_slots()
-        .clone()
-        .acquire_owned()
-        .await
-        .context("transport DNS TCP fermé")?;
+    query_tcp_with_slots(
+        dns_tcp_slots().clone(),
+        address,
+        fqdn,
+        record_type,
+        recursion_desired,
+        timeout_duration,
+    )
+    .await
+}
+
+async fn query_tcp_with_slots(
+    slots: Arc<tokio::sync::Semaphore>,
+    address: SocketAddr,
+    fqdn: &str,
+    record_type: RecordType,
+    recursion_desired: bool,
+    timeout_duration: Duration,
+) -> Result<Message> {
     let id = PROBE_COUNTER.fetch_add(1, Ordering::Relaxed) as u16;
     let name = Name::from_str(&format!("{}.", fqdn.trim_end_matches('.')))?;
     let query = Query::query(name.clone(), record_type);
@@ -851,7 +926,14 @@ async fn query_tcp(
         .add_query(query.clone())
         .set_edns(edns);
     let payload = message.to_vec()?;
+    // The queue behind the global TCP cap is part of this request's deadline.
+    // Previously thousands of truncated UDP answers could wait in batches of
+    // sixteen and each batch received a fresh timeout after acquiring a slot.
     let response = tokio::time::timeout(timeout_duration, async move {
+        let _tcp_slot = slots
+            .acquire_owned()
+            .await
+            .context("transport DNS TCP fermé")?;
         let mut stream = TcpStream::connect(address).await?;
         stream
             .write_all(&(payload.len() as u16).to_be_bytes())
@@ -889,15 +971,52 @@ impl FastResolver {
         recursion_desired: bool,
         timeout: Duration,
     ) -> Result<Message> {
-        let transport = self
-            .transport
-            .get_or_try_init(|| FastUdpTransport::connect(self.address))
-            .await?;
+        self.query_with_signal(fqdn, record_type, recursion_desired, timeout, None)
+            .await
+    }
+
+    async fn query_with_signal(
+        &self,
+        fqdn: &str,
+        record_type: RecordType,
+        recursion_desired: bool,
+        timeout: Duration,
+        send_signal: Option<&DnsSendSignal>,
+    ) -> Result<Message> {
+        let started = Instant::now();
+        let transport = tokio::time::timeout(
+            timeout,
+            self.transport
+                .get_or_try_init(|| FastUdpTransport::connect(self.address)),
+        )
+        .await
+        .context("délai d'initialisation DNS UDP dépassé")??;
+        let udp_budget = timeout.saturating_sub(started.elapsed());
+        if udp_budget.is_zero() {
+            bail!("délai DNS épuisé avant la requête UDP");
+        }
         let response = transport
-            .query(fqdn, record_type, recursion_desired, timeout)
+            .query_with_signal(
+                fqdn,
+                record_type,
+                recursion_desired,
+                udp_budget,
+                send_signal,
+            )
             .await?;
         if response.truncated() {
-            query_tcp(self.address, fqdn, record_type, recursion_desired, timeout).await
+            let remaining = timeout.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                bail!("délai DNS épuisé avant le repli TCP");
+            }
+            query_tcp(
+                self.address,
+                fqdn,
+                record_type,
+                recursion_desired,
+                remaining,
+            )
+            .await
         } else {
             Ok(response)
         }
@@ -945,6 +1064,94 @@ impl Drop for ResolverInflightGuard<'_> {
     }
 }
 
+/// Shared edge-triggered signal set only after the kernel accepted a DNS
+/// datagram.  A caller-owned signal lets the durable scheduler distinguish a
+/// future merely admitted to the async window from one that actually consumed
+/// a network attempt.
+#[derive(Clone, Default)]
+struct DnsSendSignal {
+    sent_at: Arc<Mutex<Option<Instant>>>,
+    host_attempted: Option<Arc<std::sync::atomic::AtomicBool>>,
+}
+
+impl DnsSendSignal {
+    fn new(host_attempted: Option<Arc<std::sync::atomic::AtomicBool>>) -> Self {
+        Self {
+            sent_at: Arc::new(Mutex::new(None)),
+            host_attempted,
+        }
+    }
+
+    fn mark_sent(&self) {
+        let Ok(mut sent_at) = self.sent_at.lock() else {
+            return;
+        };
+        if sent_at.is_some() {
+            return;
+        }
+        *sent_at = Some(Instant::now());
+        if let Some(host_attempted) = &self.host_attempted {
+            host_attempted.store(true, Ordering::Release);
+        }
+    }
+
+    fn elapsed_ms(&self) -> Option<u64> {
+        self.sent_at
+            .lock()
+            .ok()
+            .and_then(|sent_at| *sent_at)
+            .map(|sent_at| sent_at.elapsed().as_millis().min(u64::MAX as u128) as u64)
+    }
+}
+
+/// Finalizes resolver health even when an outer phase deadline drops the
+/// query future after its packet was sent.  Pre-send cancellation leaves the
+/// signal unset and therefore cannot fabricate a request or a failure.
+struct ResolverAttemptGuard<'a> {
+    state: Option<&'a Mutex<ResolverState>>,
+    governor: &'a NetworkGovernor,
+    signal: DnsSendSignal,
+    finalized: bool,
+}
+
+impl<'a> ResolverAttemptGuard<'a> {
+    fn new(
+        state: Option<&'a Mutex<ResolverState>>,
+        governor: &'a NetworkGovernor,
+        signal: DnsSendSignal,
+    ) -> Self {
+        Self {
+            state,
+            governor,
+            signal,
+            finalized: false,
+        }
+    }
+
+    fn finish(&mut self, operational: bool) {
+        if self.finalized {
+            return;
+        }
+        self.finalized = true;
+        let Some(duration_ms) = self.signal.elapsed_ms() else {
+            return;
+        };
+        if let Some(state) = self.state
+            && let Ok(mut state) = state.lock()
+        {
+            record_resolver_state(&mut state, operational, duration_ms);
+        }
+        self.governor
+            .observe_delta(1, u64::from(!operational), duration_ms);
+    }
+}
+
+impl Drop for ResolverAttemptGuard<'_> {
+    fn drop(&mut self) {
+        self.finish(false);
+    }
+}
+
 #[derive(Debug, Default)]
 struct ResolverState {
     requests: u64,
@@ -956,6 +1163,18 @@ struct ResolverState {
     reported_successes: u64,
     reported_failures: u64,
     reported_total_ms: u64,
+}
+
+fn record_resolver_state(state: &mut ResolverState, operational: bool, duration_ms: u64) {
+    state.requests = state.requests.saturating_add(1);
+    state.total_ms = state.total_ms.saturating_add(duration_ms);
+    if operational {
+        state.successes = state.successes.saturating_add(1);
+        state.consecutive_failures = 0;
+    } else {
+        state.failures = state.failures.saturating_add(1);
+        state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+    }
 }
 
 impl DnsEngine {
@@ -1224,6 +1443,64 @@ impl DnsEngine {
             .observe_delta(1, u64::from(!operational), duration_ms);
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn observed_fast_query_until(
+        &self,
+        resolver: &FastResolver,
+        metric_node: Option<&ResolverNode>,
+        fqdn: &str,
+        record_type: RecordType,
+        recursion_desired: bool,
+        deadline: Option<tokio::time::Instant>,
+        host_attempted: Option<Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Result<Message> {
+        let rate_slot_acquired = match deadline {
+            Some(deadline) => self.wait_for_rate_slot_before(deadline).await,
+            None => {
+                self.wait_for_rate_slot().await;
+                true
+            }
+        };
+        if !rate_slot_acquired {
+            bail!("budget DNS atteint avant l'acquisition du limiteur de débit");
+        }
+        let request_timeout = deadline
+            .map(|deadline| {
+                deadline
+                    .saturating_duration_since(tokio::time::Instant::now())
+                    .min(self.timeout)
+            })
+            .unwrap_or(self.timeout);
+        if request_timeout.is_zero() {
+            bail!("budget DNS atteint avant l'envoi");
+        }
+        let _inflight = metric_node.map(|node| ResolverInflightGuard::new(&node.inflight));
+        let signal = DnsSendSignal::new(host_attempted);
+        let mut accounting = ResolverAttemptGuard::new(
+            metric_node.map(|node| &node.state),
+            self.governor.as_ref(),
+            signal.clone(),
+        );
+        let response = resolver
+            .query_with_signal(
+                fqdn,
+                record_type,
+                recursion_desired,
+                request_timeout,
+                Some(&signal),
+            )
+            .await;
+        let operational = response.as_ref().is_ok_and(|response| {
+            !response.truncated()
+                && matches!(
+                    response.response_code(),
+                    ResponseCode::NoError | ResponseCode::NXDomain
+                )
+        });
+        accounting.finish(operational);
+        response
+    }
+
     async fn wait_for_rate_slot(&self) {
         let current_rate = self.governor.current_rate();
         if current_rate == 0 {
@@ -1391,28 +1668,62 @@ impl DnsEngine {
     }
 
     pub async fn resolve_host_consensus_classified(&self, fqdn: &str) -> DnsResolutionOutcome {
+        self.resolve_host_consensus_classified_with_signal(fqdn, None)
+            .await
+    }
+
+    pub(crate) async fn resolve_host_consensus_classified_with_network_signal(
+        &self,
+        fqdn: &str,
+        host_attempted: Arc<std::sync::atomic::AtomicBool>,
+    ) -> DnsResolutionOutcome {
+        self.resolve_host_consensus_classified_with_signal(fqdn, Some(host_attempted))
+            .await
+    }
+
+    async fn resolve_host_consensus_classified_with_signal(
+        &self,
+        fqdn: &str,
+        host_attempted: Option<Arc<std::sync::atomic::AtomicBool>>,
+    ) -> DnsResolutionOutcome {
         let required = positive_quorum(self.fast_resolvers.len());
-        let results = stream::iter(self.fast_resolvers.iter())
-            .map(|resolver| async move {
-                let query_a = async {
-                    self.wait_for_rate_slot().await;
-                    classify_address_response(
-                        resolver
-                            .query(fqdn, RecordType::A, true, self.timeout)
+        let results = stream::iter(self.fast_resolvers.iter().enumerate())
+            .map(|(index, resolver)| {
+                let host_attempted = host_attempted.clone();
+                async move {
+                    let metric_node = self.resolvers.get(index);
+                    let query_a = async {
+                        classify_address_response(
+                            self.observed_fast_query_until(
+                                resolver,
+                                metric_node,
+                                fqdn,
+                                RecordType::A,
+                                true,
+                                None,
+                                host_attempted.clone(),
+                            )
                             .await,
-                        RecordType::A,
-                    )
-                };
-                let query_aaaa = async {
-                    self.wait_for_rate_slot().await;
-                    classify_address_response(
-                        resolver
-                            .query(fqdn, RecordType::AAAA, true, self.timeout)
+                            RecordType::A,
+                        )
+                    };
+                    let query_aaaa = async {
+                        classify_address_response(
+                            self.observed_fast_query_until(
+                                resolver,
+                                metric_node,
+                                fqdn,
+                                RecordType::AAAA,
+                                true,
+                                None,
+                                host_attempted.clone(),
+                            )
                             .await,
-                        RecordType::AAAA,
-                    )
-                };
-                first_positive_or_both(query_a, query_aaaa).await
+                            RecordType::AAAA,
+                        )
+                    };
+                    first_positive_or_both(query_a, query_aaaa).await
+                }
             })
             .buffer_unordered(self.fast_resolvers.len().max(1));
         // Each UDP/TCP/Hickory operation has its own network timeout. Do not
@@ -1432,16 +1743,23 @@ impl DnsEngine {
     }
 
     pub async fn authoritative_confirms(&self, fqdn: &str) -> bool {
+        self.authoritative_confirms_until(fqdn, None).await
+    }
+
+    pub(crate) async fn authoritative_confirms_until(
+        &self,
+        fqdn: &str,
+        deadline: Option<tokio::time::Instant>,
+    ) -> bool {
         let Some(root_domain) = crate::util::registrable_domain(fqdn) else {
             return false;
         };
         let mut servers = None;
-        let labels = fqdn.trim_end_matches('.').split('.').collect::<Vec<_>>();
-        let root_labels = root_domain.split('.').count();
-        let first_parent = usize::from(labels.len() > root_labels);
-        for start in first_parent..=labels.len().saturating_sub(root_labels) {
-            let zone = labels[start..].join(".");
-            if let Ok(candidate) = self.authoritative_servers(&zone).await
+        for zone in authoritative_zone_candidates(fqdn, &root_domain) {
+            if deadline.is_some_and(|deadline| deadline <= tokio::time::Instant::now()) {
+                return false;
+            }
+            if let Ok(candidate) = self.authoritative_servers_until(&zone, deadline).await
                 && !candidate.is_empty()
             {
                 servers = Some(candidate);
@@ -1465,20 +1783,32 @@ impl DnsEngine {
         let mut results = stream::iter(resolvers)
             .map(|resolver| async move {
                 let a = async {
-                    self.wait_for_rate_slot().await;
                     authoritative_response_confirms(
-                        resolver
-                            .query(fqdn, RecordType::A, false, self.timeout)
-                            .await,
+                        self.observed_fast_query_until(
+                            &resolver,
+                            None,
+                            fqdn,
+                            RecordType::A,
+                            false,
+                            deadline,
+                            None,
+                        )
+                        .await,
                         RecordType::A,
                     )
                 };
                 let aaaa = async {
-                    self.wait_for_rate_slot().await;
                     authoritative_response_confirms(
-                        resolver
-                            .query(fqdn, RecordType::AAAA, false, self.timeout)
-                            .await,
+                        self.observed_fast_query_until(
+                            &resolver,
+                            None,
+                            fqdn,
+                            RecordType::AAAA,
+                            false,
+                            deadline,
+                            None,
+                        )
+                        .await,
                         RecordType::AAAA,
                     )
                 };
@@ -1498,6 +1828,14 @@ impl DnsEngine {
             .authoritative_resolvers
             .lock()
             .map_err(|_| anyhow::anyhow!("cache des résolveurs autoritaires empoisonné"))?;
+        if !resolvers.contains_key(&address) && resolvers.len() >= MAX_AUTHORITATIVE_TRANSPORTS {
+            // Cached transports own a UDP receiver task and large socket
+            // buffers. Bound the optimization so scanning many providers does
+            // not retain one socket/task for every authoritative IP forever.
+            if let Some(evicted) = resolvers.keys().next().copied() {
+                resolvers.remove(&evicted);
+            }
+        }
         Ok(resolvers
             .entry(address)
             .or_insert_with(|| {
@@ -1579,43 +1917,36 @@ impl DnsEngine {
             .collect()
     }
 
-    async fn resolver_reports_strict_nxdomain(&self, index: usize, fqdn: &str) -> bool {
+    async fn resolver_reports_strict_nxdomain(
+        &self,
+        index: usize,
+        fqdn: &str,
+        host_attempted: Option<Arc<std::sync::atomic::AtomicBool>>,
+    ) -> bool {
         let (Some(resolver), Some(node)) =
             (self.fast_resolvers.get(index), self.resolvers.get(index))
         else {
             return false;
         };
-        self.wait_for_rate_slot().await;
-        let _inflight = ResolverInflightGuard::new(&node.inflight);
-        let started = Instant::now();
-        let response = resolver
-            .query(fqdn, RecordType::A, true, self.timeout)
+        let response = self
+            .observed_fast_query_until(
+                resolver,
+                Some(node),
+                fqdn,
+                RecordType::A,
+                true,
+                None,
+                host_attempted,
+            )
             .await;
-        let strict = response.as_ref().is_ok_and(is_definitive_nxdomain);
-        let operational = response.as_ref().is_ok_and(|response| {
-            !response.truncated()
-                && matches!(
-                    response.response_code(),
-                    ResponseCode::NoError | ResponseCode::NXDomain
-                )
-        });
-        let duration_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
-        if let Ok(mut state) = node.state.lock() {
-            state.requests += 1;
-            state.total_ms = state.total_ms.saturating_add(duration_ms);
-            if operational {
-                state.successes += 1;
-                state.consecutive_failures = 0;
-            } else {
-                state.failures += 1;
-                state.consecutive_failures += 1;
-            }
-        }
-        self.observe_network_outcome(operational, duration_ms);
-        strict
+        response.as_ref().is_ok_and(is_definitive_nxdomain)
     }
 
-    async fn discovery_nxdomain_quorum(&self, fqdn: &str) -> bool {
+    async fn discovery_nxdomain_quorum(
+        &self,
+        fqdn: &str,
+        host_attempted: Option<Arc<std::sync::atomic::AtomicBool>>,
+    ) -> bool {
         let order = self
             .resolver_order()
             .into_iter()
@@ -1626,8 +1957,8 @@ impl DnsEngine {
             return false;
         };
         let (first_negative, second_negative) = tokio::join!(
-            self.resolver_reports_strict_nxdomain(*first, fqdn),
-            self.resolver_reports_strict_nxdomain(*second, fqdn),
+            self.resolver_reports_strict_nxdomain(*first, fqdn, host_attempted.clone()),
+            self.resolver_reports_strict_nxdomain(*second, fqdn, host_attempted),
         );
         first_negative && second_negative
     }
@@ -1642,7 +1973,7 @@ impl DnsEngine {
             .into_iter()
             .take(2)
             .collect::<Vec<_>>();
-        self.lookup_records_classified_in_order(fqdn, record_type, &order)
+        self.lookup_records_classified_in_order(fqdn, record_type, &order, None)
             .await
     }
 
@@ -1651,17 +1982,26 @@ impl DnsEngine {
         fqdn: &str,
         record_type: RecordType,
         order: &[usize],
+        host_attempted: Option<Arc<std::sync::atomic::AtomicBool>>,
     ) -> RecordLookupOutcome {
         let required_negatives = order.len().clamp(1, 2);
         let mut definitive_negatives = 0_usize;
         for index in order.iter().copied() {
-            self.wait_for_rate_slot().await;
             let node = &self.resolvers[index];
-            let _inflight = ResolverInflightGuard::new(&node.inflight);
-            let started = Instant::now();
             let fast_response = if matches!(record_type, RecordType::A | RecordType::AAAA) {
                 if let Some(resolver) = self.fast_resolvers.get(index) {
-                    Some(resolver.query(fqdn, record_type, true, self.timeout).await)
+                    Some(
+                        self.observed_fast_query_until(
+                            resolver,
+                            Some(node),
+                            fqdn,
+                            record_type,
+                            true,
+                            None,
+                            host_attempted.clone(),
+                        )
+                        .await,
+                    )
                 } else {
                     None
                 }
@@ -1692,34 +2032,32 @@ impl DnsEngine {
                 &fast_response,
                 Some(Err(error)) if error.is::<tokio::time::error::Elapsed>()
             );
+            let fallback_started = Instant::now();
             let result = if fast_result.is_none() && !fast_timed_out {
-                if fast_response.is_some() {
-                    // Le repli Hickory produit une seconde sortie réseau.
-                    self.wait_for_rate_slot().await;
-                }
+                // The fast path failed without exhausting its network
+                // timeout, or this resolver has no raw transport. Hickory
+                // remains a compatibility fallback, but it is accounted only
+                // after a terminal uncached result.
+                self.wait_for_rate_slot().await;
                 Some(node.resolver.lookup(fqdn, record_type).await)
             } else {
                 None
             };
-            let fast_operational = fast_response.as_ref().is_some_and(|response| {
-                response.as_ref().is_ok_and(|response| {
-                    !response.truncated()
-                        && matches!(
-                            response.response_code(),
-                            ResponseCode::NoError | ResponseCode::NXDomain
-                        )
-                })
-            });
+            if result.is_some()
+                && let Some(host_attempted) = &host_attempted
+            {
+                // Hickory exposes no post-send hook. Its cache is disabled for
+                // Fellaga resolvers, so a terminal lookup result proves that a
+                // network attempt occurred without marking one before polling.
+                host_attempted.store(true, Ordering::Release);
+            }
+            let fallback_duration_ms =
+                fallback_started.elapsed().as_millis().min(u64::MAX as u128) as u64;
             let fallback_operational = result.as_ref().is_some_and(|result| match result {
                 Ok(_) => true,
                 Err(error) => error.is_nx_domain() || error.is_no_records_found(),
             });
-            let operational = if fast_result.is_some() || fast_timed_out {
-                fast_operational
-            } else {
-                fallback_operational
-            };
-            let duration_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+            let had_fallback = result.is_some();
             let classified = if let Some(result) = fast_result {
                 result
             } else if fast_timed_out {
@@ -1749,18 +2087,12 @@ impl DnsEngine {
                     Err(_) => RecordLookupOutcome::Indeterminate,
                 }
             };
-            if let Ok(mut state) = node.state.lock() {
-                state.requests += 1;
-                state.total_ms = state.total_ms.saturating_add(duration_ms);
-                if operational {
-                    state.successes += 1;
-                    state.consecutive_failures = 0;
-                } else {
-                    state.failures += 1;
-                    state.consecutive_failures += 1;
+            if had_fallback {
+                if let Ok(mut state) = node.state.lock() {
+                    record_resolver_state(&mut state, fallback_operational, fallback_duration_ms);
                 }
+                self.observe_network_outcome(fallback_operational, fallback_duration_ms);
             }
-            self.observe_network_outcome(operational, duration_ms);
             match classified {
                 RecordLookupOutcome::Positive(records) => {
                     return RecordLookupOutcome::Positive(records);
@@ -1928,12 +2260,17 @@ impl DnsEngine {
         &self,
         fqdn: &str,
         allow_discovery_fast_negative: bool,
+        host_attempted: Option<Arc<std::sync::atomic::AtomicBool>>,
     ) -> DnsResolutionOutcome {
         // A strict NXDOMAIN from two independent resolvers proves that the
         // owner does not exist and lets the discovery path skip AAAA. Any
         // disagreement, NODATA, CNAME, timeout, or malformed response falls
         // back to the full conservative A+AAAA path.
-        if allow_discovery_fast_negative && self.discovery_nxdomain_quorum(fqdn).await {
+        if allow_discovery_fast_negative
+            && self
+                .discovery_nxdomain_quorum(fqdn, host_attempted.clone())
+                .await
+        {
             return DnsResolutionOutcome::Negative {
                 fqdn: fqdn.to_owned(),
             };
@@ -1949,8 +2286,13 @@ impl DnsEngine {
             .take(2)
             .collect::<Vec<_>>();
         let outcome = first_positive_or_both(
-            self.lookup_records_classified_in_order(fqdn, RecordType::A, &order),
-            self.lookup_records_classified_in_order(fqdn, RecordType::AAAA, &order),
+            self.lookup_records_classified_in_order(
+                fqdn,
+                RecordType::A,
+                &order,
+                host_attempted.clone(),
+            ),
+            self.lookup_records_classified_in_order(fqdn, RecordType::AAAA, &order, host_attempted),
         )
         .await;
         classify_host_lookup(fqdn, outcome)
@@ -1961,18 +2303,39 @@ impl DnsEngine {
     /// configured discovery quorum; this method never uses the fast-negative
     /// shortcut.
     pub async fn resolve_host_classified(&self, fqdn: &str) -> DnsResolutionOutcome {
-        self.resolve_host_classified_with_policy(fqdn, false).await
+        self.resolve_host_classified_with_policy(fqdn, false, None)
+            .await
+    }
+
+    pub(crate) async fn resolve_host_classified_with_network_signal(
+        &self,
+        fqdn: &str,
+        host_attempted: Arc<std::sync::atomic::AtomicBool>,
+    ) -> DnsResolutionOutcome {
+        self.resolve_host_classified_with_policy(fqdn, false, Some(host_attempted))
+            .await
     }
 
     /// Fast classification for fresh enumeration candidates only. Callers must
     /// not use its negative outcome to demote or purge a retained/live name.
     /// Positive and indeterminate outcomes preserve the standard validation
     /// pipeline; only a qualified, discovery-only negative may short-circuit.
+    #[cfg(test)]
     pub(crate) async fn resolve_host_discovery_classified(
         &self,
         fqdn: &str,
     ) -> DnsResolutionOutcome {
-        self.resolve_host_classified_with_policy(fqdn, true).await
+        self.resolve_host_classified_with_policy(fqdn, true, None)
+            .await
+    }
+
+    pub(crate) async fn resolve_host_discovery_classified_with_network_signal(
+        &self,
+        fqdn: &str,
+        host_attempted: Arc<std::sync::atomic::AtomicBool>,
+    ) -> DnsResolutionOutcome {
+        self.resolve_host_classified_with_policy(fqdn, true, Some(host_attempted))
+            .await
     }
 
     pub async fn resolve_host(&self, fqdn: &str) -> Option<ResolvedHost> {
@@ -2037,7 +2400,7 @@ impl DnsEngine {
                 let engine = engine.clone();
                 async move {
                     engine
-                        .resolve_host_classified_with_policy(&host, discovery_fast_negative)
+                        .resolve_host_classified_with_policy(&host, discovery_fast_negative, None)
                         .await
                 }
             })
@@ -2124,43 +2487,104 @@ impl DnsEngine {
         !signature.is_empty() && !answer.records.is_empty() && answer.signature() == *signature
     }
 
-    async fn load_authoritative_servers(&self, domain: &str) -> Result<AuthoritativeServers> {
-        if self.resolvers.is_empty() {
-            bail!("aucun résolveur récursif disponible");
+    async fn load_authoritative_servers(
+        &self,
+        domain: &str,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<AuthoritativeServers> {
+        let index = self
+            .resolver_order()
+            .into_iter()
+            .find(|index| {
+                self.resolvers.get(*index).is_some() && self.fast_resolvers.get(*index).is_some()
+            })
+            .context("aucun résolveur récursif UDP instrumenté disponible")?;
+        let node = &self.resolvers[index];
+        let resolver = &self.fast_resolvers[index];
+        let ns_response = self
+            .observed_fast_query_until(
+                resolver,
+                Some(node),
+                domain,
+                RecordType::NS,
+                true,
+                deadline,
+                None,
+            )
+            .await
+            .with_context(|| format!("résolution NS de {domain}"))?;
+        if is_definitive_nxdomain(&ns_response) {
+            return Ok(Vec::new());
         }
-        let resolver = self.resolvers[self.resolver_order()[0]].resolver.clone();
-        self.wait_for_rate_slot().await;
-        let lookup = match resolver.lookup(domain, RecordType::NS).await {
-            Ok(lookup) => lookup,
-            Err(error) if error.is_no_records_found() || error.is_nx_domain() => {
-                return Ok(Vec::new());
-            }
-            Err(error) => {
-                return Err(error).with_context(|| format!("résolution NS de {domain}"));
-            }
-        };
-        let names: BTreeSet<String> = lookup
-            .answers()
-            .iter()
-            .filter(|record| record.record_type() == RecordType::NS)
-            .map(|record| record.data().to_string().trim_end_matches('.').to_owned())
-            .collect();
+        if ns_response.response_code() != ResponseCode::NoError {
+            bail!(
+                "résolution NS de {domain}: réponse {:?}",
+                ns_response.response_code()
+            );
+        }
+        let names = response_records(&ns_response, RecordType::NS)
+            .into_iter()
+            .map(|record| record.value.trim_end_matches('.').to_ascii_lowercase())
+            .filter(|name| !name.is_empty())
+            .take(MAX_NAMESERVERS_PER_ZONE)
+            .collect::<BTreeSet<_>>();
         let mut result = Vec::new();
         for name in names {
-            self.wait_for_rate_slot().await;
-            let addresses = resolver
-                .lookup_ip(name.as_str())
-                .await
-                .map(|lookup| lookup.iter().collect())
-                .unwrap_or_default();
-            result.push((name, addresses));
+            if deadline.is_some_and(|deadline| deadline <= tokio::time::Instant::now()) {
+                bail!("budget DNS autoritaire atteint pendant la résolution des adresses NS");
+            }
+            let mut addresses = BTreeSet::new();
+            for record_type in [RecordType::A, RecordType::AAAA] {
+                match self
+                    .observed_fast_query_until(
+                        resolver,
+                        Some(node),
+                        &name,
+                        record_type,
+                        true,
+                        deadline,
+                        None,
+                    )
+                    .await
+                {
+                    Ok(response) => {
+                        addresses.extend(
+                            response_records(&response, record_type)
+                                .into_iter()
+                                .filter_map(|record| record.value.parse::<IpAddr>().ok()),
+                        );
+                    }
+                    Err(error)
+                        if deadline
+                            .is_some_and(|deadline| deadline <= tokio::time::Instant::now()) =>
+                    {
+                        return Err(error).context("budget DNS autoritaire atteint");
+                    }
+                    Err(_) => {}
+                }
+            }
+            result.push((
+                name,
+                addresses
+                    .into_iter()
+                    .take(MAX_ADDRESSES_PER_NAMESERVER)
+                    .collect(),
+            ));
         }
         Ok(result)
     }
 
     pub async fn authoritative_servers(&self, domain: &str) -> Result<AuthoritativeServers> {
+        self.authoritative_servers_until(domain, None).await
+    }
+
+    pub(crate) async fn authoritative_servers_until(
+        &self,
+        domain: &str,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<AuthoritativeServers> {
         authoritative_servers_cached(&self.authoritative_server_cache, domain, |key| async move {
-            self.load_authoritative_servers(&key).await
+            self.load_authoritative_servers(&key, deadline).await
         })
         .await
     }
@@ -2169,7 +2593,7 @@ impl DnsEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hickory_net::proto::rr::rdata::{A, CNAME};
+    use hickory_net::proto::rr::rdata::{A, CNAME, NS};
 
     #[test]
     fn resolver_inflight_guard_releases_load_when_a_future_is_cancelled() {
@@ -2335,8 +2759,14 @@ mod tests {
     }
 
     fn consensus_test_engine(addresses: Vec<SocketAddr>) -> DnsEngine {
+        let metric_addresses = addresses.clone();
         DnsEngine {
-            resolvers: Arc::new(Vec::new()),
+            resolvers: Arc::new(
+                metric_addresses
+                    .into_iter()
+                    .map(|address| resolver_node_at(address, Duration::from_millis(100)))
+                    .collect(),
+            ),
             fast_resolvers: Arc::new(
                 addresses
                     .into_iter()
@@ -3494,6 +3924,54 @@ mod tests {
         assert!(transport.pending.lock().await.is_empty());
     }
 
+    #[tokio::test]
+    async fn udp_slot_queue_is_part_of_the_network_timeout() {
+        let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let transport = FastUdpTransport::connect(silent.local_addr().unwrap())
+            .await
+            .unwrap();
+        let _all_slots = transport
+            .slots
+            .clone()
+            .acquire_many_owned(4_096)
+            .await
+            .unwrap();
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(200),
+            transport.query(
+                "queued.example",
+                RecordType::A,
+                true,
+                Duration::from_millis(20),
+            ),
+        )
+        .await
+        .expect("the UDP admission queue ignored the per-query deadline");
+
+        assert!(result.is_err());
+        assert!(transport.pending.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn tcp_slot_queue_is_part_of_the_network_timeout() {
+        let result = tokio::time::timeout(
+            Duration::from_millis(200),
+            query_tcp_with_slots(
+                Arc::new(tokio::sync::Semaphore::new(0)),
+                "127.0.0.1:9".parse().unwrap(),
+                "queued.example",
+                RecordType::A,
+                true,
+                Duration::from_millis(20),
+            ),
+        )
+        .await
+        .expect("the TCP admission queue ignored the per-query deadline");
+
+        assert!(result.is_err());
+    }
+
     #[test]
     fn trusted_engines_can_share_one_rate_limiter() {
         let primary = DnsEngine::new_with_rate(
@@ -3729,6 +4207,250 @@ mod tests {
     }
 
     #[test]
+    fn authoritative_zone_search_is_bounded_but_always_reaches_the_root_zone() {
+        let zones = authoritative_zone_candidates("host.a.b.c.d.e.f.example.com", "example.com");
+        assert_eq!(zones.len(), MAX_AUTHORITATIVE_ZONE_CANDIDATES);
+        assert_eq!(
+            zones.first().map(String::as_str),
+            Some("a.b.c.d.e.f.example.com")
+        );
+        assert_eq!(zones.last().map(String::as_str), Some("example.com"));
+    }
+
+    #[test]
+    fn resolver_counters_saturate_instead_of_wrapping_or_panicking() {
+        let mut state = ResolverState {
+            requests: u64::MAX,
+            successes: u64::MAX,
+            failures: u64::MAX,
+            total_ms: u64::MAX,
+            consecutive_failures: u64::MAX,
+            ..ResolverState::default()
+        };
+        record_resolver_state(&mut state, false, u64::MAX);
+        record_resolver_state(&mut state, true, u64::MAX);
+        assert_eq!(state.requests, u64::MAX);
+        assert_eq!(state.successes, u64::MAX);
+        assert_eq!(state.failures, u64::MAX);
+        assert_eq!(state.total_ms, u64::MAX);
+    }
+
+    #[tokio::test]
+    async fn consensus_transport_failures_feed_the_shared_governor() {
+        let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut engine =
+            discovery_test_engine(&[silent.local_addr().unwrap()], Duration::from_millis(20));
+        engine.governor = Arc::new(NetworkGovernor::new(NetworkControl::Adaptive, 0, 128));
+
+        let outcome = engine
+            .resolve_host_consensus_classified("silent.example")
+            .await;
+        assert!(matches!(
+            outcome,
+            DnsResolutionOutcome::Indeterminate { .. }
+        ));
+        engine.governor.evaluate_pending_for_test();
+        assert_eq!(engine.network_governor_snapshot().backoffs, 1);
+        let metrics = engine.take_metrics();
+        assert_eq!(metrics.iter().map(|metric| metric.requests).sum::<u64>(), 2);
+        assert_eq!(metrics.iter().map(|metric| metric.failures).sum::<u64>(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_fast_failure_before_send_is_not_counted_as_a_network_attempt() {
+        let target = "fallback-health.example.test";
+        let (address, _, server_task) = target_positive_a_resolver(target, "192.0.2.88").await;
+        let transport = FastUdpTransport::connect(address).await.unwrap();
+        transport.slots.close();
+        let cell = OnceCell::new();
+        assert!(cell.set(transport).is_ok());
+
+        let mut engine = discovery_test_engine(&[address], Duration::from_millis(100));
+        engine.fast_resolvers = Arc::new(vec![FastResolver {
+            address,
+            transport: cell,
+        }]);
+        let outcome = engine
+            .lookup_records_classified(target, RecordType::A)
+            .await;
+        assert!(matches!(outcome, RecordLookupOutcome::Positive(_)));
+
+        let metrics = engine.take_metrics();
+        assert_eq!(metrics.iter().map(|metric| metric.requests).sum::<u64>(), 1);
+        assert_eq!(metrics.iter().map(|metric| metric.failures).sum::<u64>(), 0);
+        assert_eq!(
+            metrics.iter().map(|metric| metric.successes).sum::<u64>(),
+            1
+        );
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_udp_send_records_a_failure_and_governor_pressure() {
+        let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = silent.local_addr().unwrap();
+        let mut engine = discovery_test_engine(&[address], Duration::from_secs(5));
+        engine.governor = Arc::new(NetworkGovernor::new(NetworkControl::Adaptive, 0, 128));
+        let engine = Arc::new(engine);
+        let attempted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let query = tokio::spawn({
+            let engine = Arc::clone(&engine);
+            let attempted = Arc::clone(&attempted);
+            async move {
+                engine
+                    .observed_fast_query_until(
+                        &engine.fast_resolvers[0],
+                        Some(&engine.resolvers[0]),
+                        "cancelled.example.test",
+                        RecordType::A,
+                        true,
+                        None,
+                        Some(attempted),
+                    )
+                    .await
+            }
+        });
+
+        let mut packet = [0_u8; 2_048];
+        tokio::time::timeout(Duration::from_secs(1), silent.recv_from(&mut packet))
+            .await
+            .expect("the test query was never sent")
+            .unwrap();
+        assert!(attempted.load(Ordering::Acquire));
+        query.abort();
+        assert!(query.await.unwrap_err().is_cancelled());
+
+        let metrics = engine.take_metrics();
+        assert_eq!(metrics.iter().map(|metric| metric.requests).sum::<u64>(), 1);
+        assert_eq!(
+            metrics.iter().map(|metric| metric.successes).sum::<u64>(),
+            0
+        );
+        assert_eq!(metrics.iter().map(|metric| metric.failures).sum::<u64>(), 1);
+        engine.governor.evaluate_pending_for_test();
+        assert_eq!(engine.network_governor_snapshot().backoffs, 1);
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_udp_send_does_not_fabricate_metrics_or_attempts() {
+        let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = silent.local_addr().unwrap();
+        let transport = FastUdpTransport::connect(address).await.unwrap();
+        transport.slots.close();
+        let cell = OnceCell::new();
+        assert!(cell.set(transport).is_ok());
+        let mut engine = discovery_test_engine(&[address], Duration::from_millis(50));
+        engine.fast_resolvers = Arc::new(vec![FastResolver {
+            address,
+            transport: cell,
+        }]);
+        engine.governor = Arc::new(NetworkGovernor::new(NetworkControl::Adaptive, 0, 128));
+        let attempted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let result = engine
+            .observed_fast_query_until(
+                &engine.fast_resolvers[0],
+                Some(&engine.resolvers[0]),
+                "never-sent.example.test",
+                RecordType::A,
+                true,
+                None,
+                Some(Arc::clone(&attempted)),
+            )
+            .await;
+        assert!(result.is_err());
+        assert!(!attempted.load(Ordering::Acquire));
+        assert!(engine.take_metrics().is_empty());
+        engine.governor.evaluate_pending_for_test();
+        assert_eq!(engine.network_governor_snapshot().backoffs, 0);
+    }
+
+    #[tokio::test]
+    async fn authoritative_discovery_is_deadline_bounded_and_fully_measured() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = server.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let request_count = Arc::clone(&requests);
+        let server_task = tokio::spawn(async move {
+            loop {
+                let mut packet = [0_u8; 2_048];
+                let Ok((length, peer)) = server.recv_from(&mut packet).await else {
+                    break;
+                };
+                request_count.fetch_add(1, Ordering::SeqCst);
+                let mut response = Message::from_vec(&packet[..length]).unwrap();
+                let query = response.queries()[0].clone();
+                response
+                    .set_message_type(MessageType::Response)
+                    .set_response_code(ResponseCode::NoError);
+                response.metadata.recursion_available = true;
+                match query.query_type() {
+                    RecordType::NS => {
+                        response.add_answer(Record::from_rdata(
+                            query.name().clone(),
+                            60,
+                            RData::NS(NS(Name::from_str("ns1.example.test.").unwrap())),
+                        ));
+                    }
+                    RecordType::A => {
+                        response.add_answer(Record::from_rdata(
+                            query.name().clone(),
+                            60,
+                            RData::A(A("192.0.2.53".parse().unwrap())),
+                        ));
+                    }
+                    RecordType::AAAA => {}
+                    unexpected => panic!("unexpected query type: {unexpected}"),
+                }
+                server
+                    .send_to(&response.to_vec().unwrap(), peer)
+                    .await
+                    .unwrap();
+            }
+        });
+        let engine = discovery_test_engine(&[address], Duration::from_secs(1));
+
+        let servers = engine
+            .authoritative_servers_until(
+                "example.test",
+                Some(tokio::time::Instant::now() + Duration::from_secs(1)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            servers,
+            vec![(
+                "ns1.example.test".to_owned(),
+                vec!["192.0.2.53".parse().unwrap()]
+            )]
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 3);
+        let metrics = engine.take_metrics();
+        assert_eq!(metrics.iter().map(|metric| metric.requests).sum::<u64>(), 3);
+        assert_eq!(
+            metrics.iter().map(|metric| metric.successes).sum::<u64>(),
+            3
+        );
+        assert_eq!(metrics.iter().map(|metric| metric.failures).sum::<u64>(), 0);
+        server_task.abort();
+
+        let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let engine = discovery_test_engine(&[silent.local_addr().unwrap()], Duration::from_secs(2));
+        let started = Instant::now();
+        let result = engine
+            .authoritative_servers_until(
+                "deadline.example.test",
+                Some(tokio::time::Instant::now() + Duration::from_millis(25)),
+            )
+            .await;
+        assert!(result.is_err());
+        assert!(started.elapsed() < Duration::from_millis(500));
+        let metrics = engine.take_metrics();
+        assert_eq!(metrics.iter().map(|metric| metric.requests).sum::<u64>(), 1);
+        assert_eq!(metrics.iter().map(|metric| metric.failures).sum::<u64>(), 1);
+    }
+
+    #[test]
     fn resolver_pool_prefers_the_healthier_profile_but_keeps_exploration() {
         let engine = DnsEngine::new(
             10,
@@ -3843,5 +4565,36 @@ mod tests {
         let first = engine.authoritative_resolver(address).unwrap();
         let second = engine.authoritative_resolver(address).unwrap();
         assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn authoritative_transport_cache_is_bounded() {
+        let engine =
+            DnsEngine::new(10, Duration::from_secs(1), &["1.1.1.1".parse().unwrap()]).unwrap();
+        for port in 1..=(MAX_AUTHORITATIVE_TRANSPORTS as u16 + 1) {
+            engine
+                .authoritative_resolver(SocketAddr::new("192.0.2.53".parse().unwrap(), port))
+                .unwrap();
+        }
+        assert_eq!(
+            engine.authoritative_resolvers.lock().unwrap().len(),
+            MAX_AUTHORITATIVE_TRANSPORTS
+        );
+    }
+
+    #[tokio::test]
+    async fn authoritative_zone_cache_is_bounded() {
+        let cache = tokio::sync::Mutex::new(HashMap::new());
+        for index in 0..=MAX_AUTHORITATIVE_SERVER_CACHE_ENTRIES {
+            authoritative_servers_cached(&cache, &format!("zone-{index}.test"), |_| async {
+                Ok(Vec::new())
+            })
+            .await
+            .unwrap();
+        }
+        assert_eq!(
+            cache.lock().await.len(),
+            MAX_AUTHORITATIVE_SERVER_CACHE_ENTRIES
+        );
     }
 }

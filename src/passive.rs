@@ -6,8 +6,8 @@ use flate2::read::GzDecoder;
 use futures_util::{StreamExt, stream};
 use reqwest::ResponseBuilderExt;
 use reqwest::header::{
-    ACCEPT, ACCEPT_LANGUAGE, CONTENT_LENGTH, HeaderMap, HeaderValue, RANGE, RETRY_AFTER,
-    TRANSFER_ENCODING,
+    ACCEPT, ACCEPT_LANGUAGE, CONTENT_LENGTH, CONTENT_RANGE, HeaderMap, HeaderValue, RANGE,
+    RETRY_AFTER, TRANSFER_ENCODING,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -1191,6 +1191,22 @@ struct CertSpotterIssuance {
     dns_names: Vec<String>,
 }
 
+fn certspotter_next_after(
+    page: &[CertSpotterIssuance],
+    current_after: Option<&str>,
+) -> Result<Option<String>> {
+    let Some(last) = page.last() else {
+        return Ok(None);
+    };
+    if last.id.trim().is_empty() {
+        bail!("Cert Spotter: identifiant de pagination vide");
+    }
+    if current_after == Some(last.id.as_str()) {
+        bail!("Cert Spotter: curseur de pagination répété");
+    }
+    Ok(Some(last.id.clone()))
+}
+
 #[derive(Debug, Deserialize)]
 struct CommonCrawlCollection {
     #[serde(rename = "cdx-api")]
@@ -1864,10 +1880,11 @@ fn provider_error_message(value: &serde_json::Value) -> Option<String> {
         };
         let non_empty = match error {
             serde_json::Value::Null => false,
+            serde_json::Value::Bool(value) => *value,
+            serde_json::Value::Number(value) => value.as_f64() != Some(0.0),
             serde_json::Value::String(value) => !value.trim().is_empty(),
             serde_json::Value::Array(values) => !values.is_empty(),
             serde_json::Value::Object(values) => !values.is_empty(),
-            _ => true,
         };
         if non_empty {
             return Some(compact_external_error(&error.to_string()));
@@ -2347,10 +2364,7 @@ async fn certspotter(
         if page.is_empty() {
             break;
         }
-        let next_after = page.last().map(|issuance| issuance.id.clone());
-        if next_after == after {
-            break;
-        }
+        let next_after = certspotter_next_after(&page, after.as_deref())?;
         after = next_after;
         let mut page_names = BTreeSet::new();
         for issuance in page {
@@ -2420,6 +2434,33 @@ fn commoncrawl_row_is_textual(row: &CommonCrawlRow) -> bool {
             .iter()
             .any(|suffix| path.ends_with(suffix))
     })
+}
+
+fn commoncrawl_content_range_matches(value: &str, expected_start: u64, expected_end: u64) -> bool {
+    let mut fields = value.split_ascii_whitespace();
+    let Some(unit) = fields.next() else {
+        return false;
+    };
+    let Some(range_and_size) = fields.next() else {
+        return false;
+    };
+    if !unit.eq_ignore_ascii_case("bytes") || fields.next().is_some() {
+        return false;
+    }
+    let Some((range, total)) = range_and_size.split_once('/') else {
+        return false;
+    };
+    let Some((start, end)) = range.split_once('-') else {
+        return false;
+    };
+    let Ok(start) = start.parse::<u64>() else {
+        return false;
+    };
+    let Ok(end) = end.parse::<u64>() else {
+        return false;
+    };
+    let valid_total = total == "*" || total.parse::<u64>().is_ok_and(|total| total > expected_end);
+    start == expected_start && end == expected_end && expected_start <= expected_end && valid_total
 }
 
 fn parse_commoncrawl_page(body: &str, domain: &str) -> Result<CommonCrawlPage> {
@@ -2569,12 +2610,27 @@ async fn fetch_commoncrawl_warc_names(
             response.status()
         );
     }
+    let range_matches = response
+        .headers()
+        .get(CONTENT_RANGE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| commoncrawl_content_range_matches(value, record.offset, end));
+    if !range_matches {
+        bail!("Common Crawl WARC: Content-Range absent ou différent de la plage demandée");
+    }
     let (_, compressed) = response_bytes_limited_to(
         response,
         "archive Common Crawl",
         COMMONCRAWL_MAX_WARC_MEMBER_BYTES,
     )
     .await?;
+    if compressed.len() != record.length {
+        bail!(
+            "Common Crawl WARC: membre tronqué ({} octets reçus, {} attendus)",
+            compressed.len(),
+            record.length
+        );
+    }
     let limits = ArchiveLimits {
         max_archive_bytes: COMMONCRAWL_MAX_WARC_DECOMPRESSED_BYTES,
         max_record_bytes: COMMONCRAWL_MAX_WARC_DECOMPRESSED_BYTES,
@@ -2949,6 +3005,7 @@ fn trusted_pagination_url(url: &str, expected_host: &str, expected_path: &str) -
     Url::parse(url).is_ok_and(|url| {
         url.scheme() == "https"
             && url.host_str() == Some(expected_host)
+            && url.port_or_known_default() == Some(443)
             && url.path().starts_with(expected_path)
             && url.username().is_empty()
             && url.password().is_none()
@@ -3629,6 +3686,11 @@ mod tests {
             "www.virustotal.com",
             "/api/v3/domains/"
         ));
+        assert!(!trusted_pagination_url(
+            "https://www.virustotal.com:8443/api/v3/domains/example.com/subdomains",
+            "www.virustotal.com",
+            "/api/v3/domains/"
+        ));
     }
 
     #[tokio::test]
@@ -3738,6 +3800,33 @@ mod tests {
             assert!(
                 validate_commoncrawl_endpoint(endpoint).is_err(),
                 "unsafe endpoint accepted: {endpoint}"
+            );
+        }
+    }
+
+    #[test]
+    fn commoncrawl_warc_range_must_match_the_requested_member_exactly() {
+        assert!(commoncrawl_content_range_matches(
+            "bytes 42-2047/9000",
+            42,
+            2_047
+        ));
+        assert!(commoncrawl_content_range_matches(
+            "BYTES 42-2047/*",
+            42,
+            2_047
+        ));
+        for value in [
+            "bytes 41-2047/9000",
+            "bytes 42-2048/9000",
+            "bytes 42-2047/2047",
+            "bytes */9000",
+            "42-2047/9000",
+            "bytes 42-2047/9000 trailing",
+        ] {
+            assert!(
+                !commoncrawl_content_range_matches(value, 42, 2_047),
+                "{value}"
             );
         }
     }
@@ -4103,6 +4192,28 @@ mod tests {
             }))
             .is_some_and(|message| message.contains("anonymous access"))
         );
+        for value in [
+            serde_json::json!(false),
+            serde_json::json!(0),
+            serde_json::json!(0.0),
+        ] {
+            assert!(
+                provider_error_message(&serde_json::json!({
+                    "error": value,
+                    "results": []
+                }))
+                .is_none()
+            );
+        }
+        for value in [serde_json::json!(true), serde_json::json!(1)] {
+            assert!(
+                provider_error_message(&serde_json::json!({
+                    "error": value,
+                    "results": []
+                }))
+                .is_some()
+            );
+        }
         assert!(
             serde_json::from_value::<UrlscanResponse>(serde_json::json!({
                 "message": "contract changed"
@@ -4110,6 +4221,25 @@ mod tests {
             .is_err()
         );
         assert!(serde_json::from_value::<SubdomainAppResponse>(serde_json::json!({})).is_err());
+    }
+
+    #[test]
+    fn certspotter_rejects_empty_and_repeated_pagination_ids() {
+        let page = vec![CertSpotterIssuance {
+            id: "cursor-2".to_owned(),
+            dns_names: vec!["api.example.com".to_owned()],
+        }];
+        assert_eq!(
+            certspotter_next_after(&page, Some("cursor-1")).unwrap(),
+            Some("cursor-2".to_owned())
+        );
+        assert!(certspotter_next_after(&page, Some("cursor-2")).is_err());
+
+        let empty_id = vec![CertSpotterIssuance {
+            id: " ".to_owned(),
+            dns_names: Vec::new(),
+        }];
+        assert!(certspotter_next_after(&empty_id, None).is_err());
     }
 
     #[tokio::test]
