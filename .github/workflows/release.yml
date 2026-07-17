@@ -110,7 +110,8 @@ jobs:
           bash -n benchmarks/run.sh
           shellcheck benchmarks/run.sh
           python3 -m py_compile benchmarks/names.py benchmarks/preflight.py benchmarks/redact.py benchmarks/report.py benchmarks/timed.py
-          python3 -m py_compile packaging/generate_supply_chain.py
+          python3 -m py_compile packaging/check_release_consistency.py packaging/generate_supply_chain.py
+          python3 packaging/check_release_consistency.py
           python3 -m unittest discover -s benchmarks/tests -v
           python3 -m unittest discover -s packaging/tests -v
           grep -Fqx "fellaga (${{ needs.gate.outputs.version }}-1) unstable; urgency=medium" \

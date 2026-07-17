@@ -14,7 +14,7 @@ use fellaga_core::scanner::{
 };
 use fellaga_core::{passive, scanner, util};
 use futures_util::{StreamExt, stream};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{IsTerminal, Read, Write};
 use std::net::IpAddr;
 use std::path::PathBuf;
@@ -169,10 +169,75 @@ fn validate_source_check_concurrency(value: usize) -> Result<()> {
 }
 
 fn source_check_error_status(message: &str) -> &'static str {
+    let message = message.to_ascii_lowercase();
     if message.contains("budget total de") && message.contains("dépassé") {
+        "deferred_budget"
+    } else if [
+        "http 500", "http 502", "http 503", "http 504", "http 520", "http 521", "http 522",
+        "http 523", "http 524",
+    ]
+    .iter()
+    .any(|status| message.contains(status))
+    {
+        "upstream_error"
+    } else if message.contains("http 429")
+        || message.contains("retry-after")
+        || message.contains("rate limit")
+        || message.contains("rate-limit")
+        || message.contains("quota")
+        || message.contains("limite l'accès anonyme")
+    {
+        "rate_limited"
+    } else if message.contains("cloudflare")
+        || message.contains("captcha")
+        || message.contains("challenge")
+        || message.contains("just a moment")
+        || message.contains("réponse html inattendue")
+    {
+        "anti_bot"
+    } else if message.contains("http 401")
+        || message.contains("unauthorized")
+        || message.contains("authentication")
+        || message.contains("invalid api key")
+        || message.contains("missing api key")
+        || message.contains("http 403")
+    {
+        "auth_required"
+    } else if message.contains("tls")
+        || message.contains("certificate verify")
+        || message.contains("certificate validation")
+        || message.contains("unknown issuer")
+    {
+        "tls_error"
+    } else if message.contains("connection refused")
+        || message.contains("connexion refusée")
+        || message.contains("error sending request")
+        || message.contains("dns error")
+        || message.contains("connect error")
+    {
+        "transport_error"
+    } else if message.contains("json invalide")
+        || (message.contains("json ") && message.contains(" invalide"))
+        || message.contains("schéma json")
+        || message.contains("schema json")
+        || message.contains("schéma incompatible")
+        || message.contains("schema incompatible")
+        || message.contains("format ndjson incohérent")
+    {
+        "schema_error"
+    } else if message.contains("timeout") || message.contains("timed out") {
         "timeout"
     } else {
         "error"
+    }
+}
+
+fn source_check_result_status(names: usize, warning: Option<&str>) -> &'static str {
+    match warning {
+        Some(warning) if names == 0 => source_check_error_status(warning),
+        Some(_) => "degraded",
+        None if names == 0 => "empty",
+        None => "success",
     }
 }
 
@@ -359,7 +424,7 @@ struct ScanArgs {
     exclude_sources: Vec<String>,
     #[arg(
         long,
-        help = "Attempt every connector, including sources with missing API keys"
+        help = "Select every connector; key-gated sources without credentials are skipped"
     )]
     all_sources: bool,
     #[arg(
@@ -1962,13 +2027,10 @@ async fn main() -> Result<()> {
                             {
                                 Ok(result) => serde_json::json!({
                                     "name": source.name,
-                                    "status": if result.partial_warning.is_some() {
-                                        "partial"
-                                    } else if result.names.is_empty() {
-                                        "empty"
-                                    } else {
-                                        "success"
-                                    },
+                                    "status": source_check_result_status(
+                                        result.names.len(),
+                                        result.partial_warning.as_deref()
+                                    ),
                                     "names": result.names.len(),
                                     "duration_ms": started.elapsed().as_millis(),
                                     "warning": result.partial_warning,
@@ -2013,13 +2075,29 @@ async fn main() -> Result<()> {
                         .unwrap_or_default()
                         .cmp(right["name"].as_str().unwrap_or_default())
                 });
+                let mut summary = BTreeMap::<String, usize>::new();
+                for check in &checks {
+                    *summary
+                        .entry(check["status"].as_str().unwrap_or("error").to_owned())
+                        .or_default() += 1;
+                }
                 if args.json {
                     println!(
                         "{}",
                         serde_json::to_string_pretty(&serde_json::json!({
                             "target": target,
+                            "summary": summary,
                             "checks": checks
                         }))?
+                    );
+                } else {
+                    println!(
+                        "summary: {}",
+                        summary
+                            .iter()
+                            .map(|(status, count)| format!("{status}={count}"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
                     );
                 }
                 return Ok(());
@@ -2348,9 +2426,51 @@ mod tests {
             source_check_error_status(
                 "commoncrawl: budget total de 20s dépassé; résultat en cache conservé"
             ),
-            "timeout"
+            "deferred_budget"
         );
-        assert_eq!(source_check_error_status("commoncrawl: HTTP 502"), "error");
+        assert_eq!(
+            source_check_error_status("commoncrawl: HTTP 502"),
+            "upstream_error"
+        );
+        assert_eq!(
+            source_check_error_status("Cert Spotter: HTTP 429; Retry-After=60s"),
+            "rate_limited"
+        );
+        assert_eq!(
+            source_check_error_status("Common Crawl: HTTP 503; Retry-After=60s"),
+            "upstream_error"
+        );
+        assert_eq!(
+            source_check_error_status("Driftnet: HTTP 524 timeout CDN amont"),
+            "upstream_error"
+        );
+        assert_eq!(
+            source_check_error_status("Cloudflare challenge: Just a moment"),
+            "anti_bot"
+        );
+        assert_eq!(
+            source_check_error_status("error sending request: connection refused"),
+            "transport_error"
+        );
+        assert_eq!(
+            source_check_error_status(
+                "error sending request for url (https://index.commoncrawl.org/collinfo.json)"
+            ),
+            "transport_error"
+        );
+        assert_eq!(
+            source_check_error_status("JSON Common Crawl invalide"),
+            "schema_error"
+        );
+        assert_eq!(source_check_result_status(0, None), "empty");
+        assert_eq!(
+            source_check_result_status(3, Some("page 2 failed")),
+            "degraded"
+        );
+        assert_eq!(
+            source_check_result_status(0, Some("budget total de 10s dépassé")),
+            "deferred_budget"
+        );
     }
 
     #[test]

@@ -1,7 +1,9 @@
 use crate::axfr::attempt_axfr;
 use crate::candidate::{CandidateProposal, MutationRule, generate_contextual_with_rules};
 use crate::confidence::{assess_with_context as assess_confidence, evidence_families};
-use crate::ct_monitor::monitor_ct_logs_bounded;
+use crate::ct_monitor::{
+    CtProgressCallback, CtProgressEvent, monitor_ct_logs_bounded_with_progress_and_limit,
+};
 use crate::db::{CachedAnswer, Database};
 use crate::discovery::discover_dns_graph;
 use crate::dns::{DnsEngine, DnsResolutionOutcome, WildcardProbeOutcome};
@@ -11,8 +13,9 @@ use crate::model::{
     ResolvedHost, ScanResult, ServiceEndpoint, WebObservation,
 };
 use crate::passive::{
-    ApiKeyStore, current_commoncrawl_endpoint, fetch_detailed_bounded as fetch_passive_bounded,
-    sanitize_external_error, seed_commoncrawl_endpoint, source_metadata, source_policy,
+    ApiKeyStore, PassivePageSink, current_commoncrawl_endpoint,
+    fetch_detailed_bounded_with_sink as fetch_passive_bounded, sanitize_external_error,
+    seed_commoncrawl_endpoint, source_metadata, source_policy,
 };
 use crate::pipeline::DiscoveryPipeline;
 use crate::tls::discover as discover_tls_certificates;
@@ -25,8 +28,9 @@ use anyhow::{Result, bail};
 use futures_util::{FutureExt, StreamExt, stream, stream::FuturesUnordered};
 use serde_json::json;
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::future::Future;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::{
     Arc, Mutex,
@@ -419,12 +423,42 @@ fn should_expand_adaptive_wave(
         && (previous_positive >= minimum_yield || (wave_number == 2 && passive_positive >= 5))
 }
 
-fn should_retry_otx_after_key_added(key_configured: bool, last_error: Option<&str>) -> bool {
+fn source_requires_api_key(source: &str) -> bool {
+    source_metadata(source).authentication == "required"
+}
+
+fn is_missing_api_key_error(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains(" absent pour la source ")
+        || error.contains("missing api key for source")
+        || error.contains("api key missing for source")
+        || error.contains("clé api absente pour la source")
+}
+
+fn is_preflight_auth_error(error: &str) -> bool {
+    if is_missing_api_key_error(error) {
+        return true;
+    }
+    let error = error.to_ascii_lowercase();
+    error.contains("doit être au format")
+        && (error.contains("_api_key")
+            || error.contains("_credentials")
+            || error.contains("clé")
+            || error.contains("credential"))
+}
+
+fn should_retry_source_after_key_added(
+    source: &str,
+    key_configured: bool,
+    last_error: Option<&str>,
+) -> bool {
     key_configured
         && last_error.is_some_and(|error| {
-            error.contains("429")
-                && error.contains("accès anonyme")
-                && !error.contains("clé fournie")
+            is_missing_api_key_error(error)
+                || (source == "otx"
+                    && error.contains("429")
+                    && error.contains("accès anonyme")
+                    && !error.contains("clé fournie"))
         })
 }
 
@@ -495,9 +529,25 @@ fn external_retry_after_seconds(error: &str) -> Option<u64> {
     (!digits.is_empty()).then(|| digits.parse().ok()).flatten()
 }
 
+fn external_deferral_seconds(error: &str) -> Option<u64> {
+    external_retry_after_seconds(error).or_else(|| {
+        let error = error.to_ascii_lowercase();
+        (error.contains("http 429")
+            || error.contains("quota")
+            || error.contains("rate limit")
+            || error.contains("rate-limit")
+            || error.contains("too many requests"))
+        .then_some(15 * 60)
+    })
+}
+
+fn source_error_is_deferred(error: &str) -> bool {
+    external_deferral_seconds(error).is_some() || is_preflight_auth_error(error)
+}
+
 fn external_pause_status(retry_in_seconds: i64) -> String {
     let minutes = retry_in_seconds.max(1).saturating_add(59) / 60;
-    format!("quota externe, reprise dans {minutes} min, mémoire permanente")
+    format!("source externe différée, reprise dans {minutes} min, mémoire permanente")
 }
 
 fn record_candidate_wave_results(
@@ -565,6 +615,7 @@ fn seed_candidate_priority(sources: &BTreeSet<String>) -> i64 {
         .saturating_add((sources.len() as i64).saturating_mul(1_000))
 }
 
+#[cfg(test)]
 fn merge_ct_fallback_names(domain: &str, indexed: Vec<String>, cached: Vec<String>) -> Vec<String> {
     indexed
         .into_iter()
@@ -573,6 +624,21 @@ fn merge_ct_fallback_names(domain: &str, indexed: Vec<String>, cached: Vec<Strin
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()
+}
+
+#[cfg(test)]
+fn materialize_ct_fallback_bounded(
+    database: &Database,
+    domain: &str,
+    limit: usize,
+) -> Result<BTreeSet<String>> {
+    Ok(merge_ct_fallback_names(
+        domain,
+        database.ct_passive_names_bounded(domain, limit)?,
+        Vec::new(),
+    )
+    .into_iter()
+    .collect())
 }
 
 fn source_bootstrap_score(source: &str) -> i64 {
@@ -592,6 +658,158 @@ fn source_bootstrap_score(source: &str) -> i64 {
         _ => -100,
     };
     family + cost + if metadata.experimental { -150 } else { 50 }
+}
+
+const PASSIVE_REQUEST_CONCURRENCY: usize = 8;
+
+fn passive_connector_working_set_limit(max_passive: usize) -> usize {
+    max_passive
+        .saturating_add(PASSIVE_REQUEST_CONCURRENCY - 1)
+        .saturating_div(PASSIVE_REQUEST_CONCURRENCY)
+}
+
+#[cfg(test)]
+fn merge_passive_names_bounded(
+    sources: &mut BTreeMap<String, BTreeSet<String>>,
+    names: impl IntoIterator<Item = String>,
+    origin: String,
+    limit: usize,
+) -> usize {
+    let mut omitted = 0_usize;
+    for name in names {
+        if let Some(origins) = sources.get_mut(&name) {
+            origins.insert(origin.clone());
+        } else if sources.len() < limit {
+            sources.entry(name).or_default().insert(origin.clone());
+        } else {
+            omitted = omitted.saturating_add(1);
+        }
+    }
+    omitted
+}
+
+fn passive_origin_matches_source(origin: &str, source: &str) -> bool {
+    origin
+        .strip_prefix("passive:")
+        .and_then(|origin| origin.split(':').next())
+        == Some(source)
+}
+
+fn merge_passive_source_names_bounded(
+    sources: &mut BTreeMap<String, BTreeSet<String>>,
+    names: impl IntoIterator<Item = String>,
+    source: &str,
+    qualifier: Option<&str>,
+    limit: usize,
+) -> usize {
+    let origin = qualifier.map_or_else(
+        || format!("passive:{source}"),
+        |qualifier| format!("passive:{source}:{qualifier}"),
+    );
+    let mut omitted = 0_usize;
+    for name in names {
+        if let Some(origins) = sources.get_mut(&name) {
+            if !origins
+                .iter()
+                .any(|existing| passive_origin_matches_source(existing, source))
+            {
+                origins.insert(origin.clone());
+            }
+        } else if sources.len() < limit {
+            sources.entry(name).or_default().insert(origin.clone());
+        } else {
+            omitted = omitted.saturating_add(1);
+        }
+    }
+    omitted
+}
+
+fn refill_passive_union_from_cache(
+    database: &Database,
+    domain: &str,
+    ordered_sources: &[String],
+    sources: &mut BTreeMap<String, BTreeSet<String>>,
+    limit: usize,
+) -> Result<usize> {
+    let before = sources.len();
+    for source in ordered_sources {
+        if sources.len() >= limit {
+            break;
+        }
+        let Some(entry) = database.passive_cache_bounded(domain, source, limit)? else {
+            continue;
+        };
+        merge_passive_source_names_bounded(sources, entry.names, source, Some("cache"), limit);
+    }
+    Ok(sources.len().saturating_sub(before))
+}
+
+fn passive_name_fingerprints(names: &[String]) -> Vec<u64> {
+    let mut fingerprints = names
+        .iter()
+        .map(|name| {
+            let mut hasher = DefaultHasher::new();
+            name.hash(&mut hasher);
+            hasher.finish()
+        })
+        .collect::<Vec<_>>();
+    fingerprints.sort_unstable();
+    fingerprints.dedup();
+    fingerprints
+}
+
+fn passive_name_was_known(fingerprints: &[u64], name: &str) -> bool {
+    let mut hasher = DefaultHasher::new();
+    name.hash(&mut hasher);
+    fingerprints.binary_search(&hasher.finish()).is_ok()
+}
+
+fn automatic_bulk_source_limit(max_passive: usize) -> usize {
+    max_passive
+        .saturating_div(10)
+        .clamp(500, 10_000)
+        .min(max_passive)
+}
+
+fn cap_exclusive_bulk_source_names(
+    domain: &str,
+    sources: &mut BTreeMap<String, BTreeSet<String>>,
+    source_prefix: &str,
+    limit: usize,
+) -> (usize, usize) {
+    let mut exclusive = sources
+        .iter()
+        .filter(|(_, origins)| {
+            !origins.is_empty()
+                && origins
+                    .iter()
+                    .all(|origin| origin.starts_with(source_prefix))
+        })
+        .map(|(name, _)| name.clone())
+        .collect::<Vec<_>>();
+    let before = exclusive.len();
+    if before <= limit {
+        return (before, before);
+    }
+    exclusive.sort_by_key(|name| {
+        let relative = name
+            .strip_suffix(&format!(".{domain}"))
+            .unwrap_or(name.as_str());
+        (
+            !learnable_relative_name(relative),
+            relative.split('.').count(),
+            relative.len(),
+            name.clone(),
+        )
+    });
+    let keep = exclusive.into_iter().take(limit).collect::<BTreeSet<_>>();
+    sources.retain(|name, origins| {
+        !origins
+            .iter()
+            .all(|origin| origin.starts_with(source_prefix))
+            || keep.contains(name)
+    });
+    (before, keep.len())
 }
 
 fn seed_share(batch_limit: usize, active_candidates_enabled: bool) -> usize {
@@ -1452,6 +1670,9 @@ impl Scanner {
     ) -> Result<()> {
         let now = now_epoch();
         let freshness = self.options.passive_refresh.as_secs().min(i64::MAX as u64) as i64;
+        let connector_working_set_limit =
+            passive_connector_working_set_limit(self.options.max_passive);
+        let mut passive_union_omitted = 0_usize;
         // Candidate-wave adaptivity and provider health are independent. An
         // exhaustive brute-force scan must not repeatedly block on a provider
         // that the automatic source scheduler already knows is unhealthy.
@@ -1461,20 +1682,33 @@ impl Scanner {
         } else {
             BTreeSet::new()
         };
-        if let Some(diagnostic) = self
+        let diagnostics = self
             .database
-            .source_diagnostics(Duration::from_secs(24 * 3_600))?
-            .remove("otx")
-            && should_retry_otx_after_key_added(
-                self.options.api_keys.has("otx"),
-                diagnostic.last_error.as_deref(),
-            )
-        {
-            cooldowns.remove("otx");
+            .source_diagnostics(Duration::from_secs(24 * 3_600))?;
+        let credential_retry_sources = self
+            .options
+            .passive_sources
+            .iter()
+            .filter(|source| {
+                should_retry_source_after_key_added(
+                    source,
+                    self.options.api_keys.has(source),
+                    diagnostics
+                        .get(source.as_str())
+                        .and_then(|diagnostic| diagnostic.last_error.as_deref()),
+                )
+            })
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        for source in &credential_retry_sources {
+            cooldowns.remove(source);
         }
         let mut external_pauses = BTreeMap::new();
         if self.options.automatic_source_selection {
             for source in &self.options.passive_sources {
+                if credential_retry_sources.contains(source) {
+                    continue;
+                }
                 let key = format!("source.retry_until.{source}");
                 if let Some(retry_until) = self
                     .database
@@ -1487,8 +1721,28 @@ impl Scanner {
             }
         }
         let mut refresh = Vec::new();
+        let mut prior_passive_fingerprints = BTreeMap::<String, Vec<u64>>::new();
         for source in &self.options.passive_sources {
-            let cached = self.database.passive_cache(domain, source)?;
+            let cached =
+                self.database
+                    .passive_cache_bounded(domain, source, connector_working_set_limit)?;
+            if source_requires_api_key(source) && !self.options.api_keys.has(source) {
+                let names = cached.map(|entry| entry.names).unwrap_or_default();
+                self.emit(ProgressEvent::PassiveSource {
+                    source: source.clone(),
+                    status: "clé API absente, source ignorée, mémoire permanente".to_owned(),
+                    names: names.len(),
+                });
+                passive_union_omitted =
+                    passive_union_omitted.saturating_add(merge_passive_source_names_bounded(
+                        sources,
+                        names,
+                        source,
+                        Some("missing-key"),
+                        self.options.max_passive,
+                    ));
+                continue;
+            }
             if cooldowns.contains(source) || external_pauses.contains_key(source) {
                 let names = cached.map(|entry| entry.names).unwrap_or_default();
                 self.emit(ProgressEvent::PassiveSource {
@@ -1499,12 +1753,14 @@ impl Scanner {
                         .unwrap_or_else(|| "pause adaptative, mémoire permanente".to_owned()),
                     names: names.len(),
                 });
-                for name in names {
-                    sources
-                        .entry(name)
-                        .or_default()
-                        .insert(format!("passive:{source}:cooldown"));
-                }
+                passive_union_omitted =
+                    passive_union_omitted.saturating_add(merge_passive_source_names_bounded(
+                        sources,
+                        names,
+                        source,
+                        Some("cooldown"),
+                        self.options.max_passive,
+                    ));
                 continue;
             }
             if let Some(entry) = &cached
@@ -1515,18 +1771,24 @@ impl Scanner {
                     status: "cache frais".to_owned(),
                     names: entry.names.len(),
                 });
-                for name in &entry.names {
-                    sources
-                        .entry(name.clone())
-                        .or_default()
-                        .insert(format!("passive:{source}:cache"));
-                }
+                passive_union_omitted =
+                    passive_union_omitted.saturating_add(merge_passive_source_names_bounded(
+                        sources,
+                        entry.names.iter().cloned(),
+                        source,
+                        Some("cache"),
+                        self.options.max_passive,
+                    ));
             } else {
-                refresh.push((source.clone(), cached.map(|entry| entry.names)));
+                if let Some(entry) = &cached {
+                    prior_passive_fingerprints
+                        .insert(source.clone(), passive_name_fingerprints(&entry.names));
+                }
+                refresh.push(source.clone());
             }
         }
 
-        if refresh.iter().any(|(source, _)| source == "commoncrawl")
+        if refresh.iter().any(|source| source == "commoncrawl")
             && let Some(endpoint) = self.database.source_metadata(
                 "commoncrawl.latest_endpoint",
                 Duration::from_secs(30 * 24 * 3_600),
@@ -1536,7 +1798,7 @@ impl Scanner {
         }
         let keys = self.options.api_keys.clone();
         let source_scores = self.database.source_scores()?;
-        refresh.sort_by_key(|(source, _)| {
+        refresh.sort_by_key(|source| {
             (
                 Reverse(
                     source_scores
@@ -1547,26 +1809,18 @@ impl Scanner {
                 source.clone(),
             )
         });
-        let mut stale_fallbacks = BTreeMap::new();
-        let refresh = refresh
-            .into_iter()
-            .map(|(source, stale)| {
-                if let Some(stale) = stale {
-                    stale_fallbacks.insert(source.clone(), stale);
-                }
-                source
-            })
-            .collect::<Vec<_>>();
         let mut unfinished_sources = refresh.iter().cloned().collect::<BTreeSet<_>>();
-        let started_sources = Arc::new(Mutex::new(BTreeSet::<String>::new()));
+        let active_sources = Arc::new(Mutex::new(BTreeMap::<String, Instant>::new()));
         let refresh_total = refresh.len();
         let mut refresh_finished = 0_usize;
         let mut phase_timed_out = false;
         let mut results = stream::iter(refresh)
             .map(|source| {
                 let keys = keys.clone();
-                let started_sources = started_sources.clone();
+                let active_sources = active_sources.clone();
                 let passive_request_slots = self.passive_request_slots.clone();
+                let database = self.database.clone();
+                let root_domain = domain.to_owned();
                 async move {
                     let _permit = passive_request_slots
                         .acquire_owned()
@@ -1584,20 +1838,33 @@ impl Scanner {
                     if remaining.is_zero() {
                         return (source, 0, None);
                     }
-                    if let Ok(mut started_sources) = started_sources.lock() {
-                        started_sources.insert(source.clone());
+                    if let Ok(mut active_sources) = active_sources.lock() {
+                        active_sources.insert(source.clone(), Instant::now());
                     }
                     let started = Instant::now();
-                    let result =
-                        fetch_passive_bounded(&source, domain, policy.timeout, &keys, remaining)
-                            .await;
+                    let sink_source = source.clone();
+                    let page_sink: PassivePageSink = Arc::new(move |names| {
+                        database
+                            .store_passive_observation_page(&root_domain, &sink_source, names)
+                            .map(|_| ())
+                    });
+                    let result = fetch_passive_bounded(
+                        &source,
+                        domain,
+                        policy.timeout,
+                        &keys,
+                        remaining,
+                        connector_working_set_limit,
+                        page_sink,
+                    )
+                    .await;
                     (source, started.elapsed().as_millis(), Some(result))
                 }
             })
             // Providers use independent host-specific throttles; a slightly
             // wider scheduler avoids one slow service holding unrelated fast
             // sources while keeping the network footprint bounded.
-            .buffer_unordered(8);
+            .buffer_unordered(PASSIVE_REQUEST_CONCURRENCY);
         let deadline_sleep = async move {
             if let Some(deadline) = passive_deadline {
                 tokio::time::sleep_until(deadline).await;
@@ -1616,11 +1883,10 @@ impl Scanner {
                 biased;
                 _ = &mut deadline_sleep => None,
                 _ = heartbeat.tick() => {
-                    let started = started_sources
+                    let active = active_sources
                         .lock()
                         .map(|sources| sources.len())
                         .unwrap_or_default();
-                    let active = started.saturating_sub(refresh_finished);
                     let remaining = passive_deadline
                         .map(|deadline| format!("{}s", deadline.saturating_duration_since(tokio::time::Instant::now()).as_secs()))
                         .unwrap_or_else(|| "illimité".to_owned());
@@ -1650,61 +1916,104 @@ impl Scanner {
             };
             refresh_finished = refresh_finished.saturating_add(1);
             unfinished_sources.remove(&source);
-            let stale = stale_fallbacks.remove(&source);
+            if let Ok(mut active_sources) = active_sources.lock() {
+                active_sources.remove(&source);
+            }
+            let previously_known = prior_passive_fingerprints
+                .remove(&source)
+                .unwrap_or_default();
+            let stale = self.database.passive_cache_bounded(
+                domain,
+                &source,
+                connector_working_set_limit,
+            )?;
             let Some(result) = result else {
-                let names = stale.unwrap_or_default();
+                let names = stale.map(|entry| entry.names).unwrap_or_default();
                 self.emit(ProgressEvent::PassiveSource {
                     source: source.clone(),
                     status: "cache périmé, source différée par le budget".to_owned(),
                     names: names.len(),
                 });
-                for name in names {
-                    sources
-                        .entry(name)
-                        .or_default()
-                        .insert(format!("passive:{source}:stale"));
-                }
+                passive_union_omitted =
+                    passive_union_omitted.saturating_add(merge_passive_source_names_bounded(
+                        sources,
+                        names,
+                        &source,
+                        Some("stale"),
+                        self.options.max_passive,
+                    ));
                 continue;
             };
             match result {
                 Ok(fetch) => {
                     let partial_warning = fetch.partial_warning;
-                    let names = fetch.names.into_iter().collect::<Vec<_>>();
-                    let network_names = names.len();
-                    let previously_known = stale
-                        .as_ref()
-                        .into_iter()
-                        .flatten()
-                        .map(String::as_str)
-                        .collect::<HashSet<_>>();
+                    let working_set_truncated = fetch.working_set_truncated;
+                    let network_names = fetch.decoded_names;
+                    let names = fetch.names;
                     let novel_names = names
                         .iter()
                         .filter(|name| {
                             !sources.contains_key(*name)
-                                && !previously_known.contains(name.as_str())
+                                && !passive_name_was_known(&previously_known, name)
                         })
                         .count();
-                    let names = if partial_warning.is_some() {
+                    if partial_warning
+                        .as_deref()
+                        .is_some_and(|warning| warning.contains("persistance SQLite"))
+                    {
+                        // Retry the bounded working set once when the page sink
+                        // itself failed. Successful sinks must not increment
+                        // observation counters a second time.
                         self.database
-                            .store_partial_passive_cache(domain, &source, &names)?
-                    } else {
-                        self.database.store_passive_cache(domain, &source, &names)?
-                    };
+                            .store_passive_observation_page(domain, &source, &names)?;
+                    }
+                    self.database.mark_passive_cache_refresh(
+                        domain,
+                        &source,
+                        partial_warning.is_none(),
+                    )?;
+                    let stale_names = stale.map(|entry| entry.names).unwrap_or_default();
+                    let retained_names = names
+                        .len()
+                        .saturating_add(
+                            stale_names
+                                .iter()
+                                .filter(|name| !names.contains(name.as_str()))
+                                .count(),
+                        )
+                        .min(connector_working_set_limit);
                     if source == "commoncrawl"
                         && let Some(endpoint) = current_commoncrawl_endpoint()
                     {
                         self.database
                             .store_source_metadata("commoncrawl.latest_endpoint", &endpoint)?;
                     }
-                    self.database.record_source_result_with_counts(
-                        &source,
-                        network_names,
-                        novel_names,
-                        duration_ms,
-                        partial_warning.as_deref(),
-                    )?;
+                    match partial_warning.as_deref() {
+                        Some(warning) if network_names == 0 => {
+                            self.database
+                                .record_source_deferred(&source, duration_ms, warning)?;
+                        }
+                        Some(warning) => {
+                            self.database.record_source_degraded_with_counts(
+                                &source,
+                                network_names,
+                                novel_names,
+                                duration_ms,
+                                warning,
+                            )?;
+                        }
+                        None => {
+                            self.database.record_source_result_with_counts(
+                                &source,
+                                network_names,
+                                novel_names,
+                                duration_ms,
+                                None,
+                            )?;
+                        }
+                    }
                     if let Some(partial_warning) = &partial_warning {
-                        if let Some(delay) = external_retry_after_seconds(partial_warning) {
+                        if let Some(delay) = external_deferral_seconds(partial_warning) {
                             let retry_until = now_epoch()
                                 .saturating_add(delay.min(i64::MAX as u64) as i64)
                                 .to_string();
@@ -1720,6 +2029,13 @@ impl Scanner {
                         self.emit(ProgressEvent::Warning(warning.clone()));
                         warnings.push(warning);
                     }
+                    if working_set_truncated {
+                        let warning = format!(
+                            "{source}: {network_names} nom(s) décodé(s), ensemble de travail limité à {connector_working_set_limit}; les pages complètes restent dans SQLite"
+                        );
+                        self.emit(ProgressEvent::Warning(warning.clone()));
+                        warnings.push(warning);
+                    }
                     self.emit(ProgressEvent::PassiveSource {
                         source: source.clone(),
                         status: if partial_warning.is_some() {
@@ -1727,24 +2043,35 @@ impl Scanner {
                         } else {
                             "réseau + mémoire permanente".to_owned()
                         },
-                        names: names.len(),
+                        names: retained_names,
                     });
-                    for name in names {
-                        sources
-                            .entry(name)
-                            .or_default()
-                            .insert(if partial_warning.is_some() {
-                                format!("passive:{source}:partial")
-                            } else {
-                                format!("passive:{source}")
-                            });
-                    }
+                    let qualifier = if partial_warning.is_some() {
+                        Some("partial")
+                    } else {
+                        None
+                    };
+                    passive_union_omitted =
+                        passive_union_omitted.saturating_add(merge_passive_source_names_bounded(
+                            sources,
+                            names,
+                            &source,
+                            qualifier,
+                            self.options.max_passive,
+                        ));
+                    passive_union_omitted =
+                        passive_union_omitted.saturating_add(merge_passive_source_names_bounded(
+                            sources,
+                            stale_names,
+                            &source,
+                            Some("stale"),
+                            self.options.max_passive,
+                        ));
                 }
                 Err(error) => {
                     let safe_error =
                         sanitize_external_error(&format!("{error:#}"), &self.options.api_keys);
                     let warning = format!("{source}: {safe_error}");
-                    if let Some(delay) = external_retry_after_seconds(&safe_error) {
+                    if let Some(delay) = external_deferral_seconds(&safe_error) {
                         let retry_until = now_epoch()
                             .saturating_add(delay.min(i64::MAX as u64) as i64)
                             .to_string();
@@ -1753,39 +2080,61 @@ impl Scanner {
                             &retry_until,
                         )?;
                     }
-                    self.database.record_source_result(
-                        &source,
-                        0,
-                        duration_ms,
-                        Some(&safe_error),
-                    )?;
+                    if source_error_is_deferred(&safe_error) {
+                        self.database
+                            .record_source_deferred(&source, duration_ms, &safe_error)?;
+                    } else {
+                        self.database.record_source_result(
+                            &source,
+                            0,
+                            duration_ms,
+                            Some(&safe_error),
+                        )?;
+                    }
                     self.emit(ProgressEvent::Warning(warning.clone()));
                     warnings.push(warning);
-                    if let Some(names) = stale {
+                    if let Some(stale) = stale {
+                        let names = stale.names;
                         self.emit(ProgressEvent::PassiveSource {
                             source: source.clone(),
                             status: "cache périmé".to_owned(),
                             names: names.len(),
                         });
-                        for name in names {
-                            sources
-                                .entry(name)
-                                .or_default()
-                                .insert(format!("passive:{source}:stale"));
-                        }
+                        passive_union_omitted = passive_union_omitted.saturating_add(
+                            merge_passive_source_names_bounded(
+                                sources,
+                                names,
+                                &source,
+                                Some("stale"),
+                                self.options.max_passive,
+                            ),
+                        );
                     }
                 }
             }
         }
         drop(results);
         if phase_timed_out {
-            let started_sources = started_sources
+            let active_sources = active_sources
                 .lock()
                 .map(|sources| sources.clone())
                 .unwrap_or_default();
             for source in unfinished_sources {
-                let started = started_sources.contains(&source);
-                let names = stale_fallbacks.remove(&source).unwrap_or_default();
+                let started_at = active_sources.get(&source).copied();
+                let started = started_at.is_some();
+                prior_passive_fingerprints.remove(&source);
+                let names = self
+                    .database
+                    .passive_cache_bounded(domain, &source, connector_working_set_limit)?
+                    .map(|entry| entry.names)
+                    .unwrap_or_default();
+                if let Some(started_at) = started_at {
+                    self.database.record_source_deferred(
+                        &source,
+                        started_at.elapsed().as_millis(),
+                        "source cancelled when the shared passive budget ended",
+                    )?;
+                }
                 self.emit(ProgressEvent::PassiveSource {
                     source: source.clone(),
                     status: if started {
@@ -1795,12 +2144,53 @@ impl Scanner {
                     },
                     names: names.len(),
                 });
-                for name in names {
-                    sources
-                        .entry(name)
-                        .or_default()
-                        .insert(format!("passive:{source}:stale"));
-                }
+                passive_union_omitted =
+                    passive_union_omitted.saturating_add(merge_passive_source_names_bounded(
+                        sources,
+                        names,
+                        &source,
+                        Some("stale"),
+                        self.options.max_passive,
+                    ));
+            }
+        }
+        let mut durable_sources = self.options.passive_sources.clone();
+        durable_sources.sort_by_key(|source| {
+            (
+                Reverse(
+                    source_scores
+                        .get(source)
+                        .copied()
+                        .unwrap_or_else(|| source_bootstrap_score(source)),
+                ),
+                source.clone(),
+            )
+        });
+        let refilled = refill_passive_union_from_cache(
+            &self.database,
+            domain,
+            &durable_sources,
+            sources,
+            self.options.max_passive,
+        )?;
+        passive_union_omitted = passive_union_omitted.saturating_sub(refilled);
+        if passive_union_omitted > 0 {
+            let warning = format!(
+                "budget passif en mémoire atteint: {passive_union_omitted} nom(s) supplémentaires conservé(s) uniquement dans SQLite"
+            );
+            self.emit(ProgressEvent::Warning(warning.clone()));
+            warnings.push(warning);
+        }
+        if self.options.automatic_source_selection {
+            let anubis_limit = automatic_bulk_source_limit(self.options.max_passive);
+            let (anubis_total, anubis_kept) =
+                cap_exclusive_bulk_source_names(domain, sources, "passive:anubisdb", anubis_limit);
+            if anubis_kept < anubis_total {
+                let warning = format!(
+                    "garde-fou AnubisDB: {anubis_kept}/{anubis_total} noms exclusifs planifiés pour validation; réponse complète conservée en cache permanent"
+                );
+                self.emit(ProgressEvent::Warning(warning.clone()));
+                warnings.push(warning);
             }
         }
         if sources.len() > self.options.max_passive {
@@ -2789,11 +3179,19 @@ impl Scanner {
                 self.options.ct_max_logs, self.options.ct_entries_per_log,
             ),
         });
+        let ct_progress = self.progress.clone().map(|progress| {
+            Arc::new(move |event: CtProgressEvent| {
+                progress(ProgressEvent::Phase {
+                    name: "CT incrémental".to_owned(),
+                    detail: event.to_string(),
+                });
+            }) as CtProgressCallback
+        });
         match self
             .await_with_phase_heartbeat(
                 "CT incrémental",
                 "indexation opportuniste; les autres sources continuent en parallèle",
-                monitor_ct_logs_bounded(
+                monitor_ct_logs_bounded_with_progress_and_limit(
                     &self.database,
                     domain,
                     self.options.ct_timeout,
@@ -2801,6 +3199,8 @@ impl Scanner {
                     self.options.ct_entries_per_log,
                     self.options.ct_initial_backfill,
                     self.options.ct_phase_timeout,
+                    self.options.max_passive.min(100_000),
+                    ct_progress,
                 ),
             )
             .await
@@ -2810,19 +3210,6 @@ impl Scanner {
                 let warning = format!("CT incrémental: {error:#}");
                 self.emit(ProgressEvent::Warning(warning.clone()));
                 ct_warnings.push(warning);
-                let indexed = self
-                    .database
-                    .ct_names_for_domain(domain, self.options.max_passive.min(100_000))?;
-                let cached = self
-                    .database
-                    .passive_cache(domain, "ct-direct")?
-                    .map(|cache| cache.names)
-                    .unwrap_or_default();
-                let recovered = merge_ct_fallback_names(domain, indexed, cached);
-                let recovered =
-                    self.database
-                        .store_passive_cache(domain, "ct-direct", &recovered)?;
-                ct_monitor.names = recovered.into_iter().collect();
             }
         }
         if !self.options.ct_phase_timeout.is_zero()
@@ -3015,17 +3402,7 @@ impl Scanner {
                 }
                 None => {
                     ct_task_pending = true;
-                    let recovered = self
-                        .database
-                        .ct_names_for_domain(domain, self.options.max_passive.min(100_000))?
-                        .into_iter()
-                        .filter(|name| normalize_observed_name(name, domain).is_some())
-                        .collect::<Vec<_>>();
-                    let recovered =
-                        self.database
-                            .store_passive_cache(domain, "ct-direct", &recovered)?;
                     let result = CtMonitorResult {
-                        names: recovered.into_iter().collect(),
                         duration_ms: initial_discovery_started.elapsed().as_millis(),
                         ..CtMonitorResult::default()
                     };
@@ -3997,6 +4374,7 @@ impl Scanner {
         }
 
         if ct_task_pending {
+            let mut ct_aborted_without_join = false;
             let joined_ct = match ct_tasks.try_join_next() {
                 ready @ Some(_) => ready,
                 None => {
@@ -4042,18 +4420,13 @@ impl Scanner {
                 }
                 None => {
                     ct_tasks.abort_all();
-                    while ct_tasks.join_next().await.is_some() {}
-                    let recovered = self
-                        .database
-                        .ct_names_for_domain(domain, self.options.max_passive.min(100_000))?
-                        .into_iter()
-                        .filter(|name| normalize_observed_name(name, domain).is_some())
-                        .collect::<Vec<_>>();
-                    let recovered =
-                        self.database
-                            .store_passive_cache(domain, "ct-direct", &recovered)?;
+                    let _ = tokio::time::timeout(Duration::from_millis(250), async {
+                        while ct_tasks.join_next().await.is_some() {}
+                    })
+                    .await;
+                    ct_aborted_without_join = true;
                     let result = CtMonitorResult {
-                        names: recovered.into_iter().collect(),
+                        names: ct_monitor.names.clone(),
                         duration_ms: ct_task_started.elapsed().as_millis(),
                         ..CtMonitorResult::default()
                     };
@@ -4081,12 +4454,15 @@ impl Scanner {
             // were recovered only from the per-domain cache. The final stable
             // priority sort still promotes names corroborated by other
             // evidence families before the bounded validation slice.
-            let mut late_names = self
-                .database
-                .ct_names_for_domain(domain, self.options.max_passive.min(100_000))?
-                .into_iter()
-                .filter(|name| normalize_observed_name(name, domain).is_some())
-                .collect::<Vec<_>>();
+            let mut late_names = if ct_aborted_without_join {
+                Vec::new()
+            } else {
+                self.database
+                    .ct_names_for_domain(domain, self.options.max_passive.min(100_000))?
+                    .into_iter()
+                    .filter(|name| normalize_observed_name(name, domain).is_some())
+                    .collect::<Vec<_>>()
+            };
             let mut late_seen = late_names.iter().cloned().collect::<BTreeSet<_>>();
             for name in &ct_monitor.names {
                 if late_names.len() >= self.options.max_passive {
@@ -6387,17 +6763,21 @@ mod tests {
     use super::{
         BatchDnsMode, RefreshOptions, RefreshRunGuard, ScanRunGuard, Scanner,
         active_candidate_budget_exhausted, active_candidate_work_allowed, active_resume_required,
-        apply_completed_refresh_wildcard_cleanup, before_refresh_deadline,
-        cache_requires_revalidation, candidate_refill_capacity, candidate_uses_active_budget,
-        candidate_uses_discovery_fast_path, capped_phase_deadline, collect_dns_outcomes_until,
-        consume_phase_budget, external_pause_status, external_retry_after_seconds,
-        late_ct_seed_reserve, merge_ct_fallback_names, persist_routed_dns_outcomes,
-        record_bounded_parent_candidate, refresh_allows_wildcard_purge,
+        apply_completed_refresh_wildcard_cleanup, automatic_bulk_source_limit,
+        before_refresh_deadline, cache_requires_revalidation, candidate_refill_capacity,
+        candidate_uses_active_budget, candidate_uses_discovery_fast_path,
+        cap_exclusive_bulk_source_names, capped_phase_deadline, collect_dns_outcomes_until,
+        consume_phase_budget, external_deferral_seconds, external_pause_status,
+        external_retry_after_seconds, is_missing_api_key_error, is_preflight_auth_error,
+        late_ct_seed_reserve, materialize_ct_fallback_bounded, merge_ct_fallback_names,
+        merge_passive_names_bounded, passive_connector_working_set_limit,
+        persist_routed_dns_outcomes, record_bounded_parent_candidate,
+        refill_passive_union_from_cache, refresh_allows_wildcard_purge,
         refresh_parent_selection_is_complete, refresh_wildcard_observation_is_reliable,
         refresh_wildcard_profile_is_reliable, route_dns_outcomes, should_expand_adaptive_wave,
-        should_retry_otx_after_key_added, source_bootstrap_score, unprofiled_deepest_parents,
-        wildcard_cache_algorithm_is_current, wildcard_profile_after_probe,
-        wildcard_profile_observed,
+        should_retry_source_after_key_added, source_bootstrap_score, source_error_is_deferred,
+        source_requires_api_key, unprofiled_deepest_parents, wildcard_cache_algorithm_is_current,
+        wildcard_profile_after_probe, wildcard_profile_observed,
     };
     use crate::candidate::CandidateProposal;
     use crate::db::Database;
@@ -6435,12 +6815,141 @@ mod tests {
     }
 
     #[test]
+    fn ct_error_fallback_is_read_only_and_respects_max_passive() {
+        let db = Database::in_memory().unwrap();
+        let names = (0..500)
+            .map(|index| format!("host-{index:04}.example.com"))
+            .collect::<BTreeSet<_>>();
+        db.store_ct_global_batch("https://ct.example/log/", 500, &names)
+            .unwrap();
+
+        let recovered = materialize_ct_fallback_bounded(&db, "example.com", 23).unwrap();
+
+        assert_eq!(recovered.len(), 23);
+        assert_eq!(
+            db.ct_names_for_domain("example.com", 1_000).unwrap().len(),
+            500
+        );
+        assert!(
+            db.observation_names("example.com", "passive:ct-direct")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn late_ct_reserve_is_bounded_and_old_wildcard_caches_are_rejected() {
         assert_eq!(late_ct_seed_reserve(10_000, true), 2_000);
         assert_eq!(late_ct_seed_reserve(100, true), 20);
         assert_eq!(late_ct_seed_reserve(100, false), 0);
         assert!(!wildcard_cache_algorithm_is_current(3, 5));
         assert!(wildcard_cache_algorithm_is_current(5, 5));
+    }
+
+    #[test]
+    fn automatic_anubis_guard_caps_only_source_exclusive_names() {
+        assert_eq!(automatic_bulk_source_limit(25_000), 2_500);
+        let mut sources = BTreeMap::from([
+            (
+                "a.example.com".to_owned(),
+                BTreeSet::from(["passive:anubisdb".to_owned()]),
+            ),
+            (
+                "b.example.com".to_owned(),
+                BTreeSet::from(["passive:anubisdb:partial".to_owned()]),
+            ),
+            (
+                "trusted.example.com".to_owned(),
+                BTreeSet::from([
+                    "passive:anubisdb".to_owned(),
+                    "passive:certspotter".to_owned(),
+                ]),
+            ),
+        ]);
+        let (before, kept) =
+            cap_exclusive_bulk_source_names("example.com", &mut sources, "passive:anubisdb", 1);
+        assert_eq!((before, kept), (2, 1));
+        assert_eq!(sources.len(), 2);
+        assert!(sources.contains_key("trusted.example.com"));
+    }
+
+    #[test]
+    fn passive_union_cap_keeps_existing_multi_source_provenance() {
+        assert_eq!(passive_connector_working_set_limit(25_000), 3_125);
+        let mut sources = BTreeMap::new();
+        assert_eq!(
+            merge_passive_names_bounded(
+                &mut sources,
+                [
+                    "one.example.com".to_owned(),
+                    "shared.example.com".to_owned()
+                ],
+                "passive:first".to_owned(),
+                2,
+            ),
+            0
+        );
+        assert_eq!(
+            merge_passive_names_bounded(
+                &mut sources,
+                [
+                    "shared.example.com".to_owned(),
+                    "two.example.com".to_owned()
+                ],
+                "passive:second".to_owned(),
+                2,
+            ),
+            1
+        );
+        assert_eq!(sources.len(), 2);
+        assert_eq!(
+            sources.get("shared.example.com"),
+            Some(&BTreeSet::from([
+                "passive:first".to_owned(),
+                "passive:second".to_owned(),
+            ]))
+        );
+        assert!(!sources.contains_key("two.example.com"));
+    }
+
+    #[test]
+    fn durable_passive_refill_recovers_coverage_beyond_the_connector_cap() {
+        let db = Database::in_memory().unwrap();
+        let all_names = (0..20)
+            .map(|index| format!("host-{index:02}.example.com"))
+            .collect::<BTreeSet<_>>();
+        db.store_passive_observation_page("example.com", "fixture", &all_names)
+            .unwrap();
+        let mut sources = all_names
+            .iter()
+            .take(3)
+            .cloned()
+            .map(|name| (name, BTreeSet::from(["passive:fixture".to_owned()])))
+            .collect::<BTreeMap<_, _>>();
+
+        let added = refill_passive_union_from_cache(
+            &db,
+            "example.com",
+            &["fixture".to_owned()],
+            &mut sources,
+            10,
+        )
+        .unwrap();
+
+        assert_eq!(added, 7);
+        assert_eq!(sources.len(), 10);
+        assert_eq!(
+            sources.get("host-00.example.com"),
+            Some(&BTreeSet::from(["passive:fixture".to_owned()]))
+        );
+        assert_eq!(
+            db.passive_cache("example.com", "fixture")
+                .unwrap()
+                .unwrap()
+                .names
+                .len(),
+            20
+        );
     }
 
     #[test]
@@ -7288,20 +7797,55 @@ mod tests {
     }
 
     #[test]
-    fn adding_an_otx_key_bypasses_only_the_anonymous_rate_limit_cooldown() {
-        assert!(should_retry_otx_after_key_added(
+    fn adding_credentials_bypasses_only_legacy_missing_key_cooldowns() {
+        assert!(source_requires_api_key("censys"));
+        assert!(!source_requires_api_key("crtsh"));
+        assert!(is_missing_api_key_error(
+            "BINARYEDGE_API_KEY absent pour la source binaryedge"
+        ));
+        assert!(!is_missing_api_key_error(
+            "binaryedge: HTTP 401 invalid api key"
+        ));
+        assert!(is_preflight_auth_error(
+            "CENSYS_API_KEY doit être au format API_ID:API_SECRET"
+        ));
+        assert!(source_error_is_deferred(
+            "BINARYEDGE_API_KEY absent pour la source binaryedge"
+        ));
+        assert!(source_error_is_deferred(
+            "CENSYS_API_KEY doit être au format API_ID:API_SECRET"
+        ));
+        assert!(!source_error_is_deferred(
+            "censys: HTTP 401 invalid api key"
+        ));
+
+        assert!(should_retry_source_after_key_added(
+            "binaryedge",
+            true,
+            Some("BINARYEDGE_API_KEY absent pour la source binaryedge")
+        ));
+        assert!(!should_retry_source_after_key_added(
+            "binaryedge",
+            false,
+            Some("BINARYEDGE_API_KEY absent pour la source binaryedge")
+        ));
+        assert!(should_retry_source_after_key_added(
+            "otx",
             true,
             Some("OTX limite l'accès anonyme (HTTP 429)")
         ));
-        assert!(!should_retry_otx_after_key_added(
+        assert!(!should_retry_source_after_key_added(
+            "otx",
             false,
             Some("OTX limite l'accès anonyme (HTTP 429)")
         ));
-        assert!(!should_retry_otx_after_key_added(
+        assert!(!should_retry_source_after_key_added(
+            "otx",
             true,
             Some("OTX refuse la clé fournie (HTTP 429)")
         ));
-        assert!(!should_retry_otx_after_key_added(
+        assert!(!should_retry_source_after_key_added(
+            "otx",
             true,
             Some("OTX indisponible (HTTP 503)")
         ));
@@ -7317,8 +7861,13 @@ mod tests {
         );
         assert_eq!(
             external_pause_status(61),
-            "quota externe, reprise dans 2 min, mémoire permanente"
+            "source externe différée, reprise dans 2 min, mémoire permanente"
         );
         assert_eq!(external_retry_after_seconds("HTTP 503"), None);
+        assert_eq!(
+            external_deferral_seconds("Driftnet: HTTP 403: quota exceeded"),
+            Some(900)
+        );
+        assert_eq!(external_deferral_seconds("HTTP 403 unauthorized"), None);
     }
 }
