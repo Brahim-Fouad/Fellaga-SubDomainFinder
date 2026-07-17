@@ -119,6 +119,12 @@ Refresh stops after five minutes by default and commits validation results in bo
 # Human-readable streaming output
 fellaga scan your-domain.example
 
+# Final raw FQDN list, sorted and deduplicated
+fellaga scan your-domain.example --show > subdomains.txt
+
+# Final raw list restricted to live non-wildcard names
+fellaga scan your-domain.example --show --only-live > live-subdomains.txt
+
 # One final JSON document
 fellaga scan your-domain.example --json > result.json
 
@@ -132,7 +138,7 @@ fellaga scan your-domain.example --stream-jsonl > findings.jsonl
 fellaga scan your-domain.example --stream-jsonl --only-live > live-findings.jsonl
 ```
 
-Progress is written to standard error. Machine-readable output stays on standard output. `--quiet` disables progress messages, and `--output` or `--output-dir` writes scan results to files.
+Progress is written to standard error. Machine-readable output stays on standard output. `--show` suppresses progress and the human summary, waits for final wildcard classification, then writes one sorted and deduplicated FQDN per line. It includes every retained state by default; combine it with `--only-live` for final live non-wildcard names only. `--show` is mutually exclusive with `--json`, `--jsonl`, and `--stream-jsonl`. `--quiet` disables progress messages, and `--output` or `--output-dir` writes scan results to files.
 
 Long operations emit periodic heartbeats rather than leaving the terminal apparently frozen. Passive heartbeats report completed, active, and remaining sources plus the active-time budget. DNS-validation heartbeats report completed work, and the enrichment phases periodically report how long their current bounded operation has been running.
 

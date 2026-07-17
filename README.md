@@ -38,8 +38,8 @@ Fellaga is a fast, adaptive subdomain enumerator written in Rust for Kali Linux 
 Download the release package and install it with APT. Checksums, a Sigstore-signed manifest, and GitHub attestations are available for independent verification:
 
 ```bash
-curl -fLO https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/download/v0.9.1/fellaga_0.9.1-1_amd64.deb
-sudo apt install ./fellaga_0.9.1-1_amd64.deb
+curl -fLO https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/download/v0.9.2/fellaga_0.9.2-1_amd64.deb
+sudo apt install ./fellaga_0.9.2-1_amd64.deb
 fellaga --version
 ```
 
@@ -70,6 +70,12 @@ fellaga scan your-domain.example --profile turbo
 
 # Show only currently validated DNS names
 fellaga scan your-domain.example --only-live
+
+# Print only final discovered names, one per line
+fellaga scan your-domain.example --show
+
+# Raw output restricted to currently validated non-wildcard names
+fellaga scan your-domain.example --show --only-live
 
 # Passive discovery without the active enrichment pipeline
 fellaga scan your-domain.example --profile passive
