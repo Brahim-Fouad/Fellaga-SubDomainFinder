@@ -10,6 +10,7 @@ use crate::util::{
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::OpenOptions;
 use std::io::{BufRead, Read, Seek, SeekFrom};
@@ -25,6 +26,14 @@ use std::time::{Duration, Instant};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 const PERMANENT_EXPIRY: i64 = i64::MAX;
+const MAX_SCHEDULER_OUTCOMES: usize = 4_096;
+const MAX_SCHEDULER_GENERATORS: usize = 1_024;
+const MAX_SCHEDULER_COUNT_DELTA: u64 = 10_000_000;
+const MAX_SCHEDULER_COST_DELTA: f64 = 1_000_000_000_000.0;
+const MAX_SCHEDULER_TOTAL: f64 = 1_000_000_000_000_000.0;
+const MAX_DISCOVERY_ACTIONS: usize = 4_096;
+const MAX_DISCOVERY_ACTION_CLAIM: usize = 512;
+const MAX_DISCOVERY_OUTCOME_JSON: usize = 64 * 1024;
 const CURRENT_SCAN_WILDCARD_MATCH_DETAILS: &str =
     r#"{"network_positive":true,"reason":"current_scan_wildcard_match"}"#;
 const CURRENT_SCAN_WILDCARD_AMBIGUITY_DETAILS: &str =
@@ -227,7 +236,8 @@ fn directory_is_dedicated_to_database(parent: &Path, path: &Path) -> bool {
         name.push(suffix);
         allowed_names.push(name);
     }
-    let backup_prefix = database_name.to_str().map(|name| format!("{name}.pre-v8-"));
+    let backup_prefix_v8 = database_name.to_str().map(|name| format!("{name}.pre-v8-"));
+    let backup_prefix_v9 = database_name.to_str().map(|name| format!("{name}.pre-v9-"));
 
     let Ok(entries) = std::fs::read_dir(parent) else {
         return false;
@@ -238,10 +248,13 @@ fn directory_is_dedicated_to_database(parent: &Path, path: &Path) -> bool {
         };
         let name = entry.file_name();
         allowed_names.contains(&name)
-            || backup_prefix.as_ref().is_some_and(|prefix| {
-                name.to_str()
-                    .is_some_and(|name| name.starts_with(prefix) && name.ends_with(".bak"))
-            })
+            || [backup_prefix_v8.as_ref(), backup_prefix_v9.as_ref()]
+                .into_iter()
+                .flatten()
+                .any(|prefix| {
+                    name.to_str()
+                        .is_some_and(|name| name.starts_with(prefix) && name.ends_with(".bak"))
+                })
     })
 }
 
@@ -312,7 +325,7 @@ fn secure_existing_sqlite_files(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn next_v8_backup_path(path: &Path) -> Result<PathBuf> {
+fn next_schema_backup_path(path: &Path, version: u8) -> Result<PathBuf> {
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -321,9 +334,9 @@ fn next_v8_backup_path(path: &Path) -> Result<PathBuf> {
     let timestamp = now_epoch();
     for suffix in 0_u32.. {
         let candidate_name = if suffix == 0 {
-            format!("{file_name}.pre-v8-{timestamp}.bak")
+            format!("{file_name}.pre-v{version}-{timestamp}.bak")
         } else {
-            format!("{file_name}.pre-v8-{timestamp}-{suffix}.bak")
+            format!("{file_name}.pre-v{version}-{timestamp}-{suffix}.bak")
         };
         let candidate = parent.join(candidate_name);
         let mut options = OpenOptions::new();
@@ -348,6 +361,14 @@ fn next_v8_backup_path(path: &Path) -> Result<PathBuf> {
         }
     }
     unreachable!("la recherche d'un nom de sauvegarde libre est bornée par le système de fichiers")
+}
+
+fn next_v8_backup_path(path: &Path) -> Result<PathBuf> {
+    next_schema_backup_path(path, 8)
+}
+
+fn next_v9_backup_path(path: &Path) -> Result<PathBuf> {
+    next_schema_backup_path(path, 9)
 }
 
 #[derive(Debug, Clone)]
@@ -453,6 +474,72 @@ pub struct SourceDiagnostic {
     pub last_used: i64,
     pub next_retry: Option<i64>,
     pub retry_in_seconds: Option<i64>,
+}
+
+/// One bounded learning update for the cost-aware candidate scheduler.
+/// `exclusive_live` must only count names first discovered by this generator,
+/// confirmed live and not synthesized by a wildcard.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SchedulerOutcome {
+    pub generator: String,
+    pub attempts: u64,
+    pub exclusive_live: u64,
+    pub packets: u64,
+    /// Normalized aggregate cost. Callers may combine logical DNS operations, elapsed
+    /// work and other local resource costs, but the unit must remain stable
+    /// between generators in the same installation.
+    pub total_cost: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct SchedulerArmRanking {
+    pub generator: String,
+    pub priority_milli: i64,
+    pub posterior_mean: f64,
+    pub posterior_upper: f64,
+    pub average_cost: f64,
+    pub exclusive_per_1000_cost: f64,
+    pub packets: u64,
+    pub exclusive_live: u64,
+    pub contexts_matched: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DiscoveryActionInput {
+    pub fqdn: Option<String>,
+    pub zone: String,
+    pub kind: String,
+    pub generator: String,
+    pub context_key: String,
+    pub priority_class: u8,
+    pub predicted_unique_live: f64,
+    pub predicted_cost: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct DiscoveryActionRecord {
+    pub id: i64,
+    pub fqdn: Option<String>,
+    pub zone: String,
+    pub kind: String,
+    pub generator: String,
+    pub context_key: String,
+    pub priority_class: u8,
+    pub predicted_unique_live: f64,
+    pub predicted_cost: f64,
+}
+
+#[derive(Debug, Default)]
+struct SchedulerArmAggregate {
+    weighted_successes: f64,
+    weighted_failures: f64,
+    weighted_attempts: f64,
+    weighted_packets: f64,
+    weighted_rewards: f64,
+    weighted_cost: f64,
+    max_packets: u64,
+    max_rewards: u64,
+    contexts_matched: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -801,6 +888,106 @@ fn candidate_contexts(connection: &Connection, domain: &str) -> Result<Vec<Strin
     Ok(contexts)
 }
 
+fn scheduler_context_weight(context: &str) -> f64 {
+    match context.split(':').next().unwrap_or_default() {
+        "suffix" | "registrable" | "provider" => 2.0,
+        _ => 1.0,
+    }
+}
+
+fn validate_scheduler_identifier(value: &str, field: &str) -> Result<()> {
+    if value.is_empty()
+        || value.len() > 256
+        || value.trim() != value
+        || value.chars().any(char::is_control)
+    {
+        bail!("identifiant {field} invalide pour le scheduler");
+    }
+    Ok(())
+}
+
+fn validate_scheduler_outcome(outcome: &SchedulerOutcome) -> Result<()> {
+    validate_scheduler_identifier(&outcome.generator, "generator")?;
+    if outcome.attempts > MAX_SCHEDULER_COUNT_DELTA
+        || outcome.packets > MAX_SCHEDULER_COUNT_DELTA
+        || outcome.exclusive_live > outcome.attempts
+    {
+        bail!(
+            "compteurs hors limites pour le générateur {}",
+            outcome.generator
+        );
+    }
+    if !outcome.total_cost.is_finite()
+        || !(0.0..=MAX_SCHEDULER_COST_DELTA).contains(&outcome.total_cost)
+    {
+        bail!("coût hors limites pour le générateur {}", outcome.generator);
+    }
+    Ok(())
+}
+
+fn validate_discovery_action(action: &DiscoveryActionInput) -> Result<()> {
+    validate_scheduler_identifier(&action.zone, "zone")?;
+    validate_scheduler_identifier(&action.kind, "kind")?;
+    validate_scheduler_identifier(&action.generator, "generator")?;
+    validate_scheduler_identifier(&action.context_key, "context")?;
+    if let Some(fqdn) = &action.fqdn {
+        validate_scheduler_identifier(fqdn, "fqdn")?;
+    }
+    if action.priority_class > 3 {
+        bail!("classe de priorité discovery_action hors limites");
+    }
+    if !action.predicted_unique_live.is_finite()
+        || !(0.0..=1_000_000_000.0).contains(&action.predicted_unique_live)
+        || !action.predicted_cost.is_finite()
+        || !(0.000_001..=MAX_SCHEDULER_COST_DELTA).contains(&action.predicted_cost)
+    {
+        bail!("prédiction hors limites pour discovery_action");
+    }
+    Ok(())
+}
+
+fn upsert_scheduler_arm(
+    transaction: &rusqlite::Transaction<'_>,
+    context: &str,
+    outcome: &SchedulerOutcome,
+    now: i64,
+) -> Result<()> {
+    validate_scheduler_identifier(context, "context")?;
+    validate_scheduler_outcome(outcome)?;
+    let failures = outcome.attempts.saturating_sub(outcome.exclusive_live);
+    transaction.execute(
+        r#"INSERT INTO scheduler_arms(
+               context, generator, alpha, beta, packets,
+               exclusive_rewards, total_cost, last_seen
+           ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+           ON CONFLICT(context, generator) DO UPDATE SET
+               alpha=MIN(?9, MAX(scheduler_arms.alpha, 1.0)+excluded.alpha-1.0),
+               beta=MIN(?9, MAX(scheduler_arms.beta, 1.0)+excluded.beta-1.0),
+               packets=CASE
+                   WHEN MAX(scheduler_arms.packets, 0) > 9223372036854775807-excluded.packets
+                   THEN 9223372036854775807
+                   ELSE MAX(scheduler_arms.packets, 0)+excluded.packets END,
+               exclusive_rewards=CASE
+                   WHEN MAX(scheduler_arms.exclusive_rewards, 0) > 9223372036854775807-excluded.exclusive_rewards
+                   THEN 9223372036854775807
+                   ELSE MAX(scheduler_arms.exclusive_rewards, 0)+excluded.exclusive_rewards END,
+               total_cost=MIN(?9, MAX(scheduler_arms.total_cost, 0.0)+excluded.total_cost),
+               last_seen=excluded.last_seen"#,
+        params![
+            context,
+            outcome.generator,
+            1.0 + outcome.exclusive_live as f64,
+            1.0 + failures as f64,
+            outcome.packets as i64,
+            outcome.exclusive_live as i64,
+            outcome.total_cost,
+            now,
+            MAX_SCHEDULER_TOTAL
+        ],
+    )?;
+    Ok(())
+}
+
 #[derive(Clone)]
 pub struct Database {
     path: PathBuf,
@@ -815,16 +1002,20 @@ impl Database {
             .with_context(|| format!("ouverture de SQLite {}", path.display()))?;
         secure_existing_sqlite_files(path)?;
         let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version > 8 {
-            bail!("base SQLite version {version} plus récente que cette version de Fellaga (v8)");
+        if version > 9 {
+            bail!("base SQLite version {version} plus récente que cette version de Fellaga (v9)");
         }
-        if (1..8).contains(&version) {
-            let backup = next_v8_backup_path(path)?;
+        if (1..9).contains(&version) {
+            let backup = if version < 8 {
+                next_v8_backup_path(path)?
+            } else {
+                next_v9_backup_path(path)?
+            };
             connection
                 .execute("VACUUM INTO ?1", [backup.to_string_lossy().as_ref()])
                 .with_context(|| {
                     format!(
-                        "sauvegarde SQLite pré-v8 de {} vers {}",
+                        "sauvegarde SQLite pré-migration de {} vers {}",
                         path.display(),
                         backup.display()
                     )
@@ -842,9 +1033,9 @@ impl Database {
     fn from_connection(path: PathBuf, mut connection: Connection) -> Result<Self> {
         let starting_version: i64 =
             connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if starting_version > 8 {
+        if starting_version > 9 {
             bail!(
-                "base SQLite version {starting_version} plus récente que cette version de Fellaga (v8)"
+                "base SQLite version {starting_version} plus récente que cette version de Fellaga (v9)"
             );
         }
         connection.pragma_update(None, "journal_mode", "WAL")?;
@@ -855,6 +1046,7 @@ impl Database {
             secure_existing_sqlite_files(&path)?;
         }
         let migrating_to_v8 = starting_version < 8;
+        let migrating_to_v9 = starting_version < 9;
         // Version upgrades and same-version additive repairs are one atomic
         // unit. A failed compatible migration must never leave half-created
         // tables or indexes behind for the next launch.
@@ -881,6 +1073,7 @@ impl Database {
                 root_domain TEXT NOT NULL,
                 first_seen INTEGER NOT NULL,
                 last_seen INTEGER NOT NULL,
+                first_scan_id INTEGER REFERENCES scans(id),
                 last_scan_id INTEGER REFERENCES scans(id),
                 times_seen INTEGER NOT NULL DEFAULT 1,
                 active INTEGER NOT NULL DEFAULT 1,
@@ -916,6 +1109,11 @@ impl Database {
                 last_verified_at INTEGER,
                 evidence_families_json TEXT NOT NULL DEFAULT '[]',
                 authoritative_validation INTEGER NOT NULL DEFAULT 0,
+                wildcard_verdict TEXT NOT NULL DEFAULT 'not_profiled'
+                    CHECK(wildcard_verdict IN ('exact_owner', 'synthesized', 'ambiguous', 'not_profiled')),
+                owner_proofs_json TEXT NOT NULL DEFAULT '[]',
+                generation_path_json TEXT NOT NULL DEFAULT '[]',
+                discovery_score REAL,
                 PRIMARY KEY(scan_id, fqdn)
             );
 
@@ -1317,6 +1515,96 @@ impl Database {
                 PRIMARY KEY(context, generator)
             );
 
+            CREATE TABLE IF NOT EXISTS discovery_actions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                scan_id INTEGER NOT NULL REFERENCES scans(id) ON DELETE CASCADE,
+                fqdn TEXT,
+                zone TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                generator TEXT NOT NULL,
+                context_key TEXT NOT NULL DEFAULT 'global',
+                priority_class INTEGER NOT NULL CHECK(priority_class BETWEEN 0 AND 3),
+                predicted_unique_live REAL NOT NULL DEFAULT 0.0,
+                predicted_cost REAL NOT NULL DEFAULT 1.0,
+                state TEXT NOT NULL DEFAULT 'queued'
+                    CHECK(state IN ('queued', 'processing', 'done', 'deferred')),
+                outcome_json TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                UNIQUE(scan_id, kind, fqdn, zone, generator)
+            );
+            CREATE INDEX IF NOT EXISTS idx_discovery_actions_queue
+                ON discovery_actions(scan_id, state, priority_class, predicted_unique_live DESC);
+            CREATE INDEX IF NOT EXISTS idx_discovery_actions_yield
+                ON discovery_actions(
+                    scan_id, state, priority_class,
+                    (predicted_unique_live / MAX(predicted_cost, 0.000001)) DESC,
+                    id
+                );
+
+            CREATE TABLE IF NOT EXISTS intelligence_edges (
+                root_domain TEXT NOT NULL,
+                from_node TEXT NOT NULL,
+                to_node TEXT NOT NULL,
+                relation TEXT NOT NULL,
+                weight REAL NOT NULL DEFAULT 1.0,
+                first_seen INTEGER NOT NULL,
+                last_seen INTEGER NOT NULL,
+                evidence_json TEXT NOT NULL DEFAULT '[]',
+                PRIMARY KEY(root_domain, from_node, to_node, relation)
+            ) WITHOUT ROWID;
+
+            CREATE TABLE IF NOT EXISTS name_templates (
+                root_domain TEXT NOT NULL,
+                parent_zone TEXT NOT NULL,
+                template TEXT NOT NULL,
+                support INTEGER NOT NULL DEFAULT 0,
+                successes INTEGER NOT NULL DEFAULT 0,
+                score REAL NOT NULL DEFAULT 0.0,
+                first_seen INTEGER NOT NULL,
+                last_seen INTEGER NOT NULL,
+                PRIMARY KEY(root_domain, parent_zone, template)
+            ) WITHOUT ROWID;
+
+            CREATE TABLE IF NOT EXISTS dnssec_proofs (
+                zone TEXT NOT NULL,
+                owner TEXT NOT NULL,
+                proof_type TEXT NOT NULL,
+                next_owner TEXT,
+                parameters_json TEXT NOT NULL DEFAULT '{}',
+                validated INTEGER NOT NULL DEFAULT 0,
+                compact_denial INTEGER NOT NULL DEFAULT 0,
+                observed_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                PRIMARY KEY(zone, owner, proof_type)
+            ) WITHOUT ROWID;
+            CREATE INDEX IF NOT EXISTS idx_dnssec_proofs_range
+                ON dnssec_proofs(zone, proof_type, validated, expires_at);
+
+            CREATE TABLE IF NOT EXISTS ct_tiles (
+                log_url TEXT NOT NULL,
+                tile_path TEXT NOT NULL,
+                checkpoint_size INTEGER NOT NULL,
+                checkpoint_hash TEXT NOT NULL DEFAULT '',
+                content_hash TEXT NOT NULL,
+                payload BLOB NOT NULL,
+                verified INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY(log_url, tile_path)
+            ) WITHOUT ROWID;
+
+            CREATE TABLE IF NOT EXISTS scheduler_arms (
+                context TEXT NOT NULL,
+                generator TEXT NOT NULL,
+                alpha REAL NOT NULL DEFAULT 1.0,
+                beta REAL NOT NULL DEFAULT 1.0,
+                packets INTEGER NOT NULL DEFAULT 0,
+                exclusive_rewards INTEGER NOT NULL DEFAULT 0,
+                total_cost REAL NOT NULL DEFAULT 0.0,
+                last_seen INTEGER NOT NULL,
+                PRIMARY KEY(context, generator)
+            ) WITHOUT ROWID;
+
             CREATE TABLE IF NOT EXISTS ct_global_state (
                 log_url TEXT PRIMARY KEY,
                 next_index INTEGER NOT NULL,
@@ -1416,6 +1704,11 @@ impl Database {
                 "verification_state",
                 "verification_state TEXT NOT NULL DEFAULT 'live' CHECK(verification_state IN ('live', 'historical', 'unverified'))",
             ),
+            (
+                "subdomains",
+                "first_scan_id",
+                "first_scan_id INTEGER REFERENCES scans(id)",
+            ),
             ("subdomains", "last_verified_at", "last_verified_at INTEGER"),
             (
                 "scan_findings",
@@ -1436,6 +1729,27 @@ impl Database {
                 "scan_findings",
                 "authoritative_validation",
                 "authoritative_validation INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "scan_findings",
+                "wildcard_verdict",
+                "wildcard_verdict TEXT NOT NULL DEFAULT 'not_profiled' CHECK(wildcard_verdict IN ('exact_owner', 'synthesized', 'ambiguous', 'not_profiled'))",
+            ),
+            (
+                "scan_findings",
+                "owner_proofs_json",
+                "owner_proofs_json TEXT NOT NULL DEFAULT '[]'",
+            ),
+            (
+                "scan_findings",
+                "generation_path_json",
+                "generation_path_json TEXT NOT NULL DEFAULT '[]'",
+            ),
+            ("scan_findings", "discovery_score", "discovery_score REAL"),
+            (
+                "ct_tiles",
+                "checkpoint_hash",
+                "checkpoint_hash TEXT NOT NULL DEFAULT ''",
             ),
             (
                 "dns_cache",
@@ -1512,6 +1826,26 @@ impl Database {
                 connection.execute(&format!("ALTER TABLE {table} ADD COLUMN {definition}"), [])?;
             }
         }
+        // Preserve useful pre-v9 learning without ever double-applying it.
+        // Existing native scheduler rows win; missing rows receive the legacy
+        // Beta posterior and a conservative unit cost per historical pull.
+        // Legacy rewards were not proven exclusive-live, so that counter is
+        // deliberately initialized to zero instead of relabeling old data.
+        connection.execute(
+            r#"INSERT OR IGNORE INTO scheduler_arms(
+                   context, generator, alpha, beta, packets,
+                   exclusive_rewards, total_cost, last_seen
+               )
+               SELECT context, generator,
+                      MAX(COALESCE(alpha, 1.0), 1.0),
+                      MAX(COALESCE(beta, 1.0), 1.0),
+                      MAX(COALESCE(pulls, 0), 0),
+                      0,
+                      CAST(MAX(COALESCE(pulls, 0), 0) AS REAL),
+                      last_seen
+               FROM generator_bandits"#,
+            [],
+        )?;
         connection.execute(
             r#"UPDATE source_stats
                   SET last_status=CASE
@@ -1568,7 +1902,7 @@ impl Database {
                        last_verified_at=NULL"#,
                 [],
             )?;
-            connection.pragma_update(None, "user_version", 8)?;
+            connection.pragma_update(None, "user_version", 9)?;
         } else {
             connection.execute(
                 r#"UPDATE subdomains
@@ -1583,7 +1917,15 @@ impl Database {
                      AND last_verified_at IS NULL"#,
                 [],
             )?;
-            connection.pragma_update(None, "user_version", 8)?;
+            connection.pragma_update(None, "user_version", 9)?;
+        }
+        if migrating_to_v9 {
+            connection.execute(
+                r#"INSERT INTO migration_state(name, completed_at)
+                   VALUES ('intelligence-v9', ?1)
+                   ON CONFLICT(name) DO UPDATE SET completed_at=excluded.completed_at"#,
+                [now_epoch()],
+            )?;
         }
         migrate_legacy_observations(&mut connection, true)?;
         connection.execute_batch("COMMIT")?;
@@ -4024,6 +4366,51 @@ impl Database {
         Ok(inserted)
     }
 
+    /// Quarantines names whose non-existence was established by a locally
+    /// validated DNSSEC NSEC/NSEC3 proof.  This is intentionally separate from
+    /// heuristic wildcard cleanup: the caller must supply only cryptographic
+    /// proof outcomes, and every mutation remains scoped to one root domain.
+    pub fn quarantine_dnssec_nonexistent(
+        &self,
+        scan_id: i64,
+        root_domain: &str,
+        hosts: &[String],
+    ) -> Result<usize> {
+        let suffix = format!(".{root_domain}");
+        let hosts = hosts
+            .iter()
+            .filter(|host| host.ends_with(&suffix))
+            .take(64)
+            .collect::<BTreeSet<_>>();
+        if hosts.is_empty() {
+            return Ok(0);
+        }
+        let now = now_epoch();
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        let mut journal = transaction.prepare(
+            r#"INSERT INTO dns_verifications(
+                   scan_id, fqdn, checked_at, outcome, resolver_count,
+                   authoritative, records_hash, details_json
+               ) VALUES (?1, ?2, ?3, 'negative', 1, 0, NULL,
+                         '{"reason":"dnssec_validated_nonexistence","cache":"never_for_compact_denial"}')"#,
+        )?;
+        for host in &hosts {
+            quarantine_wildcard_host(
+                &transaction,
+                root_domain,
+                host,
+                scan_id,
+                "dnssec_validated_nonexistence",
+                now,
+            )?;
+            journal.execute(params![scan_id, *host, now])?;
+        }
+        drop(journal);
+        transaction.commit()?;
+        Ok(hosts.len())
+    }
+
     /// Records a current positive response that cannot be distinguished from
     /// an indeterminate or rotating wildcard profile. Unlike the exact-match
     /// marker above, this never authorizes quarantine. It removes reusable
@@ -4241,9 +4628,9 @@ impl Database {
                 .flatten();
             transaction.execute(
                 r#"INSERT INTO subdomains(
-                   fqdn, root_domain, first_seen, last_seen, last_scan_id, times_seen, active,
+                   fqdn, root_domain, first_seen, last_seen, first_scan_id, last_scan_id, times_seen, active,
                    sources, verification_state, last_verified_at
-                   ) VALUES (?1, ?2, ?3, ?3, ?4, 1, ?5, ?6, ?7, ?8)
+                   ) VALUES (?1, ?2, ?3, ?3, ?4, ?4, 1, ?5, ?6, ?7, ?8)
                    ON CONFLICT(fqdn) DO UPDATE SET last_seen=excluded.last_seen,
                    last_scan_id=excluded.last_scan_id,
                    times_seen=times_seen + CASE
@@ -4266,8 +4653,9 @@ impl Database {
                 r#"INSERT OR REPLACE INTO scan_findings(
                    scan_id, fqdn, wildcard, from_cache,
                    confidence_score, confidence_label, confidence_reasons_json,
-                   state, last_verified_at, evidence_families_json, authoritative_validation
-                   ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"#,
+                   state, last_verified_at, evidence_families_json, authoritative_validation,
+                   wildcard_verdict, owner_proofs_json, generation_path_json, discovery_score
+                   ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)"#,
                 params![
                     scan_id,
                     finding.fqdn,
@@ -4279,7 +4667,11 @@ impl Database {
                     finding.state.as_str(),
                     verified_at,
                     serde_json::to_string(&finding.evidence_families)?,
-                    finding.authoritative_validation as i64
+                    finding.authoritative_validation as i64,
+                    finding.wildcard_verdict.as_str(),
+                    serde_json::to_string(&finding.owner_proofs)?,
+                    serde_json::to_string(&finding.generation_path)?,
+                    finding.discovery_score
                 ],
             )?;
             transaction.execute(
@@ -4321,8 +4713,9 @@ impl Database {
                 r#"INSERT OR REPLACE INTO scan_findings(
                    scan_id, fqdn, wildcard, from_cache,
                    confidence_score, confidence_label, confidence_reasons_json,
-                   state, last_verified_at, evidence_families_json, authoritative_validation
-                   ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"#,
+                   state, last_verified_at, evidence_families_json, authoritative_validation,
+                   wildcard_verdict, owner_proofs_json, generation_path_json, discovery_score
+                   ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)"#,
                 params![
                     scan_id,
                     finding.fqdn,
@@ -4334,7 +4727,11 @@ impl Database {
                     finding.state.as_str(),
                     finding.last_verified_at,
                     serde_json::to_string(&finding.evidence_families)?,
-                    finding.authoritative_validation as i64
+                    finding.authoritative_validation as i64,
+                    finding.wildcard_verdict.as_str(),
+                    serde_json::to_string(&finding.owner_proofs)?,
+                    serde_json::to_string(&finding.generation_path)?,
+                    finding.discovery_score
                 ],
             )?;
         }
@@ -5396,51 +5793,538 @@ impl Database {
             .map_err(Into::into)
     }
 
-    pub fn generator_scores(&self, domain: &str) -> Result<HashMap<String, i64>> {
+    pub fn enqueue_discovery_actions(
+        &self,
+        scan_id: i64,
+        actions: &[DiscoveryActionInput],
+    ) -> Result<usize> {
+        if actions.len() > MAX_DISCOVERY_ACTIONS {
+            bail!(
+                "trop de discovery_actions dans un lot: {} > {MAX_DISCOVERY_ACTIONS}",
+                actions.len()
+            );
+        }
+        for action in actions {
+            validate_discovery_action(action)?;
+        }
+        if actions.is_empty() {
+            return Ok(0);
+        }
+        let now = now_epoch();
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        let mut changed = 0_usize;
+        {
+            let mut insert = transaction.prepare(
+                r#"INSERT INTO discovery_actions(
+                       scan_id, fqdn, zone, kind, generator, context_key,
+                       priority_class, predicted_unique_live, predicted_cost,
+                       state, created_at, updated_at
+                   ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'queued', ?10, ?10)
+                   ON CONFLICT(scan_id, kind, fqdn, zone, generator) DO UPDATE SET
+                       context_key=excluded.context_key,
+                       priority_class=excluded.priority_class,
+                       predicted_unique_live=excluded.predicted_unique_live,
+                       predicted_cost=excluded.predicted_cost,
+                       updated_at=excluded.updated_at
+                   WHERE discovery_actions.state='queued'"#,
+            )?;
+            for action in actions {
+                changed = changed.saturating_add(insert.execute(params![
+                    scan_id,
+                    action.fqdn.as_deref().unwrap_or(""),
+                    action.zone,
+                    action.kind,
+                    action.generator,
+                    action.context_key,
+                    i64::from(action.priority_class),
+                    action.predicted_unique_live,
+                    action.predicted_cost,
+                    now
+                ])?);
+            }
+        }
+        transaction.commit()?;
+        Ok(changed)
+    }
+
+    /// Atomically claims the highest expected exclusive-live yield per unit
+    /// cost. At most 512 actions are returned in one call.
+    pub fn claim_discovery_actions(
+        &self,
+        scan_id: i64,
+        limit: usize,
+    ) -> Result<Vec<DiscoveryActionRecord>> {
+        let limit = limit.min(MAX_DISCOVERY_ACTION_CLAIM);
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        let selected = {
+            let mut statement = transaction.prepare(
+                r#"SELECT id, NULLIF(fqdn, ''), zone, kind, generator, context_key,
+                          priority_class, predicted_unique_live, predicted_cost
+                   FROM discovery_actions
+                   WHERE scan_id=?1 AND state='queued'
+                   ORDER BY priority_class ASC,
+                            predicted_unique_live / MAX(predicted_cost, 0.000001) DESC,
+                            predicted_unique_live DESC, id ASC
+                   LIMIT ?2"#,
+            )?;
+            statement
+                .query_map(params![scan_id, limit as i64], |row| {
+                    Ok(DiscoveryActionRecord {
+                        id: row.get(0)?,
+                        fqdn: row.get(1)?,
+                        zone: row.get(2)?,
+                        kind: row.get(3)?,
+                        generator: row.get(4)?,
+                        context_key: row.get(5)?,
+                        priority_class: row.get::<_, i64>(6)?.clamp(0, 3) as u8,
+                        predicted_unique_live: row.get(7)?,
+                        predicted_cost: row.get(8)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let now = now_epoch();
+        let mut claimed = Vec::with_capacity(selected.len());
+        for action in selected {
+            if transaction.execute(
+                r#"UPDATE discovery_actions SET state='processing', updated_at=?2
+                   WHERE id=?1 AND state='queued'"#,
+                params![action.id, now],
+            )? == 1
+            {
+                claimed.push(action);
+            }
+        }
+        transaction.commit()?;
+        Ok(claimed)
+    }
+
+    /// Completes an action and applies its scheduler reward in the same
+    /// transaction. Replaying an already completed action is idempotent.
+    pub fn complete_discovery_action(
+        &self,
+        action_id: i64,
+        outcome: &SchedulerOutcome,
+        details: &Value,
+    ) -> Result<bool> {
+        validate_scheduler_outcome(outcome)?;
+        let outcome_json = serde_json::to_string(&json!({
+            "attempts": outcome.attempts,
+            "exclusive_live": outcome.exclusive_live,
+            "packets": outcome.packets,
+            "total_cost": outcome.total_cost,
+            "details": details,
+        }))?;
+        if outcome_json.len() > MAX_DISCOVERY_OUTCOME_JSON {
+            bail!("résultat discovery_action supérieur à {MAX_DISCOVERY_OUTCOME_JSON} octets");
+        }
+        let now = now_epoch();
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        let action = transaction
+            .query_row(
+                r#"SELECT generator, context_key, state FROM discovery_actions WHERE id=?1"#,
+                [action_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((generator, context, state)) = action else {
+            bail!("discovery_action #{action_id} introuvable");
+        };
+        if state == "done" {
+            return Ok(false);
+        }
+        if state == "deferred" {
+            bail!("discovery_action #{action_id} déjà différée");
+        }
+        if generator != outcome.generator {
+            bail!("générateur incohérent pour discovery_action #{action_id}");
+        }
+        let updated = transaction.execute(
+            r#"UPDATE discovery_actions
+               SET state='done', outcome_json=?2, updated_at=?3
+               WHERE id=?1 AND state IN ('queued', 'processing')"#,
+            params![action_id, outcome_json, now],
+        )?;
+        if updated != 1 {
+            return Ok(false);
+        }
+        upsert_scheduler_arm(&transaction, &context, outcome, now)?;
+        if context != "global" {
+            upsert_scheduler_arm(&transaction, "global", outcome, now)?;
+        }
+        transaction.commit()?;
+        Ok(true)
+    }
+
+    /// Atomically persists a bounded set of exclusive-live scheduler results
+    /// into all contexts relevant to `domain`.
+    pub fn record_scheduler_outcomes(
+        &self,
+        domain: &str,
+        outcomes: &[SchedulerOutcome],
+    ) -> Result<()> {
+        if outcomes.len() > MAX_SCHEDULER_OUTCOMES {
+            bail!(
+                "trop de résultats scheduler dans un lot: {} > {MAX_SCHEDULER_OUTCOMES}",
+                outcomes.len()
+            );
+        }
+        let mut aggregated = BTreeMap::<String, SchedulerOutcome>::new();
+        for outcome in outcomes {
+            validate_scheduler_outcome(outcome)?;
+            let entry = aggregated
+                .entry(outcome.generator.clone())
+                .or_insert_with(|| SchedulerOutcome {
+                    generator: outcome.generator.clone(),
+                    attempts: 0,
+                    exclusive_live: 0,
+                    packets: 0,
+                    total_cost: 0.0,
+                });
+            entry.attempts = entry
+                .attempts
+                .checked_add(outcome.attempts)
+                .context("dépassement du compteur d'essais scheduler")?;
+            entry.exclusive_live = entry
+                .exclusive_live
+                .checked_add(outcome.exclusive_live)
+                .context("dépassement du compteur de récompenses scheduler")?;
+            entry.packets = entry
+                .packets
+                .checked_add(outcome.packets)
+                .context("dépassement du compteur de paquets scheduler")?;
+            entry.total_cost += outcome.total_cost;
+            validate_scheduler_outcome(entry)?;
+        }
+        if aggregated.is_empty() {
+            return Ok(());
+        }
+
+        let now = now_epoch();
+        let mut connection = self.lock()?;
+        let contexts = candidate_contexts(&connection, domain)?;
+        let transaction = connection.transaction()?;
+        for outcome in aggregated.values() {
+            for context in &contexts {
+                upsert_scheduler_arm(&transaction, context, outcome, now)?;
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Returns deterministic, cost-aware Beta-UCB priorities. Reads are
+    /// bounded per context so a very old local database cannot stall startup.
+    pub fn scheduler_rankings(
+        &self,
+        domain: &str,
+        generators: &[String],
+        limit: usize,
+    ) -> Result<Vec<SchedulerArmRanking>> {
+        if generators.len() > MAX_SCHEDULER_GENERATORS {
+            bail!(
+                "trop de générateurs à classer: {} > {MAX_SCHEDULER_GENERATORS}",
+                generators.len()
+            );
+        }
+        if limit == 0 || generators.is_empty() {
+            return Ok(Vec::new());
+        }
+        let generator_set = generators
+            .iter()
+            .map(|generator| {
+                validate_scheduler_identifier(generator, "generator")?;
+                Ok(generator.clone())
+            })
+            .collect::<Result<BTreeSet<_>>>()?;
         let connection = self.lock()?;
-        let mut scores = [
+        let contexts = candidate_contexts(&connection, domain)?;
+        let mut aggregates = generator_set
+            .iter()
+            .map(|generator| (generator.clone(), SchedulerArmAggregate::default()))
+            .collect::<BTreeMap<_, _>>();
+        let placeholders = std::iter::repeat_n("?", generator_set.len())
+            .collect::<Vec<_>>()
+            .join(",");
+
+        for context in contexts {
+            let weight = scheduler_context_weight(&context);
+            let sql = format!(
+                r#"SELECT generator, alpha, beta, packets,
+                          exclusive_rewards, total_cost
+                   FROM scheduler_arms
+                   WHERE context=? AND generator IN ({placeholders})"#
+            );
+            let mut statement = connection.prepare(&sql)?;
+            let parameters =
+                std::iter::once(context.as_str()).chain(generator_set.iter().map(String::as_str));
+            let rows = statement.query_map(rusqlite::params_from_iter(parameters), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, f64>(1)?,
+                    row.get::<_, f64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, f64>(5)?,
+                ))
+            })?;
+            for row in rows {
+                let (generator, alpha, beta, packets, rewards, total_cost) = row?;
+                let Some(aggregate) = aggregates.get_mut(&generator) else {
+                    continue;
+                };
+                let alpha = if alpha.is_finite() {
+                    alpha.clamp(1.0, MAX_SCHEDULER_TOTAL)
+                } else {
+                    1.0
+                };
+                let beta = if beta.is_finite() {
+                    beta.clamp(1.0, MAX_SCHEDULER_TOTAL)
+                } else {
+                    1.0
+                };
+                let successes = (alpha - 1.0).max(0.0);
+                let failures = (beta - 1.0).max(0.0);
+                let attempts = successes + failures;
+                let packets = packets.max(0) as u64;
+                let rewards = (rewards.max(0) as u64).min(attempts.round().max(0.0) as u64);
+                let total_cost = if total_cost.is_finite() {
+                    total_cost.clamp(0.0, MAX_SCHEDULER_TOTAL)
+                } else {
+                    0.0
+                };
+                aggregate.weighted_successes += successes * weight;
+                aggregate.weighted_failures += failures * weight;
+                aggregate.weighted_attempts += attempts * weight;
+                aggregate.weighted_packets += packets as f64 * weight;
+                aggregate.weighted_rewards += rewards as f64 * weight;
+                aggregate.weighted_cost += total_cost * weight;
+                aggregate.max_packets = aggregate.max_packets.max(packets);
+                aggregate.max_rewards = aggregate.max_rewards.max(rewards);
+                aggregate.contexts_matched = aggregate.contexts_matched.saturating_add(1);
+            }
+        }
+
+        let mut rankings = aggregates
+            .into_iter()
+            .map(|(generator, aggregate)| {
+                let alpha = 1.0 + aggregate.weighted_successes;
+                let beta = 1.0 + aggregate.weighted_failures;
+                let total = (alpha + beta).max(2.0);
+                let posterior_mean = alpha / total;
+                let variance = (alpha * beta / (total * total * (total + 1.0))).max(0.0);
+                let posterior_upper = (posterior_mean + 1.645 * variance.sqrt()).min(1.0);
+                let average_cost = if aggregate.weighted_attempts > 0.0
+                    && aggregate.weighted_cost > 0.0
+                {
+                    (aggregate.weighted_cost / aggregate.weighted_attempts).clamp(0.05, 1_000_000.0)
+                } else {
+                    1.0
+                };
+                let priority_milli = ((posterior_upper / average_cost) * 1_000.0)
+                    .round()
+                    .clamp(0.0, 100_000.0) as i64;
+                let exclusive_per_1000_cost = if aggregate.weighted_cost > 0.0 {
+                    aggregate.weighted_rewards * 1_000.0 / aggregate.weighted_cost
+                } else {
+                    0.0
+                };
+                SchedulerArmRanking {
+                    generator,
+                    priority_milli,
+                    posterior_mean,
+                    posterior_upper,
+                    average_cost,
+                    exclusive_per_1000_cost,
+                    packets: aggregate.max_packets,
+                    exclusive_live: aggregate.max_rewards,
+                    contexts_matched: aggregate.contexts_matched,
+                }
+            })
+            .collect::<Vec<_>>();
+        rankings.sort_by(|left, right| {
+            right
+                .priority_milli
+                .cmp(&left.priority_milli)
+                .then_with(|| {
+                    right
+                        .exclusive_per_1000_cost
+                        .total_cmp(&left.exclusive_per_1000_cost)
+                })
+                .then_with(|| left.generator.cmp(&right.generator))
+        });
+        rankings.truncate(limit.min(MAX_SCHEDULER_GENERATORS));
+        Ok(rankings)
+    }
+
+    pub fn generator_scores(&self, domain: &str) -> Result<HashMap<String, i64>> {
+        let generators = [
             "environment-swap",
             "number-neighbor",
             "token-order",
             "service-environment",
-        ]
-        .into_iter()
-        .map(|generator| (generator.to_owned(), 650_i64))
-        .collect::<HashMap<_, _>>();
-        let contexts = candidate_contexts(&connection, domain)?;
-        let context_set = contexts.iter().cloned().collect::<BTreeSet<_>>();
-        let mut statement = connection.prepare(
-            r#"SELECT context, generator, alpha, beta, pulls
-               FROM generator_bandits"#,
-        )?;
-        let rows = statement.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, f64>(2)?,
-                row.get::<_, f64>(3)?,
-                row.get::<_, i64>(4)?,
-            ))
-        })?;
-        for row in rows {
-            let (bandit_context, generator, alpha, beta, pulls) = row?;
-            if !context_set.contains(&bandit_context) {
-                continue;
+        ];
+        let mut scores = generators
+            .into_iter()
+            .map(|generator| (generator.to_owned(), 650_i64))
+            .collect::<HashMap<_, _>>();
+        let generator_names = generators
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let rankings = self.scheduler_rankings(domain, &generator_names, generator_names.len())?;
+        let scheduler_generators = rankings
+            .iter()
+            .filter(|ranking| ranking.contexts_matched > 0)
+            .map(|ranking| ranking.generator.clone())
+            .collect::<BTreeSet<_>>();
+        for ranking in rankings {
+            if ranking.contexts_matched > 0 {
+                *scores.entry(ranking.generator).or_default() += ranking.priority_milli;
             }
-            let total = (alpha + beta).max(1.0);
-            let mean = alpha / total;
-            let uncertainty = (alpha * beta / (total * total * (total + 1.0))).sqrt();
-            let exploration = if pulls < 5 { 0.35 } else { 0.12 };
-            let posterior_score =
-                ((mean + exploration * uncertainty).min(1.0) * 1_000.0).round() as i64;
-            let weight = match bandit_context.split(':').next().unwrap_or_default() {
-                "global" | "depth" => 1,
-                "suffix" | "registrable" | "provider" => 2,
-                _ => 1,
-            };
-            *scores.entry(generator).or_default() += posterior_score * weight;
+        }
+
+        // Old databases and same-process legacy API calls may not yet have a
+        // scheduler_arms row. Retain the historical score only for those
+        // generators, avoiding double-counting once v9 learning is available.
+        let connection = self.lock()?;
+        let contexts = candidate_contexts(&connection, domain)?;
+        let placeholders = std::iter::repeat_n("?", generator_names.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        for bandit_context in contexts {
+            let sql = format!(
+                r#"SELECT generator, alpha, beta, pulls
+                   FROM generator_bandits
+                   WHERE context=? AND generator IN ({placeholders})"#
+            );
+            let mut statement = connection.prepare(&sql)?;
+            let parameters = std::iter::once(bandit_context.as_str())
+                .chain(generator_names.iter().map(String::as_str));
+            let rows = statement.query_map(rusqlite::params_from_iter(parameters), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, f64>(1)?,
+                    row.get::<_, f64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })?;
+            for row in rows {
+                let (generator, alpha, beta, pulls) = row?;
+                if scheduler_generators.contains(&generator) {
+                    continue;
+                }
+                let total = (alpha + beta).max(1.0);
+                let mean = alpha / total;
+                let uncertainty = (alpha * beta / (total * total * (total + 1.0))).sqrt();
+                let exploration = if pulls < 5 { 0.35 } else { 0.12 };
+                let posterior_score =
+                    ((mean + exploration * uncertainty).min(1.0) * 1_000.0).round() as i64;
+                let weight = scheduler_context_weight(&bandit_context).round() as i64;
+                *scores.entry(generator).or_default() += posterior_score * weight;
+            }
         }
         Ok(scores)
+    }
+
+    /// Returns rewards that are genuinely new for this scan. A generator is
+    /// rewarded only when it produced a strict live, non-wildcard name whose
+    /// permanent inventory row was first created by the same scan.
+    pub fn exclusive_generator_successes(&self, scan_id: i64) -> Result<HashMap<String, usize>> {
+        let connection = self.lock()?;
+        let mut statement = connection.prepare(
+            r#"SELECT candidate.generator, COUNT(DISTINCT candidate.fqdn)
+               FROM scan_candidates candidate
+               JOIN subdomains inventory ON inventory.fqdn=candidate.fqdn
+               JOIN scan_findings finding
+                 ON finding.scan_id=candidate.scan_id AND finding.fqdn=candidate.fqdn
+               WHERE candidate.scan_id=?1
+                 AND inventory.first_scan_id=?1
+                 AND finding.state='live'
+                 AND finding.wildcard=0
+                 AND finding.wildcard_verdict<>'synthesized'
+               GROUP BY candidate.generator"#,
+        )?;
+        let rows = statement.query_map([scan_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        let mut rewards = HashMap::new();
+        for row in rows {
+            let (generator, count) = row?;
+            rewards.insert(generator, count.max(0) as usize);
+        }
+        Ok(rewards)
+    }
+
+    pub fn exclusive_live_count(&self, scan_id: i64) -> Result<usize> {
+        let count: i64 = self.lock()?.query_row(
+            r#"SELECT COUNT(*)
+               FROM scan_findings finding
+               JOIN subdomains inventory ON inventory.fqdn=finding.fqdn
+               WHERE finding.scan_id=?1
+                 AND inventory.first_scan_id=?1
+                 AND finding.state='live'
+                 AND finding.wildcard=0
+                 AND finding.wildcard_verdict<>'synthesized'"#,
+            [scan_id],
+            |row| row.get(0),
+        )?;
+        Ok(count.max(0) as usize)
+    }
+
+    pub fn store_name_templates(
+        &self,
+        root_domain: &str,
+        templates: &[crate::intelligence::NameTemplate],
+    ) -> Result<()> {
+        if templates.is_empty() {
+            return Ok(());
+        }
+        let now = now_epoch();
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        for template in templates.iter().take(1_024) {
+            let parent_zone = if template.parent_relative.is_empty() {
+                root_domain.to_owned()
+            } else {
+                format!("{}.{}", template.parent_relative, root_domain)
+            };
+            let serialized = serde_json::to_string(template)?;
+            let score =
+                template.support as f64 + f64::from(template.temporal_score_milli) / 1_000.0;
+            transaction.execute(
+                r#"INSERT INTO name_templates(
+                       root_domain, parent_zone, template, support, successes,
+                       score, first_seen, last_seen
+                   ) VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, ?6)
+                   ON CONFLICT(root_domain, parent_zone, template) DO UPDATE SET
+                   support=excluded.support,
+                   score=excluded.score,
+                   last_seen=excluded.last_seen"#,
+                params![
+                    root_domain,
+                    parent_zone,
+                    serialized,
+                    template.support as i64,
+                    score,
+                    now
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
     }
 
     pub fn record_generator_results(
@@ -5631,6 +6515,27 @@ impl Database {
                         [generator],
                     )?;
                 }
+            }
+        }
+
+        for (generator, attempt_count) in generator_attempts {
+            let success_count = generator_successes
+                .get(generator)
+                .copied()
+                .unwrap_or_default();
+            let attempts = u64::try_from(*attempt_count)
+                .context("compteur d'essais generator supérieur à u64")?;
+            let exclusive_live = u64::try_from(success_count)
+                .context("compteur de récompenses generator supérieur à u64")?;
+            let outcome = SchedulerOutcome {
+                generator: generator.clone(),
+                attempts,
+                exclusive_live,
+                packets: attempts,
+                total_cost: attempts as f64,
+            };
+            for scheduler_context in &bandit_contexts {
+                upsert_scheduler_arm(&transaction, scheduler_context, &outcome, now)?;
             }
         }
 
@@ -6035,6 +6940,133 @@ impl Database {
                 ))
             })?
             .collect::<rusqlite::Result<HashMap<_, _>>>()?)
+    }
+
+    /// Returns an immutable Static CT data tile only when it was committed
+    /// under the exact checkpoint currently being processed.  The caller also
+    /// rechecks `content_hash` before parsing, so local corruption falls back
+    /// to a bounded network fetch instead of poisoning the durable cursor.
+    pub fn ct_static_tile(
+        &self,
+        log_url: &str,
+        tile_path: &str,
+        checkpoint_size: u64,
+        checkpoint_hash: &str,
+    ) -> Result<Option<(String, Vec<u8>)>> {
+        let connection = self.lock()?;
+        connection
+            .query_row(
+                r#"SELECT content_hash, payload FROM ct_tiles
+                   WHERE log_url=?1 AND tile_path=?2
+                     AND checkpoint_size=?3 AND checkpoint_hash=?4"#,
+                params![
+                    log_url,
+                    tile_path,
+                    checkpoint_size.min(i64::MAX as u64) as i64,
+                    checkpoint_hash
+                ],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Atomically commits a completely parsed Static CT delta: immutable tile
+    /// payloads, extracted names and the next cursor become visible together.
+    /// Any conflicting tile or SQLite error rolls the whole batch back, so the
+    /// cursor is replayed on the next run.
+    pub fn store_ct_static_batch(
+        &self,
+        log_url: &str,
+        batch: &crate::ct_static::StaticCtBatch,
+    ) -> Result<()> {
+        if batch.next_cursor > batch.checkpoint_size {
+            bail!(
+                "curseur CT statique {} supérieur au checkpoint {}",
+                batch.next_cursor,
+                batch.checkpoint_size
+            );
+        }
+        if batch.checkpoint_hash.is_empty() {
+            bail!("hash de checkpoint CT statique absent");
+        }
+        let now = now_epoch();
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+
+        for tile in &batch.tiles {
+            if tile.path.is_empty()
+                || tile.checkpoint_size != batch.checkpoint_size
+                || tile.checkpoint_hash != batch.checkpoint_hash
+            {
+                bail!("métadonnées de tuile CT statique incohérentes");
+            }
+            let computed_hash = format!("{:x}", Sha256::digest(&tile.payload));
+            if computed_hash != tile.content_hash {
+                bail!("hash de contenu invalide pour la tuile CT {}", tile.path);
+            }
+            let existing = transaction
+                .query_row(
+                    r#"SELECT content_hash, payload FROM ct_tiles
+                       WHERE log_url=?1 AND tile_path=?2"#,
+                    params![log_url, tile.path],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
+                )
+                .optional()?;
+            if existing.as_ref().is_some_and(|(hash, payload)| {
+                hash != &tile.content_hash || payload != &tile.payload
+            }) {
+                bail!("le journal CT a modifié la tuile immuable {}", tile.path);
+            }
+            transaction.execute(
+                r#"INSERT INTO ct_tiles(
+                       log_url, tile_path, checkpoint_size, checkpoint_hash,
+                       content_hash, payload, verified, updated_at
+                   ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7)
+                   ON CONFLICT(log_url, tile_path) DO UPDATE SET
+                       checkpoint_size=excluded.checkpoint_size,
+                       checkpoint_hash=excluded.checkpoint_hash,
+                       updated_at=excluded.updated_at"#,
+                params![
+                    log_url,
+                    tile.path,
+                    tile.checkpoint_size.min(i64::MAX as u64) as i64,
+                    tile.checkpoint_hash,
+                    tile.content_hash,
+                    tile.payload,
+                    now
+                ],
+            )?;
+        }
+
+        {
+            let mut insert_name = transaction.prepare(
+                r#"INSERT INTO ct_names(
+                       fqdn, reversed_name, first_seen, last_seen, times_seen
+                   ) VALUES (?1, ?2, ?3, ?3, 1)
+                   ON CONFLICT(fqdn) DO UPDATE SET
+                       last_seen=excluded.last_seen, times_seen=ct_names.times_seen+1"#,
+            )?;
+            for name in &batch.names {
+                insert_name.execute(params![name, reverse_hostname(name), now])?;
+            }
+        }
+        transaction.execute(
+            r#"INSERT INTO ct_global_state(log_url, next_index, updated_at)
+               VALUES (?1, ?2, ?3)
+               ON CONFLICT(log_url) DO UPDATE SET
+               next_index=CASE WHEN ?4<>0 THEN excluded.next_index
+                               ELSE MAX(ct_global_state.next_index, excluded.next_index) END,
+               updated_at=excluded.updated_at"#,
+            params![
+                log_url,
+                batch.next_cursor.min(i64::MAX as u64) as i64,
+                now,
+                batch.reset_cursor as i64
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(())
     }
 
     pub fn reset_ct_global_cursor(&self, log_url: &str, next: u64) -> Result<()> {
@@ -6888,6 +7920,36 @@ impl Database {
                 }))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut scheduler_statement = connection.prepare(
+            r#"SELECT context, generator, alpha, beta, packets,
+                      exclusive_rewards, total_cost, last_seen
+               FROM scheduler_arms
+               ORDER BY context, generator LIMIT ?1"#,
+        )?;
+        let scheduler_arms = scheduler_statement
+            .query_map([limit as i64], |row| {
+                let alpha = row.get::<_, f64>(2)?;
+                let beta = row.get::<_, f64>(3)?;
+                let total_cost = row.get::<_, f64>(6)?;
+                let rewards = row.get::<_, i64>(5)?.max(0);
+                Ok(json!({
+                    "context": row.get::<_, String>(0)?,
+                    "generator": row.get::<_, String>(1)?,
+                    "alpha": alpha,
+                    "beta": beta,
+                    "posterior_mean": alpha / (alpha + beta).max(1.0),
+                    "packets": row.get::<_, i64>(4)?,
+                    "exclusive_rewards": rewards,
+                    "total_cost": total_cost,
+                    "exclusive_per_1000_cost": if total_cost > 0.0 {
+                        rewards as f64 * 1_000.0 / total_cost
+                    } else {
+                        0.0
+                    },
+                    "last_seen": row.get::<_, i64>(7)?
+                }))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(json!({
             "local_only": true,
             "builtin_candidates": builtin_candidates,
@@ -6898,6 +7960,7 @@ impl Database {
             "tls_certificates": tls_certificates,
             "candidate_generators": candidate_generators,
             "generator_bandits": generator_bandits,
+            "scheduler_arms": scheduler_arms,
             "resolver_profiles": resolver_profiles,
             "wildcard_cache_entries": connection.query_row(
                 "SELECT COUNT(*) FROM wildcard_cache", [], |row| row.get::<_, i64>(0)
@@ -6979,7 +8042,7 @@ mod tests {
     }
 
     #[test]
-    fn v7_to_v8_preserves_5239_names_and_creates_a_consistent_backup() {
+    fn v7_to_v9_preserves_5239_names_and_creates_a_consistent_pre_v8_backup() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("fellaga.db");
         let connection = Connection::open(&path).unwrap();
@@ -7024,7 +8087,7 @@ mod tests {
             connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            8
+            9
         );
         assert_eq!(
             connection
@@ -7084,10 +8147,301 @@ mod tests {
     }
 
     #[test]
+    fn v8_to_v9_is_transactional_preserves_observations_and_creates_a_pre_v9_backup() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("fellaga.db");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE scans (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    domain TEXT NOT NULL,
+                    started_at INTEGER NOT NULL,
+                    finished_at INTEGER,
+                    status TEXT NOT NULL,
+                    candidates INTEGER NOT NULL DEFAULT 0,
+                    found INTEGER NOT NULL DEFAULT 0,
+                    cache_hits INTEGER NOT NULL DEFAULT 0,
+                    duration_ms INTEGER NOT NULL DEFAULT 0,
+                    options_json TEXT NOT NULL,
+                    warnings_json TEXT NOT NULL DEFAULT '[]',
+                    learning_applied INTEGER NOT NULL DEFAULT 0
+                );
+                INSERT INTO scans(
+                    id, domain, started_at, finished_at, status, options_json
+                ) VALUES (41, 'example.com', 100, 200, 'complete', '{}');
+
+                CREATE TABLE subdomains (
+                    fqdn TEXT PRIMARY KEY,
+                    root_domain TEXT NOT NULL,
+                    first_seen INTEGER NOT NULL,
+                    last_seen INTEGER NOT NULL,
+                    last_scan_id INTEGER REFERENCES scans(id),
+                    times_seen INTEGER NOT NULL DEFAULT 1,
+                    active INTEGER NOT NULL DEFAULT 1,
+                    sources TEXT NOT NULL,
+                    verification_state TEXT NOT NULL DEFAULT 'live',
+                    last_verified_at INTEGER
+                );
+                INSERT INTO subdomains(
+                    fqdn, root_domain, first_seen, last_seen, last_scan_id,
+                    times_seen, active, sources, verification_state, last_verified_at
+                ) VALUES (
+                    'api.example.com', 'example.com', 101, 199, 41,
+                    3, 1, 'passive:test,dns', 'live', 198
+                );
+
+                CREATE TABLE scan_findings (
+                    scan_id INTEGER NOT NULL REFERENCES scans(id) ON DELETE CASCADE,
+                    fqdn TEXT NOT NULL REFERENCES subdomains(fqdn) ON DELETE CASCADE,
+                    wildcard INTEGER NOT NULL DEFAULT 0,
+                    from_cache INTEGER NOT NULL DEFAULT 0,
+                    confidence_score INTEGER NOT NULL DEFAULT 0,
+                    confidence_label TEXT NOT NULL DEFAULT 'faible',
+                    confidence_reasons_json TEXT NOT NULL DEFAULT '[]',
+                    state TEXT NOT NULL DEFAULT 'unverified',
+                    last_verified_at INTEGER,
+                    evidence_families_json TEXT NOT NULL DEFAULT '[]',
+                    authoritative_validation INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY(scan_id, fqdn)
+                );
+                INSERT INTO scan_findings(
+                    scan_id, fqdn, wildcard, from_cache, confidence_score,
+                    confidence_label, confidence_reasons_json, state,
+                    last_verified_at, evidence_families_json, authoritative_validation
+                ) VALUES (
+                    41, 'api.example.com', 0, 0, 93,
+                    'forte', '["dns"]', 'live', 198, '["live_dns"]', 1
+                );
+
+                CREATE TABLE observed_names (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    fqdn TEXT NOT NULL UNIQUE,
+                    reversed_name TEXT NOT NULL,
+                    first_seen INTEGER NOT NULL,
+                    last_seen INTEGER NOT NULL
+                );
+                CREATE TABLE observation_evidence (
+                    root_domain TEXT NOT NULL,
+                    name_id INTEGER NOT NULL REFERENCES observed_names(id) ON DELETE CASCADE,
+                    kind TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    value TEXT NOT NULL DEFAULT '',
+                    first_seen INTEGER NOT NULL,
+                    last_seen INTEGER NOT NULL,
+                    times_seen INTEGER NOT NULL DEFAULT 1,
+                    PRIMARY KEY(root_domain, name_id, kind, source, value)
+                );
+                INSERT INTO observed_names(
+                    id, fqdn, reversed_name, first_seen, last_seen
+                ) VALUES (
+                    7, 'api.example.com', 'com.example.api', 101, 199
+                );
+                INSERT INTO observation_evidence(
+                    root_domain, name_id, kind, source, value,
+                    first_seen, last_seen, times_seen
+                ) VALUES (
+                    'example.com', 7, 'passive', 'passive:test', 'fixture',
+                    101, 199, 3
+                );
+                PRAGMA user_version=8;
+                "#,
+            )
+            .unwrap();
+        drop(connection);
+
+        let database = Database::open(&path).unwrap();
+        let connection = database.lock().unwrap();
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            9
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    r#"SELECT fqdn, reversed_name, first_seen, last_seen
+                       FROM observed_names WHERE id=7"#,
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, i64>(3)?,
+                        ))
+                    },
+                )
+                .unwrap(),
+            (
+                "api.example.com".to_owned(),
+                "com.example.api".to_owned(),
+                101,
+                199
+            )
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    r#"SELECT kind, source, value, first_seen, last_seen, times_seen
+                       FROM observation_evidence
+                       WHERE root_domain='example.com' AND name_id=7"#,
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, i64>(4)?,
+                            row.get::<_, i64>(5)?,
+                        ))
+                    },
+                )
+                .unwrap(),
+            (
+                "passive".to_owned(),
+                "passive:test".to_owned(),
+                "fixture".to_owned(),
+                101,
+                199,
+                3
+            )
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    r#"SELECT wildcard_verdict, owner_proofs_json,
+                              generation_path_json, discovery_score
+                       FROM scan_findings
+                       WHERE scan_id=41 AND fqdn='api.example.com'"#,
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, Option<f64>>(3)?,
+                        ))
+                    },
+                )
+                .unwrap(),
+            (
+                "not_profiled".to_owned(),
+                "[]".to_owned(),
+                "[]".to_owned(),
+                None
+            )
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT first_scan_id FROM subdomains WHERE fqdn='api.example.com'",
+                    [],
+                    |row| row.get::<_, Option<i64>>(0),
+                )
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    r#"SELECT COUNT(*) FROM sqlite_master
+                       WHERE type='table' AND name IN (
+                           'discovery_actions', 'intelligence_edges', 'name_templates',
+                           'dnssec_proofs', 'ct_tiles', 'scheduler_arms'
+                       )"#,
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            6
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    r#"SELECT COUNT(*) FROM pragma_table_info('ct_tiles')
+                       WHERE name='checkpoint_hash' AND type='TEXT'"#,
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM migration_state WHERE name='intelligence-v9'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            "ok"
+        );
+        drop(connection);
+        drop(database);
+
+        let backup = std::fs::read_dir(directory.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("fellaga.db.pre-v9-"))
+            })
+            .expect("une sauvegarde pré-v9 doit exister");
+        #[cfg(unix)]
+        assert_eq!(unix_mode(&backup), 0o600);
+        let backup_connection = Connection::open(backup).unwrap();
+        assert_eq!(
+            backup_connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            8
+        );
+        assert_eq!(
+            backup_connection
+                .query_row(
+                    "SELECT COUNT(*) FROM observation_evidence WHERE times_seen=3",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            backup_connection
+                .query_row(
+                    r#"SELECT COUNT(*) FROM pragma_table_info('scan_findings')
+                       WHERE name='wildcard_verdict'"#,
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            backup_connection
+                .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            "ok"
+        );
+    }
+
+    #[test]
     fn a_future_database_version_is_rejected_without_downgrading_it() {
         let temporary = tempfile::NamedTempFile::new().unwrap();
         let connection = Connection::open(temporary.path()).unwrap();
-        connection.pragma_update(None, "user_version", 9).unwrap();
+        connection.pragma_update(None, "user_version", 10).unwrap();
         drop(connection);
 
         assert!(Database::open(temporary.path()).is_err());
@@ -7096,7 +8450,7 @@ mod tests {
             connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            9
+            10
         );
     }
 
@@ -7148,7 +8502,7 @@ mod tests {
                 )
                 .unwrap(),
         );
-        assert_eq!(version, 8);
+        assert_eq!(version, 9);
         assert_eq!(migrations, 1);
     }
 
@@ -7210,6 +8564,7 @@ mod tests {
             last_verified_at: answers[0].last_verified_at,
             evidence_families: BTreeSet::from([crate::model::EvidenceFamily::LiveDns]),
             authoritative_validation: false,
+            ..Finding::default()
         };
         let expected_confidence = finding.confidence.score;
         db.persist_findings(scan_id, "example.com", &[finding], 86_400)
@@ -7295,6 +8650,7 @@ mod tests {
             last_verified_at: answer.last_verified_at,
             evidence_families: BTreeSet::from([crate::model::EvidenceFamily::LiveDns]),
             authoritative_validation: false,
+            ..Finding::default()
         };
         db.persist_findings(
             scan_id,
@@ -7361,6 +8717,7 @@ mod tests {
                 crate::model::EvidenceFamily::CertificateTransparency,
             ]),
             authoritative_validation: false,
+            ..Finding::default()
         };
         db.persist_findings(scan_id, "example.com", &[finding], 86_400)
             .unwrap();
@@ -7405,6 +8762,7 @@ mod tests {
             last_verified_at: Some(100),
             evidence_families: BTreeSet::from([crate::model::EvidenceFamily::PassiveDns]),
             authoritative_validation: false,
+            ..Finding::default()
         };
         db.persist_findings(first_scan, "example.com", &[finding.clone()], 60)
             .unwrap();
@@ -7645,6 +9003,7 @@ mod tests {
             last_verified_at: answer.last_verified_at,
             evidence_families: BTreeSet::from([crate::model::EvidenceFamily::LiveDns]),
             authoritative_validation: true,
+            ..Finding::default()
         };
         db.persist_findings(previous_scan, "example.com", &[finding], 86_400)
             .unwrap();
@@ -8114,6 +9473,7 @@ mod tests {
                 last_verified_at: answer.last_verified_at,
                 evidence_families: BTreeSet::from([crate::model::EvidenceFamily::LiveDns]),
                 authoritative_validation: true,
+                ..Finding::default()
             }],
             86_400,
         )
@@ -8774,6 +10134,7 @@ mod tests {
             last_verified_at: Some(now_epoch()),
             evidence_families: BTreeSet::new(),
             authoritative_validation: false,
+            ..Finding::default()
         };
         let generated = "generated.example.com";
         let cached_only = "cached-only.example.com";
@@ -9049,6 +10410,7 @@ mod tests {
                 last_verified_at: answer.last_verified_at,
                 evidence_families: BTreeSet::new(),
                 authoritative_validation: false,
+                ..Finding::default()
             }],
             86_400,
         )
@@ -9129,6 +10491,7 @@ mod tests {
             last_verified_at: answer.last_verified_at,
             evidence_families: BTreeSet::from([crate::model::EvidenceFamily::LiveDns]),
             authoritative_validation: false,
+            ..Finding::default()
         };
         db.persist_findings(
             parent_scan,
@@ -9213,6 +10576,7 @@ mod tests {
                 last_verified_at: answer.last_verified_at,
                 evidence_families: BTreeSet::from([crate::model::EvidenceFamily::LiveDns]),
                 authoritative_validation: false,
+                ..Finding::default()
             }],
             86_400,
         )
@@ -9338,6 +10702,7 @@ mod tests {
             last_verified_at: answer.last_verified_at,
             evidence_families: BTreeSet::new(),
             authoritative_validation: false,
+            ..Finding::default()
         };
         db.persist_findings(scan_id, "example.com", &[finding], 86_400)
             .unwrap();
@@ -9421,6 +10786,7 @@ mod tests {
             last_verified_at: Some(now_epoch()),
             evidence_families: BTreeSet::new(),
             authoritative_validation: false,
+            ..Finding::default()
         };
         let mut findings = vec![make("a-independent.example.com", "passive:crtsh")];
         findings.extend(
@@ -9603,6 +10969,7 @@ mod tests {
             last_verified_at: None,
             evidence_families: BTreeSet::new(),
             authoritative_validation: false,
+            ..Finding::default()
         };
         let first = make("one.example.com");
         let second = make("two.example.com");
@@ -10029,7 +11396,7 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_same_version_schema_repair_rolls_back_every_additive_change() {
+    fn a_failed_v8_to_v9_migration_rolls_back_every_additive_change() {
         let temporary = tempfile::NamedTempFile::new().unwrap();
         let connection = Connection::open(temporary.path()).unwrap();
         connection
@@ -10053,6 +11420,12 @@ mod tests {
 
         assert!(Database::open(temporary.path()).is_err());
         let connection = Connection::open(temporary.path()).unwrap();
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            8
+        );
         let repaired_columns: i64 = connection
             .query_row(
                 r#"SELECT COUNT(*) FROM pragma_table_info('scan_candidates')
@@ -10074,10 +11447,22 @@ mod tests {
             )
             .unwrap();
         assert_eq!(leaked_tables, 0);
+        let leaked_v9_tables: i64 = connection
+            .query_row(
+                r#"SELECT COUNT(*) FROM sqlite_master
+                   WHERE type='table' AND name IN (
+                       'discovery_actions', 'intelligence_edges', 'name_templates',
+                       'dnssec_proofs', 'ct_tiles', 'scheduler_arms'
+                   )"#,
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(leaked_v9_tables, 0);
     }
 
     #[test]
-    fn imported_names_remain_unverified_after_reopening_v8() {
+    fn imported_names_remain_unverified_after_reopening_v9() {
         let temporary = tempfile::NamedTempFile::new().unwrap();
         {
             let db = Database::open(temporary.path()).unwrap();
@@ -10491,6 +11876,409 @@ mod tests {
         assert!(
             plan.iter()
                 .any(|detail| detail.contains("idx_ct_names_reversed"))
+        );
+    }
+
+    #[test]
+    fn scheduler_ranking_is_cost_aware_deterministic_and_bounded() {
+        let db = Database::in_memory().unwrap();
+        db.record_scheduler_outcomes(
+            "example.com",
+            &[
+                SchedulerOutcome {
+                    generator: "cheap".to_owned(),
+                    attempts: 100,
+                    exclusive_live: 20,
+                    packets: 120,
+                    total_cost: 50.0,
+                },
+                SchedulerOutcome {
+                    generator: "expensive".to_owned(),
+                    attempts: 100,
+                    exclusive_live: 20,
+                    packets: 120,
+                    total_cost: 200.0,
+                },
+            ],
+        )
+        .unwrap();
+        let rankings = db
+            .scheduler_rankings(
+                "example.com",
+                &["cheap".to_owned(), "expensive".to_owned()],
+                10,
+            )
+            .unwrap();
+        assert_eq!(rankings.len(), 2);
+        assert_eq!(rankings[0].generator, "cheap");
+        assert!(rankings[0].priority_milli > rankings[1].priority_milli);
+        assert!((rankings[0].average_cost - 0.5).abs() < f64::EPSILON);
+        assert!((rankings[1].average_cost - 2.0).abs() < f64::EPSILON);
+        assert_eq!(rankings[0].exclusive_live, 20);
+        assert_eq!(rankings[0].packets, 120);
+
+        let global = db
+            .lock()
+            .unwrap()
+            .query_row(
+                r#"SELECT alpha, beta, packets, exclusive_rewards, total_cost
+                   FROM scheduler_arms WHERE context='global' AND generator='cheap'"#,
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, f64>(0)?,
+                        row.get::<_, f64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, f64>(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(global, (21.0, 81.0, 120, 20, 50.0));
+
+        let invalid = SchedulerOutcome {
+            generator: "invalid".to_owned(),
+            attempts: 1,
+            exclusive_live: 2,
+            packets: 1,
+            total_cost: 1.0,
+        };
+        assert!(
+            db.record_scheduler_outcomes("example.com", &[invalid])
+                .is_err()
+        );
+        assert_eq!(
+            db.lock()
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM scheduler_arms WHERE generator='invalid'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+
+        let too_many_generators = (0..=MAX_SCHEDULER_GENERATORS)
+            .map(|index| format!("generator-{index}"))
+            .collect::<Vec<_>>();
+        assert!(
+            db.scheduler_rankings("example.com", &too_many_generators, usize::MAX)
+                .is_err()
+        );
+        let too_many_outcomes = vec![
+            SchedulerOutcome {
+                generator: "bounded".to_owned(),
+                attempts: 1,
+                exclusive_live: 0,
+                packets: 1,
+                total_cost: 1.0,
+            };
+            MAX_SCHEDULER_OUTCOMES + 1
+        ];
+        assert!(
+            db.record_scheduler_outcomes("example.com", &too_many_outcomes)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn generator_scores_consume_cost_aware_scheduler_arms() {
+        let db = Database::in_memory().unwrap();
+        db.record_scheduler_outcomes(
+            "example.com",
+            &[
+                SchedulerOutcome {
+                    generator: "number-neighbor".to_owned(),
+                    attempts: 50,
+                    exclusive_live: 10,
+                    packets: 50,
+                    total_cost: 25.0,
+                },
+                SchedulerOutcome {
+                    generator: "token-order".to_owned(),
+                    attempts: 50,
+                    exclusive_live: 10,
+                    packets: 50,
+                    total_cost: 200.0,
+                },
+            ],
+        )
+        .unwrap();
+
+        let scores = db.generator_scores("example.com").unwrap();
+        assert!(scores["number-neighbor"] > scores["token-order"]);
+    }
+
+    #[test]
+    fn discovery_actions_claim_yield_per_cost_and_complete_exactly_once() {
+        let db = Database::in_memory().unwrap();
+        let scan_id = db.create_scan("example.com", &json!({})).unwrap();
+        let actions = [
+            DiscoveryActionInput {
+                fqdn: Some("a.example.com".to_owned()),
+                zone: "example.com".to_owned(),
+                kind: "dns".to_owned(),
+                generator: "generator-a".to_owned(),
+                context_key: "suffix:com".to_owned(),
+                priority_class: 0,
+                predicted_unique_live: 0.8,
+                predicted_cost: 2.0,
+            },
+            DiscoveryActionInput {
+                fqdn: Some("b.example.com".to_owned()),
+                zone: "example.com".to_owned(),
+                kind: "dns".to_owned(),
+                generator: "generator-b".to_owned(),
+                context_key: "suffix:com".to_owned(),
+                priority_class: 0,
+                predicted_unique_live: 0.5,
+                predicted_cost: 0.5,
+            },
+            DiscoveryActionInput {
+                fqdn: Some("c.example.com".to_owned()),
+                zone: "example.com".to_owned(),
+                kind: "dns".to_owned(),
+                generator: "generator-c".to_owned(),
+                context_key: "suffix:com".to_owned(),
+                priority_class: 1,
+                predicted_unique_live: 10.0,
+                predicted_cost: 0.01,
+            },
+        ];
+        assert_eq!(db.enqueue_discovery_actions(scan_id, &actions).unwrap(), 3);
+        let claimed = db.claim_discovery_actions(scan_id, 2).unwrap();
+        assert_eq!(
+            claimed
+                .iter()
+                .map(|action| action.generator.as_str())
+                .collect::<Vec<_>>(),
+            vec!["generator-b", "generator-a"]
+        );
+        let outcome = SchedulerOutcome {
+            generator: "generator-b".to_owned(),
+            attempts: 1,
+            exclusive_live: 1,
+            packets: 2,
+            total_cost: 0.5,
+        };
+        assert!(
+            db.complete_discovery_action(claimed[0].id, &outcome, &json!({"rcode": "NOERROR"}))
+                .unwrap()
+        );
+        assert!(
+            !db.complete_discovery_action(claimed[0].id, &outcome, &json!({}))
+                .unwrap()
+        );
+        assert_eq!(
+            db.lock()
+                .unwrap()
+                .query_row(
+                    r#"SELECT COUNT(*) FROM scheduler_arms
+                       WHERE generator='generator-b' AND context IN ('global', 'suffix:com')
+                         AND alpha=2.0 AND beta=1.0
+                         AND exclusive_rewards=1 AND total_cost=0.5"#,
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn legacy_bandit_is_migrated_to_scheduler_once() {
+        let temporary = tempfile::NamedTempFile::new().unwrap();
+        {
+            let db = Database::open(temporary.path()).unwrap();
+            let connection = db.lock().unwrap();
+            connection
+                .execute("DELETE FROM scheduler_arms", [])
+                .unwrap();
+            connection
+                .execute(
+                    r#"INSERT INTO generator_bandits(
+                           context, generator, alpha, beta, pulls, rewards, last_seen
+                       ) VALUES ('global', 'legacy', 4.0, 7.0, 9, 3, 123)"#,
+                    [],
+                )
+                .unwrap();
+        }
+        for _ in 0..2 {
+            let db = Database::open(temporary.path()).unwrap();
+            assert_eq!(
+                db.lock()
+                    .unwrap()
+                    .query_row(
+                        r#"SELECT alpha, beta, packets, exclusive_rewards, total_cost
+                           FROM scheduler_arms
+                           WHERE context='global' AND generator='legacy'"#,
+                        [],
+                        |row| {
+                            Ok((
+                                row.get::<_, f64>(0)?,
+                                row.get::<_, f64>(1)?,
+                                row.get::<_, i64>(2)?,
+                                row.get::<_, i64>(3)?,
+                                row.get::<_, f64>(4)?,
+                            ))
+                        },
+                    )
+                    .unwrap(),
+                (4.0, 7.0, 9, 0, 9.0)
+            );
+        }
+    }
+
+    #[test]
+    fn static_ct_tiles_names_and_cursor_commit_atomically_and_are_reusable() {
+        let db = Database::in_memory().unwrap();
+        let log_url = "https://ct.example/2026h2/";
+        db.store_ct_global_batch(log_url, 900, &BTreeSet::new())
+            .unwrap();
+        let payload = b"immutable-static-ct-tile".to_vec();
+        let content_hash = format!("{:x}", Sha256::digest(&payload));
+        let batch = crate::ct_static::StaticCtBatch {
+            checkpoint_origin: "ct.example/2026h2".to_owned(),
+            checkpoint_size: 512,
+            checkpoint_hash: "checkpoint-a".to_owned(),
+            reset_cursor: true,
+            next_cursor: 257,
+            entries_processed: 1,
+            names: BTreeSet::from(["api.example.com".to_owned()]),
+            tiles: vec![crate::ct_static::StaticTile {
+                path: "tile/data/001".to_owned(),
+                checkpoint_size: 512,
+                checkpoint_hash: "checkpoint-a".to_owned(),
+                content_hash: content_hash.clone(),
+                payload: payload.clone(),
+            }],
+            ..crate::ct_static::StaticCtBatch::default()
+        };
+
+        db.store_ct_static_batch(log_url, &batch).unwrap();
+
+        assert_eq!(db.ct_global_cursor(log_url).unwrap(), Some(257));
+        assert_eq!(
+            db.ct_names_for_domain("example.com", 10).unwrap(),
+            vec!["api.example.com"]
+        );
+        assert_eq!(
+            db.ct_static_tile(log_url, "tile/data/001", 512, "checkpoint-a")
+                .unwrap(),
+            Some((content_hash, payload))
+        );
+        assert!(
+            db.ct_static_tile(log_url, "tile/data/001", 513, "checkpoint-a")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.ct_static_tile(log_url, "tile/data/001", 512, "checkpoint-b")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn existing_v9_ct_tile_table_is_repaired_without_losing_payloads() {
+        let temporary = tempfile::NamedTempFile::new().unwrap();
+        {
+            let db = Database::open(temporary.path()).unwrap();
+            let connection = db.lock().unwrap();
+            connection.execute("DROP TABLE ct_tiles", []).unwrap();
+            connection
+                .execute_batch(
+                    r#"CREATE TABLE ct_tiles (
+                           log_url TEXT NOT NULL,
+                           tile_path TEXT NOT NULL,
+                           checkpoint_size INTEGER NOT NULL,
+                           content_hash TEXT NOT NULL,
+                           payload BLOB NOT NULL,
+                           verified INTEGER NOT NULL DEFAULT 0,
+                           updated_at INTEGER NOT NULL,
+                           PRIMARY KEY(log_url, tile_path)
+                       ) WITHOUT ROWID;
+                       INSERT INTO ct_tiles(
+                           log_url, tile_path, checkpoint_size, content_hash,
+                           payload, verified, updated_at
+                       ) VALUES (
+                           'https://ct.example/2026h2/', 'tile/data/000', 256,
+                           'legacy-hash', X'010203', 0, 1
+                       );
+                       PRAGMA user_version=9;"#,
+                )
+                .unwrap();
+        }
+
+        let reopened = Database::open(temporary.path()).unwrap();
+        let connection = reopened.lock().unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    r#"SELECT checkpoint_hash, content_hash, payload
+                       FROM ct_tiles WHERE tile_path='tile/data/000'"#,
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, Vec<u8>>(2)?,
+                        ))
+                    },
+                )
+                .unwrap(),
+            ("".to_owned(), "legacy-hash".to_owned(), vec![1, 2, 3])
+        );
+    }
+
+    #[test]
+    fn conflicting_static_ct_tile_rolls_back_names_and_cursor() {
+        let db = Database::in_memory().unwrap();
+        let log_url = "https://ct.example/2026h2/";
+        let first_payload = b"first immutable payload".to_vec();
+        let first = crate::ct_static::StaticCtBatch {
+            checkpoint_origin: "ct.example/2026h2".to_owned(),
+            checkpoint_size: 512,
+            checkpoint_hash: "checkpoint-a".to_owned(),
+            next_cursor: 257,
+            entries_processed: 1,
+            names: BTreeSet::from(["api.example.com".to_owned()]),
+            tiles: vec![crate::ct_static::StaticTile {
+                path: "tile/data/001".to_owned(),
+                checkpoint_size: 512,
+                checkpoint_hash: "checkpoint-a".to_owned(),
+                content_hash: format!("{:x}", Sha256::digest(&first_payload)),
+                payload: first_payload,
+            }],
+            ..crate::ct_static::StaticCtBatch::default()
+        };
+        db.store_ct_static_batch(log_url, &first).unwrap();
+
+        let conflicting_payload = b"rewritten payload".to_vec();
+        let conflicting = crate::ct_static::StaticCtBatch {
+            checkpoint_origin: "ct.example/2026h2".to_owned(),
+            checkpoint_size: 768,
+            checkpoint_hash: "checkpoint-b".to_owned(),
+            next_cursor: 513,
+            entries_processed: 256,
+            names: BTreeSet::from(["must-not-commit.example.com".to_owned()]),
+            tiles: vec![crate::ct_static::StaticTile {
+                path: "tile/data/001".to_owned(),
+                checkpoint_size: 768,
+                checkpoint_hash: "checkpoint-b".to_owned(),
+                content_hash: format!("{:x}", Sha256::digest(&conflicting_payload)),
+                payload: conflicting_payload,
+            }],
+            ..crate::ct_static::StaticCtBatch::default()
+        };
+
+        assert!(db.store_ct_static_batch(log_url, &conflicting).is_err());
+        assert_eq!(db.ct_global_cursor(log_url).unwrap(), Some(257));
+        assert_eq!(
+            db.ct_names_for_domain("example.com", 10).unwrap(),
+            vec!["api.example.com"]
         );
     }
 

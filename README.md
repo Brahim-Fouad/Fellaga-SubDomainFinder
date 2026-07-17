@@ -12,15 +12,21 @@ Fellaga is a fast, adaptive subdomain enumerator written in Rust for Kali Linux 
 
 ## Highlights
 
-- Native asynchronous DNS engine with correlated UDP queries, EDNS0, TCP fallback, resolver balancing, retries, global rate limiting, and a health-qualified two-packet negative path for fresh generated candidates.
+- Native asynchronous DNS engine with correlated UDP queries, EDNS0, TCP fallback, resolver balancing, retries, and one shared adaptive network governor for discovery, consensus, DNSSEC, Web, and TLS preparation.
 - Adaptive `deep` scan by default: 30 passive connectors, Certificate Transparency, a one-million-candidate corpus, recursive DNS, AXFR, DNSSEC/NSEC, Web and JavaScript discovery, TLS/STARTTLS, and bounded PTR pivots.
+- Protocol-aware DNS discovery follows bounded DNS-SD, NAPTR, URI, SPF, DMARC, MTA-STS, TLS reporting, and BIMI relationships without querying names outside the authorized root.
+- Target-local grammar induction learns service, environment, region, cloud, separator, and numeric conventions from retained names, then emits a bounded ranked candidate beam.
+- Static CT tiles provide a durable fallback when a log no longer exposes the legacy entry API; tile payloads, checkpoint identity, extracted names, and cursors are committed together in SQLite.
+- Standardized metadata and semantic static analysis extract names from API catalogs, OpenID/OAuth metadata, SSH known-hosts data, Terraform discovery, HTML, JSON, JavaScript, source maps, and bounded Common Crawl WARC records without executing scripts.
+- Differential TLS compares a small prioritized set of SNI and no-SNI certificates, exposing default virtual-host names while sharing one deadline and never turning an out-of-scope SAN into active work.
 - Targeted BinaryEdge, MerkleMap, and Brave Search connectors use one-page fast paths and request at most one additional page when the provider reports more raw results.
 - OTX passive DNS is enabled automatically when its API key is configured, while the official authenticated Driftnet Certificate Transparency connector becomes eligible for automatic `deep` scans with its key; browser-facing anti-bot connectors remain manual in every profile.
 - Persistent, lazy candidate scheduling: passive/authoritative seeds and active word generators are consumed in bounded SQLite-backed waves instead of being materialized in memory before DNS starts.
 - Yield-aware source scheduling learns each connector's marginal unique-name yield, reliability, and latency; complete pages remain usable when a later page reaches its deadline, and source checks distinguish `success`, `empty`, `degraded`, `deferred_budget`, `skipped_missing_key`, `rate_limited`, `auth_required`, `anti_bot`, `upstream_error`, `transport_error`, `tls_error`, `schema_error`, `timeout`, and the uncategorized `error` fallback.
-- Hierarchical wildcard detection, rotating-answer recognition, exact-signature filtering, trusted-resolver consensus, and optional authoritative validation.
+- Hierarchical wildcard detection, rotating-answer recognition, exact-signature filtering, trusted-resolver consensus, authoritative validation, and locally validated DNSSEC denial proofs for purging proven synthesized owners.
 - Permanent SQLite inventory with `live`, `historical`, and `unverified` states; a complete refresh quarantines exact wildcard-signature matches only after fresh trusted-resolver consensus, while retaining their provenance and validation history.
 - Evidence-family scoring so multiple providers backed by the same underlying dataset are not counted as independent proof.
+- Cost-aware local scheduling rewards only first-seen live discoveries, records network cost, and uses a conservative statistical yield bound to decide when more brute force is no longer useful.
 - Checkpoints every 30 seconds and `--resume latest` for interrupted or time-limited scans; queued work, retry counts, source provenance, and learning counters survive a restart.
 - Text, JSON, per-domain JSONL, streaming JSONL, CSV export, and import support for common enumeration tools.
 - No telemetry, no remote cache synchronization, and no automatic sharing of targets, findings, or learned patterns.
@@ -32,8 +38,8 @@ Fellaga is a fast, adaptive subdomain enumerator written in Rust for Kali Linux 
 Download the release package and install it with APT. Checksums, a Sigstore-signed manifest, and GitHub attestations are available for independent verification:
 
 ```bash
-curl -fLO https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/download/v0.8.6/fellaga_0.8.6-1_amd64.deb
-sudo apt install ./fellaga_0.8.6-1_amd64.deb
+curl -fLO https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/download/v0.9.0/fellaga_0.9.0-1_amd64.deb
+sudo apt install ./fellaga_0.9.0-1_amd64.deb
 fellaga --version
 ```
 

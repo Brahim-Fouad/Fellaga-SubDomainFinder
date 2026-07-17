@@ -67,7 +67,7 @@ Queue claims are atomic and include an attempt counter. Rows left in the process
 
 The final scan status, checkpoint completion, generator learning, successful words and patterns, and cleanup of temporary learning rows are committed in one transaction. The transaction is guarded against applying the same scan's learning twice. Prepared statements and queue-selection indexes keep finalization and bounded claims predictable on large databases. Physical deletion of completed or superseded queue rows is maintenance work performed after the completion commit; its failure does not reopen or fail the scan.
 
-Compatible v8 schema additions are also transactional. Fellaga adds required columns before their dependent indexes and rolls back the complete repair if any statement fails, preventing a partially upgraded database from being accepted on the next launch.
+The v8-to-v9 migration is transactional and creates a timestamped pre-v9 backup before changing an existing database. Fellaga adds required columns before dependent indexes, preserves observations and validation history exactly, repairs an interrupted same-version v9 initialization additively, and rolls back the complete migration if any statement fails. A database created by a newer unsupported schema version is rejected instead of being modified.
 
 ## Backup
 

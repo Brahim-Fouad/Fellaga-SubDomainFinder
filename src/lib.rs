@@ -1,15 +1,22 @@
 #![recursion_limit = "256"]
 
+pub mod archive_intelligence;
 pub mod axfr;
 pub mod benchmark;
 pub mod candidate;
 pub mod confidence;
 pub mod ct_monitor;
+pub mod ct_static;
 pub mod db;
 pub mod discovery;
 pub mod dns;
+pub mod dns_policy;
 pub mod dnssec;
+pub mod dnssec_proof;
+pub mod intelligence;
+pub mod metadata_discovery;
 pub mod model;
+pub mod network_governor;
 pub mod passive;
 pub mod pipeline;
 pub mod scanner;

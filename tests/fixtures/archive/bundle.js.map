@@ -1,0 +1,15 @@
+{
+  "version": 3,
+  "file": "https://static.example.com/bundle.js",
+  "sourceRoot": "https://src.example.com/",
+  "sources": [
+    "https://source-one.example.com/src/client.js",
+    "client.js",
+    "webpack://fellaga/src/index.js"
+  ],
+  "sourcesContent": [
+    "fetch('https://source-api.example.com/v2'); const ignored = 'https://example.com.attacker.invalid';"
+  ],
+  "names": [],
+  "mappings": "AAAA"
+}

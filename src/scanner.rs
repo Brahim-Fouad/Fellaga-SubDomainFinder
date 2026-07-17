@@ -8,9 +8,13 @@ use crate::db::{CachedAnswer, Database};
 use crate::discovery::discover_dns_graph;
 use crate::dns::{DnsEngine, DnsResolutionOutcome, WildcardProbeOutcome};
 use crate::dnssec::discover_nsec_bounded;
+use crate::dnssec_proof::{DnssecOwnerState, DnssecProofAssessment, DnssecProofKind};
+use crate::intelligence::{IntelligenceConfig, NameObservation, learn_and_generate};
+use crate::metadata_discovery::{MetadataDiscoveryConfig, discover_metadata};
 use crate::model::{
-    CtMonitorResult, DiscoveryEdge, DnssecWalkResult, Finding, PhaseTiming, PipelineMetrics,
-    ResolvedHost, ScanResult, ServiceEndpoint, WebObservation,
+    CtMonitorResult, DiscoveryEdge, DnssecWalkResult, Finding, OwnerProof, PhaseTiming,
+    PipelineMetrics, ResolvedHost, ResolverMetric, ScanResult, SchedulerMetrics, ServiceEndpoint,
+    StopReason, WebObservation, WildcardVerdict,
 };
 use crate::passive::{
     ApiKeyStore, PassivePageSink, current_commoncrawl_endpoint,
@@ -26,6 +30,7 @@ use crate::util::{
 use crate::web_discovery::discover_web_bounded;
 use anyhow::{Result, bail};
 use futures_util::{FutureExt, StreamExt, stream, stream::FuturesUnordered};
+use hickory_net::proto::rr::RecordType;
 use serde_json::json;
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
@@ -37,6 +42,53 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::time::{Duration, Instant};
+
+const DNSSEC_WILDCARD_SUSPECT_CAP: usize = 4;
+const DNSSEC_WILDCARD_SUSPECT_BUDGET: Duration = Duration::from_secs(8);
+const METADATA_PHASE_BUDGET_CAP: Duration = Duration::from_secs(30);
+const METADATA_DNS_CONCURRENCY: usize = 4;
+
+fn metadata_phase_budget(web_budget_remaining: Option<Duration>) -> Duration {
+    web_budget_remaining
+        .map(|remaining| remaining.min(METADATA_PHASE_BUDGET_CAP))
+        .unwrap_or(METADATA_PHASE_BUDGET_CAP)
+}
+
+fn merge_resolver_metrics(
+    primary: Vec<ResolverMetric>,
+    trusted: Vec<ResolverMetric>,
+) -> Vec<ResolverMetric> {
+    let mut merged = BTreeMap::<String, (u64, u64, u64, u128, u64)>::new();
+    for metric in primary.into_iter().chain(trusted) {
+        let entry = merged.entry(metric.resolver).or_default();
+        entry.0 = entry.0.saturating_add(metric.requests);
+        entry.1 = entry.1.saturating_add(metric.successes);
+        entry.2 = entry.2.saturating_add(metric.failures);
+        entry.3 = entry.3.saturating_add(
+            u128::from(metric.average_ms).saturating_mul(u128::from(metric.requests)),
+        );
+        entry.4 = entry.4.max(metric.consecutive_failures);
+    }
+    merged
+        .into_iter()
+        .map(
+            |(resolver, (requests, successes, failures, total_ms, consecutive_failures))| {
+                ResolverMetric {
+                    resolver,
+                    requests,
+                    successes,
+                    failures,
+                    average_ms: if requests == 0 {
+                        0
+                    } else {
+                        (total_ms / u128::from(requests)).min(u128::from(u64::MAX)) as u64
+                    },
+                    consecutive_failures,
+                }
+            },
+        )
+        .collect()
+}
 
 #[derive(Debug, Clone)]
 pub enum ProgressEvent {
@@ -166,6 +218,9 @@ pub struct ScanOptions {
     pub ct_max_logs: usize,
     pub ct_entries_per_log: usize,
     pub ct_initial_backfill: usize,
+    pub metadata_discovery: bool,
+    pub metadata_all_hosts: bool,
+    pub metadata_max_requests: usize,
     pub web_discovery: bool,
     pub web_max_hosts: usize,
     pub web_timeout: Duration,
@@ -411,6 +466,20 @@ fn wildcard_signature_is_confirmed(signature: &BTreeSet<String>) -> bool {
     !signature.is_empty() && !wildcard_signature_is_indeterminate(signature)
 }
 
+fn wilson_upper_bound(successes: usize, trials: usize) -> f64 {
+    if trials == 0 {
+        return 1.0;
+    }
+    // One-sided 95% Wilson score bound.
+    let z = 1.644_853_626_951_472_2_f64;
+    let n = trials as f64;
+    let p = successes.min(trials) as f64 / n;
+    let z2 = z * z;
+    let center = p + z2 / (2.0 * n);
+    let margin = z * ((p * (1.0 - p) / n) + z2 / (4.0 * n * n)).sqrt();
+    ((center + margin) / (1.0 + z2 / n)).clamp(0.0, 1.0)
+}
+
 fn should_expand_adaptive_wave(
     wildcard_classification_is_reliable: bool,
     previous_positive: usize,
@@ -418,9 +487,14 @@ fn should_expand_adaptive_wave(
     wave_number: usize,
     passive_positive: usize,
 ) -> bool {
-    let minimum_yield = previous_attempted.div_ceil(500).max(2);
-    wildcard_classification_is_reliable
-        && (previous_positive >= minimum_yield || (wave_number == 2 && passive_positive >= 5))
+    if !wildcard_classification_is_reliable {
+        return false;
+    }
+    if wave_number == 2 && passive_positive >= 5 {
+        return true;
+    }
+    previous_attempted < 512
+        || wilson_upper_bound(previous_positive, previous_attempted) * 1_000.0 >= 1.0
 }
 
 fn source_requires_api_key(source: &str) -> bool {
@@ -1084,6 +1158,68 @@ async fn collect_refresh_dns_outcomes(
     }
 }
 
+fn dnssec_assessment_proves_nonexistence(assessment: &DnssecProofAssessment) -> bool {
+    assessment.state == DnssecOwnerState::DoesNotExist
+        && assessment.proofs.iter().any(|proof| {
+            matches!(
+                proof,
+                DnssecProofKind::NxnameNsec
+                    | DnssecProofKind::NxnameNsec3
+                    | DnssecProofKind::NsecRangeDenial
+                    | DnssecProofKind::Nsec3RangeDenial
+            )
+        })
+}
+
+/// Assess a deliberately tiny set under one absolute deadline.
+///
+/// The supplied assessment must already come from local DNSSEC validation.
+/// This function intentionally has no AD-bit input and additionally requires a
+/// concrete denial proof kind before it can return a hostname for quarantine.
+async fn assess_dnssec_suspects_bounded<F, Fut>(
+    domain: &str,
+    suspects: impl IntoIterator<Item = String>,
+    deadline: tokio::time::Instant,
+    assess: F,
+) -> BTreeSet<String>
+where
+    F: Fn(String) -> Fut,
+    Fut: Future<Output = DnssecProofAssessment>,
+{
+    if deadline <= tokio::time::Instant::now() {
+        return BTreeSet::new();
+    }
+    let suspects = suspects
+        .into_iter()
+        .filter_map(|fqdn| normalize_observed_name(&fqdn, domain))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .take(DNSSEC_WILDCARD_SUSPECT_CAP)
+        .collect::<Vec<_>>();
+    let mut pending = stream::iter(suspects)
+        .map(|fqdn| {
+            let assessment = assess(fqdn.clone());
+            async move { (fqdn, assessment.await) }
+        })
+        .buffer_unordered(DNSSEC_WILDCARD_SUSPECT_CAP);
+    let mut nonexistent = BTreeSet::new();
+    loop {
+        match tokio::time::timeout_at(deadline, pending.next()).await {
+            Ok(Some((fqdn, assessment))) => {
+                if dnssec_assessment_proves_nonexistence(&assessment) {
+                    nonexistent.insert(fqdn);
+                }
+            }
+            Ok(None) => break,
+            Err(_) => break,
+        }
+    }
+    // Dropping the buffered stream cancels all unfinished resolver futures;
+    // they never receive a fresh per-name wall-clock budget.
+    drop(pending);
+    nonexistent
+}
+
 #[derive(Debug, Default)]
 struct BatchResolution {
     answers: Vec<ResolvedHost>,
@@ -1241,6 +1377,76 @@ impl Scanner {
             Self::applicable_wildcard_signature(&answer.fqdn, root_wildcard, wildcard_by_parent);
         wildcard_signature_is_confirmed(signature)
             && DnsEngine::exactly_matches_wildcard(answer, signature)
+    }
+
+    fn dnssec_wildcard_suspects(
+        answers: &[ResolvedHost],
+        root_wildcard: &BTreeSet<String>,
+        wildcard_by_parent: &BTreeMap<String, BTreeSet<String>>,
+    ) -> Vec<String> {
+        let mut ranked = answers
+            .iter()
+            .filter(|answer| {
+                Self::answer_is_wildcard_ambiguous(answer, root_wildcard, wildcard_by_parent)
+            })
+            .map(|answer| {
+                (
+                    u8::from(!Self::answer_matches_confirmed_wildcard(
+                        answer,
+                        root_wildcard,
+                        wildcard_by_parent,
+                    )),
+                    answer.fqdn.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        ranked.sort();
+        ranked.dedup_by(|left, right| left.1 == right.1);
+        ranked
+            .into_iter()
+            .map(|(_, fqdn)| fqdn)
+            .take(DNSSEC_WILDCARD_SUSPECT_CAP)
+            .collect()
+    }
+
+    async fn quarantine_dnssec_wildcard_suspects(
+        &self,
+        scan_id: i64,
+        domain: &str,
+        suspects: Vec<String>,
+        phase_deadline: Option<tokio::time::Instant>,
+    ) -> Result<BTreeSet<String>> {
+        if suspects.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+        let local_deadline = tokio::time::Instant::now() + DNSSEC_WILDCARD_SUSPECT_BUDGET;
+        let deadline = phase_deadline
+            .map(|deadline| deadline.min(local_deadline))
+            .unwrap_or(local_deadline);
+        let dns = self.trusted_dns.as_ref().unwrap_or(&self.dns);
+        let nonexistent =
+            assess_dnssec_suspects_bounded(domain, suspects, deadline, |fqdn| async move {
+                // TXT is intentionally orthogonal to the A/AAAA response that
+                // triggered wildcard suspicion. A real owner yields secure
+                // exact-owner NODATA, while a synthesized owner can expose the
+                // validated denial needed to prove that QNAME nonexistent.
+                dns.dnssec_denial_assessment(&fqdn, RecordType::TXT).await
+            })
+            .await;
+        if nonexistent.is_empty() {
+            return Ok(nonexistent);
+        }
+        let hosts = nonexistent.iter().cloned().collect::<Vec<_>>();
+        self.database
+            .quarantine_dnssec_nonexistent(scan_id, domain, &hosts)?;
+        self.emit(ProgressEvent::Phase {
+            name: "DNSSEC wildcard".to_owned(),
+            detail: format!(
+                "{} faux positif(s) prouvé(s) inexistant(s), cache actif purgé avec audit",
+                nonexistent.len()
+            ),
+        });
+        Ok(nonexistent)
     }
 
     async fn wildcard_signature_cached(&self, zone: &str) -> Option<BTreeSet<String>> {
@@ -1495,6 +1701,7 @@ impl Scanner {
         limit: usize,
     ) -> Result<Vec<CandidateProposal>> {
         let limit = limit.min(100_000);
+        let observed_names = observed_names.into_iter().collect::<Vec<_>>();
         let mut candidates = Vec::new();
         let mut seen = BTreeSet::new();
         let mut add = |candidate: CandidateProposal| {
@@ -1502,6 +1709,26 @@ impl Scanner {
                 candidates.push(candidate);
             }
         };
+        let observations = observed_names
+            .iter()
+            .cloned()
+            .map(|fqdn| NameObservation::new(fqdn, None))
+            .collect::<Vec<_>>();
+        let grammar_config = IntelligenceConfig {
+            max_candidates: limit.min(5_000),
+            ..IntelligenceConfig::default()
+        };
+        if let Ok(intelligence) = learn_and_generate(domain, &observations, &grammar_config) {
+            self.database
+                .store_name_templates(domain, &intelligence.grammar.templates)?;
+            for candidate in intelligence.candidates {
+                add(CandidateProposal {
+                    relative_name: candidate.relative_name,
+                    generator: format!("grammar:{}", candidate.template_id),
+                    score: 100_000_i64.saturating_add(candidate.score),
+                });
+            }
+        }
         for candidate in generate_contextual_with_rules(
             domain,
             observed_names,
@@ -2523,6 +2750,17 @@ impl Scanner {
             state,
             !answer.from_cache,
         );
+        let discovery_score = confidence.score as f64 / 100.0;
+        let generation_path = answer_sources
+            .iter()
+            .filter(|source| {
+                source.starts_with("candidate:")
+                    || source.starts_with("grammar:")
+                    || source.starts_with("dns-wave-")
+                    || source.starts_with("metadata:")
+            })
+            .cloned()
+            .collect::<Vec<_>>();
         Some(Finding {
             fqdn: answer.fqdn.clone(),
             records: answer.records.clone(),
@@ -2536,6 +2774,20 @@ impl Scanner {
                 .flatten(),
             evidence_families: families,
             authoritative_validation: answer.authoritative_validation,
+            wildcard_verdict: if wildcard_ambiguous {
+                WildcardVerdict::Ambiguous
+            } else {
+                WildcardVerdict::ExactOwner
+            },
+            owner_proofs: if answer.authoritative_validation {
+                BTreeSet::from([OwnerProof::AuthoritativeDistinct])
+            } else if !wildcard_ambiguous {
+                BTreeSet::from([OwnerProof::ControlDistribution])
+            } else {
+                BTreeSet::new()
+            },
+            generation_path,
+            discovery_score: Some(discovery_score),
         })
     }
 
@@ -2568,6 +2820,7 @@ impl Scanner {
             state,
             authoritative && !from_cache,
         );
+        let discovery_score = confidence.score as f64 / 100.0;
         Finding {
             fqdn,
             records: Vec::new(),
@@ -2579,6 +2832,19 @@ impl Scanner {
             last_verified_at: None,
             evidence_families: families,
             authoritative_validation: authoritative,
+            wildcard_verdict: if wildcard_ambiguous {
+                WildcardVerdict::Ambiguous
+            } else if authoritative {
+                WildcardVerdict::ExactOwner
+            } else {
+                WildcardVerdict::NotProfiled
+            },
+            owner_proofs: authoritative
+                .then_some(OwnerProof::AuthoritativeDistinct)
+                .into_iter()
+                .collect(),
+            generation_path: Vec::new(),
+            discovery_score: Some(discovery_score),
         }
     }
 
@@ -2636,6 +2902,7 @@ impl Scanner {
                 };
                 let families = evidence_families(&entry.sources);
                 let confidence = assess_confidence(&entry.sources, wildcard, state, false);
+                let discovery_score = confidence.score as f64 / 100.0;
                 findings.push(Finding {
                     fqdn: entry.fqdn,
                     records: answer
@@ -2650,6 +2917,14 @@ impl Scanner {
                     evidence_families: families,
                     authoritative_validation: answer
                         .is_some_and(|answer| answer.authoritative_validation),
+                    wildcard_verdict: if wildcard {
+                        WildcardVerdict::Ambiguous
+                    } else {
+                        WildcardVerdict::NotProfiled
+                    },
+                    owner_proofs: BTreeSet::new(),
+                    generation_path: vec!["persistent_inventory".to_owned()],
+                    discovery_score: Some(discovery_score),
                 });
             }
         }
@@ -2822,6 +3097,18 @@ impl Scanner {
         let mut definitive_negative = routed.cacheable_negatives;
         let mut discovery_negative = routed.discovery_negatives;
         let mut indeterminate = routed.indeterminate;
+        let dnssec_suspects =
+            Self::dnssec_wildcard_suspects(&network_answers, root_wildcard, wildcard_by_parent);
+        let dnssec_nonexistent = self
+            .quarantine_dnssec_wildcard_suspects(scan_id, domain, dnssec_suspects, deadline)
+            .await?;
+        if !dnssec_nonexistent.is_empty() {
+            // These names are removed only after a locally validated denial.
+            // Inconclusive, ENT, positive, unsigned, and AD-only outcomes stay
+            // on the pre-existing wildcard path unchanged.
+            network_answers.retain(|answer| !dnssec_nonexistent.contains(&answer.fqdn));
+            answers.retain(|answer| !dnssec_nonexistent.contains(&answer.fqdn));
+        }
         let mut wildcard_answers = Vec::new();
         let mut validation_candidates = Vec::new();
         let mut suppressed_wildcard = 0_usize;
@@ -3063,6 +3350,9 @@ impl Scanner {
             "ct_max_logs": self.options.ct_max_logs,
             "ct_entries_per_log": self.options.ct_entries_per_log,
             "ct_initial_backfill": self.options.ct_initial_backfill,
+            "metadata_discovery": self.options.metadata_discovery,
+            "metadata_all_hosts": self.options.metadata_all_hosts,
+            "metadata_max_requests": self.options.metadata_max_requests,
             "web_discovery": self.options.web_discovery,
             "web_max_hosts": self.options.web_max_hosts,
             "web_timeout_ms": self.options.web_timeout.as_millis(),
@@ -3925,6 +4215,21 @@ impl Scanner {
                 Self::is_strict_enrichment_seed(answer, &root_wildcard, &wildcard_by_parent)
             })
             .count();
+        let required_yield_waves = if self.options.profile == "turbo" {
+            2
+        } else {
+            3
+        };
+        let minimum_statistical_attempts = match self.options.profile.as_str() {
+            "turbo" => 512,
+            "balanced" => 1_500,
+            _ => 3_000,
+        };
+        let mut adaptive_yield_window = VecDeque::new();
+        if previous_attempted > 0 {
+            adaptive_yield_window.push_back((previous_attempted, previous_positive));
+        }
+        let mut remaining_yield_upper_bound: f64;
         let mut wave_number = 2;
         loop {
             if resume_candidate_queue_draining
@@ -3963,14 +4268,24 @@ impl Scanner {
                     active_budget_warning_emitted = true;
                 }
             }
+            let rolling_attempted = adaptive_yield_window
+                .iter()
+                .map(|(attempted, _)| *attempted)
+                .sum::<usize>();
+            let rolling_positive = adaptive_yield_window
+                .iter()
+                .map(|(_, positive)| *positive)
+                .sum::<usize>();
+            remaining_yield_upper_bound = wilson_upper_bound(rolling_positive, rolling_attempted);
             if generated_candidates_enabled
                 && self.options.adaptive
                 && !explicit_wordlist_pending
-                && previous_attempted > 0
+                && rolling_attempted >= minimum_statistical_attempts
+                && adaptive_yield_window.len() >= required_yield_waves
                 && !should_expand_adaptive_wave(
                     !wildcard_signature_is_indeterminate(&root_wildcard),
-                    previous_positive,
-                    previous_attempted,
+                    rolling_positive,
+                    rolling_attempted,
                     wave_number,
                     passive_positive,
                 )
@@ -3978,8 +4293,9 @@ impl Scanner {
                 self.emit(ProgressEvent::Phase {
                     name: "adaptation".to_owned(),
                     detail: format!(
-                        "arrêt naturel après {} mots: rendement DNS insuffisant",
-                        generator_attempts.values().sum::<usize>()
+                        "arrêt statistique après {} mots: borne haute {:.2} nouveau nom / 1000 paquets",
+                        generator_attempts.values().sum::<usize>(),
+                        remaining_yield_upper_bound * 1_000.0
                     ),
                 });
                 generated_candidates_enabled = false;
@@ -4359,6 +4675,10 @@ impl Scanner {
                     })
                     .count();
                 previous_attempted = wave_generated_hosts.len();
+                adaptive_yield_window.push_back((previous_attempted, previous_positive));
+                while adaptive_yield_window.len() > required_yield_waves {
+                    adaptive_yield_window.pop_front();
+                }
             }
             for answer in wave_answers {
                 answers.insert(answer.fqdn.clone(), answer);
@@ -4917,6 +5237,163 @@ impl Scanner {
         }
 
         let mut web_observations = Vec::<WebObservation>::new();
+        let mut measured_http_requests = 0_u64;
+        let mut measured_http_bytes = 0_u64;
+        let mut measured_tls_connections = 0_u64;
+        if self.options.metadata_discovery {
+            let metadata_phase_started = Instant::now();
+            let metadata_budget = metadata_phase_budget(web_budget_remaining);
+            let metadata_deadline = tokio::time::Instant::now() + metadata_budget;
+            let mut metadata_hosts = vec![domain.to_owned()];
+            metadata_hosts.extend(
+                answers
+                    .values()
+                    .filter(|answer| {
+                        Self::is_strict_enrichment_seed(answer, &root_wildcard, &wildcard_by_parent)
+                    })
+                    .map(|answer| answer.fqdn.clone())
+                    .filter(|host| {
+                        if self.options.metadata_all_hosts {
+                            return true;
+                        }
+                        let relative = host
+                            .strip_suffix(&format!(".{domain}"))
+                            .unwrap_or(host.as_str());
+                        matches!(
+                            relative.split('.').next().unwrap_or_default(),
+                            "api"
+                                | "auth"
+                                | "login"
+                                | "sso"
+                                | "developer"
+                                | "dev"
+                                | "mail"
+                                | "account"
+                                | "accounts"
+                        )
+                    }),
+            );
+            metadata_hosts.sort();
+            metadata_hosts.dedup();
+            metadata_hosts.truncate(self.options.metadata_max_requests.div_ceil(6).max(1));
+            self.emit(ProgressEvent::Phase {
+                name: "métadonnées standardisées".to_owned(),
+                detail: format!(
+                    "{} hôte(s), {} requêtes HTTPS maximum, budget partagé {}s",
+                    metadata_hosts.len(),
+                    self.options.metadata_max_requests,
+                    metadata_budget.as_secs()
+                ),
+            });
+            let metadata_config = MetadataDiscoveryConfig {
+                max_body_bytes: 512 * 1024,
+                max_redirects: 2,
+                max_requests: self.options.metadata_max_requests,
+                request_timeout: self.options.web_timeout.min(Duration::from_secs(8)),
+                phase_deadline: Some(metadata_deadline),
+                dns_concurrency: METADATA_DNS_CONCURRENCY,
+            };
+            let metadata_dns = self.trusted_dns.as_ref().unwrap_or(&self.dns);
+            let metadata_result = self
+                .await_with_phase_heartbeat(
+                    "métadonnées standardisées",
+                    "API Catalog, identité, Terraform et SSH",
+                    discover_metadata(metadata_dns, domain, metadata_hosts, metadata_config),
+                )
+                .await;
+            consume_phase_budget(&mut web_budget_remaining, metadata_phase_started.elapsed());
+            web_budget_exhausted |=
+                web_budget_remaining.is_some_and(|remaining| remaining.is_zero());
+            match metadata_result {
+                Ok(metadata) => {
+                    measured_http_requests =
+                        measured_http_requests.saturating_add(metadata.network_requests as u64);
+                    measured_http_bytes =
+                        measured_http_bytes.saturating_add(metadata.bytes_transferred);
+                    for observation in &metadata.observations {
+                        for name in &observation.names {
+                            sources.entry(name.clone()).or_default().insert(format!(
+                                "{}:{}",
+                                observation.endpoint.source_name(),
+                                observation.url
+                            ));
+                        }
+                        web_observations.push(WebObservation {
+                            url: observation.url.clone(),
+                            status: observation.status,
+                            names: observation.names.clone(),
+                            from_cache: false,
+                        });
+                    }
+                    for name in metadata.unique_names {
+                        pipeline.enqueue(name, 130);
+                    }
+                    let metadata_candidates = if self.options.pipeline {
+                        pipeline.drain(self.options.pipeline_budget)
+                    } else {
+                        pipeline.drain(usize::MAX)
+                    };
+                    if !metadata_candidates.is_empty() {
+                        validation_rounds += 1;
+                        pipeline_names_validated += metadata_candidates.len();
+                        self.register_wildcard_parents_with_budget(
+                            &metadata_candidates,
+                            domain,
+                            &mut parent_by_host,
+                            &mut wildcard_by_parent,
+                            12,
+                            &mut active_budget_remaining,
+                        )
+                        .await;
+                        let (metadata_answers, metadata_cache_hits, metadata_network_resolved) =
+                            self.resolve_batch(
+                                scan_id,
+                                domain,
+                                &metadata_candidates,
+                                "DNS métadonnées",
+                                &started,
+                                &sources,
+                                &root_wildcard,
+                                &parent_by_host,
+                                &wildcard_by_parent,
+                            )
+                            .await?;
+                        cache_hits += metadata_cache_hits;
+                        network_resolved += metadata_network_resolved;
+                        for answer in metadata_answers {
+                            answers.insert(answer.fqdn.clone(), answer);
+                        }
+                    }
+                    if metadata.budget_exhausted {
+                        warnings.push(
+                            "métadonnées standardisées: budget atteint, résultats partiels conservés"
+                                .to_owned(),
+                        );
+                    }
+                    if !metadata.failures.is_empty() {
+                        self.emit(ProgressEvent::Phase {
+                            name: "métadonnées standardisées".to_owned(),
+                            detail: format!(
+                                "{} requête(s), {} échec(s), {} nom(s)",
+                                metadata.network_requests,
+                                metadata.failures.len(),
+                                sources
+                                    .values()
+                                    .filter(|origins| origins
+                                        .iter()
+                                        .any(|origin| { origin.starts_with("metadata:") }))
+                                    .count()
+                            ),
+                        });
+                    }
+                }
+                Err(error) => {
+                    let warning = format!("métadonnées standardisées indisponibles: {error:#}");
+                    self.emit(ProgressEvent::Warning(warning.clone()));
+                    warnings.push(warning);
+                }
+            }
+        }
         if self.options.web_discovery {
             let mut web_hosts = answers
                 .values()
@@ -4974,6 +5451,9 @@ impl Scanner {
                     ),
                 )
                 .await?;
+            measured_http_requests =
+                measured_http_requests.saturating_add(web.network_requests as u64);
+            measured_http_bytes = measured_http_bytes.saturating_add(web.bytes_transferred);
             consume_phase_budget(&mut web_budget_remaining, web_phase_started.elapsed());
             web_budget_exhausted = web.budget_exhausted
                 || web_budget_remaining.is_some_and(|remaining| remaining.is_zero());
@@ -5040,7 +5520,7 @@ impl Scanner {
                     answers.insert(answer.fqdn.clone(), answer);
                 }
             }
-            web_observations = web.observations;
+            web_observations.extend(web.observations);
         }
 
         let mut tls_certificates = Vec::new();
@@ -5088,6 +5568,11 @@ impl Scanner {
                     ),
                 )
                 .await?;
+            measured_tls_connections = measured_tls_connections.saturating_add(
+                discovery
+                    .attempted_network
+                    .saturating_add(discovery.differential_attempted) as u64,
+            );
             self.emit(ProgressEvent::TlsCertificates {
                 endpoints: endpoints.len(),
                 network: discovery.attempted_network,
@@ -5286,6 +5771,9 @@ impl Scanner {
                             ),
                         )
                         .await?;
+                    measured_http_requests =
+                        measured_http_requests.saturating_add(web.network_requests as u64);
+                    measured_http_bytes = measured_http_bytes.saturating_add(web.bytes_transferred);
                     consume_phase_budget(&mut web_budget_remaining, web_phase_started.elapsed());
                     if web.budget_exhausted
                         || web_budget_remaining.is_some_and(|remaining| remaining.is_zero())
@@ -5356,6 +5844,12 @@ impl Scanner {
                                 ),
                             )
                             .await?;
+                        measured_tls_connections = measured_tls_connections.saturating_add(
+                            discovery
+                                .attempted_network
+                                .saturating_add(discovery.differential_attempted)
+                                as u64,
+                        );
                         self.emit(ProgressEvent::TlsCertificates {
                             endpoints: endpoints.len(),
                             network: discovery.attempted_network,
@@ -5809,7 +6303,6 @@ impl Scanner {
 
         let durable_learning = self.database.scan_candidate_learning(scan_id)?;
         generator_attempts = durable_learning.generator_attempts;
-        generator_successes = durable_learning.generator_successes;
         attempted_words.extend(durable_learning.attempted_words);
         let durable_candidate_attempts = durable_learning.total_attempts;
 
@@ -5871,10 +6364,56 @@ impl Scanner {
             findings.retain(|finding| finding.state == crate::model::ObservationState::Live);
         }
         self.database.persist_scan_snapshot(scan_id, &findings)?;
-        let resolver_metrics = self.dns.take_metrics();
+        let resolver_metrics = merge_resolver_metrics(
+            self.dns.take_metrics(),
+            self.trusted_dns
+                .as_ref()
+                .map(DnsEngine::take_metrics)
+                .unwrap_or_default(),
+        );
         self.database.store_resolver_metrics(&resolver_metrics)?;
         self.database
             .store_pipeline_metrics(scan_id, &pipeline_metrics)?;
+        let exclusive_generator_successes = self.database.exclusive_generator_successes(scan_id)?;
+        let exclusive_discoveries = self.database.exclusive_live_count(scan_id)?;
+        let dns_queries = resolver_metrics
+            .iter()
+            .map(|metric| metric.requests)
+            .sum::<u64>();
+        let elapsed_seconds = started.elapsed().as_secs_f64().max(0.001);
+        let effective_qps = dns_queries as f64 / elapsed_seconds;
+        let governor = self.dns.network_governor_snapshot();
+        let stop_reason = if active_resume_required {
+            StopReason::BudgetExhausted
+        } else if candidate_expansion_stopped_naturally {
+            StopReason::PosteriorLowYield
+        } else if governor.degraded {
+            StopReason::NetworkDegraded
+        } else {
+            StopReason::QueueDrained
+        };
+        let scheduler_metrics = SchedulerMetrics {
+            dns_queries,
+            tcp_connections: measured_tls_connections.saturating_add(axfr_attempts.len() as u64),
+            http_requests: measured_http_requests,
+            tls_connections: measured_tls_connections,
+            bytes_transferred: measured_http_bytes,
+            exclusive_discoveries,
+            exploration_actions: generator_attempts.values().copied().sum(),
+            backoffs: governor.backoffs,
+            effective_qps_min: if governor.minimum_rate_seen == 0 {
+                effective_qps
+            } else {
+                governor.minimum_rate_seen as f64
+            },
+            effective_qps_max: if governor.maximum_rate_seen == 0 {
+                effective_qps
+            } else {
+                governor.maximum_rate_seen as f64
+            },
+            remaining_yield_upper_bound,
+            stop_reason: Some(stop_reason),
+        };
         let duration_before_learning_ms = started.elapsed().as_millis();
         let discovered_seed_count =
             self.database.scan_seed_candidate_count(scan_id)?.max(0) as usize;
@@ -5893,7 +6432,7 @@ impl Scanner {
                 scan_id,
                 domain,
                 &generator_attempts,
-                &generator_successes,
+                &exclusive_generator_successes,
                 &attempted_words,
                 &successful_words,
                 &successful_patterns,
@@ -5938,6 +6477,7 @@ impl Scanner {
             ct_monitor,
             pipeline: pipeline_metrics,
             resolver_metrics,
+            scheduler_metrics,
             warnings,
         })
     }
@@ -6525,6 +7065,14 @@ pub async fn refresh_inventory_bounded(
                 last_verified_at: answer.last_verified_at,
                 evidence_families: BTreeSet::from([crate::model::EvidenceFamily::LiveDns]),
                 authoritative_validation: answer.authoritative_validation,
+                wildcard_verdict: WildcardVerdict::ExactOwner,
+                owner_proofs: answer
+                    .authoritative_validation
+                    .then_some(OwnerProof::AuthoritativeDistinct)
+                    .into_iter()
+                    .collect(),
+                generation_path: vec!["refresh".to_owned()],
+                discovery_score: Some(1.0),
             })
             .collect::<Vec<_>>();
         database.persist_findings(scan_id, &domain, &findings, ttl_cap)?;
@@ -6646,6 +7194,14 @@ pub async fn refresh_inventory_bounded(
                     last_verified_at: answer.last_verified_at,
                     evidence_families: BTreeSet::from([crate::model::EvidenceFamily::LiveDns]),
                     authoritative_validation: answer.authoritative_validation,
+                    wildcard_verdict: WildcardVerdict::ExactOwner,
+                    owner_proofs: answer
+                        .authoritative_validation
+                        .then_some(OwnerProof::AuthoritativeDistinct)
+                        .into_iter()
+                        .collect(),
+                    generation_path: vec!["refresh".to_owned()],
+                    discovery_score: Some(1.0),
                 })
                 .collect::<Vec<_>>();
             database.persist_findings(scan_id, &domain, &findings, ttl_cap)?;
@@ -6763,26 +7319,28 @@ mod tests {
     use super::{
         BatchDnsMode, RefreshOptions, RefreshRunGuard, ScanRunGuard, Scanner,
         active_candidate_budget_exhausted, active_candidate_work_allowed, active_resume_required,
-        apply_completed_refresh_wildcard_cleanup, automatic_bulk_source_limit,
-        before_refresh_deadline, cache_requires_revalidation, candidate_refill_capacity,
-        candidate_uses_active_budget, candidate_uses_discovery_fast_path,
-        cap_exclusive_bulk_source_names, capped_phase_deadline, collect_dns_outcomes_until,
-        consume_phase_budget, external_deferral_seconds, external_pause_status,
-        external_retry_after_seconds, is_missing_api_key_error, is_preflight_auth_error,
-        late_ct_seed_reserve, materialize_ct_fallback_bounded, merge_ct_fallback_names,
-        merge_passive_names_bounded, passive_connector_working_set_limit,
+        apply_completed_refresh_wildcard_cleanup, assess_dnssec_suspects_bounded,
+        automatic_bulk_source_limit, before_refresh_deadline, cache_requires_revalidation,
+        candidate_refill_capacity, candidate_uses_active_budget,
+        candidate_uses_discovery_fast_path, cap_exclusive_bulk_source_names, capped_phase_deadline,
+        collect_dns_outcomes_until, consume_phase_budget, dnssec_assessment_proves_nonexistence,
+        external_deferral_seconds, external_pause_status, external_retry_after_seconds,
+        is_missing_api_key_error, is_preflight_auth_error, late_ct_seed_reserve,
+        materialize_ct_fallback_bounded, merge_ct_fallback_names, merge_passive_names_bounded,
+        merge_resolver_metrics, metadata_phase_budget, passive_connector_working_set_limit,
         persist_routed_dns_outcomes, record_bounded_parent_candidate,
         refill_passive_union_from_cache, refresh_allows_wildcard_purge,
         refresh_parent_selection_is_complete, refresh_wildcard_observation_is_reliable,
         refresh_wildcard_profile_is_reliable, route_dns_outcomes, should_expand_adaptive_wave,
         should_retry_source_after_key_added, source_bootstrap_score, source_error_is_deferred,
         source_requires_api_key, unprofiled_deepest_parents, wildcard_cache_algorithm_is_current,
-        wildcard_profile_after_probe, wildcard_profile_observed,
+        wildcard_profile_after_probe, wildcard_profile_observed, wilson_upper_bound,
     };
     use crate::candidate::CandidateProposal;
     use crate::db::Database;
     use crate::dns::{DnsEngine, DnsResolutionOutcome, WildcardProbeOutcome};
-    use crate::model::{DnsRecord, Finding, ObservationState, ResolvedHost};
+    use crate::dnssec_proof::{DnssecOwnerState, DnssecProofAssessment, DnssecProofKind};
+    use crate::model::{DnsRecord, Finding, ObservationState, ResolvedHost, ResolverMetric};
     use serde_json::json;
     use std::collections::{BTreeMap, BTreeSet, HashMap};
     use std::sync::{
@@ -6790,6 +7348,250 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
     use std::time::{Duration, Instant};
+
+    fn proven_dnssec_denial(kind: DnssecProofKind) -> DnssecProofAssessment {
+        DnssecProofAssessment {
+            state: DnssecOwnerState::DoesNotExist,
+            proofs: BTreeSet::from([kind]),
+            ..DnssecProofAssessment::default()
+        }
+    }
+
+    #[test]
+    fn resolver_cost_metrics_include_primary_and_trusted_engines() {
+        let metrics = merge_resolver_metrics(
+            vec![ResolverMetric {
+                resolver: "1.1.1.1".to_owned(),
+                requests: 2,
+                successes: 2,
+                failures: 0,
+                average_ms: 10,
+                consecutive_failures: 0,
+            }],
+            vec![ResolverMetric {
+                resolver: "1.1.1.1".to_owned(),
+                requests: 1,
+                successes: 0,
+                failures: 1,
+                average_ms: 40,
+                consecutive_failures: 1,
+            }],
+        );
+        assert_eq!(metrics.len(), 1);
+        assert_eq!(metrics[0].requests, 3);
+        assert_eq!(metrics[0].successes, 2);
+        assert_eq!(metrics[0].failures, 1);
+        assert_eq!(metrics[0].average_ms, 20);
+        assert_eq!(metrics[0].consecutive_failures, 1);
+    }
+
+    #[test]
+    fn metadata_uses_the_remaining_web_budget_with_a_hard_cap() {
+        assert_eq!(metadata_phase_budget(None), Duration::from_secs(30));
+        assert_eq!(
+            metadata_phase_budget(Some(Duration::from_secs(90))),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            metadata_phase_budget(Some(Duration::from_secs(7))),
+            Duration::from_secs(7)
+        );
+        assert!(metadata_phase_budget(Some(Duration::ZERO)).is_zero());
+    }
+
+    #[test]
+    fn dnssec_quarantine_requires_a_concrete_local_denial_proof() {
+        let state_only = DnssecProofAssessment {
+            state: DnssecOwnerState::DoesNotExist,
+            ..DnssecProofAssessment::default()
+        };
+        assert!(!dnssec_assessment_proves_nonexistence(&state_only));
+        assert!(dnssec_assessment_proves_nonexistence(
+            &proven_dnssec_denial(DnssecProofKind::NxnameNsec)
+        ));
+        assert!(dnssec_assessment_proves_nonexistence(
+            &proven_dnssec_denial(DnssecProofKind::Nsec3RangeDenial)
+        ));
+        let ent = DnssecProofAssessment {
+            state: DnssecOwnerState::EmptyNonTerminal,
+            proofs: BTreeSet::from([DnssecProofKind::EmptyNonTerminal]),
+            ..DnssecProofAssessment::default()
+        };
+        assert!(!dnssec_assessment_proves_nonexistence(&ent));
+    }
+
+    #[tokio::test]
+    async fn dnssec_suspect_assessment_is_parallel_scoped_and_capped_at_four() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let maximum_in_flight = Arc::new(AtomicUsize::new(0));
+        let mut suspects = (0..8)
+            .rev()
+            .map(|index| format!("host-{index:02}.example.com"))
+            .collect::<Vec<_>>();
+        suspects.extend([
+            "HOST-00.EXAMPLE.COM.".to_owned(),
+            "outside.test".to_owned(),
+            "example.com".to_owned(),
+        ]);
+
+        let nonexistent = assess_dnssec_suspects_bounded(
+            "example.com",
+            suspects,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+            {
+                let calls = Arc::clone(&calls);
+                let in_flight = Arc::clone(&in_flight);
+                let maximum_in_flight = Arc::clone(&maximum_in_flight);
+                move |fqdn| {
+                    let calls = Arc::clone(&calls);
+                    let in_flight = Arc::clone(&in_flight);
+                    let maximum_in_flight = Arc::clone(&maximum_in_flight);
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        let current = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                        maximum_in_flight.fetch_max(current, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        in_flight.fetch_sub(1, Ordering::SeqCst);
+                        if fqdn.starts_with("host-00") {
+                            proven_dnssec_denial(DnssecProofKind::NxnameNsec)
+                        } else if fqdn.starts_with("host-01") {
+                            // A state without locally validated proof material
+                            // must not authorize quarantine (including AD-only).
+                            DnssecProofAssessment {
+                                state: DnssecOwnerState::DoesNotExist,
+                                ..DnssecProofAssessment::default()
+                            }
+                        } else if fqdn.starts_with("host-03") {
+                            proven_dnssec_denial(DnssecProofKind::NsecRangeDenial)
+                        } else {
+                            DnssecProofAssessment::default()
+                        }
+                    }
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        assert!(maximum_in_flight.load(Ordering::SeqCst) > 1);
+        assert_eq!(
+            nonexistent,
+            BTreeSet::from([
+                "host-00.example.com".to_owned(),
+                "host-03.example.com".to_owned(),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn dnssec_suspect_assessment_uses_one_absolute_deadline() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let started = Instant::now();
+        let nonexistent = assess_dnssec_suspects_bounded(
+            "example.com",
+            (0..8).map(|index| format!("slow-{index}.example.com")),
+            tokio::time::Instant::now() + Duration::from_millis(35),
+            {
+                let calls = Arc::clone(&calls);
+                move |_fqdn| {
+                    let calls = Arc::clone(&calls);
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                        proven_dnssec_denial(DnssecProofKind::NxnameNsec3)
+                    }
+                }
+            },
+        )
+        .await;
+
+        assert!(nonexistent.is_empty());
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        assert!(
+            started.elapsed() < Duration::from_millis(150),
+            "les évaluations ont reçu des deadlines individuelles"
+        );
+    }
+
+    #[test]
+    fn dnssec_quarantine_purges_only_proven_name_and_preserves_audit() {
+        let database = Database::in_memory().unwrap();
+        let scan_id = database.create_scan("example.com", &json!({})).unwrap();
+        let make_finding = |fqdn: &str| Finding {
+            fqdn: fqdn.to_owned(),
+            records: vec![DnsRecord {
+                record_type: "A".to_owned(),
+                value: "192.0.2.44".to_owned(),
+                ttl: 60,
+            }],
+            sources: BTreeSet::from(["dns-wave-1".to_owned()]),
+            state: ObservationState::Live,
+            last_verified_at: Some(1),
+            ..Finding::default()
+        };
+        let proven = "proven.example.com";
+        let retained = "retained.example.com";
+        database
+            .persist_findings(
+                scan_id,
+                "example.com",
+                &[make_finding(proven), make_finding(retained)],
+                86_400,
+            )
+            .unwrap();
+        let cached = [proven, retained]
+            .into_iter()
+            .map(|fqdn| ResolvedHost {
+                fqdn: fqdn.to_owned(),
+                records: make_finding(fqdn).records,
+                from_cache: false,
+                last_verified_at: Some(1),
+                authoritative_validation: false,
+                resolver_count: 2,
+            })
+            .collect::<Vec<_>>();
+        database
+            .update_cache_outcomes(Some(scan_id), &cached, &[], &[], 300)
+            .unwrap();
+
+        assert_eq!(
+            database
+                .quarantine_dnssec_nonexistent(scan_id, "example.com", &[proven.to_owned()])
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            database
+                .inventory(Some("example.com"), false)
+                .unwrap()
+                .into_iter()
+                .map(|entry| entry.fqdn)
+                .collect::<Vec<_>>(),
+            vec![retained]
+        );
+        let cache = database
+            .fresh_cache(&[proven.to_owned(), retained.to_owned()])
+            .unwrap();
+        assert!(!cache.contains_key(proven));
+        assert!(cache.contains_key(retained));
+        let explanation = database.explain(proven).unwrap();
+        assert_eq!(
+            explanation["quarantine"][0]["reason"],
+            "dnssec_validated_nonexistence"
+        );
+        assert!(
+            explanation["dns_verifications"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|verification| {
+                    verification["outcome"] == "negative"
+                        && verification["details"]["reason"] == "dnssec_validated_nonexistence"
+                })
+        );
+        assert_eq!(explanation["scan_history"].as_array().unwrap().len(), 1);
+    }
 
     #[test]
     fn ct_error_fallback_merges_indexed_and_cached_names_in_scope() {
@@ -7568,6 +8370,7 @@ mod tests {
             last_verified_at: Some(1),
             evidence_families: BTreeSet::new(),
             authoritative_validation: false,
+            ..Finding::default()
         };
         let weak = "weak.example.com";
         let corroborated = "ct.example.com";
@@ -7641,6 +8444,7 @@ mod tests {
             last_verified_at: Some(1),
             evidence_families: BTreeSet::new(),
             authoritative_validation: false,
+            ..Finding::default()
         };
         database
             .persist_findings(scan_id, "example.com", &[finding], 86_400)
@@ -7789,11 +8593,20 @@ mod tests {
     #[test]
     fn adaptive_waves_require_a_minimum_yield_rate() {
         assert!(should_expand_adaptive_wave(true, 0, 500, 2, 5));
-        assert!(!should_expand_adaptive_wave(true, 1, 500, 3, 10));
+        assert!(should_expand_adaptive_wave(true, 1, 500, 3, 10));
         assert!(should_expand_adaptive_wave(true, 2, 1_000, 3, 0));
-        assert!(!should_expand_adaptive_wave(true, 2, 1_500, 3, 0));
         assert!(should_expand_adaptive_wave(true, 3, 1_500, 3, 0));
+        assert!(!should_expand_adaptive_wave(true, 0, 3_000, 3, 0));
         assert!(!should_expand_adaptive_wave(false, 20, 500, 2, 20));
+    }
+
+    #[test]
+    fn statistical_yield_bound_is_conservative_and_monotonic() {
+        assert_eq!(wilson_upper_bound(0, 0), 1.0);
+        assert!(wilson_upper_bound(1, 500) > 0.001);
+        assert!(wilson_upper_bound(0, 3_000) < 0.001);
+        assert!(wilson_upper_bound(0, 6_000) < wilson_upper_bound(0, 3_000));
+        assert!(wilson_upper_bound(5, 3_000) > wilson_upper_bound(0, 3_000));
     }
 
     #[test]

@@ -5,6 +5,7 @@ use fellaga_core::candidate::{default_mutation_rules, load_mutation_rules};
 use fellaga_core::db::Database;
 use fellaga_core::dns::DnsEngine;
 use fellaga_core::model::{AxfrStatus, Finding, ObservationState, ScanResult};
+use fellaga_core::network_governor::NetworkControl;
 use fellaga_core::passive::{
     ApiKeyStore, automatic_sources_for_profile, source_statuses, validate_sources,
 };
@@ -83,6 +84,21 @@ enum Command {
     Export(ExportArgs),
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+enum NetworkControlArg {
+    Adaptive,
+    Fixed,
+}
+
+impl From<NetworkControlArg> for NetworkControl {
+    fn from(value: NetworkControlArg) -> Self {
+        match value {
+            NetworkControlArg::Adaptive => Self::Adaptive,
+            NetworkControlArg::Fixed => Self::Fixed,
+        }
+    }
+}
+
 #[derive(Debug, Args)]
 struct DnsArgs {
     #[arg(
@@ -109,6 +125,13 @@ struct DnsArgs {
     dns_rate_limit: u64,
     #[arg(
         long,
+        value_enum,
+        default_value_t = NetworkControlArg::Adaptive,
+        help = "Network pressure control; adaptive treats rate and concurrency as ceilings"
+    )]
+    network_control: NetworkControlArg,
+    #[arg(
+        long,
         value_delimiter = ',',
         default_value = "1.1.1.1,8.8.8.8,9.9.9.9",
         help = "Independent resolvers used for final consensus validation"
@@ -124,6 +147,13 @@ enum ScanProfile {
     Turbo,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+enum MetadataDiscoveryArg {
+    Auto,
+    Off,
+    All,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StreamJsonlMode {
     Disabled,
@@ -137,6 +167,14 @@ const fn stream_jsonl_mode(enabled: bool, only_live: bool) -> StreamJsonlMode {
         (true, false) => StreamJsonlMode::Realtime,
         (true, true) => StreamJsonlMode::FinalOnly,
     }
+}
+
+fn metadata_discovery_enabled(
+    mode: MetadataDiscoveryArg,
+    passive_profile: bool,
+    web_disabled: bool,
+) -> bool {
+    mode != MetadataDiscoveryArg::Off && !passive_profile && !web_disabled
 }
 
 const fn is_strict_live(state: ObservationState, wildcard: bool) -> bool {
@@ -589,6 +627,13 @@ struct ScanArgs {
     ct_backfill: Option<usize>,
     #[arg(
         long,
+        value_enum,
+        default_value_t = MetadataDiscoveryArg::Auto,
+        help = "Standardized .well-known discovery: auto, off, or all validated Web hosts"
+    )]
+    metadata_discovery: MetadataDiscoveryArg,
+    #[arg(
+        long,
         help = "Disable HTTP, HTML, JavaScript, and source-map extraction"
     )]
     no_web: bool,
@@ -992,11 +1037,12 @@ fn make_dns(args: &DnsArgs) -> Result<DnsEngine> {
     if args.dns_rate_limit > 100_000 {
         bail!("--dns-rate-limit ne peut pas dépasser 100000 requêtes/s");
     }
-    DnsEngine::new_with_rate(
+    DnsEngine::new_with_rate_and_control(
         args.concurrency,
         Duration::from_secs_f64(args.timeout),
         &args.resolvers,
         args.dns_rate_limit,
+        args.network_control.into(),
     )
 }
 
@@ -1320,6 +1366,15 @@ fn print_scan_summary(result: &ScanResult) {
             "[DNS] {} résolveur(s) profilé(s), {} requête(s) mesurée(s).",
             result.resolver_metrics.len(),
             requests
+        );
+    }
+    if let Some(reason) = result.scheduler_metrics.stop_reason {
+        println!(
+            "[SCHED] arrêt={}, {} découverte(s) exclusive(s), {} repli(s) réseau, rendement restant ≤ {:.3}/1000.",
+            reason.as_str(),
+            result.scheduler_metrics.exclusive_discoveries,
+            result.scheduler_metrics.backoffs,
+            result.scheduler_metrics.remaining_yield_upper_bound * 1_000.0,
         );
     }
 }
@@ -1647,11 +1702,12 @@ async fn main() -> Result<()> {
             let trusted_dns = if args.no_trusted_validation {
                 None
             } else {
-                let trusted = DnsEngine::new_with_rate(
+                let trusted = DnsEngine::new_with_rate_and_control(
                     args.dns.concurrency.min(256),
                     Duration::from_secs_f64(args.dns.timeout),
                     &args.dns.trusted_resolvers,
                     args.dns.dns_rate_limit,
+                    args.dns.network_control.into(),
                 )?
                 .share_rate_limit_with(&dns);
                 trusted.seed_metrics(&database.resolver_history()?);
@@ -1719,6 +1775,17 @@ async fn main() -> Result<()> {
                 ct_max_logs: ct_logs,
                 ct_entries_per_log: ct_entries,
                 ct_initial_backfill: ct_backfill,
+                metadata_discovery: metadata_discovery_enabled(
+                    args.metadata_discovery,
+                    profile_passive,
+                    args.no_web,
+                ),
+                metadata_all_hosts: args.metadata_discovery == MetadataDiscoveryArg::All,
+                metadata_max_requests: if args.profile == ScanProfile::Deep {
+                    64
+                } else {
+                    24
+                },
                 web_discovery: !args.no_web && !profile_passive,
                 web_max_hosts: web_hosts,
                 web_timeout: Duration::from_secs_f64(args.web_timeout),
@@ -1891,11 +1958,12 @@ async fn main() -> Result<()> {
             let database = Database::open(&database_path)?;
             let dns = make_dns(&args.dns)?;
             dns.seed_metrics(&database.resolver_history()?);
-            let trusted_dns = DnsEngine::new_with_rate(
+            let trusted_dns = DnsEngine::new_with_rate_and_control(
                 args.dns.concurrency.min(256),
                 Duration::from_secs_f64(args.dns.timeout),
                 &args.dns.trusted_resolvers,
                 args.dns.dns_rate_limit,
+                args.dns.network_control.into(),
             )?
             .share_rate_limit_with(&dns);
             trusted_dns.seed_metrics(&database.resolver_history()?);
@@ -2383,6 +2451,48 @@ mod tests {
         assert_eq!(stream_jsonl_mode(false, true), StreamJsonlMode::Disabled);
         assert_eq!(stream_jsonl_mode(true, false), StreamJsonlMode::Realtime);
         assert_eq!(stream_jsonl_mode(true, true), StreamJsonlMode::FinalOnly);
+    }
+
+    #[test]
+    fn intelligent_scan_controls_parse_with_safe_defaults_and_explicit_overrides() {
+        let defaults = Cli::try_parse_from(["fellaga", "scan", "example.com"]).unwrap();
+        let Command::Scan(defaults) = defaults.command else {
+            panic!("scan command expected");
+        };
+        assert_eq!(defaults.dns.network_control, NetworkControlArg::Adaptive);
+        assert_eq!(defaults.metadata_discovery, MetadataDiscoveryArg::Auto);
+        assert!(metadata_discovery_enabled(
+            defaults.metadata_discovery,
+            false,
+            defaults.no_web
+        ));
+
+        let overridden = Cli::try_parse_from([
+            "fellaga",
+            "scan",
+            "example.com",
+            "--network-control",
+            "fixed",
+            "--metadata-discovery",
+            "all",
+            "--no-web",
+        ])
+        .unwrap();
+        let Command::Scan(overridden) = overridden.command else {
+            panic!("scan command expected");
+        };
+        assert_eq!(overridden.dns.network_control, NetworkControlArg::Fixed);
+        assert_eq!(overridden.metadata_discovery, MetadataDiscoveryArg::All);
+        assert!(!metadata_discovery_enabled(
+            overridden.metadata_discovery,
+            false,
+            overridden.no_web
+        ));
+        assert!(!metadata_discovery_enabled(
+            MetadataDiscoveryArg::Auto,
+            true,
+            false
+        ));
     }
 
     #[test]

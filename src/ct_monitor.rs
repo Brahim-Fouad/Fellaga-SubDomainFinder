@@ -1,3 +1,4 @@
+use crate::ct_static::{CachedStaticTile, fetch_static_delta_with_cache};
 use crate::db::Database;
 use crate::model::CtMonitorResult;
 use crate::passive::{compact_external_error, external_user_agent, response_bytes_limited_to};
@@ -542,6 +543,76 @@ async fn process_and_store_batch(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn process_static_log(
+    database: &Database,
+    client: &reqwest::Client,
+    log_url: &str,
+    entries_per_log: usize,
+    initial_backfill: usize,
+    deadline: Option<TokioInstant>,
+    position: usize,
+    total_logs: usize,
+    progress: &Option<CtProgressCallback>,
+) -> Result<(usize, usize, BTreeSet<String>)> {
+    let stored_cursor = database.ct_global_cursor(log_url)?;
+    let batch = before_ct_deadline(
+        deadline,
+        fetch_static_delta_with_cache(
+            client,
+            log_url,
+            stored_cursor,
+            entries_per_log,
+            initial_backfill,
+            |tile_path, checkpoint_size, checkpoint_hash| {
+                database
+                    .ct_static_tile(log_url, tile_path, checkpoint_size, checkpoint_hash)
+                    .map(|cached| {
+                        cached.map(|(content_hash, payload)| CachedStaticTile {
+                            content_hash,
+                            payload,
+                        })
+                    })
+            },
+        ),
+    )
+    .await?;
+    if deadline.is_some_and(|deadline| deadline <= TokioInstant::now()) {
+        bail!(
+            "budget de temps cumulé CT atteint avant le commit statique; curseur SQLite inchangé"
+        );
+    }
+    let start_cursor = batch
+        .next_cursor
+        .saturating_sub(batch.entries_processed as u64);
+    emit_progress(
+        progress,
+        CtProgressEvent::TreeHead {
+            position,
+            total: total_logs,
+            log_url: log_url.to_owned(),
+            tree_size: batch.checkpoint_size,
+            cursor: start_cursor,
+        },
+    );
+    database.store_ct_static_batch(log_url, &batch)?;
+    if batch.entries_processed > 0 {
+        emit_progress(
+            progress,
+            CtProgressEvent::BatchCommitted {
+                position,
+                total: total_logs,
+                log_url: log_url.to_owned(),
+                batch: 1,
+                entries: batch.entries_processed,
+                names: batch.names.len(),
+                next_cursor: batch.next_cursor,
+            },
+        );
+    }
+    Ok((batch.entries_processed, batch.tiles.len(), batch.names))
+}
+
 async fn materialize_target_names(
     database: &Database,
     domain: &str,
@@ -777,6 +848,7 @@ async fn monitor_ct_logs_until(
 
     let client = reqwest::Client::builder()
         .connect_timeout(timeout)
+        .timeout(timeout)
         .pool_idle_timeout(Duration::from_secs(30))
         .user_agent(external_user_agent())
         .build()?;
@@ -850,7 +922,32 @@ async fn monitor_ct_logs_until(
                         )
                         .await
                     })
-                    .await?;
+                    .await;
+                    let sth = match sth {
+                        Ok(sth) => sth,
+                        Err(rfc_error) => {
+                            if deadline.is_some_and(|deadline| deadline <= TokioInstant::now()) {
+                                return Err(rfc_error);
+                            }
+                            return process_static_log(
+                                &database,
+                                &client,
+                                &log_url,
+                                entries_per_log,
+                                initial_backfill,
+                                deadline,
+                                position,
+                                log_count,
+                                &progress,
+                            )
+                            .await
+                            .with_context(|| {
+                                format!(
+                                    "API RFC6962 indisponible ({rfc_error:#}); repli CT statique"
+                                )
+                            });
+                        }
+                    };
                     let stored = database.ct_global_cursor(&log_url)?;
                     if sth.tree_size == 0 {
                         let cursor = stored.unwrap_or_default();
@@ -944,7 +1041,39 @@ async fn monitor_ct_logs_until(
                             )
                             .await
                         })
-                        .await?;
+                        .await;
+                        let response = match response {
+                            Ok(response) => response,
+                            Err(rfc_error) => {
+                                if deadline
+                                    .is_some_and(|deadline| deadline <= TokioInstant::now())
+                                {
+                                    return Err(rfc_error);
+                                }
+                                let (processed, static_pages, static_names) =
+                                    process_static_log(
+                                        &database,
+                                        &client,
+                                        &log_url,
+                                        remaining,
+                                        initial_backfill,
+                                        deadline,
+                                        position,
+                                        log_count,
+                                        &progress,
+                                    )
+                                    .await
+                                    .with_context(|| {
+                                        format!(
+                                            "API RFC6962 indisponible ({rfc_error:#}); repli CT statique"
+                                        )
+                                    })?;
+                                total_processed = total_processed.saturating_add(processed);
+                                pages = pages.saturating_add(static_pages);
+                                names.extend(static_names);
+                                return Ok((total_processed, pages, names));
+                            }
+                        };
                         let committed = process_and_store_batch(
                             &database,
                             &log_url,

@@ -1,0 +1,7 @@
+{
+  "issuer": "https://auth.example.com",
+  "authorization_endpoint": "https://login.example.com/oauth2/authorize",
+  "token_endpoint": "https://auth.example.com/oauth2/token",
+  "jwks_uri": "https://keys.example.com/jwks.json",
+  "userinfo_endpoint": "https://identity.example.net/userinfo"
+}
