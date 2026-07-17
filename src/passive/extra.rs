@@ -1,6 +1,7 @@
 use super::{
-    ApiKeyStore, client, commit_result_page, hostname_from_url, response_bytes_limited,
-    response_json, response_text, send_external, send_with_retry, source_policy,
+    ApiKeyStore, client, commit_result_page, compact_external_error, hostname_from_url,
+    response_bytes_limited, response_json, response_text, send_external,
+    send_with_retry_for_source, source_policy,
 };
 use crate::util::normalize_observed_name;
 use anyhow::{Context, Result, bail};
@@ -53,15 +54,12 @@ fn extract_from_json(value: &Value, domain: &str, names: &mut BTreeSet<String>) 
 
 #[derive(Deserialize)]
 struct HostsResponse {
-    #[serde(default)]
-    hosts: Vec<String>,
-    #[serde(default)]
-    subdomains: Vec<String>,
+    hosts: Option<Vec<String>>,
+    subdomains: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
 struct ShodanDomainResponse {
-    #[serde(default)]
     subdomains: Vec<String>,
     #[serde(default)]
     more: bool,
@@ -75,7 +73,6 @@ struct BinaryEdgeSubdomainPage {
     page: usize,
     #[serde(default)]
     pagesize: usize,
-    #[serde(default)]
     events: Vec<String>,
 }
 
@@ -83,7 +80,6 @@ struct BinaryEdgeSubdomainPage {
 struct MerkleMapSearchPage {
     #[serde(default)]
     count: usize,
-    #[serde(default)]
     results: Vec<MerkleMapSearchResult>,
 }
 
@@ -95,7 +91,6 @@ struct MerkleMapSearchResult {
 
 #[derive(Deserialize, Default)]
 struct BraveSearchPage {
-    #[serde(default)]
     query: BraveSearchQuery,
     web: Option<BraveWebResults>,
 }
@@ -121,9 +116,33 @@ struct BraveWebResult {
     extra_snippets: Vec<String>,
 }
 
+#[derive(Deserialize)]
+struct DriftnetPage {
+    #[serde(default)]
+    page: Option<Value>,
+    #[serde(default)]
+    pages: Option<Value>,
+    results: Vec<DriftnetReport>,
+    #[serde(default)]
+    timed_out: bool,
+}
+
+#[derive(Deserialize)]
+struct DriftnetReport {
+    #[serde(default)]
+    items: Vec<DriftnetItem>,
+}
+
+#[derive(Deserialize)]
+struct DriftnetItem {
+    #[serde(default)]
+    value: Value,
+}
+
 const BINARYEDGE_MAX_PAGES: usize = 2;
 const MERKLEMAP_MAX_PAGES: usize = 2;
 const BRAVE_MAX_PAGES: usize = 2;
+const DRIFTNET_MAX_PAGES: usize = 10;
 
 fn binaryedge_request(
     client: &reqwest::Client,
@@ -169,6 +188,21 @@ fn merklemap_request(
         .query(&[
             ("query", format!("*.{domain}")),
             ("type", "wildcard".to_owned()),
+            ("page", page.to_string()),
+        ])
+}
+
+fn driftnet_request(
+    client: &reqwest::Client,
+    domain: &str,
+    page: usize,
+    token: &str,
+) -> reqwest::RequestBuilder {
+    client
+        .get("https://api.driftnet.io/v1/ct/log")
+        .bearer_auth(token)
+        .query(&[
+            ("field", format!("host:{domain}")),
             ("page", page.to_string()),
         ])
 }
@@ -229,6 +263,57 @@ fn merklemap_has_more(page: &MerkleMapSearchPage, page_number: usize) -> bool {
     result_count > 0 && page.count > (page_number + 1).saturating_mul(result_count)
 }
 
+fn driftnet_page_number(value: Option<&Value>, field: &str) -> Result<Option<usize>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let parsed = match value {
+        Value::Number(value) => value.as_u64().and_then(|value| usize::try_from(value).ok()),
+        Value::String(value) => value.trim().parse::<usize>().ok(),
+        Value::Null => return Ok(None),
+        _ => None,
+    };
+    parsed
+        .map(Some)
+        .ok_or_else(|| anyhow::anyhow!("Driftnet: champ de pagination {field} invalide"))
+}
+
+fn driftnet_pagination(page: &DriftnetPage, requested_page: usize) -> Result<(usize, usize)> {
+    let returned_page = driftnet_page_number(page.page.as_ref(), "page")?.unwrap_or(requested_page);
+    if returned_page != requested_page {
+        bail!("Driftnet: page inattendue {returned_page}, page {requested_page} demandée");
+    }
+    let pages = driftnet_page_number(page.pages.as_ref(), "pages")?
+        .unwrap_or_else(|| returned_page.saturating_add(1));
+    if !page.results.is_empty() && pages <= returned_page {
+        bail!("Driftnet: pagination incohérente (page {returned_page}, pages {pages})");
+    }
+    Ok((returned_page, pages))
+}
+
+fn driftnet_page_names(page: &DriftnetPage, domain: &str) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    for item in page.results.iter().flat_map(|report| &report.items) {
+        extract_from_json(&item.value, domain, &mut names);
+    }
+    names
+}
+
+fn driftnet_http_error(status: reqwest::StatusCode, body: &[u8]) -> Option<String> {
+    let reason = match status.as_u16() {
+        401 => "jeton API invalide",
+        403 => "quota API dépassé",
+        524 => "timeout CDN amont",
+        _ => return None,
+    };
+    let detail = compact_external_error(&String::from_utf8_lossy(body));
+    Some(if detail.is_empty() {
+        format!("Driftnet: {reason} (HTTP {})", status.as_u16())
+    } else {
+        format!("Driftnet: {reason} (HTTP {}): {detail}", status.as_u16())
+    })
+}
+
 pub(super) async fn bevigil(
     domain: &str,
     timeout: Duration,
@@ -247,7 +332,12 @@ pub(super) async fn bevigil(
     .await
     .context("connexion à BeVigil")?;
     let response = response_json::<HostsResponse>(response, "BeVigil").await?;
-    Ok(normalize_many(response.subdomains, domain))
+    Ok(normalize_many(
+        response
+            .subdomains
+            .context("BeVigil: champ subdomains absent")?,
+        domain,
+    ))
 }
 
 pub(super) async fn binaryedge(
@@ -271,8 +361,12 @@ pub(super) async fn binaryedge(
         };
         let page_names = binaryedge_page_names(&response, domain);
         commit_result_page(&mut names, page_names);
-        if !binaryedge_has_more(&response, requested_page) {
+        let has_more = binaryedge_has_more(&response, requested_page);
+        if !has_more {
             break;
+        }
+        if requested_page == BINARYEDGE_MAX_PAGES {
+            bail!("BinaryEdge: limite de pagination atteinte avec des résultats supplémentaires");
         }
     }
     Ok(names)
@@ -299,8 +393,12 @@ pub(super) async fn brave(
         };
         let page_names = brave_page_names(&response, domain);
         commit_result_page(&mut names, page_names);
-        if !brave_has_more(&response) {
+        let has_more = brave_has_more(&response);
+        if !has_more {
             break;
+        }
+        if offset + 1 == BRAVE_MAX_PAGES {
+            bail!("Brave Search: limite de pagination atteinte avec des résultats supplémentaires");
         }
     }
     Ok(names)
@@ -332,22 +430,24 @@ pub(super) async fn builtwith(
     .context("connexion à BuiltWith")?;
     let response = response_json::<Value>(response, "BuiltWith").await?;
     let mut names = BTreeSet::new();
-    if let Some(results) = response.get("Results").and_then(Value::as_array) {
-        for result in results {
-            let paths = result
-                .pointer("/Result/Paths")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten();
-            for path in paths {
-                let base = path.get("Domain").and_then(Value::as_str).unwrap_or(domain);
-                let label = path
-                    .get("SubDomain")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                if let Some(name) = normalize_observed_name(&format!("{label}.{base}"), domain) {
-                    names.insert(name);
-                }
+    let results = response
+        .get("Results")
+        .and_then(Value::as_array)
+        .context("BuiltWith: tableau Results absent")?;
+    for result in results {
+        let paths = result
+            .pointer("/Result/Paths")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten();
+        for path in paths {
+            let base = path.get("Domain").and_then(Value::as_str).unwrap_or(domain);
+            let label = path
+                .get("SubDomain")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if let Some(name) = normalize_observed_name(&format!("{label}.{base}"), domain) {
+                names.insert(name);
             }
         }
     }
@@ -366,7 +466,7 @@ pub(super) async fn censys(
     let http = client(timeout)?;
     let mut cursor: Option<String> = None;
     let mut names = BTreeSet::new();
-    for _ in 0..10 {
+    for iteration in 0..10 {
         let mut request = http
             .get("https://search.censys.io/api/v2/certificates/search")
             .basic_auth(identifier, Some(secret))
@@ -382,27 +482,36 @@ pub(super) async fn censys(
             Err(error) => return Err(error).context("connexion à Censys"),
         };
         let mut page_names = BTreeSet::new();
-        if let Some(hits) = response.pointer("/result/hits").and_then(Value::as_array) {
-            for hit in hits {
-                if let Some(values) = hit.get("names").and_then(Value::as_array) {
-                    page_names.extend(
-                        values
-                            .iter()
-                            .filter_map(Value::as_str)
-                            .filter_map(|name| normalize_observed_name(name, domain)),
-                    );
-                }
+        let hits = response
+            .pointer("/result/hits")
+            .and_then(Value::as_array)
+            .context("Censys: tableau result.hits absent")?;
+        for hit in hits {
+            if let Some(values) = hit.get("names").and_then(Value::as_array) {
+                page_names.extend(
+                    values
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .filter_map(|name| normalize_observed_name(name, domain)),
+                );
             }
         }
         commit_result_page(&mut names, page_names);
-        cursor = response
+        let next_cursor = response
             .pointer("/result/links/next")
             .and_then(Value::as_str)
             .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned);
-        if cursor.is_none() {
+        let Some(next_cursor) = next_cursor else {
             break;
+        };
+        if cursor.as_deref() == Some(next_cursor.as_str()) {
+            bail!("Censys: curseur de pagination répété");
         }
+        if iteration + 1 == 10 {
+            bail!("Censys: limite de pagination atteinte avec un curseur suivant");
+        }
+        cursor = Some(next_cursor);
     }
     Ok(names)
 }
@@ -473,29 +582,59 @@ pub(super) async fn chaos(
     let response = response_json::<HostsResponse>(response, "Chaos").await?;
     Ok(response
         .subdomains
+        .context("Chaos: champ subdomains absent")?
         .into_iter()
         .filter_map(|label| normalize_observed_name(&format!("{label}.{domain}"), domain))
         .collect())
 }
 
-pub(super) async fn driftnet(domain: &str, timeout: Duration) -> Result<BTreeSet<String>> {
-    let response = send_external(
-        "driftnet",
-        client(timeout)?
-            .get("https://api.driftnet.io/v1/multi/summary")
-            .bearer_auth("anon")
-            .query(&[
-                ("summary_limit", "1000"),
-                ("timeout", "30"),
-                ("field", &format!("host:{domain}")),
-            ]),
-        domain,
-    )
-    .await
-    .context("connexion à Driftnet")?;
-    let response = response_json::<Value>(response, "Driftnet").await?;
+pub(super) async fn driftnet(
+    domain: &str,
+    timeout: Duration,
+    token: &str,
+) -> Result<BTreeSet<String>> {
+    let token = token.trim();
+    if token.is_empty() {
+        bail!("Driftnet: jeton API manquant");
+    }
+    let http = client(timeout)?;
+    let policy = source_policy("driftnet");
     let mut names = BTreeSet::new();
-    extract_from_json(&response, domain, &mut names);
+    for requested_page in 0..DRIFTNET_MAX_PAGES {
+        let response = send_with_retry_for_source(
+            "driftnet",
+            driftnet_request(&http, domain, requested_page, token),
+            policy.attempts,
+            policy.base_backoff,
+            domain,
+        )
+        .await
+        .context("connexion à Driftnet Certificate Transparency")?;
+        if response.status() == reqwest::StatusCode::NO_CONTENT {
+            break;
+        }
+        if matches!(response.status().as_u16(), 401 | 403 | 524) {
+            let (status, body) = response_bytes_limited(response, "Driftnet").await?;
+            bail!(
+                "{}",
+                driftnet_http_error(status, &body)
+                    .unwrap_or_else(|| format!("Driftnet: HTTP {status}"))
+            );
+        }
+        let page = response_json::<DriftnetPage>(response, "Driftnet").await?;
+        let (returned_page, pages) = driftnet_pagination(&page, requested_page)?;
+        let has_results = !page.results.is_empty();
+        commit_result_page(&mut names, driftnet_page_names(&page, domain));
+        if page.timed_out {
+            bail!("Driftnet: délai interne du fournisseur atteint à la page {returned_page}");
+        }
+        if !has_results || returned_page.saturating_add(1) >= pages {
+            break;
+        }
+        if requested_page + 1 == DRIFTNET_MAX_PAGES {
+            bail!("Driftnet: limite de pagination atteinte avant la dernière page");
+        }
+    }
     Ok(names)
 }
 
@@ -517,7 +656,10 @@ pub(super) async fn fullhunt(
     .await
     .context("connexion à FullHunt")?;
     let response = response_json::<HostsResponse>(response, "FullHunt").await?;
-    Ok(normalize_many(response.hosts, domain))
+    Ok(normalize_many(
+        response.hosts.context("FullHunt: champ hosts absent")?,
+        domain,
+    ))
 }
 
 pub(super) async fn github(
@@ -545,8 +687,10 @@ pub(super) async fn github(
             },
             Err(error) => return Err(error).context("connexion à GitHub Code Search"),
         };
-        let items = response.get("items").and_then(Value::as_array);
-        let Some(items) = items else { break };
+        let items = response
+            .get("items")
+            .and_then(Value::as_array)
+            .context("GitHub Code Search: tableau items absent")?;
         if items.is_empty() {
             break;
         }
@@ -564,6 +708,9 @@ pub(super) async fn github(
         if items.len() < 100 {
             break;
         }
+        if page == 3 {
+            bail!("GitHub Code Search: limite de pagination atteinte avec une page complète");
+        }
     }
     Ok(names)
 }
@@ -576,7 +723,8 @@ pub(super) async fn gitlab(
     let token = keys.pick("gitlab")?;
     let http = client(timeout)?;
     let mut names = BTreeSet::new();
-    for page in 1..=3 {
+    let mut page = "1".to_owned();
+    for iteration in 0..3 {
         let request = http
             .get("https://gitlab.com/api/v4/search")
             .header("PRIVATE-TOKEN", &token)
@@ -584,7 +732,7 @@ pub(super) async fn gitlab(
                 ("scope", "blobs".to_owned()),
                 ("search", domain.to_owned()),
                 ("per_page", "100".to_owned()),
-                ("page", page.to_string()),
+                ("page", page.clone()),
             ]);
         let response = match send_external("gitlab", request, domain).await {
             Ok(response) => response,
@@ -605,9 +753,19 @@ pub(super) async fn gitlab(
             extract_from_json(value, domain, &mut page_names);
         }
         commit_result_page(&mut names, page_names);
-        if values.is_empty() || next_page.is_none() {
+        if values.is_empty() {
             break;
         }
+        let Some(next_page) = next_page else {
+            break;
+        };
+        if next_page == page {
+            bail!("GitLab Code Search: page suivante répétée ({page})");
+        }
+        if iteration + 1 == 3 {
+            bail!("GitLab Code Search: limite de pagination atteinte avant la dernière page");
+        }
+        page = next_page;
     }
     Ok(names)
 }
@@ -643,7 +801,7 @@ pub(super) async fn intelx(
         .and_then(Value::as_str)
         .context("ID Intelligence X absent")?;
     let mut names = BTreeSet::new();
-    for _ in 0..10 {
+    for iteration in 0..10 {
         let request = http
             .get(format!("https://{host}/phonebook/search/result"))
             .query(&[("k", key), ("id", id), ("limit", "10000")]);
@@ -655,19 +813,27 @@ pub(super) async fn intelx(
             Err(error) => return Err(error).context("lecture des résultats Intelligence X"),
         };
         let mut page_names = BTreeSet::new();
-        if let Some(selectors) = response.get("selectors").and_then(Value::as_array) {
-            for selector in selectors {
-                if let Some(name) = selector.get("selectorvalue").and_then(Value::as_str)
-                    && let Some(name) = normalize_observed_name(name, domain)
-                {
-                    page_names.insert(name);
-                }
+        let selectors = response
+            .get("selectors")
+            .and_then(Value::as_array)
+            .context("Intelligence X: tableau selectors absent")?;
+        for selector in selectors {
+            if let Some(name) = selector.get("selectorvalue").and_then(Value::as_str)
+                && let Some(name) = normalize_observed_name(name, domain)
+            {
+                page_names.insert(name);
             }
         }
         commit_result_page(&mut names, page_names);
-        let status = response.get("status").and_then(Value::as_i64).unwrap_or(2);
+        let status = response
+            .get("status")
+            .and_then(Value::as_i64)
+            .context("Intelligence X: statut absent")?;
         if status != 0 && status != 3 {
             break;
+        }
+        if iteration + 1 == 10 {
+            bail!("Intelligence X: recherche encore active après la limite de scrutation");
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
@@ -717,8 +883,12 @@ pub(super) async fn merklemap(
         };
         let page_names = merklemap_page_names(&response, domain);
         commit_result_page(&mut names, page_names);
-        if !merklemap_has_more(&response, page) {
+        let has_more = merklemap_has_more(&response, page);
+        if !has_more {
             break;
+        }
+        if page + 1 == MERKLEMAP_MAX_PAGES {
+            bail!("MerkleMap: limite de pagination atteinte avec des résultats supplémentaires");
         }
     }
     Ok(names)
@@ -726,7 +896,6 @@ pub(super) async fn merklemap(
 
 #[derive(Deserialize)]
 struct OtxResponse {
-    #[serde(default)]
     passive_dns: Vec<OtxRecord>,
     error: Option<String>,
 }
@@ -753,13 +922,14 @@ pub(super) async fn otx(
     timeout: Duration,
     keys: &ApiKeyStore,
 ) -> Result<BTreeSet<String>> {
-    let token = keys.optional("otx");
+    let token = keys.pick("otx")?;
     let policy = source_policy("otx");
     let endpoint =
         format!("https://otx.alienvault.com/api/v1/indicators/domain/{domain}/passive_dns");
-    let response = send_with_retry(
-        otx_request(&client(timeout)?, &endpoint, token.as_deref()),
-        if token.is_some() { policy.attempts } else { 1 },
+    let response = send_with_retry_for_source(
+        "otx",
+        otx_request(&client(timeout)?, &endpoint, Some(&token)),
+        policy.attempts,
         policy.base_backoff,
         domain,
     )
@@ -768,12 +938,6 @@ pub(super) async fn otx(
     if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
         let (_, body) = response_bytes_limited(response, "OTX").await?;
         let detail = String::from_utf8_lossy(&body);
-        if token.is_none() {
-            bail!(
-                "OTX limite l'accès anonyme (HTTP 429); configurez OTX_API_KEY ou X_OTX_API_KEY: {}",
-                detail.trim()
-            );
-        }
         bail!("OTX limite la clé fournie (HTTP 429): {}", detail.trim());
     }
     let response = response_json::<OtxResponse>(response, "OTX").await?;
@@ -820,6 +984,9 @@ pub(super) async fn shodan(
         commit_result_page(&mut names, page_names);
         if !response.more {
             break;
+        }
+        if page == 10 {
+            bail!("Shodan: limite de pagination atteinte avec des résultats supplémentaires");
         }
     }
     Ok(names)
@@ -875,6 +1042,132 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("secret-test")
         );
+    }
+
+    #[test]
+    fn driftnet_request_uses_the_documented_ct_contract() {
+        assert_eq!(DRIFTNET_MAX_PAGES, 10);
+        let request = driftnet_request(
+            &client(Duration::from_secs(1)).unwrap(),
+            "example.com",
+            3,
+            "driftnet-token",
+        )
+        .build()
+        .unwrap();
+        assert_eq!(request.url().host_str(), Some("api.driftnet.io"));
+        assert_eq!(request.url().path(), "/v1/ct/log");
+        assert_eq!(
+            request
+                .headers()
+                .get("Authorization")
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer driftnet-token")
+        );
+        let query = request.url().query_pairs().collect::<Vec<_>>();
+        assert!(query.contains(&("field".into(), "host:example.com".into())));
+        assert!(query.contains(&("page".into(), "3".into())));
+        assert!(!query.iter().any(|(name, _)| name == "summary_limit"));
+    }
+
+    #[test]
+    fn driftnet_pages_accept_numeric_strings_and_extract_only_in_scope_names() {
+        let page: DriftnetPage = serde_json::from_value(serde_json::json!({
+            "page": "0",
+            "pages": "2",
+            "result_count": 101,
+            "results": [{
+                "date": "2026-07-16",
+                "id": "fixture-report",
+                "items": [
+                    {"context": "cert-dns-name", "type": "host", "value": "api.example.com"},
+                    {"context": "cert-dns-name", "type": "host", "value": "*.wild.example.com"},
+                    {"context": "ct-log", "type": "url", "value": "https://cdn.example.com/log/"},
+                    {"context": "cert-dns-name", "type": "host", "value": "outside.test"},
+                    {"context": "ct-log", "type": "index", "value": 42}
+                ]
+            }]
+        }))
+        .unwrap();
+        assert_eq!(driftnet_pagination(&page, 0).unwrap(), (0, 2));
+        assert!(!page.timed_out);
+        assert_eq!(
+            driftnet_page_names(&page, "example.com"),
+            BTreeSet::from([
+                "api.example.com".to_owned(),
+                "cdn.example.com".to_owned(),
+                "wild.example.com".to_owned()
+            ])
+        );
+    }
+
+    #[test]
+    fn driftnet_schema_and_pagination_fail_explicitly() {
+        assert!(
+            serde_json::from_value::<DriftnetPage>(serde_json::json!({
+                "page": 0,
+                "pages": 1,
+                "error": "quota exceeded"
+            }))
+            .is_err()
+        );
+
+        let invalid_page: DriftnetPage = serde_json::from_value(serde_json::json!({
+            "page": [],
+            "pages": 1,
+            "results": []
+        }))
+        .unwrap();
+        assert!(
+            format!("{:#}", driftnet_pagination(&invalid_page, 0).unwrap_err())
+                .contains("champ de pagination page invalide")
+        );
+
+        let repeated_page: DriftnetPage = serde_json::from_value(serde_json::json!({
+            "page": 1,
+            "pages": 2,
+            "results": []
+        }))
+        .unwrap();
+        assert!(
+            format!("{:#}", driftnet_pagination(&repeated_page, 0).unwrap_err())
+                .contains("page inattendue 1")
+        );
+
+        let timed_out: DriftnetPage = serde_json::from_value(serde_json::json!({
+            "page": 0,
+            "pages": 2,
+            "timed_out": true,
+            "results": []
+        }))
+        .unwrap();
+        assert!(timed_out.timed_out);
+
+        assert!(
+            driftnet_http_error(
+                reqwest::StatusCode::UNAUTHORIZED,
+                br#"{"message":"bad token"}"#
+            )
+            .unwrap()
+            .contains("jeton API invalide (HTTP 401)")
+        );
+        assert!(
+            driftnet_http_error(reqwest::StatusCode::FORBIDDEN, br#"{"message":"quota"}"#)
+                .unwrap()
+                .contains("quota API dépassé (HTTP 403)")
+        );
+        assert!(
+            driftnet_http_error(reqwest::StatusCode::from_u16(524).unwrap(), b"")
+                .unwrap()
+                .contains("timeout CDN amont (HTTP 524)")
+        );
+        let oversized = format!("bad\nrequest \u{1b}[31m{}\u{202e}", "x".repeat(1_000));
+        let diagnostic =
+            driftnet_http_error(reqwest::StatusCode::UNAUTHORIZED, oversized.as_bytes()).unwrap();
+        assert!(diagnostic.contains("bad request"));
+        assert!(diagnostic.ends_with('…'));
+        assert!(!diagnostic.contains('\u{1b}'));
+        assert!(!diagnostic.contains('\u{202e}'));
     }
 
     #[test]

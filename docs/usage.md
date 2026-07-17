@@ -149,7 +149,7 @@ fellaga sources --json
 fellaga sources --check --target your-domain.example
 ```
 
-Use `--passive-sources` for an explicit comma-separated allowlist and `--exclude-sources` to remove providers. `--all-sources` also attempts connectors whose required credentials are missing and therefore normally creates predictable configuration errors; it is mainly a connector-diagnostic option.
+Use `--passive-sources` for an explicit comma-separated allowlist and `--exclude-sources` to remove providers. `--all-sources` includes every registered connector, but a connector whose required credential is absent is skipped during local preflight without making a network request. `sources --check` reports that condition as `skipped_missing_key`; scans retain any permanent cached observations from the connector and report it as unavailable for refresh.
 
 Initial passive collection and AXFR checks run concurrently, while the direct CT-log monitor runs as an opportunistic background task. DNS validation can begin without waiting for unfinished raw CT indexing. The passive budget is charged only for elapsed passive phases, not for CT, AXFR, DNS validation, or other unrelated work. Each connector receives a deadline bounded by the remaining phase budget. If a paginated connector returns valid pages and then times out, Fellaga saves the names already collected, marks the source result as partial/degraded, and reports the condition in progress output and scan warnings.
 

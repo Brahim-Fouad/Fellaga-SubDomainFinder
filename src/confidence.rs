@@ -24,6 +24,7 @@ pub fn evidence_family(source: &str) -> Option<EvidenceFamily> {
         || source.starts_with("passive:ct-direct")
         || source.starts_with("passive:google-ct")
         || source.starts_with("passive:merklemap")
+        || source.starts_with("passive:driftnet")
     {
         return Some(EvidenceFamily::CertificateTransparency);
     }
@@ -215,6 +216,10 @@ mod tests {
         );
         assert_eq!(
             evidence_family("passive:merklemap"),
+            Some(EvidenceFamily::CertificateTransparency)
+        );
+        assert_eq!(
+            evidence_family("passive:driftnet"),
             Some(EvidenceFamily::CertificateTransparency)
         );
         assert_eq!(

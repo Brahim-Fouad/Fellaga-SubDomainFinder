@@ -15,7 +15,7 @@ Fellaga separates discovery from validation. A provider response, certificate na
 
 The `passive` profile disables stages that directly contact target application services or authoritative servers for enrichment, but passive-provider requests, CT collection, wildcard probes, and DNS validation still use the network.
 
-Initial passive collection, direct CT monitoring, and AXFR are independent futures. Direct CT-log indexing is opportunistic and never gates the first DNS-validation wave. A process-wide single-flight gate allows only one raw-log indexer at a time. After a completed global pass, its SQLite refresh marker and indexed names are reused for ten minutes instead of repeating the same log reads for another target. Completed results are merged within the bounded background window, and committed partial progress remains available to later scans. Profile CT budgets are 30 seconds for `deep`, 10 for `balanced`, 30 for `passive`, and 5 for `turbo`. Targeted CT providers such as crt.sh, Cert Spotter, and MerkleMap remain part of the passive connector phase.
+Initial passive collection, direct CT monitoring, and AXFR are independent futures. Direct CT-log indexing is opportunistic and never gates the first DNS-validation wave. Its progress identifies the selected public log, log position, stored cursor, tree size, entry range, per-request timeout, and remaining phase budget. A process-wide single-flight gate allows only one raw-log indexer at a time. After a completed global pass, its SQLite refresh marker and indexed names are reused for ten minutes instead of repeating the same log reads for another target. Completed results are merged within the bounded background window, and committed partial progress remains available to later scans. Profile CT budgets are 30 seconds for `deep`, 10 for `balanced`, 30 for `passive`, and 5 for `turbo`. Targeted CT providers such as crt.sh, Cert Spotter, and MerkleMap remain part of the passive connector phase.
 
 ## Persistent candidate scheduler
 
@@ -34,7 +34,7 @@ Active generation is lazy: the one-million-name corpus is traversed with a durab
 
 | Method | Behavior |
 | --- | --- |
-| Passive connectors | Queries a registry of 30 public and credentialed services with per-provider rate limits, bounded responses, retry policy, partial-page retention, and permanent merged observations. BinaryEdge, MerkleMap, and Brave use targeted one-page fast paths with at most one provider-signalled follow-up page. |
+| Passive connectors | Queries a registry of 30 public and credentialed services with per-provider rate limits, bounded responses, safe-method retry policy, immediate SQLite page commits, bounded in-memory candidate sets, and permanent merged observations. BinaryEdge, MerkleMap, and Brave use targeted one-page fast paths with at most one provider-signalled follow-up page. |
 | Certificate Transparency | Combines provider results with direct incremental CT-log monitoring and extracts in-scope SAN/CN names. |
 | DNS brute force | Processes an embedded one-million-candidate corpus, user wordlists, mutations, and locally learned patterns in prioritized waves. |
 | Recursive discovery | Tests high-yield labels below validated parents up to the selected profile depth. |

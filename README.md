@@ -15,8 +15,9 @@ Fellaga is a fast, adaptive subdomain enumerator written in Rust for Kali Linux 
 - Native asynchronous DNS engine with correlated UDP queries, EDNS0, TCP fallback, resolver balancing, retries, global rate limiting, and a health-qualified two-packet negative path for fresh generated candidates.
 - Adaptive `deep` scan by default: 30 passive connectors, Certificate Transparency, a one-million-candidate corpus, recursive DNS, AXFR, DNSSEC/NSEC, Web and JavaScript discovery, TLS/STARTTLS, and bounded PTR pivots.
 - Targeted BinaryEdge, MerkleMap, and Brave Search connectors use one-page fast paths and request at most one additional page when the provider reports more raw results.
+- OTX passive DNS is enabled automatically when its API key is configured, while the official authenticated Driftnet Certificate Transparency connector becomes eligible for automatic `deep` scans with its key; browser-facing anti-bot connectors remain manual in every profile.
 - Persistent, lazy candidate scheduling: passive/authoritative seeds and active word generators are consumed in bounded SQLite-backed waves instead of being materialized in memory before DNS starts.
-- Yield-aware source scheduling learns each connector's marginal unique-name yield, reliability, and latency; complete pages remain usable when a later page reaches its deadline.
+- Yield-aware source scheduling learns each connector's marginal unique-name yield, reliability, and latency; complete pages remain usable when a later page reaches its deadline, and source checks distinguish `success`, `empty`, `degraded`, `deferred_budget`, `skipped_missing_key`, `rate_limited`, `auth_required`, `anti_bot`, `upstream_error`, `transport_error`, `tls_error`, `schema_error`, `timeout`, and the uncategorized `error` fallback.
 - Hierarchical wildcard detection, rotating-answer recognition, exact-signature filtering, trusted-resolver consensus, and optional authoritative validation.
 - Permanent SQLite inventory with `live`, `historical`, and `unverified` states; a complete refresh quarantines exact wildcard-signature matches only after fresh trusted-resolver consensus, while retaining their provenance and validation history.
 - Evidence-family scoring so multiple providers backed by the same underlying dataset are not counted as independent proof.
@@ -31,8 +32,8 @@ Fellaga is a fast, adaptive subdomain enumerator written in Rust for Kali Linux 
 Download the release package and install it with APT. Checksums, a Sigstore-signed manifest, and GitHub attestations are available for independent verification:
 
 ```bash
-curl -fLO https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/download/v0.8.5/fellaga_0.8.5-1_amd64.deb
-sudo apt install ./fellaga_0.8.5-1_amd64.deb
+curl -fLO https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/download/v0.8.6/fellaga_0.8.6-1_amd64.deb
+sudo apt install ./fellaga_0.8.6-1_amd64.deb
 fellaga --version
 ```
 
@@ -58,6 +59,9 @@ Replace `your-domain.example` with an authorized target:
 # Adaptive deep scan with safe resource limits
 fellaga scan your-domain.example
 
+# Fast bounded scan with broad DNS discovery and shorter enrichment budgets
+fellaga scan your-domain.example --profile turbo
+
 # Show only currently validated DNS names
 fellaga scan your-domain.example --only-live
 
@@ -73,7 +77,7 @@ fellaga scan your-domain.example --resume latest
 
 The default scan processes one domain at a time, caps shared DNS traffic at 250 logical queries per second, and keeps at most 128 host resolutions in flight. The rate cap remains active across validation and enrichment traffic unless `--dns-rate-limit 0` explicitly disables it. Runtime limits are profile-specific: `deep` stops after 600 seconds, `balanced` and `turbo` after 300 seconds, and `passive` after 180 seconds unless `--max-runtime` overrides the limit. The default `deep` profile also gives wildcard profiling and active candidate work a shared 120-second budget. Embedded and user wordlists, mutations, retries, and recursive candidate generation all consume that budget. At the deadline, completed outcomes are kept, unfinished names are requeued as indeterminate, and the scan can continue later with `--resume latest`. Set `--active-max-runtime 0` to disable this time bound. `--no-adaptive` disables low-yield stopping and uses the configured recursion ceilings, but it does not disable ranking, time limits, or DNS rate safeguards. Transient candidate-resolution failures receive at most three total attempts.
 
-Long-running phases emit periodic progress on standard error. Direct CT-log indexing runs opportunistically in the background and never gates the first DNS-validation wave; its `deep`/`balanced`/`passive`/`turbo` budgets are 30/10/30/5 seconds. One process-wide CT indexer runs at a time, and a completed global pass establishes a ten-minute SQLite freshness window that prevents duplicate raw-log work. Initial passive collection and AXFR remain bounded independently; passive budgets are 45/25/60/15 seconds and AXFR allows four concurrent transfers globally with a four-second default per nameserver. Wildcard detection starts with three randomized probes and spends two additional probes only when the first stage is ambiguous. Web and JavaScript discovery also uses one cumulative profile budget across the initial crawl and later pipeline rounds. Completed connector pages and Web fetches are retained after a later operation times out, and the affected phase is reported as partial. Final JSON records include `phase_timings` for initial discovery, candidate DNS, enrichment, and finalization.
+Long-running phases emit periodic progress on standard error. Direct CT-log indexing reports the selected log, durable cursor, entry range, request timeout, and remaining phase budget. It runs opportunistically in the background and never gates the first DNS-validation wave; its `deep`/`balanced`/`passive`/`turbo` budgets are 30/10/30/5 seconds. One process-wide CT indexer runs at a time, and a completed global pass establishes a ten-minute SQLite freshness window that prevents duplicate raw-log work. Initial passive collection and AXFR remain bounded independently; passive budgets are 45/25/60/15 seconds and AXFR allows four concurrent transfers globally with a four-second default per nameserver. Wildcard detection starts with three randomized probes and spends two additional probes only when the first stage is ambiguous. Web and JavaScript discovery also uses one cumulative profile budget across the initial crawl and later pipeline rounds. Completed connector pages are committed to permanent SQLite observations as they arrive, while the active in-memory source set remains bounded. Web fetches are likewise retained after a later operation times out, and the affected phase is reported as partial. Final JSON records include `phase_timings` for initial discovery, candidate DNS, enrichment, and finalization.
 
 Fellaga displays all retained states by default:
 
@@ -109,6 +113,8 @@ fellaga refresh your-domain.example
 ```
 
 Run `fellaga <command> --help` for the complete option list.
+
+Driftnet requires `DRIFTNET_API_KEY`, and OTX requires `OTX_API_KEY` (or `X_OTX_API_KEY`). Credentials can be supplied through environment variables or `~/.config/fellaga/config.json`. Fellaga sends a transparent `Fellaga/<version>` HTTP user agent with the project URL by default; `FELLAGA_USER_AGENT` provides an optional organization-specific override. See [passive sources and credentials](docs/sources.md) for the connector catalog, health statuses, and configuration format.
 
 ## Documentation
 

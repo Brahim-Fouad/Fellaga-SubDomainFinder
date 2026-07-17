@@ -2,7 +2,10 @@ use crate::model::EvidenceFamily;
 use crate::util::normalize_observed_name;
 use anyhow::{Context, Result, bail};
 use futures_util::{StreamExt, stream};
-use reqwest::header::RETRY_AFTER;
+use reqwest::ResponseBuilderExt;
+use reqwest::header::{
+    ACCEPT, ACCEPT_LANGUAGE, CONTENT_LENGTH, HeaderMap, HeaderValue, RETRY_AFTER, TRANSFER_ENCODING,
+};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -15,7 +18,7 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, RwLock};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex as TokioMutex, Semaphore};
 use url::Url;
 
@@ -164,9 +167,9 @@ const SOURCE_DEFINITIONS: &[SourceDefinition] = &[
     },
     SourceDefinition {
         name: "driftnet",
-        requires_key: false,
-        key_environment: None,
-        automatic: false,
+        requires_key: true,
+        key_environment: Some("DRIFTNET_API_KEY"),
+        automatic: true,
     },
     SourceDefinition {
         name: "fullhunt",
@@ -218,7 +221,7 @@ const SOURCE_DEFINITIONS: &[SourceDefinition] = &[
     },
     SourceDefinition {
         name: "otx",
-        requires_key: false,
+        requires_key: true,
         key_environment: Some("OTX_API_KEY"),
         automatic: true,
     },
@@ -740,6 +743,7 @@ fn environment_names(source: &str) -> &'static [&'static str] {
         "circl" => &["CIRCL_PDNS_CREDENTIALS"],
         "certspotter" => &["CERTSPOTTER_API_TOKEN"],
         "chaos" => &["CHAOS_API_KEY"],
+        "driftnet" => &["DRIFTNET_API_KEY"],
         "fullhunt" => &["FULLHUNT_API_KEY"],
         "github" => &["GITHUB_TOKEN", "GITHUB_TOKENS"],
         "gitlab" => &["GITLAB_TOKEN"],
@@ -765,9 +769,7 @@ pub fn source_statuses(keys: &ApiKeyStore) -> Vec<SourceStatus> {
             requires_key: entry.requires_key,
             key_environment: entry.key_environment.map(ToOwned::to_owned),
             configured: keys.has(entry.name),
-            automatic: entry.automatic
-                && (!entry.requires_key || keys.has(entry.name))
-                && (entry.name != "otx" || keys.has(entry.name)),
+            automatic: entry.automatic && (!entry.requires_key || keys.has(entry.name)),
             metadata: source_metadata(entry.name),
         })
         .collect()
@@ -826,7 +828,10 @@ pub fn source_metadata(name: &str) -> SourceMetadata {
         authentication,
         rate_limit_per_minute,
         experimental,
-        documented: !experimental,
+        documented: !matches!(
+            name,
+            "certificatedetails" | "subdomainapp" | "subdomaincenter"
+        ),
     }
 }
 
@@ -841,10 +846,7 @@ pub fn automatic_sources_for_profile(
     source_statuses(keys)
         .into_iter()
         .filter(|source| {
-            (source.automatic && (!source.metadata.experimental || include_experimental))
-                || (include_experimental
-                    && source.metadata.experimental
-                    && (!source.requires_key || source.configured))
+            source.automatic && (!source.metadata.experimental || include_experimental)
         })
         .map(|source| source.name)
         .collect()
@@ -864,6 +866,10 @@ static COMMONCRAWL_GATE: OnceLock<Semaphore> = OnceLock::new();
 static COMMONCRAWL_LAST_REQUEST: OnceLock<TokioMutex<Option<Instant>>> = OnceLock::new();
 type ExternalHostLimiters = StdMutex<BTreeMap<String, Arc<TokioMutex<Option<Instant>>>>>;
 static EXTERNAL_HOST_LIMITERS: OnceLock<ExternalHostLimiters> = OnceLock::new();
+type ExternalSourceLimiters = StdMutex<BTreeMap<String, Arc<TokioMutex<Option<Instant>>>>>;
+static EXTERNAL_SOURCE_LIMITERS: OnceLock<ExternalSourceLimiters> = OnceLock::new();
+type ExternalClients = StdMutex<BTreeMap<u64, reqwest::Client>>;
+static EXTERNAL_CLIENTS: OnceLock<ExternalClients> = OnceLock::new();
 
 const MAX_EXTERNAL_BODY_BYTES: usize = 16 * 1024 * 1024;
 const COMMONCRAWL_INDEX_COUNT: usize = 5;
@@ -917,28 +923,123 @@ impl std::error::Error for SourceBudgetExceeded {}
 pub struct PassiveFetchResult {
     pub names: BTreeSet<String>,
     pub partial_warning: Option<String>,
+    /// Names decoded by the provider before applying the working-set cap.
+    /// Paginated connectors sum the distinct count of each decoded page, so a
+    /// provider that repeats a name across pages may count it more than once.
+    pub decoded_names: usize,
+    /// The connector decoded more distinct names than it retained in its
+    /// in-memory working set. A configured page sink still receives the full
+    /// decoded pages before this cap is applied.
+    pub working_set_truncated: bool,
 }
 
-#[derive(Clone, Default)]
+pub type PassivePageSink = Arc<dyn Fn(&BTreeSet<String>) -> Result<()> + Send + Sync>;
+
+#[derive(Default)]
+struct PartialResultState {
+    names: BTreeSet<String>,
+    committed_pages: usize,
+    decoded_names: usize,
+    working_set_truncated: bool,
+    persistence_error: Option<String>,
+}
+
+#[derive(Clone)]
 struct PartialResultCheckpoint {
-    names: Arc<StdMutex<BTreeSet<String>>>,
+    state: Arc<StdMutex<PartialResultState>>,
+    working_set_limit: usize,
+    page_sink: Option<PassivePageSink>,
 }
 
 impl PartialResultCheckpoint {
-    fn merge(&self, names: &BTreeSet<String>) {
-        let mut checkpoint = self
-            .names
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        checkpoint.extend(names.iter().cloned());
+    fn new(working_set_limit: usize, page_sink: Option<PassivePageSink>) -> Self {
+        Self {
+            state: Arc::new(StdMutex::new(PartialResultState::default())),
+            working_set_limit,
+            page_sink,
+        }
     }
 
-    fn snapshot(&self) -> BTreeSet<String> {
-        self.names
+    fn commit_page(&self, names: &BTreeSet<String>) {
+        let persistence_error = self
+            .page_sink
+            .as_ref()
+            .and_then(|sink| sink(names).err())
+            .map(|error| format!("persistance SQLite de page passive: {error:#}"));
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.committed_pages = state.committed_pages.saturating_add(1);
+        state.decoded_names = state.decoded_names.saturating_add(names.len());
+        state.working_set_truncated |= extend_btree_set_bounded(
+            &mut state.names,
+            names.iter().cloned(),
+            self.working_set_limit,
+        );
+        if state.persistence_error.is_none() {
+            state.persistence_error = persistence_error;
+        }
+    }
+
+    fn persist_non_paginated_result(&self, names: &BTreeSet<String>) {
+        let should_persist = self
+            .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
+            .committed_pages
+            == 0;
+        if !should_persist || names.is_empty() {
+            return;
+        }
+        let persistence_error = self
+            .page_sink
+            .as_ref()
+            .and_then(|sink| sink(names).err())
+            .map(|error| format!("persistance SQLite du résultat passif: {error:#}"));
+        if let Some(persistence_error) = persistence_error {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if state.persistence_error.is_none() {
+                state.persistence_error = Some(persistence_error);
+            }
+        }
     }
+
+    fn snapshot(&self) -> PartialResultState {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        PartialResultState {
+            names: state.names.clone(),
+            committed_pages: state.committed_pages,
+            decoded_names: state.decoded_names,
+            working_set_truncated: state.working_set_truncated,
+            persistence_error: state.persistence_error.clone(),
+        }
+    }
+}
+
+fn extend_btree_set_bounded(
+    target: &mut BTreeSet<String>,
+    names: impl IntoIterator<Item = String>,
+    limit: usize,
+) -> bool {
+    let mut truncated = false;
+    for name in names {
+        if target.contains(&name) {
+            continue;
+        }
+        if target.len() < limit {
+            target.insert(name);
+        } else {
+            truncated = true;
+        }
+    }
+    truncated
 }
 
 tokio::task_local! {
@@ -952,8 +1053,19 @@ pub(super) fn commit_result_page(accumulated: &mut BTreeSet<String>, page: BTree
     if page.is_empty() {
         return;
     }
-    let _ = PARTIAL_RESULT_CHECKPOINT.try_with(|checkpoint| checkpoint.merge(&page));
-    accumulated.extend(page);
+    if PARTIAL_RESULT_CHECKPOINT
+        .try_with(|checkpoint| {
+            checkpoint.commit_page(&page);
+            extend_btree_set_bounded(
+                accumulated,
+                page.iter().cloned(),
+                checkpoint.working_set_limit,
+            )
+        })
+        .is_err()
+    {
+        accumulated.extend(page);
+    }
 }
 
 pub fn source_policy(source: &str) -> SourcePolicy {
@@ -967,7 +1079,7 @@ pub fn source_policy(source: &str) -> SourcePolicy {
         "commoncrawl" => SourcePolicy {
             timeout: Duration::from_secs(30),
             total_timeout: Duration::from_secs(45),
-            attempts: 3,
+            attempts: 2,
             base_backoff: Duration::from_secs(1),
         },
         "wayback" => SourcePolicy {
@@ -1043,7 +1155,6 @@ async fn throttle_commoncrawl() {
 
 #[derive(Debug, Deserialize)]
 struct CrtRow {
-    #[serde(default)]
     name_value: String,
 }
 
@@ -1067,7 +1178,6 @@ struct CommonCrawlRow {
 
 #[derive(Debug, Deserialize)]
 struct UrlscanResponse {
-    #[serde(default)]
     results: Vec<UrlscanResult>,
 }
 
@@ -1087,13 +1197,11 @@ struct UrlscanHost {
 
 #[derive(Debug, Deserialize)]
 struct SubdomainAppResponse {
-    #[serde(default)]
     subdomains: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct VirusTotalResponse {
-    #[serde(default)]
     data: Vec<VirusTotalDomain>,
     links: Option<VirusTotalLinks>,
 }
@@ -1110,7 +1218,6 @@ struct VirusTotalLinks {
 
 #[derive(Debug, Deserialize)]
 struct SecurityTrailsResponse {
-    #[serde(default)]
     subdomains: Vec<String>,
 }
 
@@ -1134,7 +1241,6 @@ struct WhoisXmlRecord {
 
 #[derive(Debug, Deserialize)]
 struct NetlasResponse {
-    #[serde(default)]
     items: Vec<NetlasItem>,
 }
 
@@ -1148,12 +1254,45 @@ struct NetlasDomain {
     domain: String,
 }
 
-fn client(timeout: Duration) -> Result<reqwest::Client> {
+fn valid_user_agent_override(value: &str) -> bool {
+    let value = value.trim();
+    !value.is_empty()
+        && value.len() <= 256
+        && value.is_ascii()
+        && !value.chars().any(char::is_control)
+        && HeaderValue::from_str(value).is_ok()
+}
+
+pub(crate) fn external_user_agent() -> String {
+    std::env::var("FELLAGA_USER_AGENT")
+        .ok()
+        .filter(|value| valid_user_agent_override(value))
+        .map(|value| value.trim().to_owned())
+        .unwrap_or_else(|| {
+            format!(
+                "Fellaga/{} (+https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder)",
+                env!("CARGO_PKG_VERSION")
+            )
+        })
+}
+
+fn build_client(timeout: Duration) -> Result<reqwest::Client> {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        ACCEPT,
+        HeaderValue::from_static(
+            "application/json, application/x-ndjson, text/plain;q=0.9, text/html;q=0.7, */*;q=0.5",
+        ),
+    );
+    headers.insert(ACCEPT_LANGUAGE, HeaderValue::from_static("en-US,en;q=0.8"));
     Ok(reqwest::Client::builder()
         .timeout(timeout)
         .connect_timeout(timeout.min(Duration::from_secs(10)))
         .pool_idle_timeout(Duration::from_secs(30))
+        .pool_max_idle_per_host(2)
         .tcp_keepalive(Duration::from_secs(30))
+        .tcp_nodelay(true)
+        .default_headers(headers)
         .redirect(reqwest::redirect::Policy::custom(|attempt| {
             let Some(previous) = attempt.previous().last() else {
                 return attempt.error("redirect without an origin request");
@@ -1166,11 +1305,28 @@ fn client(timeout: Duration) -> Result<reqwest::Client> {
                 attempt.error("cross-origin external redirect rejected")
             }
         }))
-        .user_agent(concat!(
-            "Fellaga-SubDomainFinder/",
-            env!("CARGO_PKG_VERSION")
-        ))
+        .user_agent(external_user_agent())
         .build()?)
+}
+
+fn client(timeout: Duration) -> Result<reqwest::Client> {
+    let timeout_key = timeout.as_millis().clamp(1, u64::MAX as u128) as u64;
+    if let Some(client) = EXTERNAL_CLIENTS
+        .get_or_init(|| StdMutex::new(BTreeMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&timeout_key)
+        .cloned()
+    {
+        return Ok(client);
+    }
+
+    let built = build_client(timeout)?;
+    let mut clients = EXTERNAL_CLIENTS
+        .get_or_init(|| StdMutex::new(BTreeMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    Ok(clients.entry(timeout_key).or_insert(built).clone())
 }
 
 fn same_http_origin(previous: &Url, next: &Url) -> bool {
@@ -1189,6 +1345,12 @@ fn retry_after_delay(value: &str) -> Option<Duration> {
         .ok()
 }
 
+fn unix_reset_delay(value: &str) -> Option<Duration> {
+    let reset_at = value.trim().parse::<u64>().ok()?;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+    Some(Duration::from_secs(reset_at.saturating_sub(now)))
+}
+
 fn backoff_delay(seed: &str, attempt: usize, base: Duration) -> Duration {
     let multiplier = 1_u32.checked_shl(attempt.min(8) as u32).unwrap_or(256);
     let base = base.saturating_mul(multiplier);
@@ -1200,16 +1362,48 @@ fn backoff_delay(seed: &str, attempt: usize, base: Duration) -> Duration {
 }
 
 fn retryable_status(status: reqwest::StatusCode) -> bool {
-    matches!(
-        status,
-        reqwest::StatusCode::REQUEST_TIMEOUT
-            | reqwest::StatusCode::TOO_EARLY
-            | reqwest::StatusCode::TOO_MANY_REQUESTS
-            | reqwest::StatusCode::INTERNAL_SERVER_ERROR
-            | reqwest::StatusCode::BAD_GATEWAY
-            | reqwest::StatusCode::SERVICE_UNAVAILABLE
-            | reqwest::StatusCode::GATEWAY_TIMEOUT
-    )
+    status.as_u16() == 524
+        || matches!(
+            status,
+            reqwest::StatusCode::REQUEST_TIMEOUT
+                | reqwest::StatusCode::TOO_EARLY
+                | reqwest::StatusCode::TOO_MANY_REQUESTS
+                | reqwest::StatusCode::INTERNAL_SERVER_ERROR
+                | reqwest::StatusCode::BAD_GATEWAY
+                | reqwest::StatusCode::SERVICE_UNAVAILABLE
+                | reqwest::StatusCode::GATEWAY_TIMEOUT
+        )
+}
+
+fn retry_safe_method(method: &reqwest::Method) -> bool {
+    method == reqwest::Method::GET
+        || method == reqwest::Method::HEAD
+        || method == reqwest::Method::OPTIONS
+        || method == reqwest::Method::TRACE
+}
+
+fn retryable_transport_error(error: &reqwest::Error) -> bool {
+    if error.is_timeout() || error.is_body() {
+        return true;
+    }
+    if !error.is_connect() {
+        return false;
+    }
+    let mut message = String::new();
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(error) = current {
+        if !message.is_empty() {
+            message.push_str(": ");
+        }
+        message.push_str(&error.to_string());
+        current = error.source();
+    }
+    let message = message.to_ascii_lowercase();
+    !message.contains("connection refused")
+        && !message.contains("connexion refusée")
+        && !message.contains("certificate")
+        && !message.contains("unknown issuer")
+        && !message.contains("invalid peer certificate")
 }
 
 fn host_minimum_gap(host: &str) -> Duration {
@@ -1226,18 +1420,16 @@ fn host_minimum_gap(host: &str) -> Duration {
     }
 }
 
-fn request_host(request: &reqwest::RequestBuilder) -> Option<String> {
-    request
-        .try_clone()?
-        .build()
-        .ok()?
-        .url()
-        .host_str()
-        .map(str::to_ascii_lowercase)
+fn request_host(request: &reqwest::RequestBuilder) -> Option<(String, String)> {
+    let request = request.try_clone()?.build().ok()?;
+    let url = request.url();
+    let host = url.host_str()?.to_ascii_lowercase();
+    let port = url.port_or_known_default()?;
+    Some((format!("{host}|{port}"), host))
 }
 
 async fn throttle_external_host(request: &reqwest::RequestBuilder) {
-    let Some(host) = request_host(request) else {
+    let Some((limiter_key, host)) = request_host(request) else {
         return;
     };
     let limiter = {
@@ -1246,7 +1438,7 @@ async fn throttle_external_host(request: &reqwest::RequestBuilder) {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         limiters
-            .entry(host.clone())
+            .entry(limiter_key)
             .or_insert_with(|| Arc::new(TokioMutex::new(None)))
             .clone()
     };
@@ -1260,33 +1452,222 @@ async fn throttle_external_host(request: &reqwest::RequestBuilder) {
     *last_request = Some(Instant::now());
 }
 
-fn server_retry_delay(response: &reqwest::Response) -> Option<Duration> {
-    response
-        .headers()
+async fn throttle_external_source(source: &str) {
+    let limiter = {
+        let mut limiters = EXTERNAL_SOURCE_LIMITERS
+            .get_or_init(|| StdMutex::new(BTreeMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        limiters
+            .entry(source.to_owned())
+            .or_insert_with(|| Arc::new(TokioMutex::new(None)))
+            .clone()
+    };
+    let requests_per_minute = source_metadata(source).rate_limit_per_minute.max(1);
+    let minimum_gap = Duration::from_millis(60_000_u64.div_ceil(u64::from(requests_per_minute)));
+    let mut last_request = limiter.lock().await;
+    if let Some(last) = *last_request
+        && last.elapsed() < minimum_gap
+    {
+        tokio::time::sleep(minimum_gap.saturating_sub(last.elapsed())).await;
+    }
+    *last_request = Some(Instant::now());
+}
+
+fn retry_delay_from_headers(headers: &HeaderMap) -> Option<Duration> {
+    headers
         .get(RETRY_AFTER)
         .and_then(|value| value.to_str().ok())
         .and_then(retry_after_delay)
         .or_else(|| {
-            response
-                .headers()
+            headers
+                .get("ratelimit-reset")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .map(Duration::from_secs)
+        })
+        .or_else(|| {
+            headers
                 .get("x-rate-limit-reset-after")
                 .and_then(|value| value.to_str().ok())
                 .and_then(retry_after_delay)
         })
+        .or_else(|| {
+            headers
+                .get("x-ratelimit-reset-after")
+                .and_then(|value| value.to_str().ok())
+                .and_then(retry_after_delay)
+        })
+        .or_else(|| {
+            headers
+                .get("x-rate-limit-reset")
+                .or_else(|| headers.get("x-ratelimit-reset"))
+                .and_then(|value| value.to_str().ok())
+                .and_then(unix_reset_delay)
+        })
 }
 
-fn compact_external_error(body: &str) -> String {
-    let compact = body.split_whitespace().collect::<Vec<_>>().join(" ");
-    let mut characters = compact.chars();
-    let shortened = characters.by_ref().take(500).collect::<String>();
-    if characters.next().is_some() {
-        format!("{shortened}…")
-    } else {
-        shortened
+fn server_retry_delay(response: &reqwest::Response) -> Option<Duration> {
+    retry_delay_from_headers(response.headers())
+}
+
+fn exhausted_rate_limit(response: &reqwest::Response) -> bool {
+    response
+        .headers()
+        .get("ratelimit-remaining")
+        .or_else(|| response.headers().get("x-rate-limit-remaining"))
+        .or_else(|| response.headers().get("x-ratelimit-remaining"))
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.trim() == "0")
+}
+
+fn unsafe_log_character(character: char) -> bool {
+    character.is_control()
+        || matches!(
+            character,
+            '\u{061C}'
+                | '\u{200E}'
+                | '\u{200F}'
+                | '\u{202A}'..='\u{202E}'
+                | '\u{2066}'..='\u{2069}'
+        )
+}
+
+pub(super) fn compact_external_error(body: &str) -> String {
+    const MAX_CHARACTERS: usize = 500;
+
+    let mut compact = String::with_capacity(body.len().min(MAX_CHARACTERS));
+    let mut characters = 0_usize;
+    let mut pending_space = false;
+    let mut truncated = false;
+
+    for character in body.chars() {
+        if character.is_whitespace() {
+            pending_space |= !compact.is_empty();
+            continue;
+        }
+        if unsafe_log_character(character) {
+            continue;
+        }
+        if pending_space {
+            if characters >= MAX_CHARACTERS {
+                truncated = true;
+                break;
+            }
+            compact.push(' ');
+            characters += 1;
+            pending_space = false;
+        }
+        if characters >= MAX_CHARACTERS {
+            truncated = true;
+            break;
+        }
+        compact.push(character);
+        characters += 1;
+    }
+    if truncated {
+        compact.push('…');
+    }
+    compact
+}
+
+#[derive(Debug)]
+struct ResponseBufferError {
+    message: String,
+    retryable: bool,
+}
+
+impl fmt::Display for ResponseBufferError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
     }
 }
 
-async fn response_bytes_limited_to(
+impl std::error::Error for ResponseBufferError {}
+
+/// Marks a response whose decoded body was already read completely and
+/// bounded by `buffer_external_response`. Downstream parsers can consume that
+/// single body allocation directly instead of copying it through another
+/// chunk accumulator.
+#[derive(Clone, Debug)]
+struct BufferedExternalBody;
+
+async fn buffer_external_response(
+    mut response: reqwest::Response,
+    max_bytes: usize,
+) -> std::result::Result<reqwest::Response, ResponseBufferError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > max_bytes as u64)
+    {
+        return Err(ResponseBufferError {
+            message: format!(
+                "réponse externe supérieure à {} Mio",
+                max_bytes / 1024 / 1024
+            ),
+            retryable: false,
+        });
+    }
+    let status = response.status();
+    let retryable_body = status.is_success();
+    let version = response.version();
+    let url = response.url().clone();
+    let mut headers = response.headers().clone();
+    let extensions = std::mem::take(response.extensions_mut());
+    let mut body = Vec::new();
+    loop {
+        let chunk = response
+            .chunk()
+            .await
+            .map_err(|error| ResponseBufferError {
+                message: format!("HTTP {status}: lecture interrompue du corps: {error}"),
+                retryable: retryable_body,
+            })?;
+        let Some(chunk) = chunk else {
+            break;
+        };
+        if body.len().saturating_add(chunk.len()) > max_bytes {
+            return Err(ResponseBufferError {
+                message: format!(
+                    "réponse externe décompressée supérieure à {} Mio",
+                    max_bytes / 1024 / 1024
+                ),
+                retryable: false,
+            });
+        }
+        body.extend_from_slice(&chunk);
+    }
+    headers.remove(CONTENT_LENGTH);
+    headers.remove(TRANSFER_ENCODING);
+    let mut rebuilt = http::Response::builder().status(status).version(version);
+    *rebuilt
+        .headers_mut()
+        .expect("un constructeur de réponse HTTP valide expose toujours ses en-têtes") = headers;
+    *rebuilt
+        .extensions_mut()
+        .expect("un constructeur de réponse HTTP valide expose toujours ses extensions") =
+        extensions;
+    let rebuilt = rebuilt.url(url);
+    let mut response = rebuilt
+        .body(reqwest::Body::from(body))
+        .map(reqwest::Response::from)
+        .map_err(|error| ResponseBufferError {
+            message: format!("reconstruction de la réponse HTTP: {error}"),
+            retryable: false,
+        })?;
+    response.extensions_mut().insert(BufferedExternalBody);
+    Ok(response)
+}
+
+fn external_response_buffer_limit(source: Option<&str>) -> usize {
+    if source == Some("commoncrawl") {
+        COMMONCRAWL_MAX_BODY_BYTES
+    } else {
+        MAX_EXTERNAL_BODY_BYTES
+    }
+}
+
+pub(crate) async fn response_bytes_limited_to(
     mut response: reqwest::Response,
     source: &str,
     max_bytes: usize,
@@ -1301,6 +1682,26 @@ async fn response_bytes_limited_to(
         );
     }
     let status = response.status();
+    if response
+        .extensions()
+        .get::<BufferedExternalBody>()
+        .is_some()
+    {
+        let body = response
+            .bytes()
+            .await
+            .with_context(|| format!("lecture de la réponse {source}"))?;
+        if body.len() > max_bytes {
+            bail!(
+                "{source}: réponse décompressée supérieure à {} Mio",
+                max_bytes / 1024 / 1024
+            );
+        }
+        // `Bytes -> Vec<u8>` reuses the owned Vec allocation when possible.
+        // Responses rebuilt above contain exactly one owned body frame, so
+        // this avoids the previous second full-body copy.
+        return Ok((status, Vec::from(body)));
+    }
     let mut body = Vec::new();
     while let Some(chunk) = response
         .chunk()
@@ -1336,7 +1737,107 @@ pub(super) async fn response_json<T: DeserializeOwned>(
             compact_external_error(&String::from_utf8_lossy(&body))
         );
     }
-    serde_json::from_slice(&body).with_context(|| format!("JSON {source} invalide"))
+    if body
+        .iter()
+        .copied()
+        .find(|byte| !byte.is_ascii_whitespace())
+        == Some(b'<')
+    {
+        bail!("{source}: réponse HTML inattendue à la place de JSON");
+    }
+    let value = serde_json::from_slice::<serde_json::Value>(&body)
+        .with_context(|| format!("JSON {source} invalide"))?;
+    if let Some(message) = provider_error_message(&value) {
+        bail!("{source}: erreur fournisseur: {message}");
+    }
+    if value.as_object().is_some_and(|object| object.is_empty()) {
+        bail!("schéma JSON {source} incompatible: objet vide");
+    }
+    serde_json::from_value(value).with_context(|| format!("schéma JSON {source} incompatible"))
+}
+
+fn provider_error_message(value: &serde_json::Value) -> Option<String> {
+    let object = value.as_object()?;
+    let status_error = object
+        .get("status")
+        .and_then(serde_json::Value::as_u64)
+        .is_some_and(|status| status >= 400)
+        || object
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|status| {
+                matches!(
+                    status.to_ascii_lowercase().as_str(),
+                    "error" | "failed" | "unauthorized" | "forbidden"
+                )
+            });
+    let code_error = object
+        .get("code")
+        .and_then(serde_json::Value::as_u64)
+        .is_some_and(|code| code >= 400)
+        || object
+            .get("code")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|code| {
+                let code = code.to_ascii_lowercase();
+                code.contains("error")
+                    || code.contains("unauthorized")
+                    || code.contains("forbidden")
+                    || code.contains("quota")
+            });
+    let failed = object.get("success").and_then(serde_json::Value::as_bool) == Some(false)
+        || object
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|status| {
+                matches!(status.to_ascii_lowercase().as_str(), "error" | "failed")
+            })
+        || status_error
+        || code_error;
+    for key in ["error", "errors"] {
+        let Some(error) = object.get(key) else {
+            continue;
+        };
+        let non_empty = match error {
+            serde_json::Value::Null => false,
+            serde_json::Value::String(value) => !value.trim().is_empty(),
+            serde_json::Value::Array(values) => !values.is_empty(),
+            serde_json::Value::Object(values) => !values.is_empty(),
+            _ => true,
+        };
+        if non_empty {
+            return Some(compact_external_error(&error.to_string()));
+        }
+    }
+    if failed {
+        return object
+            .get("message")
+            .map(|message| compact_external_error(&message.to_string()))
+            .or_else(|| Some("réponse marquée en échec".to_owned()));
+    }
+    let payload_keys = [
+        "data",
+        "domains",
+        "events",
+        "hosts",
+        "items",
+        "passive_dns",
+        "records",
+        "result",
+        "results",
+        "subdomains",
+        "web",
+    ];
+    if !payload_keys.iter().any(|key| object.contains_key(*key))
+        && let Some(message) = object
+            .get("message")
+            .or_else(|| object.get("detail"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|message| !message.trim().is_empty())
+    {
+        return Some(compact_external_error(message));
+    }
+    None
 }
 
 pub(super) async fn response_text(response: reqwest::Response, source: &str) -> Result<String> {
@@ -1371,17 +1872,49 @@ pub(super) async fn send_external(
     seed: &str,
 ) -> Result<reqwest::Response> {
     let policy = source_policy(source);
-    send_with_retry(request, policy.attempts, policy.base_backoff, seed).await
+    send_with_retry_for_source(source, request, policy.attempts, policy.base_backoff, seed).await
 }
 
+pub(super) async fn send_with_retry_for_source(
+    source: &str,
+    request: reqwest::RequestBuilder,
+    attempts: usize,
+    base_backoff: Duration,
+    seed: &str,
+) -> Result<reqwest::Response> {
+    send_with_retry_scoped(Some(source), request, attempts, base_backoff, seed).await
+}
+
+#[cfg(test)]
 pub(super) async fn send_with_retry(
     request: reqwest::RequestBuilder,
     attempts: usize,
     base_backoff: Duration,
     seed: &str,
 ) -> Result<reqwest::Response> {
-    let attempts = attempts.max(1);
+    send_with_retry_scoped(None, request, attempts, base_backoff, seed).await
+}
+
+async fn send_with_retry_scoped(
+    source: Option<&str>,
+    request: reqwest::RequestBuilder,
+    attempts: usize,
+    base_backoff: Duration,
+    seed: &str,
+) -> Result<reqwest::Response> {
+    let method = request
+        .try_clone()
+        .context("requête HTTP non clonable")?
+        .build()
+        .context("construction de la requête HTTP")?
+        .method()
+        .clone();
+    let retry_safe = retry_safe_method(&method);
+    let attempts = if retry_safe { attempts.max(1) } else { 1 };
     for attempt in 0..attempts {
+        if let Some(source) = source {
+            throttle_external_source(source).await;
+        }
         throttle_external_host(&request).await;
         let response = request
             .try_clone()
@@ -1389,27 +1922,67 @@ pub(super) async fn send_with_retry(
             .send()
             .await;
         match response {
-            Ok(response) if !retryable_status(response.status()) => return Ok(response),
             Ok(response) => {
                 let retry_after = server_retry_delay(&response);
-                if let Some(delay) = retry_after
-                    && defer_retry_after(delay)
+                let rate_limited_forbidden = response.status() == reqwest::StatusCode::FORBIDDEN
+                    && exhausted_rate_limit(&response);
+                let retryable = retryable_status(response.status()) || rate_limited_forbidden;
+                if retryable {
+                    if let Some(delay) = retry_after
+                        && defer_retry_after(delay)
+                    {
+                        bail!(
+                            "HTTP {} avec Retry-After={}s; nouvelle tentative différée",
+                            response.status(),
+                            delay.as_secs()
+                        );
+                    }
+                    if attempt + 1 < attempts {
+                        let delay = retry_after
+                            .unwrap_or_else(|| backoff_delay(seed, attempt, base_backoff));
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                    if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS
+                        || rate_limited_forbidden
+                    {
+                        let delay = retry_after.unwrap_or(Duration::from_secs(15 * 60));
+                        bail!(
+                            "HTTP {} avec Retry-After={}s; quota externe différé",
+                            response.status(),
+                            delay.as_secs()
+                        );
+                    }
+                    if let Some(delay) = retry_after {
+                        bail!(
+                            "HTTP {} avec Retry-After={}s; service amont temporairement différé",
+                            response.status(),
+                            delay.as_secs()
+                        );
+                    }
+                }
+                let response = match buffer_external_response(
+                    response,
+                    external_response_buffer_limit(source),
+                )
+                .await
                 {
-                    bail!(
-                        "HTTP {} avec Retry-After={}s; nouvelle tentative différée",
-                        response.status(),
-                        delay.as_secs()
-                    );
-                }
-                if attempt + 1 >= attempts {
-                    return Ok(response);
-                }
-                let delay =
-                    retry_after.unwrap_or_else(|| backoff_delay(seed, attempt, base_backoff));
-                tokio::time::sleep(delay).await;
+                    Ok(response) => response,
+                    Err(error) if error.retryable && attempt + 1 < attempts => {
+                        tokio::time::sleep(backoff_delay(seed, attempt, base_backoff)).await;
+                        continue;
+                    }
+                    Err(error) => {
+                        return Err(anyhow::Error::msg(sanitize_external_message(
+                            &format!("{error:#}"),
+                            &[],
+                        )));
+                    }
+                };
+                return Ok(response);
             }
             Err(error) => {
-                if attempt + 1 >= attempts {
+                if attempt + 1 >= attempts || !retryable_transport_error(&error) {
                     return Err(anyhow::Error::msg(sanitize_external_message(
                         &format!("{error:#}"),
                         &[],
@@ -1434,6 +2007,7 @@ where
     })?
 }
 
+#[cfg(test)]
 async fn enforce_source_budget_preserving_partial<F>(
     source: &str,
     budget: Duration,
@@ -1442,7 +2016,21 @@ async fn enforce_source_budget_preserving_partial<F>(
 where
     F: std::future::Future<Output = Result<BTreeSet<String>>>,
 {
-    let checkpoint = PartialResultCheckpoint::default();
+    enforce_source_budget_preserving_partial_with_sink(source, budget, request, usize::MAX, None)
+        .await
+}
+
+async fn enforce_source_budget_preserving_partial_with_sink<F>(
+    source: &str,
+    budget: Duration,
+    request: F,
+    working_set_limit: usize,
+    page_sink: Option<PassivePageSink>,
+) -> Result<PassiveFetchResult>
+where
+    F: std::future::Future<Output = Result<BTreeSet<String>>>,
+{
+    let checkpoint = PartialResultCheckpoint::new(working_set_limit, page_sink);
     let result = PARTIAL_RESULT_CHECKPOINT
         .scope(
             checkpoint.clone(),
@@ -1452,19 +2040,43 @@ where
     match result {
         Err(error) => {
             let partial = checkpoint.snapshot();
-            if partial.is_empty() {
-                Err(error)
-            } else {
+            if error.downcast_ref::<SourceBudgetExceeded>().is_some() || !partial.names.is_empty() {
+                let mut warning = format!("{error:#}");
+                if let Some(persistence_error) = partial.persistence_error {
+                    warning.push_str(&format!("; {persistence_error}"));
+                }
                 Ok(PassiveFetchResult {
-                    names: partial,
-                    partial_warning: Some(format!("{error:#}")),
+                    names: partial.names,
+                    partial_warning: Some(warning),
+                    decoded_names: partial.decoded_names,
+                    working_set_truncated: partial.working_set_truncated,
                 })
+            } else {
+                Err(error)
             }
         }
-        Ok(names) => Ok(PassiveFetchResult {
-            names,
-            partial_warning: None,
-        }),
+        Ok(mut names) => {
+            checkpoint.persist_non_paginated_result(&names);
+            let snapshot = checkpoint.snapshot();
+            let decoded_names = if snapshot.committed_pages == 0 {
+                names.len()
+            } else {
+                snapshot.decoded_names
+            };
+            let result_truncated = if names.len() > working_set_limit {
+                let retained = names.into_iter().take(working_set_limit).collect();
+                names = retained;
+                true
+            } else {
+                false
+            };
+            Ok(PassiveFetchResult {
+                names,
+                partial_warning: snapshot.persistence_error,
+                decoded_names,
+                working_set_truncated: snapshot.working_set_truncated || result_truncated,
+            })
+        }
     }
 }
 
@@ -1474,6 +2086,8 @@ async fn fetch_detailed_with_total_budget(
     timeout: Duration,
     keys: &ApiKeyStore,
     total_budget: Duration,
+    working_set_limit: usize,
+    page_sink: Option<PassivePageSink>,
 ) -> Result<PassiveFetchResult> {
     let request = async {
         match source {
@@ -1496,7 +2110,10 @@ async fn fetch_detailed_with_total_budget(
             "circl" => extra::circl(domain, timeout, keys).await,
             "certificatedetails" => extra::certificate_details(domain, timeout).await,
             "chaos" => extra::chaos(domain, timeout, keys).await,
-            "driftnet" => extra::driftnet(domain, timeout).await,
+            "driftnet" => {
+                let token = keys.pick("driftnet")?;
+                extra::driftnet(domain, timeout, &token).await
+            }
             "fullhunt" => extra::fullhunt(domain, timeout, keys).await,
             "github" => extra::github(domain, timeout, keys).await,
             "gitlab" => extra::gitlab(domain, timeout, keys).await,
@@ -1510,7 +2127,14 @@ async fn fetch_detailed_with_total_budget(
             _ => Err(anyhow::anyhow!("source passive inconnue: {source}")),
         }
     };
-    let result = enforce_source_budget_preserving_partial(source, total_budget, request).await;
+    let result = enforce_source_budget_preserving_partial_with_sink(
+        source,
+        total_budget,
+        request,
+        working_set_limit,
+        page_sink,
+    )
+    .await;
     match result {
         Ok(mut fetch) => {
             if let Some(warning) = fetch.partial_warning.as_mut() {
@@ -1537,6 +2161,8 @@ pub async fn fetch_detailed(
         timeout,
         keys,
         source_policy(source).total_timeout,
+        usize::MAX,
+        None,
     )
     .await
 }
@@ -1557,6 +2183,32 @@ pub async fn fetch_detailed_bounded(
         timeout,
         keys,
         total_budget.min(source_policy(source).total_timeout),
+        usize::MAX,
+        None,
+    )
+    .await
+}
+
+/// Runs a connector with a bounded in-memory working set. Fully decoded pages
+/// are delivered to `page_sink` before the cap is applied so callers can keep
+/// permanent observations without retaining the entire provider response.
+pub async fn fetch_detailed_bounded_with_sink(
+    source: &str,
+    domain: &str,
+    timeout: Duration,
+    keys: &ApiKeyStore,
+    total_budget: Duration,
+    working_set_limit: usize,
+    page_sink: PassivePageSink,
+) -> Result<PassiveFetchResult> {
+    fetch_detailed_with_total_budget(
+        source,
+        domain,
+        timeout,
+        keys,
+        total_budget.min(source_policy(source).total_timeout),
+        working_set_limit,
+        Some(page_sink),
     )
     .await
 }
@@ -1573,7 +2225,8 @@ pub async fn fetch(
 async fn crtsh(domain: &str, timeout: Duration) -> Result<BTreeSet<String>> {
     let client = client(timeout)?;
     let policy = source_policy("crtsh");
-    let response = send_with_retry(
+    let response = send_with_retry_for_source(
+        "crtsh",
         client
             .get("https://crt.sh/")
             .query(&[("q", format!("%.{domain}")), ("output", "json".to_owned())]),
@@ -1604,7 +2257,7 @@ async fn certspotter(
     let token = keys.optional("certspotter");
     let mut after: Option<String> = None;
     let mut names = BTreeSet::new();
-    for _page in 0..25 {
+    for page_index in 0..25 {
         let mut request = client
             .get("https://api.certspotter.com/v1/issuances")
             .query(&[
@@ -1644,6 +2297,9 @@ async fn certspotter(
             }
         }
         commit_result_page(&mut names, page_names);
+        if page_index + 1 == 25 {
+            bail!("Cert Spotter: limite de pagination atteinte avec une page supplémentaire");
+        }
     }
     Ok(names)
 }
@@ -1677,13 +2333,41 @@ fn hostname_from_url(value: &str, domain: &str) -> Option<String> {
         .and_then(|hostname| normalize_observed_name(&hostname, domain))
 }
 
+fn parse_commoncrawl_rows(body: &str, domain: &str) -> Result<BTreeSet<String>> {
+    let mut names = BTreeSet::new();
+    let mut valid = 0_usize;
+    let mut invalid = 0_usize;
+    for line in body.lines().take(COMMONCRAWL_MAX_RESULT_LINES) {
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<CommonCrawlRow>(line) {
+            Ok(row) => {
+                valid = valid.saturating_add(1);
+                if let Some(name) = hostname_from_url(&row.url, domain) {
+                    names.insert(name);
+                }
+            }
+            Err(_) => invalid = invalid.saturating_add(1),
+        }
+    }
+    let total = valid.saturating_add(invalid);
+    if invalid > 0 && (valid == 0 || invalid > 10 && invalid.saturating_mul(20) > total) {
+        bail!(
+            "index Common Crawl: format NDJSON incohérent ({invalid}/{total} ligne(s) invalides)"
+        );
+    }
+    Ok(names)
+}
+
 async fn load_commoncrawl_endpoints(
     client: &reqwest::Client,
     policy: SourcePolicy,
     seed: &str,
 ) -> Result<Vec<String>> {
     throttle_commoncrawl().await;
-    let response = send_with_retry(
+    let response = send_with_retry_for_source(
+        "commoncrawl",
         client.get("https://index.commoncrawl.org/collinfo.json"),
         policy.attempts,
         policy.base_backoff,
@@ -1715,7 +2399,8 @@ async fn query_commoncrawl(
     page_size: usize,
 ) -> Result<reqwest::Response> {
     throttle_commoncrawl().await;
-    send_with_retry(
+    send_with_retry_for_source(
+        "commoncrawl",
         client.get(endpoint).query(&[
             ("url", domain),
             ("matchType", "domain"),
@@ -1775,16 +2460,19 @@ async fn commoncrawl(domain: &str, timeout: Duration) -> Result<BTreeSet<String>
             {
                 Ok(body) => {
                     if body.trim().is_empty() {
+                        successful_requests += 1;
                         break;
                     }
-                    successful_requests += 1;
-                    let page_names = body
-                        .lines()
-                        .take(COMMONCRAWL_MAX_RESULT_LINES)
-                        .filter_map(|line| serde_json::from_str::<CommonCrawlRow>(line).ok())
-                        .filter_map(|row| hostname_from_url(&row.url, domain))
-                        .collect();
-                    commit_result_page(&mut names, page_names);
+                    match parse_commoncrawl_rows(&body, domain) {
+                        Ok(page_names) => {
+                            successful_requests += 1;
+                            commit_result_page(&mut names, page_names);
+                        }
+                        Err(error) => {
+                            errors.push(format!("{endpoint} page {page}: {error:#}"));
+                            break;
+                        }
+                    }
                 }
                 Err(error) => {
                     errors.push(format!("{endpoint} page {page}: {error:#}"));
@@ -1795,6 +2483,9 @@ async fn commoncrawl(domain: &str, timeout: Duration) -> Result<BTreeSet<String>
     }
     if successful_requests == 0 {
         bail!("Common Crawl: {}", errors.join(" | "));
+    }
+    if !errors.is_empty() {
+        bail!("Common Crawl partiel: {}", errors.join(" | "));
     }
     Ok(names)
 }
@@ -1822,6 +2513,7 @@ async fn query_wayback(
         ("collapse", "urlkey".to_owned()),
         ("filter", "statuscode:200".to_owned()),
         ("limit", limit.to_string()),
+        ("gzip", "false".to_owned()),
     ];
     if let Some(from) = from {
         query.push(("from", from.to_owned()));
@@ -1829,7 +2521,8 @@ async fn query_wayback(
     if let Some(to) = to {
         query.push(("to", to.to_owned()));
     }
-    let response = send_with_retry(
+    let response = send_with_retry_for_source(
+        "wayback",
         client
             .get("https://web.archive.org/cdx/search/cdx")
             .query(&query),
@@ -1879,7 +2572,14 @@ async fn wayback(domain: &str, timeout: Duration) -> Result<BTreeSet<String>> {
         }
     }
     if completed > 0 {
-        return Ok(names);
+        if errors.is_empty() {
+            return Ok(names);
+        }
+        bail!(
+            "Wayback partiel après échec de la requête complète ({primary_error}): {} fenêtre(s) terminée(s), {}",
+            completed,
+            errors.join(" | ")
+        );
     }
     bail!(
         "Wayback complet puis fenêtres temporelles indisponibles: {primary_error}; {}",
@@ -1892,7 +2592,7 @@ async fn urlscan(domain: &str, timeout: Duration, keys: &ApiKeyStore) -> Result<
     let token = keys.optional("urlscan");
     let mut names = BTreeSet::new();
     let mut search_after: Option<String> = None;
-    for _page in 0..5 {
+    for page_index in 0..5 {
         let mut query = vec![
             (
                 "q",
@@ -1936,8 +2636,14 @@ async fn urlscan(domain: &str, timeout: Duration, keys: &ApiKeyStore) -> Result<
             }
         }
         commit_result_page(&mut names, page_names);
-        if page_len < 1_000 || next.is_none() || next == search_after {
+        if page_len < 1_000 || next.is_none() {
             break;
+        }
+        if next == search_after {
+            bail!("urlscan: curseur de pagination répété");
+        }
+        if page_index + 1 == 5 {
+            bail!("urlscan: limite de pagination atteinte avec un curseur suivant");
         }
         search_after = next;
     }
@@ -2000,6 +2706,7 @@ async fn virustotal(
     let mut next = Some(format!(
         "https://www.virustotal.com/api/v3/domains/{domain}/subdomains?limit=40"
     ));
+    let mut visited = BTreeSet::new();
     let mut names = BTreeSet::new();
     for _ in 0..5 {
         let Some(url) = next.take() else {
@@ -2007,6 +2714,9 @@ async fn virustotal(
         };
         if !trusted_pagination_url(&url, "www.virustotal.com", "/api/v3/domains/") {
             bail!("VirusTotal a renvoyé une URL de pagination non fiable");
+        }
+        if !visited.insert(url.clone()) {
+            bail!("VirusTotal a renvoyé une URL de pagination répétée");
         }
         let response = match send_external(
             "virustotal",
@@ -2031,6 +2741,9 @@ async fn virustotal(
         commit_result_page(&mut names, page_names);
         next = response.links.and_then(|links| links.next);
     }
+    if next.is_some() {
+        bail!("VirusTotal: limite de pagination atteinte avec une page suivante");
+    }
     Ok(names)
 }
 
@@ -2049,7 +2762,7 @@ async fn whoisxml(domain: &str, timeout: Duration, keys: &ApiKeyStore) -> Result
     let key = keys.pick("whoisxml")?;
     let mut search_after = String::new();
     let mut names = BTreeSet::new();
-    for _ in 0..100 {
+    for page_index in 0..100 {
         let mut query = vec![
             ("apiKey", key.clone()),
             ("domainName", domain.to_owned()),
@@ -2077,9 +2790,14 @@ async fn whoisxml(domain: &str, timeout: Duration, keys: &ApiKeyStore) -> Result
             .filter_map(|record| normalize_observed_name(&record.domain, domain))
             .collect();
         commit_result_page(&mut names, page_names);
-        if result.next_page_search_after.is_empty() || result.next_page_search_after == search_after
-        {
+        if result.next_page_search_after.is_empty() {
             break;
+        }
+        if result.next_page_search_after == search_after {
+            bail!("WhoisXML: curseur de pagination répété");
+        }
+        if page_index + 1 == 100 {
+            bail!("WhoisXML: limite de pagination atteinte avec un curseur suivant");
         }
         search_after = result.next_page_search_after;
     }
@@ -2090,7 +2808,7 @@ async fn netlas(domain: &str, timeout: Duration, keys: &ApiKeyStore) -> Result<B
     let client = client(timeout)?;
     let key = keys.pick("netlas")?;
     let mut names = BTreeSet::new();
-    for start in (0..10_000).step_by(20).take(50) {
+    for (page_index, start) in (0..10_000).step_by(20).take(50).enumerate() {
         let response = send_external(
             "netlas",
             client
@@ -2106,7 +2824,8 @@ async fn netlas(domain: &str, timeout: Duration, keys: &ApiKeyStore) -> Result<B
         .await
         .context("connexion à Netlas Domains Search")?;
         let page = response_json::<NetlasResponse>(response, "Netlas").await?;
-        if page.items.is_empty() {
+        let page_len = page.items.len();
+        if page_len == 0 {
             break;
         }
         let page_names = page
@@ -2115,6 +2834,12 @@ async fn netlas(domain: &str, timeout: Duration, keys: &ApiKeyStore) -> Result<B
             .filter_map(|item| normalize_observed_name(&item.data.domain, domain))
             .collect();
         commit_result_page(&mut names, page_names);
+        if page_len < 20 {
+            break;
+        }
+        if page_index + 1 == 50 {
+            bail!("Netlas: limite de pagination atteinte avec une page complète");
+        }
     }
     Ok(names)
 }
@@ -2301,7 +3026,7 @@ mod tests {
     }
 
     #[test]
-    fn deep_profile_enables_accessible_experimental_connectors() {
+    fn deep_profile_only_enables_automatic_accessible_experimental_connectors() {
         let keys = ApiKeyStore::default();
         let balanced = automatic_sources_for_profile(&keys, false);
         let deep = automatic_sources_for_profile(&keys, true);
@@ -2310,9 +3035,21 @@ mod tests {
         assert!(!balanced.contains(&"driftnet".to_owned()));
         assert!(deep.contains(&"anubisdb".to_owned()));
         assert!(deep.contains(&"subdomainapp".to_owned()));
-        assert!(deep.contains(&"driftnet".to_owned()));
-        assert!(deep.contains(&"subdomaincenter".to_owned()));
+        assert!(!deep.contains(&"driftnet".to_owned()));
+        assert!(!deep.contains(&"otx".to_owned()));
+        assert!(!deep.contains(&"subdomaincenter".to_owned()));
+        assert!(!deep.contains(&"certificatedetails".to_owned()));
         assert!(!deep.contains(&"bevigil".to_owned()));
+    }
+
+    #[test]
+    fn deep_profile_enables_driftnet_only_with_a_real_key() {
+        let keys = key_store(&[("driftnet", &["driftnet-key"]), ("otx", &["otx-key"])]);
+        let deep = automatic_sources_for_profile(&keys, true);
+        assert!(deep.contains(&"driftnet".to_owned()));
+        assert!(deep.contains(&"otx".to_owned()));
+        assert!(source_metadata("driftnet").documented);
+        assert_eq!(source_metadata("otx").authentication, "required");
     }
 
     #[test]
@@ -2408,6 +3145,15 @@ mod tests {
     }
 
     #[test]
+    fn user_agent_override_accepts_only_safe_http_header_values() {
+        assert!(valid_user_agent_override(
+            "Fellaga/0.8 security@example.org"
+        ));
+        assert!(!valid_user_agent_override("Fellaga\nInjected: true"));
+        assert!(!valid_user_agent_override("Fellaga/🚀"));
+    }
+
+    #[test]
     fn unstable_sources_have_bounded_individual_policies() {
         assert_eq!(source_policy("wayback").timeout, Duration::from_secs(45));
         assert_eq!(
@@ -2417,7 +3163,7 @@ mod tests {
         assert!(source_policy("commoncrawl").total_timeout <= Duration::from_secs(45));
         assert!(source_policy("subdomaincenter").total_timeout <= Duration::from_secs(30));
         assert_eq!(source_policy("crtsh").attempts, 3);
-        assert_eq!(source_policy("commoncrawl").attempts, 3);
+        assert_eq!(source_policy("commoncrawl").attempts, 2);
         assert_eq!(
             host_minimum_gap("api.binaryedge.io"),
             Duration::from_secs(3)
@@ -2433,14 +3179,77 @@ mod tests {
         assert!(retryable_status(reqwest::StatusCode::REQUEST_TIMEOUT));
         assert!(retryable_status(reqwest::StatusCode::TOO_EARLY));
         assert!(retryable_status(reqwest::StatusCode::INTERNAL_SERVER_ERROR));
+        assert!(retryable_status(
+            reqwest::StatusCode::from_u16(524).unwrap()
+        ));
+        for method in [
+            reqwest::Method::GET,
+            reqwest::Method::HEAD,
+            reqwest::Method::OPTIONS,
+            reqwest::Method::TRACE,
+        ] {
+            assert!(retry_safe_method(&method), "{method} must be replay-safe");
+        }
+        for method in [
+            reqwest::Method::POST,
+            reqwest::Method::PUT,
+            reqwest::Method::PATCH,
+            reqwest::Method::DELETE,
+        ] {
+            assert!(!retry_safe_method(&method), "{method} must not be replayed");
+        }
         assert_eq!(retry_after_delay("12"), Some(Duration::from_secs(12)));
         let date = httpdate::fmt_http_date(SystemTime::now() + Duration::from_secs(60));
         let date_delay = retry_after_delay(&date).unwrap();
         assert!(date_delay > Duration::from_secs(55));
         assert!(date_delay <= Duration::from_secs(60));
+        let mut headers = HeaderMap::new();
+        headers.insert("ratelimit-reset", HeaderValue::from_static("17"));
+        assert_eq!(
+            retry_delay_from_headers(&headers),
+            Some(Duration::from_secs(17))
+        );
+        let reset_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            .saturating_add(30)
+            .to_string();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-ratelimit-reset",
+            HeaderValue::from_str(&reset_at).unwrap(),
+        );
+        let reset_delay = retry_delay_from_headers(&headers).unwrap();
+        assert!(reset_delay >= Duration::from_secs(29));
+        assert!(reset_delay <= Duration::from_secs(30));
         assert!(
             backoff_delay("example.com", 1, Duration::from_millis(750))
                 > backoff_delay("example.com", 0, Duration::from_millis(750))
+        );
+    }
+
+    #[test]
+    fn external_error_compaction_is_bounded_and_log_safe() {
+        assert_eq!(compact_external_error("bad\n\t request"), "bad request");
+        let input = format!("\u{1b}[31m{}\u{202e}", "x".repeat(1_000));
+        let compact = compact_external_error(&input);
+        assert!(compact.ends_with('…'));
+        assert!(compact.chars().count() <= 501);
+        assert!(!compact.contains('\u{1b}'));
+        assert!(!compact.contains('\u{202e}'));
+    }
+
+    #[test]
+    fn external_host_limiters_isolate_local_ports() {
+        let client = build_client(Duration::from_secs(1)).unwrap();
+        let first = request_host(&client.get("http://127.0.0.1:41001/")).unwrap();
+        let second = request_host(&client.get("http://127.0.0.1:41002/")).unwrap();
+        assert_ne!(first.0, second.0);
+        assert_eq!(first.1, second.1);
+        assert_eq!(
+            request_host(&client.get("https://example.com/path")),
+            Some(("example.com|443".to_owned(), "example.com".to_owned()))
         );
     }
 
@@ -2479,6 +3288,54 @@ mod tests {
             BTreeSet::from(["api.example.com".to_owned(), "mail.example.com".to_owned(),])
         );
         assert!(result.partial_warning.is_some());
+        assert!(!result.working_set_truncated);
+    }
+
+    #[tokio::test]
+    async fn capped_checkpoint_persists_the_full_page_before_retaining_a_partial_set() {
+        let persisted = Arc::new(StdMutex::new(Vec::<BTreeSet<String>>::new()));
+        let persisted_for_sink = persisted.clone();
+        let sink: PassivePageSink = Arc::new(move |page| {
+            persisted_for_sink
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(page.clone());
+            Ok(())
+        });
+        let full_page = BTreeSet::from([
+            "a.example.com".to_owned(),
+            "b.example.com".to_owned(),
+            "c.example.com".to_owned(),
+        ]);
+
+        let result = enforce_source_budget_preserving_partial_with_sink(
+            "paginated-test",
+            Duration::from_millis(10),
+            async {
+                let mut accumulated = BTreeSet::new();
+                commit_result_page(&mut accumulated, full_page.clone());
+                std::future::pending::<Result<BTreeSet<String>>>().await
+            },
+            2,
+            Some(sink),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            result.names,
+            BTreeSet::from(["a.example.com".to_owned(), "b.example.com".to_owned()])
+        );
+        assert!(result.working_set_truncated);
+        assert_eq!(result.decoded_names, 3);
+        assert!(result.partial_warning.is_some());
+        assert_eq!(
+            persisted
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_slice(),
+            &[full_page]
+        );
     }
 
     #[tokio::test]
@@ -2539,17 +3396,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_budget_timeout_without_a_committed_page_remains_an_error() {
+    async fn a_budget_timeout_without_a_committed_page_is_deferred_not_failed() {
         let result = enforce_source_budget_preserving_partial(
             "empty-test",
             Duration::from_millis(10),
             std::future::pending::<Result<BTreeSet<String>>>(),
         )
-        .await;
+        .await
+        .unwrap();
 
-        let error = result.unwrap_err();
-        assert!(error.downcast_ref::<SourceBudgetExceeded>().is_some());
-        assert!(error.to_string().contains("empty-test"));
+        assert!(result.names.is_empty());
+        assert!(
+            result
+                .partial_warning
+                .as_deref()
+                .is_some_and(|warning| warning.contains("empty-test") && warning.contains("budget"))
+        );
     }
 
     #[test]
@@ -2633,6 +3495,23 @@ mod tests {
         assert_eq!(names, BTreeSet::from(["api.example.com".to_owned()]));
     }
 
+    #[test]
+    fn commoncrawl_ndjson_rejects_schema_drift_instead_of_empty_success() {
+        let names = parse_commoncrawl_rows(
+            "{\"url\":\"https://api.example.com/path\"}\n",
+            "example.com",
+        )
+        .unwrap();
+        assert_eq!(names, BTreeSet::from(["api.example.com".to_owned()]));
+        let error = parse_commoncrawl_rows(
+            "<html>upstream challenge</html>\n{\"unexpected\":true}\n",
+            "example.com",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("format NDJSON incohérent"));
+    }
+
     #[tokio::test]
     async fn retry_after_is_honored_before_a_successful_retry() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2665,6 +3544,229 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn terminal_429_without_headers_gets_a_safe_default_deferral() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1_024];
+            let _ = socket.read(&mut request);
+            socket
+                .write_all(
+                    b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+        });
+        let error = send_with_retry(
+            build_client(Duration::from_secs(2))
+                .unwrap()
+                .get(format!("http://{address}/")),
+            1,
+            Duration::from_millis(1),
+            "rate-limit-default-test",
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("Retry-After=900s"));
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn terminal_503_with_retry_after_is_an_upstream_deferral_not_a_quota() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1_024];
+            let _ = socket.read(&mut request);
+            socket
+                .write_all(
+                    b"HTTP/1.1 503 Service Unavailable\r\nRetry-After: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+        });
+        let error = send_with_retry(
+            build_client(Duration::from_secs(2))
+                .unwrap()
+                .get(format!("http://{address}/")),
+            1,
+            Duration::from_millis(1),
+            "upstream-deferral-test",
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("service amont temporairement différé"));
+        assert!(!error.contains("quota externe"));
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_generic_403_with_retry_after_is_not_mislabeled_as_quota() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1_024];
+            let _ = socket.read(&mut request);
+            socket
+                .write_all(
+                    b"HTTP/1.1 403 Forbidden\r\nRetry-After: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+        });
+        let response = send_with_retry(
+            build_client(Duration::from_secs(2))
+                .unwrap()
+                .get(format!("http://{address}/")),
+            2,
+            Duration::from_millis(1),
+            "generic-forbidden-test",
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_explicitly_exhausted_403_is_a_quota_deferral() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1_024];
+            let _ = socket.read(&mut request);
+            socket
+                .write_all(
+                    b"HTTP/1.1 403 Forbidden\r\nX-RateLimit-Remaining: 0\r\nRetry-After: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+        });
+        let error = send_with_retry(
+            build_client(Duration::from_secs(2))
+                .unwrap()
+                .get(format!("http://{address}/")),
+            1,
+            Duration::from_millis(1),
+            "explicit-rate-limit-test",
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("quota externe différé"));
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_truncated_response_body_is_retried_as_a_complete_attempt() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for attempt in 0..2 {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut request = [0_u8; 1_024];
+                let _ = socket.read(&mut request);
+                if attempt == 0 {
+                    socket
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\nConnection: close\r\n\r\n{",
+                        )
+                        .unwrap();
+                } else {
+                    socket
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]",
+                        )
+                        .unwrap();
+                }
+            }
+        });
+        let response = send_with_retry(
+            build_client(Duration::from_secs(2))
+                .unwrap()
+                .get(format!("http://{address}/")),
+            2,
+            Duration::from_millis(1),
+            "truncated-body-test",
+        )
+        .await
+        .unwrap();
+        let values = response_json::<Vec<serde_json::Value>>(response, "truncated-test")
+            .await
+            .unwrap();
+        assert!(values.is_empty());
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_truncated_401_body_is_not_replayed_and_keeps_its_status() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1_024];
+            let _ = socket.read(&mut request);
+            socket
+                .write_all(
+                    b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 20\r\nConnection: close\r\n\r\n{",
+                )
+                .unwrap();
+        });
+        let started = Instant::now();
+        let error = send_with_retry(
+            build_client(Duration::from_secs(2))
+                .unwrap()
+                .get(format!("http://{address}/")),
+            3,
+            Duration::from_secs(1),
+            "truncated-auth-test",
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("HTTP 401 Unauthorized"));
+        assert!(started.elapsed() < Duration::from_millis(750));
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn post_requests_are_never_automatically_replayed() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_listener = listener.try_clone().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = server_listener.accept().unwrap();
+            let mut request = [0_u8; 2_048];
+            let _ = socket.read(&mut request);
+            socket
+                .write_all(
+                    b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+        });
+        let response = send_with_retry(
+            build_client(Duration::from_secs(2))
+                .unwrap()
+                .post(format!("http://{address}/"))
+                .body("one-shot"),
+            3,
+            Duration::from_millis(1),
+            "post-test",
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        server.join().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        assert!(matches!(
+            listener.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+    }
+
+    #[tokio::test]
     async fn terminal_transport_errors_never_expose_query_credentials() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -2681,6 +3783,25 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(!error.contains("transport-super-secret"));
+    }
+
+    #[tokio::test]
+    async fn a_local_connection_refusal_is_not_retried() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let started = Instant::now();
+        let result = send_with_retry(
+            build_client(Duration::from_millis(250))
+                .unwrap()
+                .get(format!("http://{address}/")),
+            3,
+            Duration::from_millis(500),
+            "connection-refused-test",
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(started.elapsed() < Duration::from_millis(400));
     }
 
     #[tokio::test]
@@ -2710,6 +3831,138 @@ mod tests {
             .to_string();
         assert!(error.contains("401 Unauthorized"));
         assert!(error.contains("invalid api key"));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn api_error_envelopes_and_schema_drift_are_never_empty_successes() {
+        assert!(
+            provider_error_message(&serde_json::json!({
+                "code": 401,
+                "message": "invalid api key"
+            }))
+            .is_some_and(|message| message.contains("invalid api key"))
+        );
+        assert!(
+            provider_error_message(&serde_json::json!({
+                "message": "anonymous access is limited"
+            }))
+            .is_some_and(|message| message.contains("anonymous access"))
+        );
+        assert!(
+            serde_json::from_value::<UrlscanResponse>(serde_json::json!({
+                "message": "contract changed"
+            }))
+            .is_err()
+        );
+        assert!(serde_json::from_value::<SubdomainAppResponse>(serde_json::json!({})).is_err());
+    }
+
+    #[tokio::test]
+    async fn buffered_response_preserves_url_extensions_and_reuses_the_validated_body() {
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        struct FixtureExtension(u8);
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 2_048];
+            let _ = socket.read(&mut request);
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
+                )
+                .unwrap();
+        });
+        let requested_url = format!("http://{address}/kept?cursor=1");
+        let mut response = build_client(Duration::from_secs(2))
+            .unwrap()
+            .get(&requested_url)
+            .send()
+            .await
+            .unwrap();
+        response.extensions_mut().insert(FixtureExtension(7));
+
+        let response = buffer_external_response(response, 1_024).await.unwrap();
+        assert_eq!(response.url().as_str(), requested_url);
+        assert_eq!(
+            response.extensions().get::<FixtureExtension>(),
+            Some(&FixtureExtension(7))
+        );
+        assert!(
+            response
+                .extensions()
+                .get::<BufferedExternalBody>()
+                .is_some()
+        );
+
+        let (status, body) = response_bytes_limited_to(response, "fixture", 1_024)
+            .await
+            .unwrap();
+        assert!(status.is_success());
+        assert_eq!(body, br#"{"ok":true}"#);
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn external_client_sends_transparent_identity_and_content_negotiation() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4_096];
+            let read = socket.read(&mut request).unwrap();
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]")
+                .unwrap();
+            String::from_utf8_lossy(&request[..read]).to_ascii_lowercase()
+        });
+        let response = build_client(Duration::from_secs(2))
+            .unwrap()
+            .get(format!("http://{address}/"))
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+        let request = server.join().unwrap();
+        assert!(request.contains("user-agent: fellaga/"));
+        assert!(request.contains("accept: application/json"));
+        assert!(request.contains("accept-language: en-us"));
+    }
+
+    #[tokio::test]
+    async fn external_client_decompresses_gzip_before_json_validation() {
+        const GZIP_EMPTY_ARRAY: &[u8] = &[
+            31, 139, 8, 0, 0, 0, 0, 0, 0, 3, 139, 142, 5, 0, 41, 187, 76, 13, 2, 0, 0, 0,
+        ];
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 2_048];
+            let _ = socket.read(&mut request);
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        GZIP_EMPTY_ARRAY.len()
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+            socket.write_all(GZIP_EMPTY_ARRAY).unwrap();
+        });
+        let response = build_client(Duration::from_secs(2))
+            .unwrap()
+            .get(format!("http://{address}/"))
+            .send()
+            .await
+            .unwrap();
+        let values = response_json::<Vec<serde_json::Value>>(response, "gzip-test")
+            .await
+            .unwrap();
+        assert!(values.is_empty());
         server.join().unwrap();
     }
 

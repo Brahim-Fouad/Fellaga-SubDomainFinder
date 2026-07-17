@@ -4,8 +4,8 @@ use crate::model::{
     ResolvedHost, ResolverMetric, ServiceEndpoint, Stats,
 };
 use crate::util::{
-    domain_hash, learnable_label, learnable_relative_name, now_epoch, public_suffix,
-    registrable_domain, reverse_hostname, valid_relative_name,
+    domain_hash, learnable_label, learnable_relative_name, normalize_observed_name, now_epoch,
+    public_suffix, registrable_domain, reverse_hostname, valid_relative_name,
 };
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -19,6 +19,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     mpsc,
 };
+use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -28,6 +29,15 @@ const CURRENT_SCAN_WILDCARD_MATCH_DETAILS: &str =
     r#"{"network_positive":true,"reason":"current_scan_wildcard_match"}"#;
 const CURRENT_SCAN_WILDCARD_AMBIGUITY_DETAILS: &str =
     r#"{"network_positive":true,"reason":"wildcard_profile_ambiguous"}"#;
+
+fn ensure_ct_materialization_deadline(deadline: Option<Instant>) -> Result<()> {
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        bail!(
+            "budget de matérialisation CT atteint; traitement reporté sans supprimer le cache permanent"
+        );
+    }
+    Ok(())
+}
 
 fn has_current_scan_wildcard_match(
     transaction: &rusqlite::Transaction<'_>,
@@ -431,15 +441,37 @@ pub struct SourceDiagnostic {
     pub requests: i64,
     pub successes: i64,
     pub failures: i64,
+    pub degraded: i64,
+    pub deferred: i64,
     pub consecutive_failures: i64,
     pub names: i64,
     pub novel_names: i64,
     pub novel_requests: i64,
     pub average_ms: i64,
     pub last_error: Option<String>,
+    pub last_status: String,
     pub last_used: i64,
     pub next_retry: Option<i64>,
     pub retry_in_seconds: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceResultStatus {
+    Success,
+    Failure,
+    Degraded,
+    Deferred,
+}
+
+impl SourceResultStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Failure => "failure",
+            Self::Degraded => "degraded",
+            Self::Deferred => "deferred",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1108,6 +1140,8 @@ impl Database {
                 requests INTEGER NOT NULL DEFAULT 0,
                 successes INTEGER NOT NULL DEFAULT 0,
                 failures INTEGER NOT NULL DEFAULT 0,
+                degraded INTEGER NOT NULL DEFAULT 0,
+                deferred INTEGER NOT NULL DEFAULT 0,
                 consecutive_failures INTEGER NOT NULL DEFAULT 0,
                 names INTEGER NOT NULL DEFAULT 0,
                 novel_names INTEGER NOT NULL DEFAULT 0,
@@ -1115,6 +1149,8 @@ impl Database {
                 novel_total_ms INTEGER NOT NULL DEFAULT 0,
                 total_ms INTEGER NOT NULL DEFAULT 0,
                 last_error TEXT,
+                last_status TEXT NOT NULL DEFAULT 'unknown'
+                    CHECK(last_status IN ('unknown', 'success', 'failure', 'degraded', 'deferred')),
                 last_used INTEGER NOT NULL
             );
 
@@ -1456,11 +1492,36 @@ impl Database {
                 "novel_total_ms",
                 "novel_total_ms INTEGER NOT NULL DEFAULT 0",
             ),
+            (
+                "source_stats",
+                "degraded",
+                "degraded INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "source_stats",
+                "deferred",
+                "deferred INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "source_stats",
+                "last_status",
+                "last_status TEXT NOT NULL DEFAULT 'unknown' CHECK(last_status IN ('unknown', 'success', 'failure', 'degraded', 'deferred'))",
+            ),
         ] {
             if !table_has_column(table, column)? {
                 connection.execute(&format!("ALTER TABLE {table} ADD COLUMN {definition}"), [])?;
             }
         }
+        connection.execute(
+            r#"UPDATE source_stats
+                  SET last_status=CASE
+                      WHEN failures>0 AND last_error IS NOT NULL THEN 'failure'
+                      WHEN successes>0 THEN 'success'
+                      ELSE 'unknown'
+                  END
+                WHERE last_status='unknown'"#,
+            [],
+        )?;
         // Existing v8 databases can already contain scan_candidates while
         // missing columns introduced by a later compatible release. Create
         // dependent indexes only after the additive column repair above.
@@ -1587,14 +1648,30 @@ impl Database {
     }
 
     pub fn observation_names(&self, root_domain: &str, source: &str) -> Result<Vec<String>> {
+        self.observation_names_bounded(root_domain, source, usize::MAX)
+    }
+
+    pub fn observation_names_bounded(
+        &self,
+        root_domain: &str,
+        source: &str,
+        limit: usize,
+    ) -> Result<Vec<String>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
         let connection = self.lock()?;
         let mut statement = connection.prepare(
             r#"SELECT DISTINCT n.fqdn FROM observation_evidence e
                JOIN observed_names n ON n.id=e.name_id
-               WHERE e.root_domain=?1 AND e.source=?2 ORDER BY n.fqdn"#,
+               WHERE e.root_domain=?1 AND e.source=?2
+               ORDER BY n.fqdn LIMIT ?3"#,
         )?;
         statement
-            .query_map(params![root_domain, source], |row| row.get::<_, String>(0))?
+            .query_map(
+                params![root_domain, source, limit.min(i64::MAX as usize) as i64],
+                |row| row.get::<_, String>(0),
+            )?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
     }
@@ -4721,6 +4798,15 @@ impl Database {
     }
 
     pub fn passive_cache(&self, domain: &str, source: &str) -> Result<Option<PassiveCacheEntry>> {
+        self.passive_cache_bounded(domain, source, usize::MAX)
+    }
+
+    pub fn passive_cache_bounded(
+        &self,
+        domain: &str,
+        source: &str,
+        limit: usize,
+    ) -> Result<Option<PassiveCacheEntry>> {
         let connection = self.lock()?;
         let row: Option<(String, i64)> = connection
             .query_row(
@@ -4732,13 +4818,22 @@ impl Database {
             .optional()?;
         drop(connection);
         row.map(|(names_json, updated_at)| {
-            let names = serde_json::from_str::<Vec<String>>(&names_json)?
+            let mut names = self
+                .observation_names_bounded(domain, &format!("passive:{source}"), limit)?
                 .into_iter()
-                .chain(self.observation_names(domain, &format!("passive:{source}"))?)
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect();
-            Ok(PassiveCacheEntry { names, updated_at })
+                .collect::<BTreeSet<_>>();
+            if names.len() < limit {
+                for name in serde_json::from_str::<Vec<String>>(&names_json)? {
+                    if names.len() >= limit {
+                        break;
+                    }
+                    names.insert(name);
+                }
+            }
+            Ok(PassiveCacheEntry {
+                names: names.into_iter().collect(),
+                updated_at,
+            })
         })
         .transpose()
     }
@@ -4780,43 +4875,213 @@ impl Database {
                 })
                 .collect(),
         )?;
-        let connection = self.lock()?;
-        let existing: Option<(String, i64)> = connection
-            .query_row(
-                r#"SELECT names_json, updated_at FROM passive_cache
-                   WHERE root_domain=?1 AND source=?2"#,
-                params![domain, source],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?;
-        let legacy = existing
-            .as_ref()
-            .map(|(names_json, _)| serde_json::from_str::<Vec<String>>(names_json))
-            .transpose()?
-            .unwrap_or_default();
-        let updated_at = if complete {
-            now_epoch()
-        } else {
-            existing
-                .as_ref()
-                .map(|(_, updated_at)| *updated_at)
-                .unwrap_or_default()
-        };
-        connection.execute(
-            r#"INSERT INTO passive_cache(root_domain, source, names_json, updated_at)
-               VALUES (?1, ?2, '[]', ?3)
-               ON CONFLICT(root_domain, source) DO UPDATE SET
-               updated_at=excluded.updated_at"#,
-            params![domain, source, updated_at],
+        self.mark_passive_cache_refresh(domain, source, complete)?;
+        Ok(self
+            .passive_cache(domain, source)?
+            .map(|entry| entry.names.into_iter().collect())
+            .unwrap_or_default())
+    }
+
+    pub fn store_passive_observation_page(
+        &self,
+        domain: &str,
+        source: &str,
+        names: &BTreeSet<String>,
+    ) -> Result<usize> {
+        let written = self.store_observations(
+            domain,
+            names
+                .iter()
+                .map(|fqdn| ObservationInput {
+                    fqdn: fqdn.clone(),
+                    kind: "passive".to_owned(),
+                    source: format!("passive:{source}"),
+                    value: String::new(),
+                })
+                .collect(),
         )?;
-        drop(connection);
-        let merged = legacy
-            .into_iter()
-            .chain(self.observation_names(domain, &format!("passive:{source}"))?)
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect();
-        Ok(merged)
+        // A page is durable but does not prove that the provider pagination
+        // completed. Keep the prior freshness timestamp (or zero for a new
+        // cache row) until the connector explicitly marks a complete refresh.
+        self.mark_passive_cache_refresh(domain, source, false)?;
+        Ok(written)
+    }
+
+    fn store_passive_observation_page_if_absent(
+        &self,
+        domain: &str,
+        source: &str,
+        names: &BTreeSet<String>,
+        complete: bool,
+        deadline: Option<Instant>,
+    ) -> Result<usize> {
+        ensure_ct_materialization_deadline(deadline)?;
+        let now = now_epoch();
+        let mut connection = self.lock()?;
+        ensure_ct_materialization_deadline(deadline)?;
+        let bounded_busy = deadline.map(|deadline| {
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(250))
+                .max(Duration::from_millis(1))
+        });
+        if let Some(busy) = bounded_busy {
+            connection.busy_timeout(busy)?;
+        }
+        let result = (|| {
+            let transaction = connection.transaction()?;
+            let evidence_source = format!("passive:{source}");
+            let mut written = 0_usize;
+            for (index, fqdn) in names.iter().enumerate() {
+                if index % 64 == 0 {
+                    ensure_ct_materialization_deadline(deadline)?;
+                }
+                transaction.execute(
+                    r#"INSERT OR IGNORE INTO observed_names(
+                           fqdn, reversed_name, first_seen, last_seen
+                       ) VALUES (?1, ?2, ?3, ?3)"#,
+                    params![fqdn, reverse_hostname(fqdn), now],
+                )?;
+                let name_id: i64 = transaction.query_row(
+                    "SELECT id FROM observed_names WHERE fqdn=?1",
+                    [fqdn],
+                    |row| row.get(0),
+                )?;
+                written = written.saturating_add(transaction.execute(
+                    r#"INSERT OR IGNORE INTO observation_evidence(
+                           root_domain, name_id, kind, source, value,
+                           first_seen, last_seen, times_seen
+                       ) VALUES (?1, ?2, 'passive', ?3, '', ?4, ?4, 1)"#,
+                    params![domain, name_id, &evidence_source, now],
+                )?);
+            }
+            ensure_ct_materialization_deadline(deadline)?;
+            if complete {
+                transaction.execute(
+                    r#"INSERT INTO passive_cache(root_domain, source, names_json, updated_at)
+                       VALUES (?1, ?2, '[]', ?3)
+                       ON CONFLICT(root_domain, source) DO UPDATE SET
+                       updated_at=excluded.updated_at"#,
+                    params![domain, source, now],
+                )?;
+            } else {
+                transaction.execute(
+                    r#"INSERT OR IGNORE INTO passive_cache(
+                           root_domain, source, names_json, updated_at
+                       ) VALUES (?1, ?2, '[]', 0)"#,
+                    params![domain, source],
+                )?;
+            }
+            ensure_ct_materialization_deadline(deadline)?;
+            transaction.commit()?;
+            Ok(written)
+        })();
+        if bounded_busy.is_some() {
+            connection.busy_timeout(Duration::from_secs(5))?;
+        }
+        result
+    }
+
+    pub fn mark_passive_cache_refresh(
+        &self,
+        domain: &str,
+        source: &str,
+        complete: bool,
+    ) -> Result<()> {
+        let connection = self.lock()?;
+        if complete {
+            connection.execute(
+                r#"INSERT INTO passive_cache(root_domain, source, names_json, updated_at)
+                   VALUES (?1, ?2, '[]', ?3)
+                   ON CONFLICT(root_domain, source) DO UPDATE SET
+                   updated_at=excluded.updated_at"#,
+                params![domain, source, now_epoch()],
+            )?;
+        } else {
+            connection.execute(
+                r#"INSERT OR IGNORE INTO passive_cache(
+                       root_domain, source, names_json, updated_at
+                   ) VALUES (?1, ?2, '[]', 0)"#,
+                params![domain, source],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn ct_passive_names_bounded(&self, domain: &str, limit: usize) -> Result<Vec<String>> {
+        self.ct_passive_names_bounded_until(domain, limit, None)
+    }
+
+    pub fn ct_passive_names_bounded_until(
+        &self,
+        domain: &str,
+        limit: usize,
+        deadline: Option<Instant>,
+    ) -> Result<Vec<String>> {
+        ensure_ct_materialization_deadline(deadline)?;
+        let mut selected = Vec::with_capacity(limit.min(100_000));
+        let mut seen = BTreeSet::new();
+
+        for name in self.ct_names_for_domain(domain, limit)? {
+            ensure_ct_materialization_deadline(deadline)?;
+            if selected.len() >= limit {
+                break;
+            }
+            if let Some(name) = normalize_observed_name(&name, domain)
+                && seen.insert(name.clone())
+            {
+                selected.push(name);
+            }
+        }
+
+        if selected.len() < limit {
+            for name in self.observation_names_bounded(domain, "passive:ct-direct", limit)? {
+                ensure_ct_materialization_deadline(deadline)?;
+                if selected.len() >= limit {
+                    break;
+                }
+                if let Some(name) = normalize_observed_name(&name, domain)
+                    && seen.insert(name.clone())
+                {
+                    selected.push(name);
+                }
+            }
+        }
+        Ok(selected)
+    }
+
+    /// Materializes the target-scoped CT index into durable passive evidence
+    /// without ever loading the complete historical `ct-direct` cache.
+    /// Repeated materialization is idempotent and never refreshes evidence
+    /// timestamps or counters that were already present.
+    pub fn materialize_ct_passive_cache_bounded(
+        &self,
+        domain: &str,
+        limit: usize,
+        complete: bool,
+    ) -> Result<Vec<String>> {
+        self.materialize_ct_passive_cache_bounded_until(domain, limit, complete, None)
+    }
+
+    pub fn materialize_ct_passive_cache_bounded_until(
+        &self,
+        domain: &str,
+        limit: usize,
+        complete: bool,
+        deadline: Option<Instant>,
+    ) -> Result<Vec<String>> {
+        ensure_ct_materialization_deadline(deadline)?;
+        let selected = self.ct_passive_names_bounded_until(domain, limit, deadline)?;
+        let seen = selected.iter().cloned().collect::<BTreeSet<_>>();
+        self.store_passive_observation_page_if_absent(
+            domain,
+            "ct-direct",
+            &seen,
+            complete,
+            deadline,
+        )?;
+        ensure_ct_materialization_deadline(deadline)?;
+        Ok(selected)
     }
 
     pub fn record_source_result(
@@ -4840,6 +5105,60 @@ impl Database {
         self.record_source_result_counts(source, Some(names), novel_names, duration_ms, error)
     }
 
+    pub fn record_source_degraded(
+        &self,
+        source: &str,
+        novel_names: usize,
+        duration_ms: u128,
+        warning: &str,
+    ) -> Result<()> {
+        self.record_source_outcome_counts(
+            source,
+            None,
+            novel_names,
+            duration_ms,
+            Some(warning),
+            SourceResultStatus::Degraded,
+            true,
+        )
+    }
+
+    pub fn record_source_degraded_with_counts(
+        &self,
+        source: &str,
+        names: usize,
+        novel_names: usize,
+        duration_ms: u128,
+        warning: &str,
+    ) -> Result<()> {
+        self.record_source_outcome_counts(
+            source,
+            Some(names),
+            novel_names,
+            duration_ms,
+            Some(warning),
+            SourceResultStatus::Degraded,
+            true,
+        )
+    }
+
+    pub fn record_source_deferred(
+        &self,
+        source: &str,
+        duration_ms: u128,
+        reason: &str,
+    ) -> Result<()> {
+        self.record_source_outcome_counts(
+            source,
+            None,
+            0,
+            duration_ms,
+            Some(reason),
+            SourceResultStatus::Deferred,
+            false,
+        )
+    }
+
     fn record_source_result_counts(
         &self,
         source: &str,
@@ -4848,41 +5167,85 @@ impl Database {
         duration_ms: u128,
         error: Option<&str>,
     ) -> Result<()> {
-        let success = i64::from(error.is_none());
-        let failure = i64::from(error.is_some());
+        let status = if error.is_some() {
+            SourceResultStatus::Failure
+        } else {
+            SourceResultStatus::Success
+        };
+        self.record_source_outcome_counts(
+            source,
+            names,
+            novel_names,
+            duration_ms,
+            error,
+            status,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_source_outcome_counts(
+        &self,
+        source: &str,
+        names: Option<usize>,
+        novel_names: usize,
+        duration_ms: u128,
+        detail: Option<&str>,
+        status: SourceResultStatus,
+        record_yield_sample: bool,
+    ) -> Result<()> {
+        let success = i64::from(status == SourceResultStatus::Success);
+        let failure = i64::from(status == SourceResultStatus::Failure);
+        let degraded = i64::from(status == SourceResultStatus::Degraded);
+        let deferred = i64::from(status == SourceResultStatus::Deferred);
         let duration_ms = duration_ms.min(i64::MAX as u128) as i64;
+        let novel_requests = i64::from(record_yield_sample);
+        let novel_total_ms = if record_yield_sample { duration_ms } else { 0 };
         let connection = self.lock()?;
         connection.execute(
             r#"INSERT INTO source_stats(
-               source, requests, successes, failures, consecutive_failures,
+               source, requests, successes, failures, degraded, deferred,
+               consecutive_failures,
                names, novel_names, novel_requests, novel_total_ms,
-               total_ms, last_error, last_used
-               ) VALUES (?1, 1, ?2, ?3, ?3, ?4, ?5, 1, ?6, ?6, ?7, ?8)
+               total_ms, last_error, last_status, last_used
+               ) VALUES (?1, 1, ?2, ?3, ?4, ?5, ?3, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
                ON CONFLICT(source) DO UPDATE SET
                requests=requests+1,
                successes=successes+excluded.successes,
                failures=failures+excluded.failures,
-                consecutive_failures=CASE WHEN excluded.successes=1
-                   THEN 0 ELSE consecutive_failures+1 END,
+               degraded=degraded+excluded.degraded,
+               deferred=deferred+excluded.deferred,
+               consecutive_failures=CASE excluded.last_status
+                   WHEN 'success' THEN 0
+                   WHEN 'degraded' THEN 0
+                   WHEN 'failure' THEN consecutive_failures+1
+                   ELSE consecutive_failures
+               END,
                 names=names+excluded.names,
                 novel_names=novel_names+excluded.novel_names,
-                novel_requests=novel_requests+1,
+                novel_requests=novel_requests+excluded.novel_requests,
                 novel_total_ms=novel_total_ms+excluded.novel_total_ms,
                 total_ms=total_ms+excluded.total_ms,
                 last_error=excluded.last_error,
+                last_status=excluded.last_status,
                 last_used=excluded.last_used"#,
             params![
                 source,
                 success,
                 failure,
+                degraded,
+                deferred,
                 i64::try_from(names.unwrap_or_default()).unwrap_or(i64::MAX),
                 i64::try_from(novel_names).unwrap_or(i64::MAX),
+                novel_requests,
+                novel_total_ms,
                 duration_ms,
-                error,
+                detail,
+                status.as_str(),
                 now_epoch()
             ],
         )?;
-        if error.is_none() {
+        if status == SourceResultStatus::Success {
             connection.execute(
                 "DELETE FROM source_metadata_cache WHERE key=?1",
                 [format!("source.retry_until.{source}")],
@@ -4927,31 +5290,36 @@ impl Database {
         let connection = self.lock()?;
         let mut diagnostics = {
             let mut statement = connection.prepare(
-                r#"SELECT source, requests, successes, failures, consecutive_failures,
-                   names, novel_names, novel_requests,
+                r#"SELECT source, requests, successes, failures, degraded, deferred,
+                   consecutive_failures, names, novel_names, novel_requests,
                    CASE WHEN requests=0 THEN 0 ELSE total_ms/requests END,
-                   last_error, last_used FROM source_stats ORDER BY source"#,
+                   last_error, last_status, last_used FROM source_stats ORDER BY source"#,
             )?;
             statement
                 .query_map([], |row| {
                     let source = row.get::<_, String>(0)?;
-                    let consecutive_failures = row.get::<_, i64>(4)?;
-                    let last_used = row.get::<_, i64>(10)?;
+                    let consecutive_failures = row.get::<_, i64>(6)?;
+                    let last_status = row.get::<_, String>(12)?;
+                    let last_used = row.get::<_, i64>(13)?;
                     let retry_at = last_used.saturating_add(cooldown_seconds);
                     let next_retry =
-                        (consecutive_failures >= 3 && retry_at > now).then_some(retry_at);
+                        (consecutive_failures >= 3 && last_status == "failure" && retry_at > now)
+                            .then_some(retry_at);
                     Ok((
                         source,
                         SourceDiagnostic {
                             requests: row.get(1)?,
                             successes: row.get(2)?,
                             failures: row.get(3)?,
+                            degraded: row.get(4)?,
+                            deferred: row.get(5)?,
                             consecutive_failures,
-                            names: row.get(5)?,
-                            novel_names: row.get(6)?,
-                            novel_requests: row.get(7)?,
-                            average_ms: row.get(8)?,
-                            last_error: row.get(9)?,
+                            names: row.get(7)?,
+                            novel_names: row.get(8)?,
+                            novel_requests: row.get(9)?,
+                            average_ms: row.get(10)?,
+                            last_error: row.get(11)?,
+                            last_status,
                             last_used,
                             next_retry,
                             retry_in_seconds: next_retry.map(|retry| retry.saturating_sub(now)),
@@ -4993,7 +5361,9 @@ impl Database {
         let connection = self.lock()?;
         let mut statement = connection.prepare(
             r#"SELECT source FROM source_stats
-               WHERE consecutive_failures>=3 AND last_used>=?1"#,
+               WHERE consecutive_failures>=3
+                 AND last_status='failure'
+                 AND last_used>=?1"#,
         )?;
         statement
             .query_map([threshold], |row| row.get::<_, String>(0))?
@@ -5005,7 +5375,9 @@ impl Database {
         let connection = self.lock()?;
         let mut statement = connection.prepare(
             r#"SELECT source,
-               CAST(successes * 400 / MAX(requests, 1) AS INTEGER)
+               CASE WHEN successes+failures+degraded=0 THEN 0 ELSE
+                   CAST((successes * 400 + degraded * 250)
+                        / (successes+failures+degraded) AS INTEGER) END
                + CASE WHEN novel_requests=0 THEN 0 ELSE
                    MIN(CAST(novel_names * 60 / novel_requests AS INTEGER), 600) END
                + CASE WHEN novel_requests=0 THEN 0 ELSE
@@ -5720,9 +6092,10 @@ impl Database {
                ORDER BY last_seen DESC, fqdn ASC LIMIT ?3"#,
         )?;
         statement
-            .query_map(params![lower, upper, limit as i64], |row| {
-                row.get::<_, String>(0)
-            })?
+            .query_map(
+                params![lower, upper, limit.min(i64::MAX as usize) as i64],
+                |row| row.get::<_, String>(0),
+            )?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
     }
@@ -6410,10 +6783,10 @@ impl Database {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let mut source_stats_statement = connection.prepare(
-            r#"SELECT source, requests, successes, failures, consecutive_failures,
-               names, novel_names, novel_requests,
+            r#"SELECT source, requests, successes, failures, degraded, deferred,
+               consecutive_failures, names, novel_names, novel_requests,
                CASE WHEN requests=0 THEN 0 ELSE total_ms/requests END AS average_ms,
-               last_error, last_used
+               last_error, last_status, last_used
                FROM source_stats
                ORDER BY successes DESC, novel_names DESC, names DESC, source ASC"#,
         )?;
@@ -6424,13 +6797,16 @@ impl Database {
                     "requests": row.get::<_, i64>(1)?,
                     "successes": row.get::<_, i64>(2)?,
                     "failures": row.get::<_, i64>(3)?,
-                    "consecutive_failures": row.get::<_, i64>(4)?,
-                    "names": row.get::<_, i64>(5)?,
-                    "novel_names": row.get::<_, i64>(6)?,
-                    "novel_requests": row.get::<_, i64>(7)?,
-                    "average_ms": row.get::<_, i64>(8)?,
-                    "last_error": row.get::<_, Option<String>>(9)?,
-                    "last_used": row.get::<_, i64>(10)?
+                    "degraded": row.get::<_, i64>(4)?,
+                    "deferred": row.get::<_, i64>(5)?,
+                    "consecutive_failures": row.get::<_, i64>(6)?,
+                    "names": row.get::<_, i64>(7)?,
+                    "novel_names": row.get::<_, i64>(8)?,
+                    "novel_requests": row.get::<_, i64>(9)?,
+                    "average_ms": row.get::<_, i64>(10)?,
+                    "last_error": row.get::<_, Option<String>>(11)?,
+                    "last_status": row.get::<_, String>(12)?,
+                    "last_used": row.get::<_, i64>(13)?
                 }))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -9816,6 +10192,40 @@ mod tests {
     }
 
     #[test]
+    fn passive_cache_bounded_limits_reads_without_discarding_observations() {
+        let db = Database::in_memory().unwrap();
+        let full_page = BTreeSet::from([
+            "a.example.com".to_owned(),
+            "b.example.com".to_owned(),
+            "c.example.com".to_owned(),
+            "d.example.com".to_owned(),
+        ]);
+        db.store_passive_observation_page("example.com", "fixture", &full_page)
+            .unwrap();
+
+        let bounded = db
+            .passive_cache_bounded("example.com", "fixture", 2)
+            .unwrap()
+            .unwrap();
+        assert_eq!(bounded.names, vec!["a.example.com", "b.example.com"]);
+        assert_eq!(bounded.updated_at, 0);
+        assert!(
+            db.passive_cache_bounded("example.com", "fixture", 0)
+                .unwrap()
+                .unwrap()
+                .names
+                .is_empty()
+        );
+        assert_eq!(
+            db.passive_cache("example.com", "fixture")
+                .unwrap()
+                .unwrap()
+                .names,
+            full_page.into_iter().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn tls_cache_does_not_attribute_old_sans_to_a_rotated_certificate() {
         let db = Database::in_memory().unwrap();
         db.store_tls_cache(
@@ -10226,6 +10636,52 @@ mod tests {
     }
 
     #[test]
+    fn degraded_and_deferred_sources_never_enter_failure_cooldown() {
+        let db = Database::in_memory().unwrap();
+        for _ in 0..3 {
+            db.record_source_degraded_with_counts("partial", 10, 4, 100, "page suivante limitée")
+                .unwrap();
+            db.record_source_deferred("quota", 5, "Retry-After=60s")
+                .unwrap();
+        }
+
+        let cooldowns = db
+            .source_cooldowns(std::time::Duration::from_secs(86_400))
+            .unwrap();
+        assert!(!cooldowns.contains("partial"));
+        assert!(!cooldowns.contains("quota"));
+
+        let diagnostics = db
+            .source_diagnostics(std::time::Duration::from_secs(86_400))
+            .unwrap();
+        let partial = &diagnostics["partial"];
+        assert_eq!(partial.requests, 3);
+        assert_eq!(partial.successes, 0);
+        assert_eq!(partial.failures, 0);
+        assert_eq!(partial.degraded, 3);
+        assert_eq!(partial.deferred, 0);
+        assert_eq!(partial.consecutive_failures, 0);
+        assert_eq!(partial.names, 30);
+        assert_eq!(partial.novel_names, 12);
+        assert_eq!(partial.novel_requests, 3);
+        assert_eq!(partial.last_status, "degraded");
+        assert_eq!(partial.last_error.as_deref(), Some("page suivante limitée"));
+        assert!(partial.next_retry.is_none());
+
+        let quota = &diagnostics["quota"];
+        assert_eq!(quota.requests, 3);
+        assert_eq!(quota.successes, 0);
+        assert_eq!(quota.failures, 0);
+        assert_eq!(quota.degraded, 0);
+        assert_eq!(quota.deferred, 3);
+        assert_eq!(quota.consecutive_failures, 0);
+        assert_eq!(quota.novel_requests, 0);
+        assert_eq!(quota.last_status, "deferred");
+        assert_eq!(quota.last_error.as_deref(), Some("Retry-After=60s"));
+        assert!(quota.next_retry.is_none());
+    }
+
+    #[test]
     fn existing_source_stats_keep_raw_names_and_start_fresh_yield_metrics() {
         let temporary = tempfile::NamedTempFile::new().unwrap();
         let connection = Connection::open(temporary.path()).unwrap();
@@ -10259,12 +10715,15 @@ mod tests {
             .unwrap()
             .query_row(
                 r#"SELECT COUNT(*) FROM pragma_table_info('source_stats')
-                   WHERE name IN ('novel_names', 'novel_requests', 'novel_total_ms')"#,
+                   WHERE name IN (
+                       'novel_names', 'novel_requests', 'novel_total_ms',
+                       'degraded', 'deferred', 'last_status'
+                   )"#,
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(columns, 3);
+        assert_eq!(columns, 6);
         let score_before = db.source_scores().unwrap()["legacy"];
 
         db.record_source_result("legacy", 3, 100, None).unwrap();
@@ -10276,6 +10735,9 @@ mod tests {
         assert_eq!(diagnostic.names, 250);
         assert_eq!(diagnostic.novel_names, 3);
         assert_eq!(diagnostic.novel_requests, 1);
+        assert_eq!(diagnostic.degraded, 0);
+        assert_eq!(diagnostic.deferred, 0);
+        assert_eq!(diagnostic.last_status, "success");
         assert!(db.source_scores().unwrap()["legacy"] > score_before);
         drop(db);
 
@@ -10311,12 +10773,12 @@ mod tests {
         db.record_source_result("empty", 0, 100, None).unwrap();
         db.record_source_result_with_counts("clean-page", 10, 5, 100, None)
             .unwrap();
-        db.record_source_result_with_counts(
+        db.record_source_degraded_with_counts(
             "partial-page",
             10,
             5,
             100,
-            Some("page 2 returned invalid JSON"),
+            "page 2 returned invalid JSON",
         )
         .unwrap();
         for _ in 0..3 {
@@ -10334,11 +10796,138 @@ mod tests {
         let partial = &diagnostics["partial-page"];
         assert_eq!(partial.names, 10);
         assert_eq!(partial.novel_names, 5);
-        assert_eq!(partial.failures, 1);
-        assert_eq!(partial.consecutive_failures, 1);
+        assert_eq!(partial.failures, 0);
+        assert_eq!(partial.degraded, 1);
+        assert_eq!(partial.deferred, 0);
+        assert_eq!(partial.consecutive_failures, 0);
+        assert_eq!(partial.last_status, "degraded");
         assert_eq!(
             partial.last_error.as_deref(),
             Some("page 2 returned invalid JSON")
+        );
+    }
+
+    #[test]
+    fn ct_materialization_is_bounded_permanent_and_idempotent() {
+        let db = Database::in_memory().unwrap();
+        let names = (0..500)
+            .map(|index| format!("ct-{index:04}.example.com"))
+            .collect::<BTreeSet<_>>();
+        db.store_ct_global_batch("https://ct.example/log/", 500, &names)
+            .unwrap();
+
+        let first = db
+            .materialize_ct_passive_cache_bounded("example.com", 17, true)
+            .unwrap();
+        assert_eq!(first.len(), 17);
+        assert_eq!(
+            db.ct_names_for_domain("example.com", 1_000).unwrap().len(),
+            500
+        );
+        assert_eq!(
+            db.observation_names("example.com", "passive:ct-direct")
+                .unwrap()
+                .len(),
+            17
+        );
+
+        let tracked = first[0].clone();
+        db.lock()
+            .unwrap()
+            .execute(
+                r#"UPDATE observation_evidence
+                      SET first_seen=11, last_seen=22, times_seen=9
+                    WHERE root_domain='example.com'
+                      AND source='passive:ct-direct'
+                      AND name_id=(SELECT id FROM observed_names WHERE fqdn=?1)"#,
+                [&tracked],
+            )
+            .unwrap();
+
+        let second = db
+            .materialize_ct_passive_cache_bounded("example.com", 17, true)
+            .unwrap();
+        assert_eq!(second, first);
+        let evidence: (i64, i64, i64) = db
+            .lock()
+            .unwrap()
+            .query_row(
+                r#"SELECT first_seen, last_seen, times_seen
+                     FROM observation_evidence
+                    WHERE root_domain='example.com'
+                      AND source='passive:ct-direct'
+                      AND name_id=(SELECT id FROM observed_names WHERE fqdn=?1)"#,
+                [&tracked],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(evidence, (11, 22, 9));
+    }
+
+    #[test]
+    fn expired_ct_materialization_never_writes_or_refreshes_cache() {
+        let db = Database::in_memory().unwrap();
+        db.store_ct_global_batch(
+            "https://ct.example/log/",
+            1,
+            &BTreeSet::from(["api.example.com".to_owned()]),
+        )
+        .unwrap();
+
+        assert!(
+            db.materialize_ct_passive_cache_bounded_until(
+                "example.com",
+                10,
+                true,
+                Some(Instant::now()),
+            )
+            .is_err()
+        );
+        assert!(
+            db.observation_names("example.com", "passive:ct-direct")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            db.passive_cache_bounded("example.com", "ct-direct", 10)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn ct_materialization_does_not_wait_past_its_deadline_for_a_locked_database() {
+        let temporary = tempfile::NamedTempFile::new().unwrap();
+        let db = Database::open(temporary.path()).unwrap();
+        db.store_ct_global_batch(
+            "https://ct.example/log/",
+            1,
+            &BTreeSet::from(["api.example.com".to_owned()]),
+        )
+        .unwrap();
+        let locker = Connection::open(temporary.path()).unwrap();
+        locker.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let started = Instant::now();
+        let result = db.materialize_ct_passive_cache_bounded_until(
+            "example.com",
+            10,
+            true,
+            Some(Instant::now() + Duration::from_millis(150)),
+        );
+
+        assert!(result.is_err());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        locker.execute_batch("ROLLBACK").unwrap();
+        assert!(
+            db.observation_names("example.com", "passive:ct-direct")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            db.passive_cache_bounded("example.com", "ct-direct", 10)
+                .unwrap()
+                .is_none()
         );
     }
 }

@@ -6,6 +6,33 @@ Published releases and downloadable artifacts are available on [GitHub Releases]
 
 ## [Unreleased]
 
+## [0.8.6] - 2026-07-16
+
+### Added
+
+- added structured incremental CT progress with the selected log, durable cursor, tree size, entry range, per-request timeout, remaining phase budget, committed batch, and final materialization status;
+- added persistent `degraded` and `deferred` source-health states so partial pages, local preflight failures, phase cancellation, and provider failures remain distinct;
+- added bounded passive-cache reads and immediate SQLite page commits while retaining the complete permanent observation history;
+- added CI and release consistency checks for Cargo, Debian, changelog and documentation versions, download URLs, and the closed seven-asset release set.
+
+### Changed
+
+- use the documented authenticated Driftnet Certificate Transparency endpoint and require a real Driftnet token; require an OTX key instead of repeatedly attempting unavailable anonymous access;
+- select experimental connectors automatically only when the registry marks them safe for automation and every required credential is configured; browser-facing anti-bot connectors remain explicit;
+- share transparent HTTP identity, connection pools, compression, content negotiation, source and host rate limits, complete-attempt body validation, safe-method retries, bounded error bodies, and strict same-origin pagination across connectors;
+- validate provider JSON envelopes and pagination contracts explicitly, retain completed pages after later failures, and report pagination caps as degraded rather than complete success;
+- keep passive connector and timeout checkpoints bounded in memory, persist full decoded pages before truncation, and refill the globally ranked candidate set from SQLite up to `--max-passive`.
+
+### Fixed
+
+- prevent missing API keys from incrementing provider failure streaks, and make a newly configured key bypass legacy missing-key cooldowns immediately;
+- distinguish transport failures, schema drift, anti-bot responses, upstream 5xx maintenance, quotas, authentication failures, timeouts, and phase-budget deferrals in `sources --check`;
+- avoid replaying POST or PATCH requests, handle HTTP 524 and truncated successful bodies correctly, and apply long `Retry-After` guidance without blocking the scan;
+- eliminate unbounded error-string compaction, the second full-body HTTP copy, and loss of response URL/extensions after retry validation;
+- make direct CT cancellation cursor-safe, cap decompressed response bodies and target materialization, keep reused `ct-direct` evidence idempotent, avoid SQLite rereads after abort, release the global CT gate before target materialization, and mark the global refresh complete only when every selected log succeeds;
+- avoid rewarding duplicate raw source volume, prevent large AnubisDB responses from monopolizing automatic validation, and keep same-provider network/cache provenance from being duplicated;
+- record only actually started passive requests as deferred when the shared phase budget ends.
+
 ## [0.8.5] - 2026-07-16
 
 ### Added
@@ -156,7 +183,8 @@ Initial public release of Fellaga.
 - public MIT repository with security policy, contribution guide, third-party notices, and verifiable corpus provenance;
 - verifiable v0.8.0 release with x86-64 and ARM64 GNU/Linux archives, an amd64 Debian package, architecture SBOMs, checksums, a keyless Sigstore signature over the checksum manifest, and GitHub attestations.
 
-[Unreleased]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/compare/v0.8.5...HEAD
+[Unreleased]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/compare/v0.8.6...HEAD
+[0.8.6]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/tag/v0.8.6
 [0.8.5]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/tag/v0.8.5
 [0.8.4]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/tag/v0.8.4
 [0.8.3]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/tag/v0.8.3

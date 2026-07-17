@@ -1,3 +1,11 @@
+fellaga (0.8.6-1) unstable; urgency=medium
+
+  * Harden and classify all external connector failures.
+  * Bound passive source memory while retaining complete SQLite observations.
+  * Add detailed, cursor-safe incremental Certificate Transparency progress.
+
+ -- Brahim-Fouad GUIA <170998597+Brahim-Fouad@users.noreply.github.com>  Thu, 16 Jul 2026 00:00:00 -0400
+
 fellaga (0.8.5-1) unstable; urgency=medium
 
   * Add targeted BinaryEdge, MerkleMap, and Brave Search connectors.
