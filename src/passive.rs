@@ -1,10 +1,13 @@
+use crate::archive_intelligence::{ArchiveLimits, analyze_common_crawl_warc};
 use crate::model::EvidenceFamily;
 use crate::util::normalize_observed_name;
 use anyhow::{Context, Result, bail};
+use flate2::read::GzDecoder;
 use futures_util::{StreamExt, stream};
 use reqwest::ResponseBuilderExt;
 use reqwest::header::{
-    ACCEPT, ACCEPT_LANGUAGE, CONTENT_LENGTH, HeaderMap, HeaderValue, RETRY_AFTER, TRANSFER_ENCODING,
+    ACCEPT, ACCEPT_LANGUAGE, CONTENT_LENGTH, HeaderMap, HeaderValue, RANGE, RETRY_AFTER,
+    TRANSFER_ENCODING,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -876,6 +879,9 @@ const COMMONCRAWL_INDEX_COUNT: usize = 5;
 const COMMONCRAWL_BLOCKS_PER_REQUEST: usize = 15;
 const COMMONCRAWL_MAX_RESULT_LINES: usize = 150_000;
 const COMMONCRAWL_MAX_BODY_BYTES: usize = 3 * MAX_EXTERNAL_BODY_BYTES;
+const COMMONCRAWL_WARC_SAMPLE_LIMIT: usize = 2;
+const COMMONCRAWL_MAX_WARC_MEMBER_BYTES: usize = 2 * 1024 * 1024;
+const COMMONCRAWL_MAX_WARC_DECOMPRESSED_BYTES: usize = 4 * 1024 * 1024;
 const MAX_INLINE_RETRY_AFTER: Duration = Duration::from_secs(5);
 
 fn commoncrawl_page_plan() -> [(usize, usize); 1] {
@@ -1121,10 +1127,30 @@ fn commoncrawl_endpoint_cache() -> &'static RwLock<Option<String>> {
     COMMONCRAWL_API.get_or_init(|| RwLock::new(None))
 }
 
-pub fn seed_commoncrawl_endpoint(endpoint: String) {
-    if !endpoint.starts_with("https://index.commoncrawl.org/") {
-        return;
+fn validate_commoncrawl_endpoint(endpoint: &str) -> Result<Url> {
+    let url = Url::parse(endpoint).context("URL d'index Common Crawl invalide")?;
+    let authority = endpoint
+        .split_once("://")
+        .map(|(_, remainder)| remainder.split(['/', '?', '#']).next().unwrap_or_default())
+        .unwrap_or_default();
+    if url.scheme() != "https"
+        || url.host_str() != Some("index.commoncrawl.org")
+        || url.port_or_known_default() != Some(443)
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || authority.contains('@')
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        bail!("URL d'index Common Crawl non fiable");
     }
+    Ok(url)
+}
+
+pub fn seed_commoncrawl_endpoint(endpoint: String) {
+    let Ok(endpoint) = validate_commoncrawl_endpoint(&endpoint).map(|url| url.to_string()) else {
+        return;
+    };
     if let Ok(mut cached) = commoncrawl_endpoint_cache().write()
         && cached.is_none()
     {
@@ -1174,6 +1200,44 @@ struct CommonCrawlCollection {
 #[derive(Debug, Deserialize)]
 struct CommonCrawlRow {
     url: String,
+    #[serde(default)]
+    filename: Option<String>,
+    #[serde(default)]
+    offset: Option<CommonCrawlInteger>,
+    #[serde(default)]
+    length: Option<CommonCrawlInteger>,
+    #[serde(default)]
+    mime: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum CommonCrawlInteger {
+    Text(String),
+    Number(u64),
+}
+
+impl CommonCrawlInteger {
+    fn value(&self) -> Option<u64> {
+        match self {
+            Self::Text(value) => value.parse().ok(),
+            Self::Number(value) => Some(*value),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct CommonCrawlRecordRef {
+    url: String,
+    filename: String,
+    offset: u64,
+    length: usize,
+}
+
+#[derive(Debug, Default)]
+struct CommonCrawlPage {
+    names: BTreeSet<String>,
+    records: BTreeSet<CommonCrawlRecordRef>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2333,8 +2397,33 @@ fn hostname_from_url(value: &str, domain: &str) -> Option<String> {
         .and_then(|hostname| normalize_observed_name(&hostname, domain))
 }
 
-fn parse_commoncrawl_rows(body: &str, domain: &str) -> Result<BTreeSet<String>> {
-    let mut names = BTreeSet::new();
+fn commoncrawl_filename_is_safe(filename: &str) -> bool {
+    filename.starts_with("crawl-data/")
+        && !filename.contains('\\')
+        && filename
+            .split('/')
+            .all(|component| !matches!(component, "" | "." | ".."))
+}
+
+fn commoncrawl_row_is_textual(row: &CommonCrawlRow) -> bool {
+    let mime = row.mime.as_deref().unwrap_or_default().to_ascii_lowercase();
+    if mime.starts_with("text/")
+        || mime.contains("javascript")
+        || mime.contains("json")
+        || mime.contains("xml")
+    {
+        return true;
+    }
+    Url::parse(&row.url).ok().is_some_and(|url| {
+        let path = url.path().to_ascii_lowercase();
+        [".html", ".htm", ".js", ".mjs", ".json", ".map", ".xml"]
+            .iter()
+            .any(|suffix| path.ends_with(suffix))
+    })
+}
+
+fn parse_commoncrawl_page(body: &str, domain: &str) -> Result<CommonCrawlPage> {
+    let mut page = CommonCrawlPage::default();
     let mut valid = 0_usize;
     let mut invalid = 0_usize;
     for line in body.lines().take(COMMONCRAWL_MAX_RESULT_LINES) {
@@ -2345,7 +2434,29 @@ fn parse_commoncrawl_rows(body: &str, domain: &str) -> Result<BTreeSet<String>> 
             Ok(row) => {
                 valid = valid.saturating_add(1);
                 if let Some(name) = hostname_from_url(&row.url, domain) {
-                    names.insert(name);
+                    page.names.insert(name);
+                    let record = row
+                        .filename
+                        .as_deref()
+                        .filter(|filename| commoncrawl_filename_is_safe(filename))
+                        .zip(row.offset.as_ref().and_then(CommonCrawlInteger::value))
+                        .zip(row.length.as_ref().and_then(CommonCrawlInteger::value))
+                        .and_then(|((filename, offset), length)| {
+                            let length = usize::try_from(length).ok()?;
+                            (length > 0
+                                && length <= COMMONCRAWL_MAX_WARC_MEMBER_BYTES
+                                && offset.checked_add(length as u64).is_some()
+                                && commoncrawl_row_is_textual(&row))
+                            .then(|| CommonCrawlRecordRef {
+                                url: row.url.clone(),
+                                filename: filename.to_owned(),
+                                offset,
+                                length,
+                            })
+                        });
+                    if let Some(record) = record {
+                        page.records.insert(record);
+                    }
                 }
             }
             Err(_) => invalid = invalid.saturating_add(1),
@@ -2357,7 +2468,12 @@ fn parse_commoncrawl_rows(body: &str, domain: &str) -> Result<BTreeSet<String>> 
             "index Common Crawl: format NDJSON incohérent ({invalid}/{total} ligne(s) invalides)"
         );
     }
-    Ok(names)
+    Ok(page)
+}
+
+#[cfg(test)]
+fn parse_commoncrawl_rows(body: &str, domain: &str) -> Result<BTreeSet<String>> {
+    Ok(parse_commoncrawl_page(body, domain)?.names)
 }
 
 async fn load_commoncrawl_endpoints(
@@ -2378,8 +2494,12 @@ async fn load_commoncrawl_endpoints(
     let collections = response_json::<Vec<CommonCrawlCollection>>(response, "Common Crawl").await?;
     let endpoints = collections
         .into_iter()
+        .filter_map(|collection| {
+            validate_commoncrawl_endpoint(&collection.cdx_api)
+                .ok()
+                .map(|url| url.to_string())
+        })
         .take(COMMONCRAWL_INDEX_COUNT)
-        .map(|collection| collection.cdx_api)
         .collect::<Vec<_>>();
     let endpoint = endpoints
         .first()
@@ -2398,6 +2518,7 @@ async fn query_commoncrawl(
     page: usize,
     page_size: usize,
 ) -> Result<reqwest::Response> {
+    let endpoint = validate_commoncrawl_endpoint(endpoint)?;
     throttle_commoncrawl().await;
     send_with_retry_for_source(
         "commoncrawl",
@@ -2405,7 +2526,7 @@ async fn query_commoncrawl(
             ("url", domain),
             ("matchType", "domain"),
             ("output", "json"),
-            ("fl", "url"),
+            ("fl", "url,filename,offset,length,mime"),
             ("filter", "status:200"),
             ("collapse", "urlkey"),
             ("pageSize", &page_size.to_string()),
@@ -2416,6 +2537,67 @@ async fn query_commoncrawl(
         domain,
     )
     .await
+}
+
+async fn fetch_commoncrawl_warc_names(
+    client: &reqwest::Client,
+    record: &CommonCrawlRecordRef,
+    domain: &str,
+) -> Result<BTreeSet<String>> {
+    let base = Url::parse("https://data.commoncrawl.org/")?;
+    let url = base.join(&record.filename)?;
+    if url.scheme() != "https"
+        || url.host_str() != Some("data.commoncrawl.org")
+        || !url.path().starts_with("/crawl-data/")
+    {
+        bail!("Common Crawl WARC: chemin d'archive non fiable");
+    }
+    let end = record
+        .offset
+        .checked_add(record.length.saturating_sub(1) as u64)
+        .context("Common Crawl WARC: plage d'octets invalide")?;
+    throttle_commoncrawl().await;
+    let response = client
+        .get(url.clone())
+        .header(RANGE, format!("bytes={}-{}", record.offset, end))
+        .send()
+        .await
+        .with_context(|| format!("connexion à l'archive Common Crawl {url}"))?;
+    if response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+        bail!(
+            "Common Crawl WARC: HTTP {} au lieu d'une réponse partielle",
+            response.status()
+        );
+    }
+    let (_, compressed) = response_bytes_limited_to(
+        response,
+        "archive Common Crawl",
+        COMMONCRAWL_MAX_WARC_MEMBER_BYTES,
+    )
+    .await?;
+    let limits = ArchiveLimits {
+        max_archive_bytes: COMMONCRAWL_MAX_WARC_DECOMPRESSED_BYTES,
+        max_record_bytes: COMMONCRAWL_MAX_WARC_DECOMPRESSED_BYTES,
+        max_header_bytes: 64 * 1024,
+        max_records: 1,
+        max_document_bytes: 1024 * 1024,
+        max_analysis_bytes: 8 * 1024 * 1024,
+        max_names: 4_096,
+        max_evidence: 8_192,
+        max_urls: 512,
+        max_js_literals: 4_096,
+        max_string_bytes: 4_096,
+        max_json_values: 32_768,
+    };
+    let archive_source = format!("commoncrawl:{}@{}", record.filename, record.offset);
+    let discovery = analyze_common_crawl_warc(
+        GzDecoder::new(compressed.as_slice()),
+        domain,
+        &archive_source,
+        limits,
+    )
+    .with_context(|| format!("analyse WARC de {}", record.url))?;
+    Ok(discovery.names)
 }
 
 async fn commoncrawl(domain: &str, timeout: Duration) -> Result<BTreeSet<String>> {
@@ -2434,6 +2616,7 @@ async fn commoncrawl(domain: &str, timeout: Duration) -> Result<BTreeSet<String>
         },
     };
     let mut names = BTreeSet::new();
+    let mut warc_records = BTreeSet::new();
     let mut successful_requests = 0_usize;
     let mut errors = Vec::new();
     for endpoint in endpoints {
@@ -2463,10 +2646,14 @@ async fn commoncrawl(domain: &str, timeout: Duration) -> Result<BTreeSet<String>
                         successful_requests += 1;
                         break;
                     }
-                    match parse_commoncrawl_rows(&body, domain) {
-                        Ok(page_names) => {
+                    match parse_commoncrawl_page(&body, domain) {
+                        Ok(page) => {
                             successful_requests += 1;
-                            commit_result_page(&mut names, page_names);
+                            commit_result_page(&mut names, page.names);
+                            let remaining = COMMONCRAWL_WARC_SAMPLE_LIMIT
+                                .saturating_mul(4)
+                                .saturating_sub(warc_records.len());
+                            warc_records.extend(page.records.into_iter().take(remaining));
                         }
                         Err(error) => {
                             errors.push(format!("{endpoint} page {page}: {error:#}"));
@@ -2479,6 +2666,17 @@ async fn commoncrawl(domain: &str, timeout: Duration) -> Result<BTreeSet<String>
                     break;
                 }
             }
+        }
+    }
+    let mut sampled_urls = BTreeSet::new();
+    let mut sampled = 0_usize;
+    for record in warc_records {
+        if sampled >= COMMONCRAWL_WARC_SAMPLE_LIMIT || !sampled_urls.insert(record.url.clone()) {
+            continue;
+        }
+        sampled += 1;
+        if let Ok(archive_names) = fetch_commoncrawl_warc_names(&client, &record, domain).await {
+            commit_result_page(&mut names, archive_names);
         }
     }
     if successful_requests == 0 {
@@ -3510,6 +3708,62 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(error.contains("format NDJSON incohérent"));
+    }
+
+    #[test]
+    fn commoncrawl_endpoint_validation_accepts_only_the_official_https_origin() {
+        for endpoint in [
+            "https://index.commoncrawl.org/CC-MAIN-2026-30-index",
+            "https://index.commoncrawl.org:443/CC-MAIN-2026-30-index",
+        ] {
+            let validated = validate_commoncrawl_endpoint(endpoint).unwrap();
+            assert_eq!(validated.host_str(), Some("index.commoncrawl.org"));
+            assert_eq!(validated.port_or_known_default(), Some(443));
+        }
+
+        for endpoint in [
+            "http://index.commoncrawl.org/CC-MAIN-2026-30-index",
+            "https://localhost/CC-MAIN-2026-30-index",
+            "https://127.0.0.1/CC-MAIN-2026-30-index",
+            "https://10.0.0.1/CC-MAIN-2026-30-index",
+            "https://[::1]/CC-MAIN-2026-30-index",
+            "https://commoncrawl.org/CC-MAIN-2026-30-index",
+            "https://index.commoncrawl.org.evil.test/CC-MAIN-2026-30-index",
+            "https://user:secret@index.commoncrawl.org/CC-MAIN-2026-30-index",
+            "https://index.commoncrawl.org@127.0.0.1/CC-MAIN-2026-30-index",
+            "https://index.commoncrawl.org:8443/CC-MAIN-2026-30-index",
+            "https://index.commoncrawl.org/CC-MAIN-2026-30-index?url=evil.test",
+            "https://index.commoncrawl.org/CC-MAIN-2026-30-index#fragment",
+        ] {
+            assert!(
+                validate_commoncrawl_endpoint(endpoint).is_err(),
+                "unsafe endpoint accepted: {endpoint}"
+            );
+        }
+    }
+
+    #[test]
+    fn commoncrawl_warc_sampling_requires_safe_bounded_in_scope_records() {
+        let body = concat!(
+            r#"{"url":"https://static.example.com/app.js","filename":"crawl-data/CC-MAIN-2026-30/segments/1/warc/file.warc.gz","offset":"42","length":"2048","mime":"application/javascript"}"#,
+            "\n",
+            r#"{"url":"https://evil.test/app.js","filename":"crawl-data/CC-MAIN-2026-30/evil.warc.gz","offset":"1","length":"100","mime":"application/javascript"}"#,
+            "\n",
+            r#"{"url":"https://large.example.com/app.js","filename":"crawl-data/CC-MAIN-2026-30/large.warc.gz","offset":"1","length":"999999999","mime":"application/javascript"}"#,
+            "\n",
+            r#"{"url":"https://unsafe.example.com/app.js","filename":"../outside.warc.gz","offset":"1","length":"100","mime":"application/javascript"}"#,
+            "\n",
+        );
+        let page = parse_commoncrawl_page(body, "example.com").unwrap();
+        assert_eq!(page.records.len(), 1);
+        let record = page.records.first().unwrap();
+        assert_eq!(record.url, "https://static.example.com/app.js");
+        assert_eq!(record.offset, 42);
+        assert_eq!(record.length, 2_048);
+        assert!(page.names.contains("static.example.com"));
+        assert!(page.names.contains("large.example.com"));
+        assert!(page.names.contains("unsafe.example.com"));
+        assert!(!page.names.contains("evil.test"));
     }
 
     #[tokio::test]

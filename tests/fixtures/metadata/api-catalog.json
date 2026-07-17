@@ -1,0 +1,17 @@
+{
+  "linkset": [
+    {
+      "anchor": "https://example.com/",
+      "service-desc": [
+        { "href": "https://api.example.com/openapi.json" },
+        { "href": "https://outside.example.net/openapi.json" }
+      ],
+      "service-doc": [
+        { "href": "https://developer.example.com/apis" }
+      ],
+      "item": [
+        { "href": "https://catalog.example.com/.well-known/api-catalog" }
+      ]
+    }
+  ]
+}

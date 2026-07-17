@@ -1,0 +1,6 @@
+# Fellaga metadata fixture
+ssh.example.com,git.example.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest
+@cert-authority *.bastion.example.com ssh-ed25519 AAAAC3NzaFixture
+[git.example.com]:2222 ssh-rsa AAAAB3NzaFixture
+|1|hashed-host|hashed-value ssh-ed25519 AAAAC3NzaFixture
+outside.example.net ssh-ed25519 AAAAC3NzaFixture

@@ -1,9 +1,19 @@
 use crate::dns::{DnsEngine, DnsQueryResult};
+use crate::dns_policy::{
+    ExternalFeature, ExternalFeatureKind, PlanLimit, PolicyDelta, PolicyLimits, PolicyPlanner,
+    PolicyQuery,
+};
 use crate::model::{DiscoveryEdge, ServiceEndpoint};
-use crate::util::{extract_observed_names, normalize_observed_name};
+use crate::util::{extract_observed_names, normalize_hostname, normalize_observed_name};
 use hickory_resolver::proto::rr::RecordType;
 use std::collections::BTreeSet;
 use std::time::Instant;
+
+/// DNS-SD takes three network waves (browse -> service -> instance). SPF can
+/// legitimately add up to six include/redirect levels. Keeping a separate
+/// round limit makes the pipeline terminate even if a future planner bug were
+/// to keep producing queries despite its global query budget.
+const MAX_POLICY_WAVES: usize = 10;
 
 const SERVICE_PREFIXES: &[&str] = &[
     "_autodiscover._tcp",
@@ -31,6 +41,11 @@ pub struct DnsGraphDiscovery {
     pub names: BTreeSet<String>,
     pub child_zones: BTreeSet<String>,
     pub service_endpoints: BTreeSet<ServiceEndpoint>,
+    /// Out-of-scope names are useful naming/provider signals, but are never
+    /// promoted to DNS queries or regular in-scope candidates.
+    pub external_features: BTreeSet<ExternalFeature>,
+    pub policy_limits_hit: BTreeSet<PlanLimit>,
+    pub policy_loops: BTreeSet<String>,
     pub queried: usize,
     pub duration_ms: u128,
 }
@@ -171,6 +186,19 @@ fn absorb(results: Vec<DnsQueryResult>, domain: &str, discovery: &mut DnsGraphDi
                 service_from_record(&result.owner, &record.record_type, &record.value, domain)
             {
                 discovery.service_endpoints.insert(endpoint);
+            } else if record.record_type == "SRV"
+                && let Some(target) = record
+                    .value
+                    .split_whitespace()
+                    .nth(3)
+                    .and_then(normalize_hostname)
+                && !query_is_in_scope(&target, domain)
+            {
+                discovery.external_features.insert(ExternalFeature {
+                    owner: result.owner.clone(),
+                    value: target,
+                    kind: ExternalFeatureKind::SrvTarget,
+                });
             }
             let targets = extract_observed_names(&record.value, domain);
             discovery.names.extend(targets.clone());
@@ -195,6 +223,75 @@ fn absorb(results: Vec<DnsQueryResult>, domain: &str, discovery: &mut DnsGraphDi
     }
 }
 
+fn query_is_in_scope(name: &str, domain: &str) -> bool {
+    name == domain || name.ends_with(&format!(".{domain}"))
+}
+
+/// Adds one policy-planner delta to the graph and returns only queries that
+/// remain inside the requested root. The planner already enforces this rule;
+/// this second boundary is intentional defense in depth at the network call.
+fn queue_policy_delta(
+    delta: PolicyDelta,
+    domain: &str,
+    discovery: &mut DnsGraphDiscovery,
+) -> Vec<PolicyQuery> {
+    discovery.names.extend(delta.in_scope_names);
+    discovery.external_features.extend(delta.external_features);
+    discovery.policy_limits_hit.extend(delta.limits_hit);
+    discovery.policy_loops.extend(delta.loops);
+
+    let mut seen = BTreeSet::new();
+    delta
+        .queries
+        .into_iter()
+        .filter(|query| query_is_in_scope(&query.name, domain))
+        .filter(|query| seen.insert((query.name.clone(), query.record_type.to_string())))
+        .collect()
+}
+
+async fn discover_dns_policies(
+    dns: &DnsEngine,
+    domain: &str,
+    zones: Vec<String>,
+    discovery: &mut DnsGraphDiscovery,
+) {
+    let Ok(mut planner) = PolicyPlanner::new(domain, PolicyLimits::default()) else {
+        return;
+    };
+    let initial = planner.initial_plan(zones);
+    let mut pending = queue_policy_delta(initial, domain, discovery);
+
+    for _ in 0..MAX_POLICY_WAVES {
+        if pending.is_empty() {
+            break;
+        }
+        let queries = pending
+            .drain(..)
+            .map(|query| (query.name, query.record_type))
+            .collect::<Vec<_>>();
+        let results = dns.query_many(queries).await;
+
+        let mut next = Vec::new();
+        for result in &results {
+            for record in &result.records {
+                let delta = planner.ingest_record(&result.owner, result.query_type, &record.value);
+                next.extend(queue_policy_delta(delta, domain, discovery));
+            }
+        }
+        absorb(results, domain, discovery);
+
+        // PolicyPlanner performs scan-wide deduplication. Retain a local guard
+        // as well so multiple RDATA values cannot duplicate a network request
+        // in the same wave.
+        let mut seen = BTreeSet::new();
+        next.retain(|query| {
+            query_is_in_scope(&query.name, domain)
+                && seen.insert((query.name.clone(), query.record_type.to_string()))
+        });
+        pending = next;
+    }
+}
+
 pub async fn discover_dns_graph(
     dns: &DnsEngine,
     domain: &str,
@@ -209,14 +306,17 @@ pub async fn discover_dns_graph(
     absorb(dns.query_many(queries).await, domain, &mut discovery);
 
     if service_discovery {
-        let zones = planned_zones
+        let discovered_zones = planned_zones
             .into_iter()
             .chain(discovery.child_zones.iter().cloned())
-            .collect::<BTreeSet<_>>()
-            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let zones = std::iter::once(domain.to_owned())
+            .chain(discovered_zones.into_iter().filter(|zone| zone != domain))
+            .take(PolicyLimits::default().max_zones)
             .collect::<Vec<_>>();
         let srv_queries = zones
-            .into_iter()
+            .iter()
+            .cloned()
             .flat_map(|zone| {
                 SERVICE_PREFIXES
                     .iter()
@@ -224,6 +324,7 @@ pub async fn discover_dns_graph(
             })
             .collect::<Vec<_>>();
         absorb(dns.query_many(srv_queries).await, domain, &mut discovery);
+        discover_dns_policies(dns, domain, zones, &mut discovery).await;
     }
 
     discovery.duration_ms = started.elapsed().as_millis();
@@ -233,6 +334,8 @@ pub async fn discover_dns_graph(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dns_policy::QueryPurpose;
+    use crate::model::DnsRecord;
 
     #[test]
     fn parses_service_endpoints_from_dns_values() {
@@ -287,5 +390,81 @@ mod tests {
         assert!(queries.contains(&("dev.example.com".to_owned(), RecordType::NS)));
         assert!(!queries.contains(&("www.example.com".to_owned(), RecordType::NS)));
         assert!(queries.len() < 4 * 4 + 3);
+    }
+
+    #[test]
+    fn policy_boundary_keeps_external_names_as_features_only() {
+        let mut discovery = DnsGraphDiscovery::default();
+        let external = ExternalFeature {
+            owner: "example.com".to_owned(),
+            value: "mail.vendor.net".to_owned(),
+            kind: ExternalFeatureKind::SpfInclude,
+        };
+        let delta = PolicyDelta {
+            queries: vec![
+                PolicyQuery {
+                    name: "_spf.example.com".to_owned(),
+                    record_type: RecordType::TXT,
+                    purpose: QueryPurpose::Spf,
+                },
+                // A malformed or future planner must still not cross this
+                // final network boundary.
+                PolicyQuery {
+                    name: "mail.vendor.net".to_owned(),
+                    record_type: RecordType::TXT,
+                    purpose: QueryPurpose::Spf,
+                },
+            ],
+            in_scope_names: BTreeSet::from(["mta-sts.example.com".to_owned()]),
+            external_features: BTreeSet::from([external.clone()]),
+            ..PolicyDelta::default()
+        };
+
+        let queued = queue_policy_delta(delta, "example.com", &mut discovery);
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].name, "_spf.example.com");
+        assert!(discovery.external_features.contains(&external));
+        assert!(discovery.names.contains("mta-sts.example.com"));
+        assert!(!discovery.names.contains("mail.vendor.net"));
+    }
+
+    #[test]
+    fn policy_query_queue_is_deduplicated_and_scoped() {
+        let mut discovery = DnsGraphDiscovery::default();
+        let query = PolicyQuery {
+            name: "_services._dns-sd._udp.example.com".to_owned(),
+            record_type: RecordType::PTR,
+            purpose: QueryPurpose::DnsSdBrowse,
+        };
+        let delta = PolicyDelta {
+            queries: vec![query.clone(), query],
+            ..PolicyDelta::default()
+        };
+        let queued = queue_policy_delta(delta, "example.com", &mut discovery);
+        assert_eq!(queued.len(), 1);
+        assert!(query_is_in_scope(&queued[0].name, "example.com"));
+        assert!(!query_is_in_scope("notexample.com", "example.com"));
+    }
+
+    #[test]
+    fn external_srv_target_is_retained_but_not_promoted() {
+        let result = DnsQueryResult {
+            owner: "_submission._tcp.example.com".to_owned(),
+            query_type: RecordType::SRV,
+            records: vec![DnsRecord {
+                record_type: "SRV".to_owned(),
+                value: "0 1 587 smtp.mail-provider.net.".to_owned(),
+                ttl: 300,
+            }],
+        };
+        let mut discovery = DnsGraphDiscovery::default();
+        absorb(vec![result], "example.com", &mut discovery);
+
+        assert!(discovery.names.is_empty());
+        assert!(discovery.service_endpoints.is_empty());
+        assert!(discovery.external_features.iter().any(|feature| {
+            feature.kind == ExternalFeatureKind::SrvTarget
+                && feature.value == "smtp.mail-provider.net"
+        }));
     }
 }

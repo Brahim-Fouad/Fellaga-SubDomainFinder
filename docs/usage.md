@@ -59,6 +59,7 @@ fellaga scan your-domain.example --mutations custom-mutations.txt
 | `--domain-concurrency` | `1` | Prevents multiple large targets from multiplying network load; accepted range is 1-4. |
 | `--concurrency` | `128` | Limits concurrent host-resolution tasks; the shared rate limit controls DNS traffic. |
 | `--dns-rate-limit` | `250` | Caps the shared DNS request rate per second; the safeguard remains active across validation and enrichment. |
+| `--network-control` | `adaptive` | Starts below the configured rate/concurrency ceilings, backs off on loss or latency growth, and cautiously increases pressure after healthy windows. Use `fixed` only when a controlled network should use the configured ceilings immediately. |
 | `--active-max-runtime` | profile | Bounds all active candidate work; `deep` defaults to 120 seconds and `0` disables the bound. |
 | `--max-runtime` | profile | Stops each domain after 600/300/180/300 seconds for `deep`/`balanced`/`passive`/`turbo`. |
 | `--checkpoint-every` | `30` | Persists resumable progress every 30 seconds. |
@@ -137,7 +138,9 @@ Long operations emit periodic heartbeats rather than leaving the terminal appare
 
 Normally, `--stream-jsonl` emits an event immediately and does not add a final domain record. With `--only-live`, Fellaga defers those events until each domain has completed its final wildcard classification, ensuring that the stream contains only final `live` non-wildcard findings.
 
-The public `Finding` object includes `fqdn`, DNS `records`, `sources`, `wildcard`, `from_cache`, `confidence`, `state`, `last_verified_at`, `evidence_families`, and `authoritative_validation`. The final domain object includes `phase_timings`, which attributes wall time to initial discovery, candidate DNS, enrichment, and finalization.
+The public `Finding` object includes `fqdn`, DNS `records`, `sources`, `wildcard`, `from_cache`, `confidence`, `state`, `last_verified_at`, `evidence_families`, `authoritative_validation`, `wildcard_verdict`, `owner_proofs`, `generation_path`, and `discovery_score`. The final domain object includes `phase_timings` plus `scheduler_metrics`, which reports the logical `dns_queries` observed across the primary and trusted engines, directly measured metadata/Web request and body costs, TLS/TCP attempts, exclusive discoveries, adaptive backoffs, effective rate bounds, the remaining-yield upper bound, and the stop reason. A logical DNS query can still require a UDP retry or TCP fallback; use the controlled resolver benchmark when measuring raw transport throughput.
+
+Standardized metadata discovery is enabled for active profiles. `--metadata-discovery auto` checks the apex and a small priority set of validated identity/API/mail hosts, `all` permits every selected validated Web host within the same request budget, and `off` disables the phase. `--no-web` also disables this target-facing HTTP phase. Metadata hosts are resolved through Fellaga's configured consensus engine with bounded concurrency, pinned to public addresses, and restricted to HTTPS port 443 with bounded redirects and response bodies. DNS pinning and all metadata HTTP work share the remaining Web-phase budget and an additional 30-second hard cap; observations completed before the deadline are retained.
 
 ## Sources and resolvers
 

@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<XRD xmlns="http://docs.oasis-open.org/ns/xri/xrd-1.0">
+  <Subject>https://accounts.example.com/</Subject>
+  <Link rel="lrdd" template="https://webfinger.example.com/?resource={uri}" />
+  <Link rel="alternate" href="https://outside.example.net/host-meta" />
+</XRD>

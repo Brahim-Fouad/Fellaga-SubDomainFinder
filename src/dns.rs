@@ -1,11 +1,18 @@
+use crate::dnssec_proof::{
+    DenialSynthesis, DnssecProofAssessment, DnssecProofInput, Nsec3Proof, NsecProof, TYPE_NXNAME,
+    classify_dnssec_proof,
+};
 use crate::model::{
     DnsBenchmarkResult, DnsRecord, ResolvedHost, ResolverMetric, ResolverTestResult,
 };
+use crate::network_governor::{NetworkControl, NetworkGovernor, NetworkGovernorSnapshot};
 use anyhow::{Context, Result, bail};
 use futures_util::{Stream, StreamExt, stream};
+use hickory_net::proto::dnssec::rdata::DNSSECRData;
 use hickory_net::proto::op::{Edns, Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_net::proto::rr::{DNSClass, Name, RData, Record};
 use hickory_net::runtime::TokioRuntimeProvider;
+use hickory_net::{DnsError, NetError};
 use hickory_resolver::TokioResolver;
 use hickory_resolver::config::{ConnectionConfig, NameServerConfig, ResolverConfig};
 use hickory_resolver::proto::rr::RecordType;
@@ -481,6 +488,111 @@ fn response_records(response: &Message, record_type: RecordType) -> Vec<DnsRecor
         .unwrap_or_default()
 }
 
+fn base32hex(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHIJKLMNOPQRSTUV";
+    let mut output = String::with_capacity(bytes.len().saturating_mul(8).div_ceil(5));
+    let mut accumulator = 0_u32;
+    let mut bits = 0_u8;
+    for byte in bytes {
+        accumulator = (accumulator << 8) | u32::from(*byte);
+        bits += 8;
+        while bits >= 5 {
+            bits -= 5;
+            output.push(ALPHABET[((accumulator >> bits) & 0x1f) as usize] as char);
+        }
+    }
+    if bits > 0 {
+        output.push(ALPHABET[((accumulator << (5 - bits)) & 0x1f) as usize] as char);
+    }
+    output
+}
+
+fn nsec_synthesis(owner: &str, next_name: &str, bitmap: &BTreeSet<u16>) -> DenialSynthesis {
+    if bitmap.contains(&TYPE_NXNAME) {
+        return DenialSynthesis::Compact;
+    }
+    let owner = owner.trim_end_matches('.').to_ascii_lowercase();
+    let next = next_name.trim_end_matches('.').to_ascii_lowercase();
+    if next == format!("\\000.{owner}") {
+        // Older compact responders are ambiguous without RFC 9824 NXNAME.
+        DenialSynthesis::Unknown
+    } else {
+        DenialSynthesis::Conventional
+    }
+}
+
+fn dnssec_input_from_authorities(
+    qname: &str,
+    qtype: RecordType,
+    authorities: &[Record],
+) -> DnssecProofInput {
+    let mut input = DnssecProofInput {
+        qname: qname.to_owned(),
+        qtype: u16::from(qtype),
+        ..DnssecProofInput::default()
+    };
+    let parsed_qname = Name::from_str(&format!("{}.", qname.trim_end_matches('.'))).ok();
+    for record in authorities {
+        let RData::DNSSEC(data) = record.data() else {
+            continue;
+        };
+        match data {
+            DNSSECRData::NSEC(nsec) => {
+                let owner = record.name().to_utf8();
+                let next_name = nsec.next_domain_name().to_utf8();
+                let type_bitmap = nsec.type_bit_maps().map(u16::from).collect::<BTreeSet<_>>();
+                input.nsec.push(NsecProof {
+                    synthesis: nsec_synthesis(&owner, &next_name, &type_bitmap),
+                    owner,
+                    next_name,
+                    type_bitmap,
+                    signature_validated: record.proof.is_secure(),
+                });
+            }
+            DNSSECRData::NSEC3(nsec3) => {
+                let Some(qname_hash) = parsed_qname.as_ref().and_then(|name| {
+                    nsec3
+                        .hash_algorithm()
+                        .hash(nsec3.salt(), name, nsec3.iterations())
+                        .ok()
+                        .map(|hash| base32hex(hash.as_ref()))
+                }) else {
+                    continue;
+                };
+                let owner_hash = record
+                    .name()
+                    .to_utf8()
+                    .split('.')
+                    .next()
+                    .unwrap_or_default()
+                    .to_ascii_uppercase();
+                let next_hash = base32hex(nsec3.next_hashed_owner_name());
+                let type_bitmap = nsec3
+                    .type_bit_maps()
+                    .map(u16::from)
+                    .collect::<BTreeSet<_>>();
+                input.nsec3.push(Nsec3Proof {
+                    owner_hash,
+                    next_hash,
+                    qname_hash,
+                    type_bitmap: type_bitmap.clone(),
+                    signature_validated: record.proof.is_secure(),
+                    opt_out: nsec3.opt_out(),
+                    synthesis: if type_bitmap.contains(&TYPE_NXNAME) {
+                        DenialSynthesis::Compact
+                    } else {
+                        // A hashed online interval cannot be distinguished from
+                        // a precomputed chain without additional zone context.
+                        DenialSynthesis::Unknown
+                    },
+                });
+            }
+            _ => {}
+        }
+    }
+    input
+}
+
 fn is_definitive_nxdomain(response: &Message) -> bool {
     !response.truncated()
         && response.response_code() == ResponseCode::NXDomain
@@ -522,6 +634,7 @@ pub struct DnsEngine {
     concurrency: usize,
     timeout: Duration,
     rate_limit: u64,
+    governor: Arc<NetworkGovernor>,
     next_query_at: Arc<tokio::sync::Mutex<Instant>>,
     selection_counter: Arc<AtomicU64>,
     authoritative_resolvers: Arc<Mutex<HashMap<SocketAddr, Arc<FastResolver>>>>,
@@ -932,6 +1045,22 @@ impl DnsEngine {
         nameservers: &[IpAddr],
         rate_limit: u64,
     ) -> Result<Self> {
+        Self::new_with_rate_and_control(
+            concurrency,
+            timeout,
+            nameservers,
+            rate_limit,
+            NetworkControl::Fixed,
+        )
+    }
+
+    pub fn new_with_rate_and_control(
+        concurrency: usize,
+        timeout: Duration,
+        nameservers: &[IpAddr],
+        rate_limit: u64,
+        network_control: NetworkControl,
+    ) -> Result<Self> {
         let mut resolvers = Vec::new();
         let mut fast_resolvers = Vec::new();
         if nameservers.is_empty() {
@@ -995,6 +1124,11 @@ impl DnsEngine {
             concurrency: effective_concurrency,
             timeout,
             rate_limit,
+            governor: Arc::new(NetworkGovernor::new(
+                network_control,
+                rate_limit,
+                effective_concurrency,
+            )),
             next_query_at: Arc::new(tokio::sync::Mutex::new(Instant::now())),
             selection_counter: Arc::new(AtomicU64::new(0)),
             authoritative_resolvers: Arc::new(Mutex::new(HashMap::new())),
@@ -1053,6 +1187,11 @@ impl DnsEngine {
             concurrency: concurrency.max(1),
             timeout,
             rate_limit,
+            governor: Arc::new(NetworkGovernor::new(
+                NetworkControl::Fixed,
+                rate_limit,
+                concurrency.max(1),
+            )),
             next_query_at: Arc::new(tokio::sync::Mutex::new(Instant::now())),
             selection_counter: Arc::new(AtomicU64::new(0)),
             authoritative_resolvers: Arc::new(Mutex::new(HashMap::new())),
@@ -1064,19 +1203,33 @@ impl DnsEngine {
     /// consensus trusted) afin que la limite CLI soit réellement commune.
     pub fn share_rate_limit_with(mut self, other: &Self) -> Self {
         self.rate_limit = other.rate_limit;
+        self.governor = other.governor.clone();
         self.next_query_at = other.next_query_at.clone();
         self
     }
 
-    pub const fn concurrency(&self) -> usize {
-        self.concurrency
+    pub fn concurrency(&self) -> usize {
+        self.governor
+            .current_concurrency()
+            .min(self.concurrency)
+            .max(1)
+    }
+
+    pub fn network_governor_snapshot(&self) -> NetworkGovernorSnapshot {
+        self.governor.snapshot()
+    }
+
+    fn observe_network_outcome(&self, operational: bool, duration_ms: u64) {
+        self.governor
+            .observe_delta(1, u64::from(!operational), duration_ms);
     }
 
     async fn wait_for_rate_slot(&self) {
-        if self.rate_limit == 0 {
+        let current_rate = self.governor.current_rate();
+        if current_rate == 0 {
             return;
         }
-        let spacing = Duration::from_secs_f64(1.0 / self.rate_limit as f64);
+        let spacing = Duration::from_secs_f64(1.0 / current_rate as f64);
         let mut next = self.next_query_at.lock().await;
         let now = Instant::now();
         if *next > now {
@@ -1093,10 +1246,11 @@ impl DnsEngine {
         if deadline <= tokio::time::Instant::now() {
             return false;
         }
-        if self.rate_limit == 0 {
+        let current_rate = self.governor.current_rate();
+        if current_rate == 0 {
             return true;
         }
-        let spacing = Duration::from_secs_f64(1.0 / self.rate_limit as f64);
+        let spacing = Duration::from_secs_f64(1.0 / current_rate as f64);
         let Ok(mut next) = tokio::time::timeout_at(deadline, self.next_query_at.lock()).await
         else {
             return false;
@@ -1445,11 +1599,10 @@ impl DnsEngine {
                     ResponseCode::NoError | ResponseCode::NXDomain
                 )
         });
+        let duration_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
         if let Ok(mut state) = node.state.lock() {
             state.requests += 1;
-            state.total_ms = state
-                .total_ms
-                .saturating_add(started.elapsed().as_millis().min(u64::MAX as u128) as u64);
+            state.total_ms = state.total_ms.saturating_add(duration_ms);
             if operational {
                 state.successes += 1;
                 state.consecutive_failures = 0;
@@ -1458,6 +1611,7 @@ impl DnsEngine {
                 state.consecutive_failures += 1;
             }
         }
+        self.observe_network_outcome(operational, duration_ms);
         strict
     }
 
@@ -1547,6 +1701,24 @@ impl DnsEngine {
             } else {
                 None
             };
+            let fast_operational = fast_response.as_ref().is_some_and(|response| {
+                response.as_ref().is_ok_and(|response| {
+                    !response.truncated()
+                        && matches!(
+                            response.response_code(),
+                            ResponseCode::NoError | ResponseCode::NXDomain
+                        )
+                })
+            });
+            let fallback_operational = result.as_ref().is_some_and(|result| match result {
+                Ok(_) => true,
+                Err(error) => error.is_nx_domain() || error.is_no_records_found(),
+            });
+            let operational = if fast_result.is_some() || fast_timed_out {
+                fast_operational
+            } else {
+                fallback_operational
+            };
             let duration_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
             let classified = if let Some(result) = fast_result {
                 result
@@ -1580,10 +1752,7 @@ impl DnsEngine {
             if let Ok(mut state) = node.state.lock() {
                 state.requests += 1;
                 state.total_ms = state.total_ms.saturating_add(duration_ms);
-                if matches!(
-                    classified,
-                    RecordLookupOutcome::Positive(_) | RecordLookupOutcome::Negative
-                ) {
+                if operational {
                     state.successes += 1;
                     state.consecutive_failures = 0;
                 } else {
@@ -1591,6 +1760,7 @@ impl DnsEngine {
                     state.consecutive_failures += 1;
                 }
             }
+            self.observe_network_outcome(operational, duration_ms);
             match classified {
                 RecordLookupOutcome::Positive(records) => {
                     return RecordLookupOutcome::Positive(records);
@@ -1611,6 +1781,72 @@ impl DnsEngine {
             RecordLookupOutcome::Positive(records) => records,
             RecordLookupOutcome::Negative | RecordLookupOutcome::Indeterminate => Vec::new(),
         }
+    }
+
+    /// Performs a locally validated DNSSEC denial lookup.  This path uses
+    /// Hickory's root trust anchor and consumes only records whose per-record
+    /// proof is `Secure`; an upstream AD bit is never accepted on its own.
+    /// It is intended for a small suspicious/wildcard subset, not every brute
+    /// force candidate, and has one absolute wall deadline.
+    pub async fn dnssec_denial_assessment(
+        &self,
+        fqdn: &str,
+        record_type: RecordType,
+    ) -> DnssecProofAssessment {
+        let Some(address) = self
+            .fast_resolvers
+            .get(self.resolver_order().first().copied().unwrap_or_default())
+            .map(|resolver| resolver.address)
+        else {
+            return DnssecProofAssessment::default();
+        };
+        let mut udp = ConnectionConfig::udp();
+        udp.port = address.port();
+        let mut tcp = ConnectionConfig::tcp();
+        tcp.port = address.port();
+        let config = ResolverConfig::from_parts(
+            None,
+            Vec::new(),
+            vec![NameServerConfig::new(address.ip(), true, vec![udp, tcp])],
+        );
+        let mut builder =
+            TokioResolver::builder_with_config(config, TokioRuntimeProvider::default());
+        builder.options_mut().timeout = self.timeout.min(Duration::from_secs(3));
+        builder.options_mut().attempts = 1;
+        builder.options_mut().cache_size = 32;
+        builder.options_mut().num_concurrent_reqs = 1;
+        builder.options_mut().max_active_requests = 8;
+        builder.options_mut().validate = true;
+        let Ok(resolver) = builder.build() else {
+            return DnssecProofAssessment::default();
+        };
+        self.wait_for_rate_slot().await;
+        let deadline = self
+            .timeout
+            .saturating_mul(3)
+            .clamp(Duration::from_secs(1), Duration::from_secs(8));
+        let Ok(result) = tokio::time::timeout(deadline, resolver.lookup(fqdn, record_type)).await
+        else {
+            return DnssecProofAssessment::default();
+        };
+        let authorities = match result {
+            Err(NetError::Dns(DnsError::NoRecordsFound(no_records))) => no_records
+                .authorities
+                .map(|records| records.to_vec())
+                .unwrap_or_default(),
+            Err(NetError::Dns(DnsError::Nsec {
+                response, proof, ..
+            })) if proof.is_secure() => response.authorities.clone(),
+            // Positive responses are deliberately inconclusive here. A secure
+            // RRset can still be synthesized from a wildcard unless its denial
+            // proof establishes the exact owner separately.
+            Ok(_) | Err(_) => Vec::new(),
+        };
+        classify_dnssec_proof(&dnssec_input_from_authorities(
+            fqdn,
+            record_type,
+            &authorities,
+        ))
     }
 
     pub async fn soa_serial(&self, zone: &str) -> Option<u64> {
@@ -1640,7 +1876,7 @@ impl DnsEngine {
                     }
                 }
             })
-            .buffer_unordered(self.concurrency);
+            .buffer_unordered(self.concurrency());
         let mut results = Vec::new();
         while let Some(result) = pending.next().await {
             results.push(result);
@@ -1683,7 +1919,7 @@ impl DnsEngine {
                     (address, names)
                 }
             })
-            .buffer_unordered(self.concurrency)
+            .buffer_unordered(self.concurrency())
             .collect()
             .await
     }
@@ -1805,7 +2041,7 @@ impl DnsEngine {
                         .await
                 }
             })
-            .buffer_unordered(self.concurrency);
+            .buffer_unordered(self.concurrency());
         let mut outcomes = Vec::new();
         while let Some(outcome) = pending.next().await {
             on_completed(&outcome);
@@ -2113,6 +2349,7 @@ mod tests {
             concurrency: 8,
             timeout: Duration::from_millis(100),
             rate_limit: 0,
+            governor: Arc::new(NetworkGovernor::new(NetworkControl::Fixed, 0, 8)),
             next_query_at: Arc::new(tokio::sync::Mutex::new(Instant::now())),
             selection_counter: Arc::new(AtomicU64::new(0)),
             authoritative_resolvers: Arc::new(Mutex::new(HashMap::new())),
@@ -2163,6 +2400,7 @@ mod tests {
             concurrency: 8,
             timeout,
             rate_limit: 0,
+            governor: Arc::new(NetworkGovernor::new(NetworkControl::Fixed, 0, 8)),
             next_query_at: Arc::new(tokio::sync::Mutex::new(Instant::now())),
             selection_counter: Arc::new(AtomicU64::new(0)),
             authoritative_resolvers: Arc::new(Mutex::new(HashMap::new())),
@@ -2177,6 +2415,7 @@ mod tests {
             concurrency: 8,
             timeout,
             rate_limit: 0,
+            governor: Arc::new(NetworkGovernor::new(NetworkControl::Fixed, 0, 8)),
             next_query_at: Arc::new(tokio::sync::Mutex::new(Instant::now())),
             selection_counter: Arc::new(AtomicU64::new(0)),
             authoritative_resolvers: Arc::new(Mutex::new(HashMap::new())),
@@ -2536,6 +2775,7 @@ mod tests {
             concurrency: 8,
             timeout,
             rate_limit: 0,
+            governor: Arc::new(NetworkGovernor::new(NetworkControl::Fixed, 0, 8)),
             next_query_at: Arc::new(tokio::sync::Mutex::new(Instant::now())),
             selection_counter: Arc::new(AtomicU64::new(0)),
             authoritative_resolvers: Arc::new(Mutex::new(HashMap::new())),
@@ -2811,6 +3051,13 @@ mod tests {
                 DnsResolutionOutcome::Indeterminate { .. }
             ));
         }
+        let health = engine.take_metrics();
+        assert!(health.iter().map(|metric| metric.requests).sum::<u64>() > 0);
+        assert_eq!(
+            health.iter().map(|metric| metric.failures).sum::<u64>(),
+            0,
+            "valid NOERROR/NODATA is semantic absence, not a resolver failure"
+        );
 
         first_task.abort();
         second_task.abort();
@@ -3517,6 +3764,67 @@ mod tests {
         let adaptive = engine.resolver_order();
         assert_eq!(exploratory[0], 0);
         assert_eq!(adaptive[0], 1);
+    }
+
+    #[test]
+    fn shared_dns_engines_contribute_to_one_governor_window() {
+        let primary = DnsEngine::new_with_rate_and_control(
+            128,
+            Duration::from_secs(1),
+            &["1.1.1.1".parse().unwrap()],
+            250,
+            NetworkControl::Adaptive,
+        )
+        .unwrap();
+        let trusted = DnsEngine::new_with_rate_and_control(
+            128,
+            Duration::from_secs(1),
+            &["8.8.8.8".parse().unwrap()],
+            250,
+            NetworkControl::Adaptive,
+        )
+        .unwrap()
+        .share_rate_limit_with(&primary);
+        assert!(Arc::ptr_eq(&primary.governor, &trusted.governor));
+
+        primary.governor.observe_delta(60, 0, 6_000);
+        trusted.governor.observe_delta(40, 3, 4_000);
+        primary.governor.evaluate_pending_for_test();
+
+        assert_eq!(primary.network_governor_snapshot().backoffs, 1);
+        assert_eq!(trusted.network_governor_snapshot().current_rate, 35);
+        assert_eq!(primary.network_governor_snapshot().current_concurrency, 16);
+    }
+
+    #[test]
+    fn seeded_resolver_history_is_not_replayed_into_the_first_governor_window() {
+        let engine = DnsEngine::new_with_rate_and_control(
+            128,
+            Duration::from_secs(1),
+            &["1.1.1.1".parse().unwrap()],
+            250,
+            NetworkControl::Adaptive,
+        )
+        .unwrap();
+        engine.seed_metrics(&HashMap::from([(
+            "1.1.1.1".to_owned(),
+            ResolverMetric {
+                resolver: "1.1.1.1".to_owned(),
+                requests: 10_000,
+                successes: 0,
+                failures: 10_000,
+                average_ms: 10_000,
+                consecutive_failures: 10_000,
+            },
+        )]));
+
+        engine.observe_network_outcome(true, 10);
+        engine.governor.evaluate_pending_for_test();
+
+        let snapshot = engine.network_governor_snapshot();
+        assert_eq!(snapshot.current_rate, 50);
+        assert_eq!(snapshot.current_concurrency, 32);
+        assert_eq!(snapshot.backoffs, 0);
     }
 
     #[test]

@@ -5,11 +5,11 @@ Fellaga separates discovery from validation. A provider response, certificate na
 ## Discovery stages
 
 1. Load permanent local observations and learned candidate priorities.
-2. Query selected passive providers and run strict AXFR checks while opportunistic direct Certificate Transparency indexing proceeds in the background.
+2. Query selected passive providers and run strict AXFR checks while opportunistic direct Certificate Transparency indexing proceeds in the background, with a Static CT tile fallback for compatible logs.
 3. Detect wildcard behavior for the target and relevant child zones.
 4. Persist high-value discovery seeds and active generated candidates in separate SQLite queues, then validate them in interleaved bounded waves.
-5. Inspect the DNS graph and detect walkable NSEC zones.
-6. Extract in-scope names from Web content, JavaScript, source maps, archives, TLS certificates, and STARTTLS endpoints.
+5. Inspect the DNS graph, browse bounded DNS-SD and mail-policy relationships, and detect walkable NSEC zones.
+6. Extract in-scope names from standardized metadata, Web content, JavaScript semantics, source maps, archives, SNI/default TLS certificate differences, and STARTTLS endpoints.
 7. Feed new evidence back into the bounded event pipeline for recursive validation and enrichment.
 8. Store normalized evidence, validation events, graph edges, source health, and learning statistics locally.
 
@@ -35,14 +35,14 @@ Active generation is lazy: the one-million-name corpus is traversed with a durab
 | Method | Behavior |
 | --- | --- |
 | Passive connectors | Queries a registry of 30 public and credentialed services with per-provider rate limits, bounded responses, safe-method retry policy, immediate SQLite page commits, bounded in-memory candidate sets, and permanent merged observations. BinaryEdge, MerkleMap, and Brave use targeted one-page fast paths with at most one provider-signalled follow-up page. |
-| Certificate Transparency | Combines provider results with direct incremental CT-log monitoring and extracts in-scope SAN/CN names. |
-| DNS brute force | Processes an embedded one-million-candidate corpus, user wordlists, mutations, and locally learned patterns in prioritized waves. |
+| Certificate Transparency | Combines provider results with direct incremental CT-log monitoring, automatically falls back to compatible Static CT data tiles, and extracts in-scope SAN/CN names. Checkpoints, immutable tiles, names, and cursors are persisted atomically. |
+| DNS brute force | Processes an embedded one-million-candidate corpus, user wordlists, mutations, and locally learned patterns in prioritized waves. A target-local grammar learns service, environment, region, cloud, separator, and numeric conventions under a hard candidate cap. |
 | Recursive discovery | Tests high-yield labels below validated parents up to the selected profile depth. |
 | AXFR | Attempts TCP zone transfers against authoritative nameservers and accepts only complete protocol-valid transfers. |
-| DNS graph | Follows bounded MX, NS, SOA, TXT, CAA, SRV, HTTPS, and SVCB relationships and records child zones and service endpoints. |
-| DNSSEC | Detects NSEC, NSEC3, and minimal NSEC responses; walks only bounded, enumerable NSEC chains. |
-| Web and archives | Extracts in-scope hostnames from headers, redirects, HTML, JavaScript, JSON, manifests, source maps, Common Crawl, Wayback, and urlscan data. |
-| TLS and STARTTLS | Extracts SAN/CN names from selected TLS endpoints and performs minimal STARTTLS negotiation for supported mail protocols. |
+| DNS graph | Follows bounded MX, NS, SOA, TXT, CAA, SRV, HTTPS, SVCB, DNS-SD, NAPTR, URI, SPF, DMARC, MTA-STS, TLS reporting, and BIMI relationships. Out-of-scope references are retained only as naming features and are never queried. |
+| DNSSEC | Detects NSEC, NSEC3, and compact denial responses; walks only bounded, enumerable NSEC chains. A small suspicious wildcard subset receives local DNSSEC validation. Concrete NSEC or explicit NXNAME non-existence can authorize quarantine; conventional NSEC3 ranges, Opt-Out, unsigned, contradictory, and incomplete proofs remain non-destructive. |
+| Web, metadata, and archives | Extracts in-scope hostnames from standardized `.well-known` documents, headers, redirects, HTML, JavaScript calls/configuration/string composition, JSON, manifests, source maps, bounded Common Crawl WARC records, Wayback, and urlscan data. Metadata DNS and HTTP work share one absolute deadline capped at 30 seconds, while retaining completed observations. Static content is parsed as data and never executed. |
+| TLS and STARTTLS | Extracts SAN/CN names from selected TLS endpoints, compares at most four prioritized SNI/no-SNI certificate pairs, and performs minimal STARTTLS negotiation for supported mail protocols. |
 | PTR | Queries only IP addresses already confirmed during the scan; it does not sweep address ranges. |
 
 ## DNS validation
@@ -55,7 +55,7 @@ By default, Fellaga uses `1.1.1.1`, `8.8.8.8`, and `9.9.9.9` for both pools and 
 
 Trusted validation uses bounded concurrency after the primary batch, and both stages share the configured DNS rate limit. DNS progress is emitted as cache entries and network outcomes complete, while phase heartbeats cover bounded enrichment operations.
 
-TLS and Web hostname pinning reuse the same configured DNS engine and shared rate limiter. They do not start a separate system resolver or bypass `--resolvers`; Web targets are still filtered to public IP addresses before requests are sent.
+TLS, metadata, and Web hostname pinning reuse the same configured DNS engine and shared rate limiter. They do not start a separate system resolver or bypass `--resolvers`; non-public, loopback, link-local, reserved, and documentation-range destinations are rejected before an HTTP or TLS connection is attempted.
 
 ## Wildcard detection and cleanup
 

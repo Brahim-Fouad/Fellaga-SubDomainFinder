@@ -1,3 +1,14 @@
+fellaga (0.9.0-1) unstable; urgency=medium
+
+  * Add bounded target-local grammar, protocol-aware DNS discovery, and
+    standardized metadata intelligence.
+  * Add adaptive network pressure control, cost-aware scheduling, and
+    statistical low-yield stopping.
+  * Add Static CT, semantic archive analysis, differential TLS, and locally
+    validated DNSSEC wildcard cleanup.
+
+ -- Brahim-Fouad GUIA <170998597+Brahim-Fouad@users.noreply.github.com>  Thu, 16 Jul 2026 00:00:00 -0400
+
 fellaga (0.8.6-1) unstable; urgency=medium
 
   * Harden and classify all external connector failures.

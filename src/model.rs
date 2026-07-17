@@ -94,7 +94,7 @@ impl ResolvedHost {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Finding {
     pub fqdn: String,
     pub records: Vec<DnsRecord>,
@@ -110,6 +110,59 @@ pub struct Finding {
     pub evidence_families: BTreeSet<EvidenceFamily>,
     #[serde(default)]
     pub authoritative_validation: bool,
+    #[serde(default)]
+    pub wildcard_verdict: WildcardVerdict,
+    #[serde(default)]
+    pub owner_proofs: BTreeSet<OwnerProof>,
+    #[serde(default)]
+    pub generation_path: Vec<String>,
+    #[serde(default)]
+    pub discovery_score: Option<f64>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum WildcardVerdict {
+    ExactOwner,
+    Synthesized,
+    Ambiguous,
+    #[default]
+    NotProfiled,
+}
+
+impl WildcardVerdict {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ExactOwner => "exact_owner",
+            Self::Synthesized => "synthesized",
+            Self::Ambiguous => "ambiguous",
+            Self::NotProfiled => "not_profiled",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum OwnerProof {
+    Nxname,
+    Nsec,
+    Nsec3,
+    AuthoritativeDistinct,
+    ControlDistribution,
+    None,
+}
+
+impl OwnerProof {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Nxname => "nxname",
+            Self::Nsec => "nsec",
+            Self::Nsec3 => "nsec3",
+            Self::AuthoritativeDistinct => "authoritative_distinct",
+            Self::ControlDistribution => "control_distribution",
+            Self::None => "none",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -123,7 +176,7 @@ pub struct InventoryEntry {
     pub sources: BTreeSet<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct ConfidenceAssessment {
     pub score: u8,
     pub label: String,
@@ -296,7 +349,57 @@ pub struct ScanResult {
     pub ct_monitor: CtMonitorResult,
     pub pipeline: PipelineMetrics,
     pub resolver_metrics: Vec<ResolverMetric>,
+    #[serde(default)]
+    pub scheduler_metrics: SchedulerMetrics,
     pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StopReason {
+    QueueDrained,
+    PosteriorLowYield,
+    BudgetExhausted,
+    NetworkDegraded,
+    Interrupted,
+}
+
+impl StopReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::QueueDrained => "queue_drained",
+            Self::PosteriorLowYield => "posterior_low_yield",
+            Self::BudgetExhausted => "budget_exhausted",
+            Self::NetworkDegraded => "network_degraded",
+            Self::Interrupted => "interrupted",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct SchedulerMetrics {
+    /// DNS resolver operations observed during the scan. One logical lookup
+    /// can still produce a UDP retry or TCP fallback at the transport layer.
+    #[serde(alias = "dns_packets")]
+    pub dns_queries: u64,
+    /// TCP connection attempts directly measured by active enrichment phases.
+    /// DNS-library fallbacks and passive-provider transports are not included.
+    pub tcp_connections: u64,
+    /// HTTP requests directly measured by metadata and Web/JavaScript phases.
+    pub http_requests: u64,
+    /// TLS/STARTTLS connection attempts, including bounded no-SNI probes.
+    pub tls_connections: u64,
+    /// Response body bytes retained by measured HTTP enrichment phases. This
+    /// intentionally excludes headers, TLS framing and provider-side caches.
+    pub bytes_transferred: u64,
+    pub exclusive_discoveries: usize,
+    pub exploration_actions: usize,
+    pub backoffs: usize,
+    pub effective_qps_min: f64,
+    pub effective_qps_max: f64,
+    pub remaining_yield_upper_bound: f64,
+    pub stop_reason: Option<StopReason>,
 }
 
 fn default_completed_status() -> String {
@@ -336,4 +439,85 @@ pub struct Stats {
     pub resolver_profiles: i64,
     pub generator_bandits: i64,
     pub top_words: Vec<BTreeMap<String, serde_json::Value>>,
+}
+
+#[cfg(test)]
+mod compatibility_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn finding_deserializes_without_v8_or_v9_fields() {
+        let value = json!({
+            "fqdn": "api.example.com",
+            "records": [{"record_type": "A", "value": "192.0.2.10", "ttl": 60}],
+            "sources": ["dns"],
+            "wildcard": false,
+            "from_cache": false,
+            "confidence": {"score": 90, "label": "high", "reasons": ["live DNS"]}
+        });
+
+        let finding: Finding = serde_json::from_value(value).expect("legacy Finding JSON");
+        assert_eq!(finding.fqdn, "api.example.com");
+        assert_eq!(finding.state, ObservationState::Unverified);
+        assert!(finding.last_verified_at.is_none());
+        assert!(finding.evidence_families.is_empty());
+        assert!(!finding.authoritative_validation);
+        assert_eq!(finding.wildcard_verdict, WildcardVerdict::NotProfiled);
+        assert!(finding.owner_proofs.is_empty());
+        assert!(finding.generation_path.is_empty());
+        assert!(finding.discovery_score.is_none());
+    }
+
+    #[test]
+    fn scan_result_deserializes_without_optional_or_scheduler_fields() {
+        let value = json!({
+            "scan_id": 7,
+            "domain": "example.com",
+            "candidates": 1,
+            "resolved_from_network": 1,
+            "cache_hits": 0,
+            "duration_ms": 12,
+            "wildcard_detected": false,
+            "findings": [],
+            "axfr_attempts": [],
+            "tls_certificates": [],
+            "dns_edges": [],
+            "child_zones": [],
+            "service_endpoints": [],
+            "web_observations": [],
+            "dnssec_walks": [],
+            "ct_monitor": {
+                "logs_checked": 0,
+                "entries_processed": 0,
+                "names": [],
+                "globally_indexed_names": 0,
+                "failures": 0,
+                "duration_ms": 0
+            },
+            "pipeline": {
+                "rounds": 0,
+                "events_enqueued": 0,
+                "duplicates_suppressed": 0,
+                "names_validated": 0,
+                "budget_exhausted": false
+            },
+            "resolver_metrics": [],
+            "warnings": []
+        });
+
+        let scan: ScanResult = serde_json::from_value(value).expect("legacy ScanResult JSON");
+        assert_eq!(scan.status, "completed");
+        assert!(!scan.resumable);
+        assert!(scan.phase_timings.is_empty());
+        assert_eq!(scan.scheduler_metrics.dns_queries, 0);
+        assert!(scan.scheduler_metrics.stop_reason.is_none());
+    }
+
+    #[test]
+    fn scheduler_metrics_accepts_the_v09_preview_packet_field() {
+        let metrics: SchedulerMetrics = serde_json::from_value(json!({"dns_packets": 9})).unwrap();
+        assert_eq!(metrics.dns_queries, 9);
+        assert_eq!(metrics.http_requests, 0);
+    }
 }

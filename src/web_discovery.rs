@@ -1,3 +1,4 @@
+use crate::archive_intelligence::{ArchiveLimits, analyze_archived_document};
 use crate::db::{Database, WebCacheEntry, WebCacheMetadata};
 use crate::dns::{DnsEngine, DnsResolutionOutcome};
 use crate::model::{ResolvedHost, WebObservation};
@@ -13,6 +14,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
@@ -23,6 +25,9 @@ pub struct WebDiscovery {
     pub observations: Vec<WebObservation>,
     pub unique_names: BTreeSet<String>,
     pub network_requests: usize,
+    /// Response body bytes retained for analysis. Cached observations and
+    /// protocol overhead are deliberately excluded.
+    pub bytes_transferred: u64,
     pub cache_hits: usize,
     pub failures: usize,
     pub duration_ms: u128,
@@ -33,6 +38,12 @@ struct FetchResult {
     observation: WebObservation,
     assets: Vec<String>,
     network: bool,
+}
+
+#[derive(Default)]
+struct WebIoCounters {
+    requests: AtomicUsize,
+    bytes: AtomicU64,
 }
 
 struct BoundedFetch {
@@ -74,6 +85,9 @@ fn merge_host_fetch_batch(discovery: &mut WebDiscovery, batch: HostFetchBatch) {
     discovery.budget_exhausted |= batch.budget_exhausted;
     for result in batch.results {
         if result.network {
+            // Keep the partial object meaningful for callers/tests that merge
+            // completed batches directly. discover_web replaces this with the
+            // exact attempt counter (which also includes failed requests).
             discovery.network_requests += 1;
         } else {
             discovery.cache_hits += 1;
@@ -348,6 +362,78 @@ fn extract_asset_urls(text: &str, base: &Url, domain: &str, limit: usize) -> Vec
     urls.into_iter().collect()
 }
 
+fn response_body_limit(headers: &HeaderMap, configured_limit: usize) -> usize {
+    headers
+        .get(reqwest::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok())
+        .map_or(configured_limit, |declared| declared.min(configured_limit))
+}
+
+fn static_asset_url(value: &str, domain: &str) -> bool {
+    let Ok(url) = Url::parse(value) else {
+        return false;
+    };
+    if !in_scope_url(&url, domain) {
+        return false;
+    }
+    let path = url.path().to_ascii_lowercase();
+    path.ends_with(".js")
+        || path.ends_with(".mjs")
+        || path.ends_with(".map")
+        || path.ends_with(".json")
+        || path.ends_with(".webmanifest")
+        || path.contains("manifest")
+}
+
+fn archive_limits(max_bytes: usize, asset_limit: usize) -> ArchiveLimits {
+    ArchiveLimits {
+        max_archive_bytes: max_bytes,
+        max_record_bytes: max_bytes,
+        max_header_bytes: max_bytes.min(64 * 1024),
+        max_records: 1,
+        max_document_bytes: max_bytes,
+        max_analysis_bytes: max_bytes.saturating_mul(4).min(16 * 1024 * 1024),
+        max_names: 4_096,
+        max_evidence: 8_192,
+        max_urls: asset_limit.saturating_mul(4).min(512),
+        max_js_literals: 4_096,
+        max_string_bytes: max_bytes.min(4_096),
+        max_json_values: 32_768,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn enrich_with_archive_intelligence(
+    domain: &str,
+    source_url: &str,
+    content_type: &str,
+    body: &[u8],
+    max_bytes: usize,
+    asset_limit: usize,
+    names: &mut BTreeSet<String>,
+    assets: &mut Vec<String>,
+) {
+    let Ok(intelligence) = analyze_archived_document(
+        domain,
+        source_url,
+        content_type,
+        body,
+        archive_limits(max_bytes, asset_limit),
+    ) else {
+        return;
+    };
+    names.extend(intelligence.names);
+    for asset in intelligence.in_scope_urls {
+        if assets.len() >= asset_limit {
+            break;
+        }
+        if static_asset_url(&asset, domain) && !assets.contains(&asset) {
+            assets.push(asset);
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn fetch_url(
     database: &Database,
@@ -358,6 +444,7 @@ async fn fetch_url(
     max_bytes: usize,
     asset_limit: usize,
     phase_deadline: Option<tokio::time::Instant>,
+    io: &WebIoCounters,
 ) -> Result<BoundedFetch> {
     let now = crate::util::now_epoch();
     let freshness = refresh.as_secs().min(i64::MAX as u64) as i64;
@@ -387,6 +474,7 @@ async fn fetch_url(
                 request = request.header(IF_MODIFIED_SINCE, last_modified);
             }
         }
+        io.requests.fetch_add(1, Ordering::Relaxed);
         let mut response = request.send().await.with_context(|| format!("GET {url}"))?;
         let status = response.status();
         let headers = response.headers().clone();
@@ -416,21 +504,37 @@ async fn fetch_url(
         }
         let base = Url::parse(&url)?;
         let read_body = textual_response(&headers, &base);
-        let mut body = Vec::new();
+        let body_limit = response_body_limit(&headers, max_bytes);
+        let mut body = Vec::with_capacity(body_limit.min(64 * 1024));
         if read_body {
-            while body.len() < max_bytes {
+            while body.len() < body_limit {
                 let Some(chunk) = response.chunk().await? else {
                     break;
                 };
-                let remaining = max_bytes.saturating_sub(body.len());
+                let remaining = body_limit.saturating_sub(body.len());
                 body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
             }
         }
+        io.bytes.fetch_add(body.len() as u64, Ordering::Relaxed);
         let content_hash = format!("{:x}", Sha256::digest(&body));
-        let body = String::from_utf8_lossy(&body);
-        let metadata = format!("{}\n{}", header_text(&headers), body);
-        let names = extract_observed_names(&metadata, domain);
-        let mut assets = extract_asset_urls(&body, &base, domain, asset_limit);
+        let body_text = String::from_utf8_lossy(&body);
+        let metadata = format!("{}\n{}", header_text(&headers), body_text);
+        let mut names = extract_observed_names(&metadata, domain);
+        let mut assets = extract_asset_urls(&body_text, &base, domain, asset_limit);
+        let content_type = headers
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        enrich_with_archive_intelligence(
+            domain,
+            &url,
+            content_type,
+            &body,
+            max_bytes,
+            asset_limit,
+            &mut names,
+            &mut assets,
+        );
         if status.is_redirection()
             && let Some(location) = headers.get(LOCATION).and_then(|value| value.to_str().ok())
             && let Ok(redirect) = base.join(location)
@@ -551,6 +655,7 @@ pub async fn discover_web_bounded(
         budget_exhausted: resolution_budget_exhausted,
         ..WebDiscovery::default()
     };
+    let io = Arc::new(WebIoCounters::default());
     for host in requested_hosts
         .iter()
         .filter(|host| !pinned_hosts.contains_key(*host))
@@ -566,6 +671,8 @@ pub async fn discover_web_bounded(
         }
     }
     if pinned_hosts.is_empty() {
+        discovery.network_requests = io.requests.load(Ordering::Relaxed);
+        discovery.bytes_transferred = io.bytes.load(Ordering::Relaxed);
         return Ok(finish_web_discovery(discovery, started));
     }
     let approved_hosts = Arc::new(pinned_hosts.keys().cloned().collect::<BTreeSet<_>>());
@@ -594,6 +701,7 @@ pub async fn discover_web_bounded(
             let domain = domain_owned.clone();
             let visited = visited.clone();
             let approved_hosts = approved_hosts.clone();
+            let io = io.clone();
             async move {
                 let Some(https) = claim_url(&visited, &format!("https://{host}/")).await else {
                     return Ok::<_, anyhow::Error>(HostFetchBatch {
@@ -610,6 +718,7 @@ pub async fn discover_web_bounded(
                     max_bytes,
                     assets_per_host,
                     phase_deadline,
+                    &io,
                 )
                 .await;
                 let root = match https_result {
@@ -643,6 +752,7 @@ pub async fn discover_web_bounded(
                             max_bytes,
                             assets_per_host,
                             phase_deadline,
+                            &io,
                         )
                         .await?;
                         if http_result.budget_exhausted {
@@ -684,6 +794,7 @@ pub async fn discover_web_bounded(
                         max_bytes,
                         assets_per_host.saturating_sub(attempted_assets),
                         phase_deadline,
+                        &io,
                     )
                     .await
                     {
@@ -711,6 +822,8 @@ pub async fn discover_web_bounded(
             Err(_) => discovery.failures += 1,
         }
     }
+    discovery.network_requests = io.requests.load(Ordering::Relaxed);
+    discovery.bytes_transferred = io.bytes.load(Ordering::Relaxed);
     Ok(finish_web_discovery(discovery, started))
 }
 
@@ -863,6 +976,60 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn content_length_and_configured_cap_bound_each_response_body() {
+        let mut headers = HeaderMap::new();
+        headers.insert(reqwest::header::CONTENT_LENGTH, "12".parse().unwrap());
+        assert_eq!(response_body_limit(&headers, 1_024), 12);
+        headers.insert(
+            reqwest::header::CONTENT_LENGTH,
+            "999999999".parse().unwrap(),
+        );
+        assert_eq!(response_body_limit(&headers, 1_024), 1_024);
+        headers.insert(reqwest::header::CONTENT_LENGTH, "invalid".parse().unwrap());
+        assert_eq!(response_body_limit(&headers, 1_024), 1_024);
+    }
+
+    #[test]
+    fn static_javascript_intelligence_enriches_names_but_only_queues_safe_assets() {
+        let body = include_bytes!("../tests/fixtures/archive/bundle.js");
+        let mut names = BTreeSet::new();
+        let mut assets = Vec::new();
+        enrich_with_archive_intelligence(
+            "example.com",
+            "https://static.example.com/assets/bundle.js",
+            "application/javascript",
+            body,
+            body.len(),
+            16,
+            &mut names,
+            &mut assets,
+        );
+
+        for expected in [
+            "api-v2.example.com",
+            "fetch.example.com",
+            "axios.example.com",
+            "events.example.com",
+            "webpack.example.com",
+            "vite.example.com",
+            "next.example.com",
+            "maps.example.com",
+        ] {
+            assert!(names.contains(expected), "missing {expected}");
+        }
+        assert_eq!(
+            assets,
+            vec!["https://maps.example.com/assets/bundle.js.map"]
+        );
+        assert!(
+            assets
+                .iter()
+                .all(|asset| static_asset_url(asset, "example.com"))
+        );
+        assert!(!assets.iter().any(|asset| asset.contains("graphql")));
+    }
+
     #[tokio::test]
     async fn url_claims_are_global_and_canonical() {
         let visited = Mutex::new(BTreeSet::new());
@@ -902,6 +1069,7 @@ mod tests {
             .unwrap();
         let client = Client::builder().build().unwrap();
         let expired = Some(tokio::time::Instant::now() - Duration::from_millis(1));
+        let io = WebIoCounters::default();
 
         for refresh in [Duration::from_secs(3_600), Duration::ZERO] {
             let fetched = fetch_url(
@@ -913,6 +1081,7 @@ mod tests {
                 1_024,
                 4,
                 expired,
+                &io,
             )
             .await
             .unwrap();

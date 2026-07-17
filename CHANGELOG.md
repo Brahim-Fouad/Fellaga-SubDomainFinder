@@ -6,6 +6,35 @@ Published releases and downloadable artifacts are available on [GitHub Releases]
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-07-16
+
+### Added
+
+- added a target-local hostname grammar that learns service, environment, region, cloud, separator, and numeric conventions under deterministic beam and expansion limits;
+- added bounded DNS-SD, NAPTR, URI, SPF, DMARC, MTA-STS, TLS reporting, and BIMI discovery while keeping external relationships as non-querying features;
+- added standardized HTTPS metadata discovery for API Catalog, OpenID Connect, OAuth authorization-server metadata, SSH known hosts, Terraform discovery, and host-meta;
+- added a Static CT tile reader with durable tile/checkpoint caching and automatic fallback from unavailable RFC 6962 entry endpoints;
+- added bounded Common Crawl WARC sampling and semantic static extraction from HTML, JSON, JavaScript calls and configuration, string composition, and source maps;
+- added differential SNI/no-SNI TLS certificate inspection for a maximum of four prioritized endpoints;
+- added locally validated NSEC and compact NXNAME denial classification for a bounded wildcard-suspect set, with conservative NSEC3 exact-owner and Opt-Out handling that never promotes an ordinary range proof to destructive cleanup;
+- added SQLite schema v9 foundations for discovery actions, intelligence relationships, DNSSEC proofs, CT tiles, and scheduler arms, with bounded public APIs for action queues, learned templates, CT cache data, and cost-aware generator ranking;
+- added `wildcard_verdict`, `owner_proofs`, `generation_path`, and `discovery_score` to findings, plus final `scheduler_metrics`.
+
+### Changed
+
+- made adaptive network pressure control the default: configured DNS rate and concurrency are ceilings, with loss/latency backoff and cautious recovery;
+- rank active generators with a deterministic cost-adjusted Beta-UCB score and reward only same-scan, first-seen, live, non-wildcard discoveries;
+- use a one-sided Wilson yield bound over consecutive active waves before stopping statistically low-yield brute force;
+- route metadata hostname resolution through Fellaga's configured consensus DNS engine and pin only public addresses;
+- use the adaptive concurrency snapshot in bulk DNS operations and expose the final stop reason and network backoffs in human and JSON output.
+
+### Fixed
+
+- purge positive cache and active inventory state when locally validated DNSSEC proof establishes that a wildcard-synthesized candidate does not exist, while retaining provenance and an append-only audit event;
+- keep unsigned, AD-only, empty-non-terminal, Opt-Out, contradictory, or otherwise inconclusive DNSSEC evidence from authorizing cleanup;
+- bound archive range downloads, decompression, document analysis, output cardinality, redirects, and metadata bodies;
+- preserve v8 data transactionally during the v9 migration, reject future schemas, and repair partially initialized v9 databases without deleting observations.
+
 ## [0.8.6] - 2026-07-16
 
 ### Added
@@ -183,7 +212,8 @@ Initial public release of Fellaga.
 - public MIT repository with security policy, contribution guide, third-party notices, and verifiable corpus provenance;
 - verifiable v0.8.0 release with x86-64 and ARM64 GNU/Linux archives, an amd64 Debian package, architecture SBOMs, checksums, a keyless Sigstore signature over the checksum manifest, and GitHub attestations.
 
-[Unreleased]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/compare/v0.8.6...HEAD
+[Unreleased]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/tag/v0.9.0
 [0.8.6]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/tag/v0.8.6
 [0.8.5]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/tag/v0.8.5
 [0.8.4]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/tag/v0.8.4
