@@ -34,10 +34,28 @@ const MAX_SCHEDULER_TOTAL: f64 = 1_000_000_000_000_000.0;
 const MAX_DISCOVERY_ACTIONS: usize = 4_096;
 const MAX_DISCOVERY_ACTION_CLAIM: usize = 512;
 const MAX_DISCOVERY_OUTCOME_JSON: usize = 64 * 1024;
+const MAX_NAMED_SEED_CLAIM: usize = 4_096;
+const CT_MATERIALIZATION_PAGE_SIZE: usize = 128;
+const CT_MATERIALIZATION_LOCK_RETRY: Duration = Duration::from_millis(2);
+const CT_COMMIT_HASH_CHUNK_SIZE: usize = 64 * 1024;
+const CT_COMMIT_SQLITE_BUSY_MAX: Duration = Duration::from_millis(25);
 const CURRENT_SCAN_WILDCARD_MATCH_DETAILS: &str =
     r#"{"network_positive":true,"reason":"current_scan_wildcard_match"}"#;
 const CURRENT_SCAN_WILDCARD_AMBIGUITY_DETAILS: &str =
     r#"{"network_positive":true,"reason":"wildcard_profile_ambiguous"}"#;
+
+fn usize_to_i64_saturating(value: usize) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+fn u64_to_i64_saturating(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+fn is_strict_subdomain(fqdn: &str, root_domain: &str) -> bool {
+    fqdn.strip_suffix(root_domain)
+        .is_some_and(|prefix| !prefix.is_empty() && prefix.ends_with('.'))
+}
 
 fn ensure_ct_materialization_deadline(deadline: Option<Instant>) -> Result<()> {
     if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
@@ -46,6 +64,59 @@ fn ensure_ct_materialization_deadline(deadline: Option<Instant>) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn ensure_ct_materialization_active(
+    deadline: Option<Instant>,
+    cancellation: &AtomicBool,
+) -> Result<()> {
+    if cancellation.load(Ordering::Acquire) {
+        bail!("matérialisation CT annulée; traitement reporté sans supprimer le cache permanent");
+    }
+    ensure_ct_materialization_deadline(deadline)
+}
+
+fn ct_payload_sha256_until_cancelled(
+    payload: &[u8],
+    deadline: Option<Instant>,
+    cancellation: &AtomicBool,
+) -> Result<String> {
+    ensure_ct_materialization_active(deadline, cancellation)?;
+    let mut digest = Sha256::new();
+    for chunk in payload.chunks(CT_COMMIT_HASH_CHUNK_SIZE) {
+        ensure_ct_materialization_active(deadline, cancellation)?;
+        digest.update(chunk);
+    }
+    ensure_ct_materialization_active(deadline, cancellation)?;
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn with_ct_commit_busy_timeout<T, F>(
+    connection: &mut Connection,
+    deadline: Option<Instant>,
+    operation: F,
+) -> Result<T>
+where
+    F: FnOnce(&mut Connection) -> Result<T>,
+{
+    let busy_timeout = deadline
+        .map(|deadline| {
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(CT_COMMIT_SQLITE_BUSY_MAX)
+                .max(Duration::from_millis(1))
+        })
+        .unwrap_or(CT_COMMIT_SQLITE_BUSY_MAX);
+    connection.busy_timeout(busy_timeout)?;
+    let result = operation(connection);
+    let restore = connection
+        .busy_timeout(Duration::from_secs(5))
+        .context("restauration du delai SQLite apres commit CT");
+    match (result, restore) {
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Ok(value), Ok(())) => Ok(value),
+    }
 }
 
 fn has_current_scan_wildcard_match(
@@ -1005,21 +1076,38 @@ impl Database {
         if version > 9 {
             bail!("base SQLite version {version} plus récente que cette version de Fellaga (v9)");
         }
-        if (1..9).contains(&version) {
+        // Some pre-versioned Fellaga databases contain real user tables while
+        // still reporting user_version=0.  They need the same safety backup as
+        // numbered legacy databases; a genuinely empty/new file does not.
+        let contains_legacy_schema = version == 0
+            && connection.query_row(
+                r#"SELECT EXISTS(
+                       SELECT 1 FROM sqlite_schema
+                       WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%'
+                   )"#,
+                [],
+                |row| row.get::<_, i64>(0),
+            )? != 0;
+        if (1..9).contains(&version) || contains_legacy_schema {
             let backup = if version < 8 {
                 next_v8_backup_path(path)?
             } else {
                 next_v9_backup_path(path)?
             };
-            connection
-                .execute("VACUUM INTO ?1", [backup.to_string_lossy().as_ref()])
-                .with_context(|| {
+            if let Err(error) =
+                connection.execute("VACUUM INTO ?1", [backup.to_string_lossy().as_ref()])
+            {
+                // next_schema_backup_path reserved this exact empty file. Do
+                // not leave an empty artifact that looks like a valid backup.
+                let _ = std::fs::remove_file(&backup);
+                return Err(error).with_context(|| {
                     format!(
                         "sauvegarde SQLite pré-migration de {} vers {}",
                         path.display(),
                         backup.display()
                     )
-                })?;
+                });
+            }
             secure_existing_sqlite_files(&backup)?;
         }
         Self::from_connection(path.to_path_buf(), connection)
@@ -1954,6 +2042,36 @@ impl Database {
             .map_err(|_| anyhow::anyhow!("verrou SQLite empoisonné"))
     }
 
+    fn lock_ct_materialization_until(
+        &self,
+        deadline: Option<Instant>,
+        cancellation: &AtomicBool,
+    ) -> Result<std::sync::MutexGuard<'_, Connection>> {
+        loop {
+            ensure_ct_materialization_active(deadline, cancellation)?;
+            match self.connection.try_lock() {
+                Ok(connection) => {
+                    ensure_ct_materialization_active(deadline, cancellation)?;
+                    return Ok(connection);
+                }
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    bail!("verrou SQLite empoisonné")
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    let retry = deadline.map_or(CT_MATERIALIZATION_LOCK_RETRY, |deadline| {
+                        deadline
+                            .saturating_duration_since(Instant::now())
+                            .min(CT_MATERIALIZATION_LOCK_RETRY)
+                    });
+                    if retry.is_zero() {
+                        ensure_ct_materialization_active(deadline, cancellation)?;
+                    }
+                    std::thread::sleep(retry);
+                }
+            }
+        }
+    }
+
     pub fn store_observations(
         &self,
         root_domain: &str,
@@ -2077,7 +2195,12 @@ impl Database {
                soa_serial=excluded.soa_serial,
                updated_at=excluded.updated_at,
                expires_at=excluded.expires_at,
-               probe_count=wildcard_cache.probe_count+excluded.probe_count,
+               probe_count=CASE
+                   WHEN wildcard_cache.probe_count<0 THEN excluded.probe_count
+                   WHEN wildcard_cache.probe_count>=9223372036854775807-excluded.probe_count
+                   THEN 9223372036854775807
+                   ELSE wildcard_cache.probe_count+excluded.probe_count
+               END,
                algorithm_version=excluded.algorithm_version"#,
             params![
                 zone,
@@ -2120,25 +2243,42 @@ impl Database {
         let mut connection = self.lock()?;
         let transaction = connection.transaction()?;
         for metric in metrics {
+            let requests = u64_to_i64_saturating(metric.requests);
+            let successes = u64_to_i64_saturating(metric.successes);
+            let failures = u64_to_i64_saturating(metric.failures);
+            let total_ms = u64_to_i64_saturating(metric.average_ms.saturating_mul(metric.requests));
+            let consecutive_failures = u64_to_i64_saturating(metric.consecutive_failures);
             transaction.execute(
                 r#"INSERT INTO resolver_stats(
                    resolver, requests, successes, failures, total_ms,
                    consecutive_failures, last_used
                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                    ON CONFLICT(resolver) DO UPDATE SET
-                   requests=resolver_stats.requests+excluded.requests,
-                   successes=resolver_stats.successes+excluded.successes,
-                   failures=resolver_stats.failures+excluded.failures,
-                   total_ms=resolver_stats.total_ms+excluded.total_ms,
+                   requests=CASE
+                       WHEN MAX(resolver_stats.requests, 0)>9223372036854775807-excluded.requests
+                       THEN 9223372036854775807
+                       ELSE MAX(resolver_stats.requests, 0)+excluded.requests END,
+                   successes=CASE
+                       WHEN MAX(resolver_stats.successes, 0)>9223372036854775807-excluded.successes
+                       THEN 9223372036854775807
+                       ELSE MAX(resolver_stats.successes, 0)+excluded.successes END,
+                   failures=CASE
+                       WHEN MAX(resolver_stats.failures, 0)>9223372036854775807-excluded.failures
+                       THEN 9223372036854775807
+                       ELSE MAX(resolver_stats.failures, 0)+excluded.failures END,
+                   total_ms=CASE
+                       WHEN MAX(resolver_stats.total_ms, 0)>9223372036854775807-excluded.total_ms
+                       THEN 9223372036854775807
+                       ELSE MAX(resolver_stats.total_ms, 0)+excluded.total_ms END,
                    consecutive_failures=excluded.consecutive_failures,
                    last_used=excluded.last_used"#,
                 params![
                     metric.resolver,
-                    metric.requests as i64,
-                    metric.successes as i64,
-                    metric.failures as i64,
-                    metric.average_ms.saturating_mul(metric.requests) as i64,
-                    metric.consecutive_failures as i64,
+                    requests,
+                    successes,
+                    failures,
+                    total_ms,
+                    consecutive_failures,
                     now
                 ],
             )?;
@@ -2312,19 +2452,42 @@ impl Database {
         stage: &str,
         options_hash: &str,
     ) -> Result<()> {
-        self.lock()?.execute(
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        let scan = transaction
+            .query_row(
+                "SELECT domain, status FROM scans WHERE id=?1",
+                [scan_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        let Some((scan_domain, status)) = scan else {
+            bail!("scan #{scan_id} introuvable pour le checkpoint");
+        };
+        if scan_domain != domain {
+            bail!("le domaine du checkpoint ne correspond pas au scan #{scan_id}");
+        }
+        if status != "running" {
+            // A late heartbeat is expected while shutdown is racing with the
+            // checkpoint worker. It must be harmless and must never reopen a
+            // completed checkpoint.
+            return Ok(());
+        }
+        transaction.execute(
             r#"INSERT INTO scan_checkpoints(
                scan_id, domain, stage, options_hash, updated_at, completed
                ) VALUES (?1, ?2, ?3, ?4, ?5, 0)
                ON CONFLICT(scan_id) DO UPDATE SET
                stage=excluded.stage, options_hash=excluded.options_hash,
                updated_at=excluded.updated_at, completed=0
-               WHERE EXISTS (
+               WHERE scan_checkpoints.completed=0 AND EXISTS (
                    SELECT 1 FROM scans
                    WHERE scans.id=excluded.scan_id AND scans.status='running'
+                     AND scans.domain=excluded.domain
                )"#,
             params![scan_id, domain, stage, options_hash, now_epoch()],
         )?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -2416,20 +2579,31 @@ impl Database {
             "UPDATE scan_checkpoints SET stage='running', updated_at=?1 WHERE scan_id=?2 AND completed=0",
             params![now, scan_id],
         )?;
-        // A claimed candidate without a terminal DNS outcome is safe to retry.
-        // Completed rows are deliberately left terminal: replaying them made a
-        // resume start the brute-force phase from the beginning.
+        // A claimed candidate without a terminal DNS outcome is safe to retry
+        // only while retry budget remains. Exhausted queued rows can be left by
+        // an older binary or an interrupted finalization and must become
+        // terminal before the scan is resumed.
         transaction.execute(
-            "UPDATE scan_candidates SET status='queued' WHERE scan_id=?1 AND status='processing'",
+            r#"UPDATE scan_candidates
+               SET status=CASE WHEN attempts>=3 THEN 'done' ELSE 'queued' END
+               WHERE scan_id=?1 AND status IN ('queued', 'processing')"#,
             [scan_id],
         )?;
         transaction.execute(
-            "UPDATE scan_seed_candidates SET status='queued' WHERE scan_id=?1 AND status='processing'",
+            r#"UPDATE scan_seed_candidates
+               SET status=CASE WHEN attempts>=3 THEN 'done' ELSE 'queued' END
+               WHERE scan_id=?1 AND status IN ('queued', 'processing')"#,
             [scan_id],
         )?;
         transaction.execute(
-            "UPDATE scan_recursive_candidates SET status='queued' WHERE scan_id=?1 AND status='processing'",
+            r#"UPDATE scan_recursive_candidates
+               SET status=CASE WHEN attempts>=3 THEN 'done' ELSE 'queued' END
+               WHERE scan_id=?1 AND status IN ('queued', 'processing')"#,
             [scan_id],
+        )?;
+        transaction.execute(
+            "UPDATE discovery_actions SET state='queued', updated_at=?2 WHERE scan_id=?1 AND state='processing'",
+            params![scan_id, now],
         )?;
         transaction.commit()?;
         Ok(())
@@ -2694,14 +2868,14 @@ impl Database {
         let mut rows = {
             let mut statement = transaction.prepare(
                 r#"UPDATE scan_seed_candidates
-                   SET status='processing', attempts=attempts+1
+                   SET status='processing'
                    WHERE rowid IN (
                        SELECT rowid FROM scan_seed_candidates
-                       WHERE scan_id=?1 AND status='queued'
+                       WHERE scan_id=?1 AND status='queued' AND attempts<3
                        ORDER BY priority DESC, fqdn
                        LIMIT ?2
                    )
-                     AND scan_id=?1 AND status='queued'
+                     AND scan_id=?1 AND status='queued' AND attempts<3
                    RETURNING fqdn, sources_json, priority"#,
             )?;
             statement
@@ -2731,9 +2905,121 @@ impl Database {
             .collect()
     }
 
+    /// Réserve atomiquement un petit ensemble de graines déjà sélectionnées
+    /// par un producteur tardif (par exemple CT). Seules les lignes encore
+    /// queued sont renvoyées, ce qui empêche une seconde validation concurrente
+    /// de réclamer les mêmes noms.
+    pub fn claim_scan_seed_candidates_by_name(
+        &self,
+        scan_id: i64,
+        hosts: &[String],
+    ) -> Result<Vec<String>> {
+        if hosts.is_empty() {
+            return Ok(Vec::new());
+        }
+        if hosts.len() > MAX_NAMED_SEED_CLAIM {
+            bail!(
+                "trop de graines à réclamer par nom: {} > {MAX_NAMED_SEED_CLAIM}",
+                hosts.len()
+            );
+        }
+        let unique_hosts = hosts.iter().collect::<BTreeSet<_>>();
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        let mut claimed = Vec::with_capacity(unique_hosts.len());
+        for chunk in unique_hosts.iter().copied().collect::<Vec<_>>().chunks(400) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let mut values = Vec::<rusqlite::types::Value>::with_capacity(chunk.len() + 1);
+            values.push(scan_id.into());
+            values.extend(chunk.iter().map(|host| (*host).clone().into()));
+            let mut statement = transaction.prepare(&format!(
+                "UPDATE scan_seed_candidates SET status='processing' \
+                 WHERE scan_id=? AND status='queued' AND attempts<3 \
+                   AND fqdn IN ({placeholders}) \
+                 RETURNING fqdn"
+            ))?;
+            claimed.extend(
+                statement
+                    .query_map(rusqlite::params_from_iter(values), |row| {
+                        row.get::<_, String>(0)
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?,
+            );
+        }
+        claimed.sort();
+        transaction.commit()?;
+        Ok(claimed)
+    }
+
+    /// Charge une tentative seulement pour les graines dont une requête DNS a
+    /// réellement démarré. La réservation SQLite est volontairement séparée
+    /// de ce compteur afin qu'une deadline déjà épuisée ne consomme jamais un
+    /// retry sans paquet réseau.
+    pub fn mark_scan_seed_candidates_started(&self, scan_id: i64, hosts: &[String]) -> Result<()> {
+        if hosts.is_empty() {
+            return Ok(());
+        }
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        for chunk in hosts.chunks(500) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let mut values = Vec::<rusqlite::types::Value>::with_capacity(chunk.len() + 1);
+            values.push(scan_id.into());
+            values.extend(chunk.iter().cloned().map(Into::into));
+            transaction.execute(
+                &format!(
+                    "UPDATE scan_seed_candidates SET attempts=CASE \
+                         WHEN attempts>=9223372036854775807 THEN 9223372036854775807 \
+                         ELSE MAX(attempts, 0)+1 END \
+                     WHERE scan_id=? AND status='processing' AND fqdn IN ({placeholders})"
+                ),
+                rusqlite::params_from_iter(values),
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Rend immédiatement à la file les graines explicitement signalées comme
+    /// réservées mais non démarrées. Les tentatives de vagues précédentes sont
+    /// conservées; seule la réservation courante est annulée.
+    pub fn requeue_unstarted_scan_seed_candidates(
+        &self,
+        scan_id: i64,
+        hosts: &[String],
+    ) -> Result<()> {
+        if hosts.is_empty() {
+            return Ok(());
+        }
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        for chunk in hosts.chunks(500) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let mut values = Vec::<rusqlite::types::Value>::with_capacity(chunk.len() + 1);
+            values.push(scan_id.into());
+            values.extend(chunk.iter().cloned().map(Into::into));
+            transaction.execute(
+                &format!(
+                    "UPDATE scan_seed_candidates SET status='queued' \
+                     WHERE scan_id=? AND status='processing' \
+                       AND fqdn IN ({placeholders})"
+                ),
+                rusqlite::params_from_iter(values),
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn pending_scan_seed_candidate_count(&self, scan_id: i64) -> Result<i64> {
         Ok(self.lock()?.query_row(
-            "SELECT COUNT(*) FROM scan_seed_candidates WHERE scan_id=?1 AND status='queued'",
+            "SELECT COUNT(*) FROM scan_seed_candidates WHERE scan_id=?1 AND status='queued' AND attempts<3",
             [scan_id],
             |row| row.get(0),
         )?)
@@ -2770,8 +3056,8 @@ impl Database {
                        ), '')='error' AND attempts<3 THEN 'queued'
                        ELSE 'done'
                    END
-                   WHERE scan_id=?
-                      AND fqdn IN ({placeholders})"#
+                   WHERE scan_id=? AND status='processing'
+                     AND fqdn IN ({placeholders})"#
             );
             let mut values = Vec::<rusqlite::types::Value>::with_capacity(chunk.len() + 2);
             values.push(scan_id.into());
@@ -3184,12 +3470,12 @@ impl Database {
                    SET status='processing'
                    WHERE rowid IN (
                         SELECT rowid FROM scan_candidates
-                        WHERE scan_id=?1 AND status='queued'
+                        WHERE scan_id=?1 AND status='queued' AND attempts<3
                           AND ?3<>0
                         ORDER BY priority DESC, fqdn
                         LIMIT ?2
                    )
-                     AND scan_id=?1 AND status='queued'
+                     AND scan_id=?1 AND status='queued' AND attempts<3
                    RETURNING fqdn, relative_name, generator, priority"#,
             )?;
             statement
@@ -3232,7 +3518,9 @@ impl Database {
                 .collect::<Vec<_>>()
                 .join(",");
             let sql = format!(
-                "UPDATE scan_candidates SET attempts=attempts+1 \
+                "UPDATE scan_candidates SET attempts=CASE \
+                     WHEN attempts>=9223372036854775807 THEN 9223372036854775807 \
+                     ELSE MAX(attempts, 0)+1 END \
                  WHERE scan_id=? AND status='processing' AND fqdn IN ({placeholders})"
             );
             let mut values = Vec::<rusqlite::types::Value>::with_capacity(chunk.len() + 1);
@@ -3370,7 +3658,8 @@ impl Database {
         let mut active = transaction
             .query_row(
                 r#"SELECT COUNT(*) FROM scan_recursive_candidates
-                   WHERE scan_id=?1 AND depth=?2 AND status<>'done'"#,
+                   WHERE scan_id=?1 AND depth=?2
+                     AND status<>'done' AND attempts<3"#,
                 params![scan_id, depth],
                 |row| row.get::<_, i64>(0),
             )?
@@ -3473,10 +3762,12 @@ impl Database {
                 r#"UPDATE scan_recursive_candidates SET status='processing'
                    WHERE rowid IN (
                        SELECT rowid FROM scan_recursive_candidates
-                       WHERE scan_id=?1 AND depth=?2 AND status='queued'
+                       WHERE scan_id=?1 AND depth=?2
+                         AND status='queued' AND attempts<3
                        ORDER BY fqdn LIMIT ?3
                    )
-                     AND scan_id=?1 AND depth=?2 AND status='queued'
+                     AND scan_id=?1 AND depth=?2
+                     AND status='queued' AND attempts<3
                    RETURNING fqdn, parent, word"#,
             )?;
             statement
@@ -3520,7 +3811,9 @@ impl Database {
             values.extend(chunk.iter().cloned().map(Into::into));
             transaction.execute(
                 &format!(
-                    "UPDATE scan_recursive_candidates SET attempts=attempts+1 \
+                    "UPDATE scan_recursive_candidates SET attempts=CASE \
+                         WHEN attempts>=9223372036854775807 THEN 9223372036854775807 \
+                         ELSE MAX(attempts, 0)+1 END \
                      WHERE scan_id=? AND status='processing' AND fqdn IN ({placeholders})"
                 ),
                 rusqlite::params_from_iter(values),
@@ -3653,7 +3946,8 @@ impl Database {
         Ok(self.lock()?.query_row(
             r#"SELECT EXISTS(
                    SELECT 1 FROM scan_recursive_candidates
-                   WHERE scan_id=?1 AND depth=?2 AND status<>'done'
+                   WHERE scan_id=?1 AND depth=?2
+                     AND status<>'done' AND attempts<3
                ) OR EXISTS(
                    SELECT 1 FROM scan_recursive_parents
                    WHERE scan_id=?1 AND depth=?2 AND exhausted=0
@@ -3667,7 +3961,7 @@ impl Database {
         Ok(self.lock()?.query_row(
             r#"SELECT EXISTS(
                    SELECT 1 FROM scan_recursive_candidates
-                   WHERE scan_id=?1 AND status<>'done'
+                   WHERE scan_id=?1 AND status<>'done' AND attempts<3
                ) OR EXISTS(
                    SELECT 1 FROM scan_recursive_parents
                    WHERE scan_id=?1 AND exhausted=0
@@ -3679,7 +3973,7 @@ impl Database {
 
     pub fn pending_scan_candidate_count(&self, scan_id: i64) -> Result<i64> {
         Ok(self.lock()?.query_row(
-            "SELECT COUNT(*) FROM scan_candidates WHERE scan_id=?1 AND status='queued'",
+            "SELECT COUNT(*) FROM scan_candidates WHERE scan_id=?1 AND status='queued' AND attempts<3",
             [scan_id],
             |row| row.get(0),
         )?)
@@ -3692,7 +3986,7 @@ impl Database {
     ) -> Result<i64> {
         Ok(self.lock()?.query_row(
             r#"SELECT COUNT(*) FROM scan_candidates
-               WHERE scan_id=?1 AND status='queued'
+               WHERE scan_id=?1 AND status='queued' AND attempts<3
                  AND ?2<>0"#,
             params![scan_id, i64::from(include_active)],
             |row| row.get(0),
@@ -3999,9 +4293,9 @@ impl Database {
             params![
                 now_epoch(),
                 status,
-                candidates as i64,
-                found as i64,
-                cache_hits as i64,
+                usize_to_i64_saturating(candidates),
+                usize_to_i64_saturating(found),
+                usize_to_i64_saturating(cache_hits),
                 duration_ms.min(i64::MAX as u128) as i64,
                 serde_json::to_string(warnings)?,
                 scan_id
@@ -4031,9 +4325,9 @@ impl Database {
                WHERE id=?7 AND learning_applied=0"#,
             params![
                 now,
-                candidates as i64,
-                found as i64,
-                cache_hits as i64,
+                usize_to_i64_saturating(candidates),
+                usize_to_i64_saturating(found),
+                usize_to_i64_saturating(cache_hits),
                 duration_ms.min(i64::MAX as u128) as i64,
                 serde_json::to_string(warnings)?,
                 scan_id
@@ -4065,9 +4359,9 @@ impl Database {
                found=?3, cache_hits=?4, duration_ms=?5, warnings_json=?6 WHERE id=?7"#,
             params![
                 now_epoch(),
-                candidates as i64,
-                found as i64,
-                cache_hits as i64,
+                usize_to_i64_saturating(candidates),
+                usize_to_i64_saturating(found),
+                usize_to_i64_saturating(cache_hits),
                 duration_ms.min(i64::MAX as u128) as i64,
                 serde_json::to_string(warnings)?,
                 scan_id
@@ -4125,9 +4419,9 @@ impl Database {
             params![
                 now_epoch(),
                 status,
-                candidates as i64,
-                found as i64,
-                cache_hits as i64,
+                usize_to_i64_saturating(candidates),
+                usize_to_i64_saturating(found),
+                usize_to_i64_saturating(cache_hits),
                 duration_ms.min(i64::MAX as u128) as i64,
                 serde_json::to_string(warnings)?,
                 scan_id
@@ -4331,7 +4625,9 @@ impl Database {
         let network_answers = answers
             .iter()
             .filter(|answer| {
-                !answer.from_cache && !answer.records.is_empty() && answer.resolver_count >= 2
+                !answer.from_cache
+                    && !answer.records.is_empty()
+                    && (answer.resolver_count >= 2 || answer.authoritative_validation)
             })
             .collect::<Vec<_>>();
         if network_answers.is_empty() {
@@ -4411,11 +4707,13 @@ impl Database {
         Ok(hosts.len())
     }
 
-    /// Records a current positive response that cannot be distinguished from
-    /// an indeterminate or rotating wildcard profile. Unlike the exact-match
-    /// marker above, this never authorizes quarantine. It removes reusable
-    /// positive cache material and demotes only the materialized inventory for
-    /// this root while retaining records, sources, and append-only history.
+    /// Records a current positive response that remains ambiguous against a
+    /// freshly completed wildcard classification. The caller must never use
+    /// this destructive demotion after an indeterminate/incomplete profile.
+    /// Unlike the exact-match marker above, this never authorizes quarantine.
+    /// It removes reusable positive cache material and demotes only the
+    /// materialized inventory for this root while retaining records, sources,
+    /// and append-only history.
     pub fn record_current_wildcard_ambiguities(
         &self,
         scan_id: i64,
@@ -4433,6 +4731,25 @@ impl Database {
         let now = now_epoch();
         let mut connection = self.lock()?;
         let transaction = connection.transaction()?;
+        let scan = transaction
+            .query_row(
+                "SELECT domain, status FROM scans WHERE id=?1",
+                [scan_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        if scan.as_ref().map(|(domain, _)| domain.as_str()) != Some(root_domain) {
+            bail!("la zone d'ambiguïté wildcard ne correspond pas au scan {scan_id}");
+        }
+        if scan.as_ref().map(|(_, status)| status.as_str()) != Some("running") {
+            bail!("le scan {scan_id} n'est plus actif pour une ambiguïté wildcard");
+        }
+        if let Some(answer) = network_answers
+            .iter()
+            .find(|answer| !is_strict_subdomain(&answer.fqdn, root_domain))
+        {
+            bail!("réponse wildcard hors zone refusée: {}", answer.fqdn);
+        }
         let mut inserted = 0_usize;
         {
             let mut statement = transaction.prepare(
@@ -4483,6 +4800,23 @@ impl Database {
         negative_ttl: u32,
     ) -> Result<()> {
         let now = now_epoch();
+        // A live answer is the strongest outcome in one validation wave.  Bad
+        // caller input must not let a duplicate negative/error overwrite its
+        // permanent cache entry or demote the inventory in the same commit.
+        let positive_hosts = resolved
+            .iter()
+            .map(|answer| answer.fqdn.as_str())
+            .collect::<BTreeSet<_>>();
+        let definitive_negative = definitive_negative
+            .iter()
+            .map(String::as_str)
+            .filter(|host| !positive_hosts.contains(host))
+            .collect::<BTreeSet<_>>();
+        let indeterminate = indeterminate
+            .iter()
+            .map(String::as_str)
+            .filter(|host| !positive_hosts.contains(host) && !definitive_negative.contains(host))
+            .collect::<BTreeSet<_>>();
         let mut connection = self.lock()?;
         let transaction = connection.transaction()?;
         {
@@ -4508,12 +4842,12 @@ impl Database {
                     i64::from(answer.authoritative_validation)
                 ])?;
             }
-            for host in definitive_negative {
+            for host in &definitive_negative {
                 statement.execute(params![
-                    host,
+                    *host,
                     "negative",
                     "[]",
-                    now + i64::from(negative_ttl.max(30)),
+                    now.saturating_add(i64::from(negative_ttl.max(30))),
                     now,
                     0,
                     0
@@ -4540,10 +4874,10 @@ impl Database {
                     "{}"
                 ])?;
             }
-            for host in definitive_negative {
+            for host in &definitive_negative {
                 statement.execute(params![
                     scan_id,
-                    host,
+                    *host,
                     now,
                     "negative",
                     1,
@@ -4552,10 +4886,10 @@ impl Database {
                     "{}"
                 ])?;
             }
-            for host in indeterminate {
+            for host in &indeterminate {
                 statement.execute(params![
                     scan_id,
-                    host,
+                    *host,
                     now,
                     "error",
                     0,
@@ -4565,6 +4899,7 @@ impl Database {
                 ])?;
             }
         }
+        let definitive_negative = definitive_negative.into_iter().collect::<Vec<_>>();
         for chunk in definitive_negative.chunks(500) {
             let placeholders = std::iter::repeat_n("?", chunk.len())
                 .collect::<Vec<_>>()
@@ -4574,11 +4909,11 @@ impl Database {
                     "UPDATE subdomains SET active=0, verification_state='historical' \
                      WHERE fqdn IN ({placeholders})"
                 ),
-                rusqlite::params_from_iter(chunk.iter()),
+                rusqlite::params_from_iter(chunk.iter().copied()),
             )?;
             transaction.execute(
                 &format!("UPDATE dns_records SET active=0 WHERE fqdn IN ({placeholders})"),
-                rusqlite::params_from_iter(chunk.iter()),
+                rusqlite::params_from_iter(chunk.iter().copied()),
             )?;
         }
         transaction.commit()?;
@@ -4623,7 +4958,24 @@ impl Database {
                 .cloned()
                 .collect::<Vec<_>>()
                 .join(",");
-            let verified_at = (finding.state == ObservationState::Live)
+            // Wildcard-positive rows remain in scan_findings for audit, but
+            // must never materialize as reusable live inventory/DNS records if
+            // a later cleanup phase is cancelled or crashes.
+            let materialized_live = finding.state == ObservationState::Live && !finding.wildcard;
+            if finding.wildcard {
+                // update_cache_outcomes runs before wildcard classification.
+                // Remove that provisional positive in this same transaction as
+                // the inventory demotion so it cannot be reused by a later scan.
+                transaction.execute("DELETE FROM dns_cache WHERE fqdn=?1", [&finding.fqdn])?;
+            }
+            let inventory_state = if materialized_live {
+                ObservationState::Live
+            } else if finding.state == ObservationState::Historical {
+                ObservationState::Historical
+            } else {
+                ObservationState::Unverified
+            };
+            let verified_at = materialized_live
                 .then_some(finding.last_verified_at)
                 .flatten();
             transaction.execute(
@@ -4637,16 +4989,18 @@ impl Database {
                        WHEN subdomains.last_scan_id<>excluded.last_scan_id THEN 1 ELSE 0 END,
                    active=excluded.active, sources=excluded.sources,
                    verification_state=excluded.verification_state,
-                   last_verified_at=COALESCE(excluded.last_verified_at, subdomains.last_verified_at)"#,
+                   last_verified_at=CASE WHEN ?9<>0 THEN NULL
+                       ELSE COALESCE(excluded.last_verified_at, subdomains.last_verified_at) END"#,
                 params![
                     finding.fqdn,
                     domain,
                     now,
                     scan_id,
-                    i64::from(finding.state == ObservationState::Live),
+                    i64::from(materialized_live),
                     sources,
-                    finding.state.as_str(),
-                    verified_at
+                    inventory_state.as_str(),
+                    verified_at,
+                    i64::from(finding.wildcard)
                 ],
             )?;
             transaction.execute(
@@ -4693,7 +5047,7 @@ impl Database {
                         record.ttl,
                         PERMANENT_EXPIRY,
                         now,
-                        i64::from(finding.state == ObservationState::Live)
+                        i64::from(materialized_live)
                     ],
                 )?;
             }
@@ -4860,7 +5214,23 @@ impl Database {
     where
         F: FnMut(usize) -> bool,
     {
-        let mut connection = self.lock()?;
+        let mut connection = loop {
+            if should_cancel(0) {
+                return Ok(None);
+            }
+            match self.connection.try_lock() {
+                Ok(connection) => break connection,
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    bail!("verrou SQLite empoisonné")
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    std::thread::sleep(CT_MATERIALIZATION_LOCK_RETRY);
+                }
+            }
+        };
+        if should_cancel(0) {
+            return Ok(None);
+        }
         let transaction = connection.transaction()?;
         let scan_domain = transaction
             .query_row("SELECT domain FROM scans WHERE id=?1", [scan_id], |row| {
@@ -5311,72 +5681,89 @@ impl Database {
         names: &BTreeSet<String>,
         complete: bool,
         deadline: Option<Instant>,
+        cancellation: &AtomicBool,
     ) -> Result<usize> {
-        ensure_ct_materialization_deadline(deadline)?;
+        ensure_ct_materialization_active(deadline, cancellation)?;
         let now = now_epoch();
-        let mut connection = self.lock()?;
-        ensure_ct_materialization_deadline(deadline)?;
-        let bounded_busy = deadline.map(|deadline| {
-            deadline
-                .saturating_duration_since(Instant::now())
-                .min(Duration::from_millis(250))
-                .max(Duration::from_millis(1))
-        });
-        if let Some(busy) = bounded_busy {
-            connection.busy_timeout(busy)?;
-        }
-        let result = (|| {
-            let transaction = connection.transaction()?;
-            let evidence_source = format!("passive:{source}");
-            let mut written = 0_usize;
-            for (index, fqdn) in names.iter().enumerate() {
-                if index % 64 == 0 {
-                    ensure_ct_materialization_deadline(deadline)?;
+        let evidence_source = format!("passive:{source}");
+        let names = names.iter().collect::<Vec<_>>();
+        let mut written = 0_usize;
+        for page in names.chunks(CT_MATERIALIZATION_PAGE_SIZE) {
+            ensure_ct_materialization_active(deadline, cancellation)?;
+            let mut connection = self.lock_ct_materialization_until(deadline, cancellation)?;
+            ensure_ct_materialization_active(deadline, cancellation)?;
+            let bounded_busy = deadline.map(|deadline| {
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(250))
+                    .max(Duration::from_millis(1))
+            });
+            if let Some(busy) = bounded_busy {
+                connection.busy_timeout(busy)?;
+            }
+            let page_result: Result<usize> = (|| {
+                let transaction = connection.transaction()?;
+                let mut page_written = 0_usize;
+                for (index, fqdn) in page.iter().enumerate() {
+                    if index % 32 == 0 {
+                        ensure_ct_materialization_active(deadline, cancellation)?;
+                    }
+                    transaction.execute(
+                        r#"INSERT OR IGNORE INTO observed_names(
+                               fqdn, reversed_name, first_seen, last_seen
+                           ) VALUES (?1, ?2, ?3, ?3)"#,
+                        params![fqdn, reverse_hostname(fqdn), now],
+                    )?;
+                    let name_id: i64 = transaction.query_row(
+                        "SELECT id FROM observed_names WHERE fqdn=?1",
+                        [fqdn],
+                        |row| row.get(0),
+                    )?;
+                    page_written = page_written.saturating_add(transaction.execute(
+                        r#"INSERT OR IGNORE INTO observation_evidence(
+                               root_domain, name_id, kind, source, value,
+                               first_seen, last_seen, times_seen
+                           ) VALUES (?1, ?2, 'passive', ?3, '', ?4, ?4, 1)"#,
+                        params![domain, name_id, &evidence_source, now],
+                    )?);
                 }
-                transaction.execute(
-                    r#"INSERT OR IGNORE INTO observed_names(
-                           fqdn, reversed_name, first_seen, last_seen
-                       ) VALUES (?1, ?2, ?3, ?3)"#,
-                    params![fqdn, reverse_hostname(fqdn), now],
-                )?;
-                let name_id: i64 = transaction.query_row(
-                    "SELECT id FROM observed_names WHERE fqdn=?1",
-                    [fqdn],
-                    |row| row.get(0),
-                )?;
-                written = written.saturating_add(transaction.execute(
-                    r#"INSERT OR IGNORE INTO observation_evidence(
-                           root_domain, name_id, kind, source, value,
-                           first_seen, last_seen, times_seen
-                       ) VALUES (?1, ?2, 'passive', ?3, '', ?4, ?4, 1)"#,
-                    params![domain, name_id, &evidence_source, now],
-                )?);
+                ensure_ct_materialization_active(deadline, cancellation)?;
+                transaction.commit()?;
+                Ok(page_written)
+            })();
+            if bounded_busy.is_some() {
+                connection.busy_timeout(Duration::from_secs(5))?;
             }
-            ensure_ct_materialization_deadline(deadline)?;
-            if complete {
-                transaction.execute(
-                    r#"INSERT INTO passive_cache(root_domain, source, names_json, updated_at)
-                       VALUES (?1, ?2, '[]', ?3)
-                       ON CONFLICT(root_domain, source) DO UPDATE SET
-                       updated_at=excluded.updated_at"#,
-                    params![domain, source, now],
-                )?;
-            } else {
-                transaction.execute(
-                    r#"INSERT OR IGNORE INTO passive_cache(
-                           root_domain, source, names_json, updated_at
-                       ) VALUES (?1, ?2, '[]', 0)"#,
-                    params![domain, source],
-                )?;
-            }
-            ensure_ct_materialization_deadline(deadline)?;
-            transaction.commit()?;
-            Ok(written)
-        })();
-        if bounded_busy.is_some() {
-            connection.busy_timeout(Duration::from_secs(5))?;
+            written = written.saturating_add(page_result?);
+            drop(connection);
+            ensure_ct_materialization_active(deadline, cancellation)?;
         }
-        result
+
+        // Freshness is committed only after every evidence page completed.
+        // A cancelled run can retain permanent observations, but it cannot
+        // advertise a complete target materialization.
+        let mut connection = self.lock_ct_materialization_until(deadline, cancellation)?;
+        ensure_ct_materialization_active(deadline, cancellation)?;
+        let transaction = connection.transaction()?;
+        if complete {
+            transaction.execute(
+                r#"INSERT INTO passive_cache(root_domain, source, names_json, updated_at)
+                   VALUES (?1, ?2, '[]', ?3)
+                   ON CONFLICT(root_domain, source) DO UPDATE SET
+                   updated_at=excluded.updated_at"#,
+                params![domain, source, now],
+            )?;
+        } else {
+            transaction.execute(
+                r#"INSERT OR IGNORE INTO passive_cache(
+                       root_domain, source, names_json, updated_at
+                   ) VALUES (?1, ?2, '[]', 0)"#,
+                params![domain, source],
+            )?;
+        }
+        ensure_ct_materialization_active(deadline, cancellation)?;
+        transaction.commit()?;
+        Ok(written)
     }
 
     pub fn mark_passive_cache_refresh(
@@ -5415,32 +5802,129 @@ impl Database {
         limit: usize,
         deadline: Option<Instant>,
     ) -> Result<Vec<String>> {
-        ensure_ct_materialization_deadline(deadline)?;
+        let cancellation = AtomicBool::new(false);
+        self.ct_passive_names_bounded_until_cancelled(domain, limit, deadline, &cancellation)
+    }
+
+    fn ct_passive_names_bounded_until_cancelled(
+        &self,
+        domain: &str,
+        limit: usize,
+        deadline: Option<Instant>,
+        cancellation: &AtomicBool,
+    ) -> Result<Vec<String>> {
+        ensure_ct_materialization_active(deadline, cancellation)?;
         let mut selected = Vec::with_capacity(limit.min(100_000));
         let mut seen = BTreeSet::new();
-
-        for name in self.ct_names_for_domain(domain, limit)? {
-            ensure_ct_materialization_deadline(deadline)?;
-            if selected.len() >= limit {
-                break;
-            }
-            if let Some(name) = normalize_observed_name(&name, domain)
-                && seen.insert(name.clone())
-            {
-                selected.push(name);
-            }
+        if limit == 0 {
+            return Ok(selected);
         }
 
-        if selected.len() < limit {
-            for name in self.observation_names_bounded(domain, "passive:ct-direct", limit)? {
-                ensure_ct_materialization_deadline(deadline)?;
-                if selected.len() >= limit {
-                    break;
-                }
+        let reversed = reverse_hostname(domain);
+        let lower = format!("{reversed}.");
+        let upper = format!("{reversed}/");
+        let mut ct_cursor = None::<(i64, String)>;
+        while selected.len() < limit {
+            ensure_ct_materialization_active(deadline, cancellation)?;
+            let connection = self.lock_ct_materialization_until(deadline, cancellation)?;
+            ensure_ct_materialization_active(deadline, cancellation)?;
+            let page = if let Some((last_seen, fqdn)) = &ct_cursor {
+                let mut statement = connection.prepare(
+                    r#"SELECT fqdn, last_seen FROM ct_names
+                       WHERE reversed_name>=?1 AND reversed_name<?2
+                         AND (last_seen<?3 OR (last_seen=?3 AND fqdn>?4))
+                       ORDER BY last_seen DESC, fqdn ASC LIMIT ?5"#,
+                )?;
+                statement
+                    .query_map(
+                        params![
+                            lower,
+                            upper,
+                            last_seen,
+                            fqdn,
+                            usize_to_i64_saturating(
+                                CT_MATERIALIZATION_PAGE_SIZE.min(limit - selected.len())
+                            )
+                        ],
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                    )?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            } else {
+                let mut statement = connection.prepare(
+                    r#"SELECT fqdn, last_seen FROM ct_names
+                       WHERE reversed_name>=?1 AND reversed_name<?2
+                       ORDER BY last_seen DESC, fqdn ASC LIMIT ?3"#,
+                )?;
+                statement
+                    .query_map(
+                        params![
+                            lower,
+                            upper,
+                            usize_to_i64_saturating(
+                                CT_MATERIALIZATION_PAGE_SIZE.min(limit - selected.len())
+                            )
+                        ],
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                    )?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            drop(connection);
+            ensure_ct_materialization_active(deadline, cancellation)?;
+            let Some((last_name, last_seen)) = page.last().cloned() else {
+                break;
+            };
+            ct_cursor = Some((last_seen, last_name));
+            for (name, _) in page {
                 if let Some(name) = normalize_observed_name(&name, domain)
                     && seen.insert(name.clone())
                 {
                     selected.push(name);
+                    if selected.len() >= limit {
+                        break;
+                    }
+                }
+            }
+        }
+
+        if selected.len() < limit {
+            let mut observation_cursor = None::<String>;
+            while selected.len() < limit {
+                ensure_ct_materialization_active(deadline, cancellation)?;
+                let connection = self.lock_ct_materialization_until(deadline, cancellation)?;
+                ensure_ct_materialization_active(deadline, cancellation)?;
+                let mut statement = connection.prepare(
+                    r#"SELECT DISTINCT n.fqdn FROM observation_evidence e
+                       JOIN observed_names n ON n.id=e.name_id
+                       WHERE e.root_domain=?1 AND e.source='passive:ct-direct'
+                         AND (?2 IS NULL OR n.fqdn>?2)
+                       ORDER BY n.fqdn LIMIT ?3"#,
+                )?;
+                let page = statement
+                    .query_map(
+                        params![
+                            domain,
+                            observation_cursor.as_deref(),
+                            usize_to_i64_saturating(CT_MATERIALIZATION_PAGE_SIZE)
+                        ],
+                        |row| row.get::<_, String>(0),
+                    )?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                drop(statement);
+                drop(connection);
+                ensure_ct_materialization_active(deadline, cancellation)?;
+                let Some(last_name) = page.last().cloned() else {
+                    break;
+                };
+                observation_cursor = Some(last_name);
+                for name in page {
+                    if let Some(name) = normalize_observed_name(&name, domain)
+                        && seen.insert(name.clone())
+                    {
+                        selected.push(name);
+                        if selected.len() >= limit {
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -5467,8 +5951,26 @@ impl Database {
         complete: bool,
         deadline: Option<Instant>,
     ) -> Result<Vec<String>> {
-        ensure_ct_materialization_deadline(deadline)?;
-        let selected = self.ct_passive_names_bounded_until(domain, limit, deadline)?;
+        self.materialize_ct_passive_cache_bounded_until_cancelled(
+            domain,
+            limit,
+            complete,
+            deadline,
+            Arc::new(AtomicBool::new(false)),
+        )
+    }
+
+    pub(crate) fn materialize_ct_passive_cache_bounded_until_cancelled(
+        &self,
+        domain: &str,
+        limit: usize,
+        complete: bool,
+        deadline: Option<Instant>,
+        cancellation: Arc<AtomicBool>,
+    ) -> Result<Vec<String>> {
+        ensure_ct_materialization_active(deadline, &cancellation)?;
+        let selected =
+            self.ct_passive_names_bounded_until_cancelled(domain, limit, deadline, &cancellation)?;
         let seen = selected.iter().cloned().collect::<BTreeSet<_>>();
         self.store_passive_observation_page_if_absent(
             domain,
@@ -5476,8 +5978,9 @@ impl Database {
             &seen,
             complete,
             deadline,
+            &cancellation,
         )?;
-        ensure_ct_materialization_deadline(deadline)?;
+        ensure_ct_materialization_active(deadline, &cancellation)?;
         Ok(selected)
     }
 
@@ -5598,8 +6101,9 @@ impl Database {
         let duration_ms = duration_ms.min(i64::MAX as u128) as i64;
         let novel_requests = i64::from(record_yield_sample);
         let novel_total_ms = if record_yield_sample { duration_ms } else { 0 };
-        let connection = self.lock()?;
-        connection.execute(
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        transaction.execute(
             r#"INSERT INTO source_stats(
                source, requests, successes, failures, degraded, deferred,
                consecutive_failures,
@@ -5607,22 +6111,53 @@ impl Database {
                total_ms, last_error, last_status, last_used
                ) VALUES (?1, 1, ?2, ?3, ?4, ?5, ?3, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
                ON CONFLICT(source) DO UPDATE SET
-               requests=requests+1,
-               successes=successes+excluded.successes,
-               failures=failures+excluded.failures,
-               degraded=degraded+excluded.degraded,
-               deferred=deferred+excluded.deferred,
+               requests=CASE WHEN MAX(source_stats.requests, 0)>=9223372036854775807
+                   THEN 9223372036854775807 ELSE MAX(source_stats.requests, 0)+1 END,
+               successes=CASE
+                   WHEN MAX(source_stats.successes, 0)>9223372036854775807-excluded.successes
+                   THEN 9223372036854775807
+                   ELSE MAX(source_stats.successes, 0)+excluded.successes END,
+               failures=CASE
+                   WHEN MAX(source_stats.failures, 0)>9223372036854775807-excluded.failures
+                   THEN 9223372036854775807
+                   ELSE MAX(source_stats.failures, 0)+excluded.failures END,
+               degraded=CASE
+                   WHEN MAX(source_stats.degraded, 0)>9223372036854775807-excluded.degraded
+                   THEN 9223372036854775807
+                   ELSE MAX(source_stats.degraded, 0)+excluded.degraded END,
+               deferred=CASE
+                   WHEN MAX(source_stats.deferred, 0)>9223372036854775807-excluded.deferred
+                   THEN 9223372036854775807
+                   ELSE MAX(source_stats.deferred, 0)+excluded.deferred END,
                consecutive_failures=CASE excluded.last_status
                    WHEN 'success' THEN 0
                    WHEN 'degraded' THEN 0
-                   WHEN 'failure' THEN consecutive_failures+1
-                   ELSE consecutive_failures
+                   WHEN 'failure' THEN CASE
+                       WHEN MAX(source_stats.consecutive_failures, 0)>=9223372036854775807
+                       THEN 9223372036854775807
+                       ELSE MAX(source_stats.consecutive_failures, 0)+1 END
+                   ELSE MAX(source_stats.consecutive_failures, 0)
                END,
-                names=names+excluded.names,
-                novel_names=novel_names+excluded.novel_names,
-                novel_requests=novel_requests+excluded.novel_requests,
-                novel_total_ms=novel_total_ms+excluded.novel_total_ms,
-                total_ms=total_ms+excluded.total_ms,
+                names=CASE
+                    WHEN MAX(source_stats.names, 0)>9223372036854775807-excluded.names
+                    THEN 9223372036854775807
+                    ELSE MAX(source_stats.names, 0)+excluded.names END,
+                novel_names=CASE
+                    WHEN MAX(source_stats.novel_names, 0)>9223372036854775807-excluded.novel_names
+                    THEN 9223372036854775807
+                    ELSE MAX(source_stats.novel_names, 0)+excluded.novel_names END,
+                novel_requests=CASE
+                    WHEN MAX(source_stats.novel_requests, 0)>9223372036854775807-excluded.novel_requests
+                    THEN 9223372036854775807
+                    ELSE MAX(source_stats.novel_requests, 0)+excluded.novel_requests END,
+                novel_total_ms=CASE
+                    WHEN MAX(source_stats.novel_total_ms, 0)>9223372036854775807-excluded.novel_total_ms
+                    THEN 9223372036854775807
+                    ELSE MAX(source_stats.novel_total_ms, 0)+excluded.novel_total_ms END,
+                total_ms=CASE
+                    WHEN MAX(source_stats.total_ms, 0)>9223372036854775807-excluded.total_ms
+                    THEN 9223372036854775807
+                    ELSE MAX(source_stats.total_ms, 0)+excluded.total_ms END,
                 last_error=excluded.last_error,
                 last_status=excluded.last_status,
                 last_used=excluded.last_used"#,
@@ -5643,11 +6178,12 @@ impl Database {
             ],
         )?;
         if status == SourceResultStatus::Success {
-            connection.execute(
+            transaction.execute(
                 "DELETE FROM source_metadata_cache WHERE key=?1",
                 [format!("source.retry_until.{source}")],
             )?;
         }
+        transaction.commit()?;
         Ok(())
     }
 
@@ -5675,6 +6211,29 @@ impl Database {
                value=excluded.value, updated_at=excluded.updated_at"#,
             params![key, value, now_epoch()],
         )?;
+        Ok(())
+    }
+
+    pub(crate) fn store_source_metadata_until_cancelled(
+        &self,
+        key: &str,
+        value: &str,
+        deadline: Option<Instant>,
+        cancellation: &AtomicBool,
+    ) -> Result<()> {
+        ensure_ct_materialization_active(deadline, cancellation)?;
+        let mut connection = self.lock_ct_materialization_until(deadline, cancellation)?;
+        ensure_ct_materialization_active(deadline, cancellation)?;
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            r#"INSERT INTO source_metadata_cache(key, value, updated_at)
+               VALUES (?1, ?2, ?3)
+               ON CONFLICT(key) DO UPDATE SET
+               value=excluded.value, updated_at=excluded.updated_at"#,
+            params![key, value, now_epoch()],
+        )?;
+        ensure_ct_materialization_active(deadline, cancellation)?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -6226,14 +6785,35 @@ impl Database {
                 if scheduler_generators.contains(&generator) {
                     continue;
                 }
-                let total = (alpha + beta).max(1.0);
-                let mean = alpha / total;
-                let uncertainty = (alpha * beta / (total * total * (total + 1.0))).sqrt();
+                // Pre-v9 rows had no CHECK constraints. Treat negative,
+                // infinite or NaN posteriors as an untrained arm instead of
+                // allowing invalid floats or integer overflow into ranking.
+                let alpha = if alpha.is_finite() {
+                    alpha.clamp(1.0, MAX_SCHEDULER_TOTAL)
+                } else {
+                    1.0
+                };
+                let beta = if beta.is_finite() {
+                    beta.clamp(1.0, MAX_SCHEDULER_TOTAL)
+                } else {
+                    1.0
+                };
+                let pulls = pulls.max(0);
+                let total = (alpha + beta).clamp(2.0, MAX_SCHEDULER_TOTAL * 2.0);
+                let mean = (alpha / total).clamp(0.0, 1.0);
+                let variance = (alpha * beta / (total * total * (total + 1.0))).max(0.0);
+                let uncertainty = if variance.is_finite() {
+                    variance.sqrt()
+                } else {
+                    0.0
+                };
                 let exploration = if pulls < 5 { 0.35 } else { 0.12 };
                 let posterior_score =
-                    ((mean + exploration * uncertainty).min(1.0) * 1_000.0).round() as i64;
+                    ((mean + exploration * uncertainty).clamp(0.0, 1.0) * 1_000.0).round() as i64;
                 let weight = scheduler_context_weight(&bandit_context).round() as i64;
-                *scores.entry(generator).or_default() += posterior_score * weight;
+                let weighted_score = posterior_score.saturating_mul(weight);
+                let score = scores.entry(generator).or_default();
+                *score = score.saturating_add(weighted_score);
             }
         }
         Ok(scores)
@@ -6607,9 +7187,9 @@ impl Database {
                found=?3, cache_hits=?4, duration_ms=?5, warnings_json=?6 WHERE id=?7"#,
             params![
                 now_epoch(),
-                candidates as i64,
-                found as i64,
-                cache_hits as i64,
+                usize_to_i64_saturating(candidates),
+                usize_to_i64_saturating(found),
+                usize_to_i64_saturating(cache_hits),
                 duration_ms.min(i64::MAX as u128) as i64,
                 serde_json::to_string(warnings)?,
                 scan_id
@@ -6980,6 +7560,18 @@ impl Database {
         log_url: &str,
         batch: &crate::ct_static::StaticCtBatch,
     ) -> Result<()> {
+        let cancellation = AtomicBool::new(false);
+        self.store_ct_static_batch_until_cancelled(log_url, batch, None, &cancellation)
+    }
+
+    pub(crate) fn store_ct_static_batch_until_cancelled(
+        &self,
+        log_url: &str,
+        batch: &crate::ct_static::StaticCtBatch,
+        deadline: Option<Instant>,
+        cancellation: &AtomicBool,
+    ) -> Result<()> {
+        ensure_ct_materialization_active(deadline, cancellation)?;
         if batch.next_cursor > batch.checkpoint_size {
             bail!(
                 "curseur CT statique {} supérieur au checkpoint {}",
@@ -6990,36 +7582,50 @@ impl Database {
         if batch.checkpoint_hash.is_empty() {
             bail!("hash de checkpoint CT statique absent");
         }
-        let now = now_epoch();
-        let mut connection = self.lock()?;
-        let transaction = connection.transaction()?;
 
+        // Validate and hash potentially large immutable tiles before owning the
+        // shared SQLite mutex.  Chunking keeps both the phase deadline and an
+        // aborted async caller observable throughout this CPU-bound work.
         for tile in &batch.tiles {
+            ensure_ct_materialization_active(deadline, cancellation)?;
             if tile.path.is_empty()
                 || tile.checkpoint_size != batch.checkpoint_size
                 || tile.checkpoint_hash != batch.checkpoint_hash
             {
                 bail!("métadonnées de tuile CT statique incohérentes");
             }
-            let computed_hash = format!("{:x}", Sha256::digest(&tile.payload));
+            let computed_hash =
+                ct_payload_sha256_until_cancelled(&tile.payload, deadline, cancellation)?;
             if computed_hash != tile.content_hash {
                 bail!("hash de contenu invalide pour la tuile CT {}", tile.path);
             }
-            let existing = transaction
-                .query_row(
-                    r#"SELECT content_hash, payload FROM ct_tiles
+        }
+
+        ensure_ct_materialization_active(deadline, cancellation)?;
+        let now = now_epoch();
+        let mut connection = self.lock_ct_materialization_until(deadline, cancellation)?;
+        ensure_ct_materialization_active(deadline, cancellation)?;
+        with_ct_commit_busy_timeout(&mut connection, deadline, |connection| {
+            let transaction = connection.transaction()?;
+
+            for tile in &batch.tiles {
+                ensure_ct_materialization_active(deadline, cancellation)?;
+                let existing = transaction
+                    .query_row(
+                        r#"SELECT content_hash, payload FROM ct_tiles
                        WHERE log_url=?1 AND tile_path=?2"#,
-                    params![log_url, tile.path],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
-                )
-                .optional()?;
-            if existing.as_ref().is_some_and(|(hash, payload)| {
-                hash != &tile.content_hash || payload != &tile.payload
-            }) {
-                bail!("le journal CT a modifié la tuile immuable {}", tile.path);
-            }
-            transaction.execute(
-                r#"INSERT INTO ct_tiles(
+                        params![log_url, tile.path],
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
+                    )
+                    .optional()?;
+                ensure_ct_materialization_active(deadline, cancellation)?;
+                if existing.as_ref().is_some_and(|(hash, payload)| {
+                    hash != &tile.content_hash || payload != &tile.payload
+                }) {
+                    bail!("le journal CT a modifié la tuile immuable {}", tile.path);
+                }
+                transaction.execute(
+                    r#"INSERT INTO ct_tiles(
                        log_url, tile_path, checkpoint_size, checkpoint_hash,
                        content_hash, payload, verified, updated_at
                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7)
@@ -7027,46 +7633,52 @@ impl Database {
                        checkpoint_size=excluded.checkpoint_size,
                        checkpoint_hash=excluded.checkpoint_hash,
                        updated_at=excluded.updated_at"#,
-                params![
-                    log_url,
-                    tile.path,
-                    tile.checkpoint_size.min(i64::MAX as u64) as i64,
-                    tile.checkpoint_hash,
-                    tile.content_hash,
-                    tile.payload,
-                    now
-                ],
-            )?;
-        }
+                    params![
+                        log_url,
+                        tile.path,
+                        tile.checkpoint_size.min(i64::MAX as u64) as i64,
+                        tile.checkpoint_hash,
+                        tile.content_hash,
+                        tile.payload,
+                        now
+                    ],
+                )?;
+            }
 
-        {
-            let mut insert_name = transaction.prepare(
-                r#"INSERT INTO ct_names(
+            {
+                let mut insert_name = transaction.prepare(
+                    r#"INSERT INTO ct_names(
                        fqdn, reversed_name, first_seen, last_seen, times_seen
                    ) VALUES (?1, ?2, ?3, ?3, 1)
                    ON CONFLICT(fqdn) DO UPDATE SET
                        last_seen=excluded.last_seen, times_seen=ct_names.times_seen+1"#,
-            )?;
-            for name in &batch.names {
-                insert_name.execute(params![name, reverse_hostname(name), now])?;
+                )?;
+                for (index, name) in batch.names.iter().enumerate() {
+                    if index % 32 == 0 {
+                        ensure_ct_materialization_active(deadline, cancellation)?;
+                    }
+                    insert_name.execute(params![name, reverse_hostname(name), now])?;
+                }
             }
-        }
-        transaction.execute(
-            r#"INSERT INTO ct_global_state(log_url, next_index, updated_at)
+            ensure_ct_materialization_active(deadline, cancellation)?;
+            transaction.execute(
+                r#"INSERT INTO ct_global_state(log_url, next_index, updated_at)
                VALUES (?1, ?2, ?3)
                ON CONFLICT(log_url) DO UPDATE SET
                next_index=CASE WHEN ?4<>0 THEN excluded.next_index
                                ELSE MAX(ct_global_state.next_index, excluded.next_index) END,
                updated_at=excluded.updated_at"#,
-            params![
-                log_url,
-                batch.next_cursor.min(i64::MAX as u64) as i64,
-                now,
-                batch.reset_cursor as i64
-            ],
-        )?;
-        transaction.commit()?;
-        Ok(())
+                params![
+                    log_url,
+                    batch.next_cursor.min(i64::MAX as u64) as i64,
+                    now,
+                    batch.reset_cursor as i64
+                ],
+            )?;
+            ensure_ct_materialization_active(deadline, cancellation)?;
+            transaction.commit()?;
+            Ok(())
+        })
     }
 
     pub fn reset_ct_global_cursor(&self, log_url: &str, next: u64) -> Result<()> {
@@ -7086,31 +7698,52 @@ impl Database {
         next: u64,
         names: &BTreeSet<String>,
     ) -> Result<()> {
+        let cancellation = AtomicBool::new(false);
+        self.store_ct_global_batch_until_cancelled(log_url, next, names, None, &cancellation)
+    }
+
+    pub(crate) fn store_ct_global_batch_until_cancelled(
+        &self,
+        log_url: &str,
+        next: u64,
+        names: &BTreeSet<String>,
+        deadline: Option<Instant>,
+        cancellation: &AtomicBool,
+    ) -> Result<()> {
+        ensure_ct_materialization_active(deadline, cancellation)?;
         let now = now_epoch();
-        let mut connection = self.lock()?;
-        let transaction = connection.transaction()?;
-        transaction.execute(
-            r#"INSERT INTO ct_global_state(log_url, next_index, updated_at)
-               VALUES (?1, ?2, ?3)
-               ON CONFLICT(log_url) DO UPDATE SET
-               next_index=MAX(ct_global_state.next_index, excluded.next_index),
-               updated_at=excluded.updated_at"#,
-            params![log_url, next.min(i64::MAX as u64) as i64, now],
-        )?;
-        {
-            let mut insert_name = transaction.prepare(
-                r#"INSERT INTO ct_names(
+        let mut connection = self.lock_ct_materialization_until(deadline, cancellation)?;
+        ensure_ct_materialization_active(deadline, cancellation)?;
+        with_ct_commit_busy_timeout(&mut connection, deadline, |connection| {
+            let transaction = connection.transaction()?;
+            {
+                let mut insert_name = transaction.prepare(
+                    r#"INSERT INTO ct_names(
                    fqdn, reversed_name, first_seen, last_seen, times_seen
                    ) VALUES (?1, ?2, ?3, ?3, 1)
                    ON CONFLICT(fqdn) DO UPDATE SET
                    last_seen=excluded.last_seen, times_seen=ct_names.times_seen+1"#,
-            )?;
-            for name in names {
-                insert_name.execute(params![name, reverse_hostname(name), now])?;
+                )?;
+                for (index, name) in names.iter().enumerate() {
+                    if index % 32 == 0 {
+                        ensure_ct_materialization_active(deadline, cancellation)?;
+                    }
+                    insert_name.execute(params![name, reverse_hostname(name), now])?;
+                }
             }
-        }
-        transaction.commit()?;
-        Ok(())
+            ensure_ct_materialization_active(deadline, cancellation)?;
+            transaction.execute(
+                r#"INSERT INTO ct_global_state(log_url, next_index, updated_at)
+               VALUES (?1, ?2, ?3)
+               ON CONFLICT(log_url) DO UPDATE SET
+               next_index=MAX(ct_global_state.next_index, excluded.next_index),
+               updated_at=excluded.updated_at"#,
+                params![log_url, next.min(i64::MAX as u64) as i64, now],
+            )?;
+            ensure_ct_materialization_active(deadline, cancellation)?;
+            transaction.commit()?;
+            Ok(())
+        })
     }
 
     pub fn ct_names_for_domain(&self, domain: &str, limit: usize) -> Result<Vec<String>> {
@@ -8740,7 +9373,7 @@ mod tests {
     }
 
     #[test]
-    fn later_findings_union_sources_and_do_not_advance_live_verification_time() {
+    fn later_wildcard_findings_union_sources_and_clear_invalidated_live_verification_time() {
         let db = Database::in_memory().unwrap();
         let first_scan = db.create_scan("example.com", &json!({})).unwrap();
         let mut finding = Finding {
@@ -8786,7 +9419,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(sources, "passive:first,web:second");
-        assert_eq!(last_verified_at, Some(100));
+        assert_eq!(last_verified_at, None);
         assert_eq!(times_seen, 2, "one scan must increment inventory only once");
     }
 
@@ -9516,6 +10149,8 @@ mod tests {
         );
         assert_eq!(first[0].1, axfr_sources);
         assert_eq!(first[1].1, multi_sources);
+        db.mark_scan_seed_candidates_started(scan_id, &[first[0].0.clone()])
+            .unwrap();
         db.mark_scan_seed_candidates_done(scan_id, &[first[0].0.clone()])
             .unwrap();
 
@@ -9537,6 +10172,81 @@ mod tests {
 
         db.clear_scan_candidates(scan_id).unwrap();
         assert_eq!(db.scan_seed_candidate_count(scan_id).unwrap(), 0);
+    }
+
+    #[test]
+    fn named_seed_claim_is_atomic_exact_and_bounded() {
+        let db = Database::in_memory().unwrap();
+        let scan_id = db.create_scan("example.com", &json!({})).unwrap();
+        let sources = BTreeSet::from(["passive:ct-direct".to_owned()]);
+        db.persist_scan_seed_candidates(
+            scan_id,
+            &[
+                ("a.example.com".to_owned(), sources.clone(), 1),
+                ("b.example.com".to_owned(), sources.clone(), 2),
+                ("c.example.com".to_owned(), sources, 3),
+            ],
+            3,
+        )
+        .unwrap();
+        assert_eq!(
+            db.pending_scan_seed_candidates(scan_id, 1).unwrap()[0].0,
+            "c.example.com"
+        );
+
+        let claimed = db
+            .claim_scan_seed_candidates_by_name(
+                scan_id,
+                &[
+                    "c.example.com".to_owned(),
+                    "b.example.com".to_owned(),
+                    "missing.example.com".to_owned(),
+                    "b.example.com".to_owned(),
+                ],
+            )
+            .unwrap();
+        assert_eq!(claimed, vec!["b.example.com"]);
+        assert!(
+            db.claim_scan_seed_candidates_by_name(scan_id, &["b.example.com".to_owned()],)
+                .unwrap()
+                .is_empty()
+        );
+        let connection = db.lock().unwrap();
+        let mut statement = connection
+            .prepare(
+                "SELECT fqdn, status, attempts FROM scan_seed_candidates WHERE scan_id=?1 ORDER BY fqdn",
+            )
+            .unwrap();
+        let states = statement
+            .query_map([scan_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        drop(statement);
+        drop(connection);
+        assert_eq!(
+            states,
+            vec![
+                ("a.example.com".to_owned(), "queued".to_owned(), 0),
+                ("b.example.com".to_owned(), "processing".to_owned(), 0),
+                ("c.example.com".to_owned(), "processing".to_owned(), 0),
+            ]
+        );
+
+        let too_many = (0..=MAX_NAMED_SEED_CLAIM)
+            .map(|index| format!("host-{index}.example.com"))
+            .collect::<Vec<_>>();
+        assert!(
+            db.claim_scan_seed_candidates_by_name(scan_id, &too_many)
+                .is_err()
+        );
+        assert_eq!(db.pending_scan_seed_candidate_count(scan_id).unwrap(), 1);
     }
 
     #[test]
@@ -9562,6 +10272,8 @@ mod tests {
                 db.pending_scan_seed_candidates(scan_id, 1).unwrap()[0].0,
                 host
             );
+            db.mark_scan_seed_candidates_started(scan_id, std::slice::from_ref(&host))
+                .unwrap();
             db.update_cache_outcomes(Some(scan_id), &[], &[], std::slice::from_ref(&host), 300)
                 .unwrap();
             db.mark_scan_seed_candidates_done(scan_id, std::slice::from_ref(&host))
@@ -10298,7 +11010,8 @@ mod tests {
         assert_eq!(
             db.record_current_wildcard_matches(scan_id, &[answer.clone()])
                 .unwrap(),
-            0
+            1,
+            "an authoritative current answer is equivalent to resolver consensus"
         );
         answer.authoritative_validation = false;
         answer.resolver_count = 2;
@@ -10334,7 +11047,8 @@ mod tests {
             .lock()
             .unwrap()
             .query_row(
-                "SELECT records_hash FROM dns_verifications WHERE scan_id=?1 AND fqdn=?2",
+                "SELECT records_hash FROM dns_verifications \
+                 WHERE scan_id=?1 AND fqdn=?2 ORDER BY id DESC LIMIT 1",
                 params![scan_id, answer.fqdn],
                 |row| row.get::<_, String>(0),
             )
@@ -10948,6 +11662,91 @@ mod tests {
                 .unwrap(),
             13
         );
+    }
+
+    #[test]
+    fn cancelled_staged_cleanup_never_waits_for_the_shared_database_lock() {
+        let db = Database::in_memory().unwrap();
+        let scan_id = db.create_scan("example.com", &json!({})).unwrap();
+        db.stage_refresh_wildcard_candidates(scan_id, &["weak.example.com".to_owned()])
+            .unwrap();
+
+        let held_lock = db.lock().unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        let worker_db = db.clone();
+        let (result_tx, result_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = worker_db.apply_staged_refresh_wildcard_cleanup(
+                scan_id,
+                "example.com",
+                1,
+                &worker_cancelled,
+            );
+            let _ = result_tx.send(result);
+        });
+
+        std::thread::sleep(Duration::from_millis(25));
+        cancelled.store(true, Ordering::Release);
+        let result = result_rx.recv_timeout(Duration::from_millis(500));
+        drop(held_lock);
+        worker.join().unwrap();
+
+        assert!(
+            result
+                .expect("cleanup ignored cancellation while waiting for SQLite")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(db.refresh_wildcard_candidate_count(scan_id).unwrap(), 1);
+    }
+
+    #[test]
+    fn candidate_attempt_counters_saturate_at_sqlite_integer_max() {
+        let db = Database::in_memory().unwrap();
+        let scan_id = db.create_scan("example.com", &json!({})).unwrap();
+        let active = "active.example.com";
+        let recursive = "recursive.example.com";
+        db.lock()
+            .unwrap()
+            .execute(
+                r#"INSERT INTO scan_candidates(
+                       scan_id, fqdn, relative_name, priority, generator, attempts, status
+                   ) VALUES (?1, ?2, 'active', 1, 'fixture', ?3, 'processing')"#,
+                params![scan_id, active, i64::MAX],
+            )
+            .unwrap();
+        db.lock()
+            .unwrap()
+            .execute(
+                r#"INSERT INTO scan_recursive_candidates(
+                       scan_id, fqdn, parent, depth, word, attempts, status
+                   ) VALUES (?1, ?2, 'example.com', 2, 'recursive', ?3, 'processing')"#,
+                params![scan_id, recursive, i64::MAX],
+            )
+            .unwrap();
+
+        db.mark_scan_candidates_started(scan_id, &[active.to_owned()])
+            .unwrap();
+        db.mark_scan_recursive_candidates_started(scan_id, &[recursive.to_owned()])
+            .unwrap();
+
+        let connection = db.lock().unwrap();
+        for (table, fqdn) in [
+            ("scan_candidates", active),
+            ("scan_recursive_candidates", recursive),
+        ] {
+            let query = format!(
+                "SELECT attempts, typeof(attempts) FROM {table} WHERE scan_id=?1 AND fqdn=?2"
+            );
+            let (attempts, value_type): (i64, String) = connection
+                .query_row(&query, params![scan_id, fqdn], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })
+                .unwrap();
+            assert_eq!(attempts, i64::MAX);
+            assert_eq!(value_type, "integer");
+        }
     }
 
     #[test]
@@ -12283,6 +13082,94 @@ mod tests {
     }
 
     #[test]
+    fn expired_static_ct_commit_keeps_tiles_names_and_cursor_atomic() {
+        let db = Database::in_memory().unwrap();
+        let log_url = "https://ct.example/2026h2/";
+        db.store_ct_global_batch(log_url, 100, &BTreeSet::new())
+            .unwrap();
+        let payload = b"must-not-be-visible".to_vec();
+        let batch = crate::ct_static::StaticCtBatch {
+            checkpoint_origin: "ct.example/2026h2".to_owned(),
+            checkpoint_size: 512,
+            checkpoint_hash: "checkpoint-deadline".to_owned(),
+            next_cursor: 101,
+            entries_processed: 1,
+            names: BTreeSet::from(["deadline.example.com".to_owned()]),
+            tiles: vec![crate::ct_static::StaticTile {
+                path: "tile/data/deadline".to_owned(),
+                checkpoint_size: 512,
+                checkpoint_hash: "checkpoint-deadline".to_owned(),
+                content_hash: format!("{:x}", Sha256::digest(&payload)),
+                payload,
+            }],
+            ..crate::ct_static::StaticCtBatch::default()
+        };
+        let cancellation = AtomicBool::new(false);
+
+        assert!(
+            db.store_ct_static_batch_until_cancelled(
+                log_url,
+                &batch,
+                Some(Instant::now()),
+                &cancellation,
+            )
+            .is_err()
+        );
+        assert_eq!(db.ct_global_cursor(log_url).unwrap(), Some(100));
+        assert!(
+            db.ct_names_for_domain("example.com", 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            db.ct_static_tile(log_url, "tile/data/deadline", 512, "checkpoint-deadline",)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn cancelled_global_ct_commit_stops_waiting_for_the_shared_mutex() {
+        let db = Database::in_memory().unwrap();
+        let log_url = "https://ct.example/log/";
+        db.store_ct_global_batch(log_url, 100, &BTreeSet::new())
+            .unwrap();
+        let shared_lock = db.lock().unwrap();
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let worker_cancellation = Arc::clone(&cancellation);
+        let worker_db = db.clone();
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let result = worker_db.store_ct_global_batch_until_cancelled(
+                log_url,
+                101,
+                &BTreeSet::from(["cancelled.example.com".to_owned()]),
+                None,
+                worker_cancellation.as_ref(),
+            );
+            result_tx.send(result).unwrap();
+        });
+
+        started_rx.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        cancellation.store(true, Ordering::Release);
+        let result = result_rx
+            .recv_timeout(Duration::from_millis(500))
+            .expect("le commit CT est reste bloque sur le mutex partage");
+        assert!(result.unwrap_err().to_string().contains("annulée"));
+        drop(shared_lock);
+        worker.join().unwrap();
+        assert_eq!(db.ct_global_cursor(log_url).unwrap(), Some(100));
+        assert!(
+            db.ct_names_for_domain("example.com", 10)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn wildcard_and_normalized_observations_are_persistent() {
         let db = Database::in_memory().unwrap();
         db.store_wildcard_cache(
@@ -12717,5 +13604,722 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn cancelled_ct_materialization_exits_while_the_shared_mutex_remains_locked() {
+        let db = Database::in_memory().unwrap();
+        db.store_ct_global_batch(
+            "https://ct.example/log/",
+            1,
+            &BTreeSet::from(["api.example.com".to_owned()]),
+        )
+        .unwrap();
+        let worker_db = db.clone();
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let worker_cancellation = Arc::clone(&cancellation);
+        let shared_lock = db.lock().unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let result = worker_db.materialize_ct_passive_cache_bounded_until_cancelled(
+                "example.com",
+                10,
+                true,
+                None,
+                worker_cancellation,
+            );
+            result_tx.send(result).unwrap();
+        });
+
+        started_rx.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        cancellation.store(true, Ordering::Release);
+        let result = result_rx
+            .recv_timeout(Duration::from_millis(500))
+            .expect("le worker CT est resté bloqué sur le mutex partagé");
+        assert!(result.unwrap_err().to_string().contains("annulée"));
+        drop(shared_lock);
+        worker.join().unwrap();
+        assert!(
+            db.observation_names("example.com", "passive:ct-direct")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn unversioned_legacy_database_is_backed_up_before_migration() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("fellaga.db");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute("CREATE TABLE legacy_rows(value TEXT NOT NULL)", [])
+            .unwrap();
+        connection
+            .execute("INSERT INTO legacy_rows(value) VALUES ('preserved')", [])
+            .unwrap();
+        drop(connection);
+
+        let database = Database::open(&path).unwrap();
+        drop(database);
+
+        let backup = std::fs::read_dir(directory.path())
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.path())
+            .find(|candidate| {
+                candidate
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.contains(".pre-v8-") && name.ends_with(".bak"))
+            })
+            .expect("unversioned legacy database had no safety backup");
+        let backup = Connection::open(backup).unwrap();
+        assert_eq!(
+            backup
+                .query_row("SELECT value FROM legacy_rows", [], |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap(),
+            "preserved"
+        );
+        assert_eq!(
+            backup
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn checkpoint_domain_is_immutable_and_resume_requeues_discovery_actions() {
+        let db = Database::in_memory().unwrap();
+        let scan_id = db.create_scan("example.com", &json!({})).unwrap();
+        assert!(
+            db.upsert_checkpoint(scan_id, "other.example", "running", "bad")
+                .is_err()
+        );
+        assert!(
+            db.resumable_checkpoint("other.example", "latest")
+                .unwrap()
+                .is_none()
+        );
+        db.upsert_checkpoint(scan_id, "example.com", "running", "good")
+            .unwrap();
+        db.persist_scan_seed_candidates(
+            scan_id,
+            &[(
+                "seed.example.com".to_owned(),
+                BTreeSet::from(["passive:test".to_owned()]),
+                1,
+            )],
+            1,
+        )
+        .unwrap();
+        let seed = "seed.example.com".to_owned();
+        assert_eq!(
+            db.pending_scan_seed_candidates(scan_id, 1).unwrap().len(),
+            1
+        );
+        db.requeue_unstarted_scan_seed_candidates(scan_id, std::slice::from_ref(&seed))
+            .unwrap();
+        assert_eq!(db.pending_scan_seed_candidate_count(scan_id).unwrap(), 1);
+        assert_eq!(
+            db.pending_scan_seed_candidates(scan_id, 1).unwrap().len(),
+            1
+        );
+        db.enqueue_discovery_actions(
+            scan_id,
+            &[DiscoveryActionInput {
+                fqdn: Some("api.example.com".to_owned()),
+                zone: "example.com".to_owned(),
+                kind: "dns".to_owned(),
+                generator: "resume-regression".to_owned(),
+                context_key: "global".to_owned(),
+                priority_class: 0,
+                predicted_unique_live: 1.0,
+                predicted_cost: 1.0,
+            }],
+        )
+        .unwrap();
+        let first = db.claim_discovery_actions(scan_id, 1).unwrap();
+        assert_eq!(first.len(), 1);
+
+        db.pause_scan(scan_id, 0, 0, 0, 1, &[]).unwrap();
+        db.reopen_scan(scan_id).unwrap();
+        assert_eq!(
+            db.pending_scan_seed_candidates(scan_id, 1).unwrap().len(),
+            1
+        );
+        assert_eq!(
+            db.lock()
+                .unwrap()
+                .query_row(
+                    "SELECT attempts FROM scan_seed_candidates WHERE scan_id=?1",
+                    [scan_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0,
+            "unstarted claims must survive deadline requeue and resume without consuming a retry"
+        );
+        db.mark_scan_seed_candidates_started(scan_id, std::slice::from_ref(&seed))
+            .unwrap();
+        assert_eq!(
+            db.lock()
+                .unwrap()
+                .query_row(
+                    "SELECT attempts FROM scan_seed_candidates WHERE scan_id=?1",
+                    [scan_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        db.update_cache_outcomes(Some(scan_id), &[], &[], std::slice::from_ref(&seed), 60)
+            .unwrap();
+        db.mark_scan_seed_candidates_done(scan_id, std::slice::from_ref(&seed))
+            .unwrap();
+        assert_eq!(
+            db.pending_scan_seed_candidates(scan_id, 1).unwrap().len(),
+            1
+        );
+        db.requeue_unstarted_scan_seed_candidates(scan_id, std::slice::from_ref(&seed))
+            .unwrap();
+        assert_eq!(db.pending_scan_seed_candidate_count(scan_id).unwrap(), 1);
+        assert_eq!(
+            db.lock()
+                .unwrap()
+                .query_row(
+                    "SELECT attempts FROM scan_seed_candidates WHERE scan_id=?1",
+                    [scan_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1,
+            "an unstarted retry must preserve attempts from earlier real DNS work"
+        );
+        let resumed = db.claim_discovery_actions(scan_id, 1).unwrap();
+        assert_eq!(resumed.len(), 1);
+        assert_eq!(resumed[0].id, first[0].id);
+    }
+
+    #[test]
+    fn exhausted_rows_are_excluded_from_every_candidate_claim_and_loop_count() {
+        let db = Database::in_memory().unwrap();
+        let scan_id = db.create_scan("example.com", &json!({})).unwrap();
+        let seed = "seed-exhausted.example.com".to_owned();
+        db.persist_scan_seed_candidates(
+            scan_id,
+            &[(
+                seed.clone(),
+                BTreeSet::from(["passive:test".to_owned()]),
+                10,
+            )],
+            10,
+        )
+        .unwrap();
+        db.persist_scan_candidates(
+            scan_id,
+            "example.com",
+            &[("active-exhausted".to_owned(), "builtin".to_owned(), 10)],
+        )
+        .unwrap();
+        db.ensure_scan_recursive_words(scan_id, &["recursive-exhausted".to_owned()])
+            .unwrap();
+        db.persist_scan_recursive_parents(scan_id, 1, &["example.com".to_owned()])
+            .unwrap();
+        assert_eq!(
+            db.refill_scan_recursive_candidates(scan_id, 1, 1).unwrap(),
+            1
+        );
+        {
+            let connection = db.lock().unwrap();
+            for table in [
+                "scan_seed_candidates",
+                "scan_candidates",
+                "scan_recursive_candidates",
+            ] {
+                connection
+                    .execute(
+                        &format!("UPDATE {table} SET attempts=3, status='queued' WHERE scan_id=?1"),
+                        [scan_id],
+                    )
+                    .unwrap();
+            }
+        }
+
+        assert!(
+            db.pending_scan_seed_candidates(scan_id, 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            db.claim_scan_seed_candidates_by_name(scan_id, std::slice::from_ref(&seed))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(db.pending_scan_seed_candidate_count(scan_id).unwrap(), 0);
+        assert!(db.pending_scan_candidates(scan_id, 10).unwrap().is_empty());
+        assert_eq!(db.pending_scan_candidate_count(scan_id).unwrap(), 0);
+        assert_eq!(
+            db.pending_scan_candidate_count_eligible(scan_id, true)
+                .unwrap(),
+            0
+        );
+        assert!(
+            db.pending_scan_recursive_candidates(scan_id, 1, 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!db.scan_recursive_depth_has_more(scan_id, 1).unwrap());
+        assert!(!db.scan_recursive_has_more(scan_id).unwrap());
+    }
+
+    #[test]
+    fn reopen_scan_requeues_only_rows_with_retry_budget_in_all_three_queues() {
+        let db = Database::in_memory().unwrap();
+        let scan_id = db.create_scan("example.com", &json!({})).unwrap();
+        db.upsert_checkpoint(scan_id, "example.com", "running", "options")
+            .unwrap();
+        {
+            let connection = db.lock().unwrap();
+            connection
+                .execute(
+                    r#"INSERT INTO scan_seed_candidates(
+                           scan_id, fqdn, priority, sources_json, attempts, status
+                       ) VALUES
+                           (?1, 'exhausted.example.com', 2, '[]', 3, 'queued'),
+                           (?1, 'retry.example.com', 1, '[]', 2, 'processing')"#,
+                    [scan_id],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    r#"INSERT INTO scan_candidates(
+                           scan_id, fqdn, relative_name, priority, generator, attempts, status
+                       ) VALUES
+                           (?1, 'exhausted.example.com', 'exhausted', 2, 'test', 3, 'processing'),
+                           (?1, 'retry.example.com', 'retry', 1, 'test', 2, 'processing')"#,
+                    [scan_id],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    r#"INSERT INTO scan_recursive_candidates(
+                           scan_id, fqdn, parent, depth, word, attempts, status
+                       ) VALUES
+                           (?1, 'exhausted.example.com', 'example.com', 1, 'exhausted', 3, 'queued'),
+                           (?1, 'retry.example.com', 'example.com', 1, 'retry', 2, 'processing')"#,
+                    [scan_id],
+                )
+                .unwrap();
+        }
+        db.pause_scan(scan_id, 0, 0, 0, 1, &[]).unwrap();
+        db.reopen_scan(scan_id).unwrap();
+
+        let connection = db.lock().unwrap();
+        for table in [
+            "scan_seed_candidates",
+            "scan_candidates",
+            "scan_recursive_candidates",
+        ] {
+            let rows = connection
+                .prepare(&format!(
+                    "SELECT fqdn, status FROM {table} WHERE scan_id=?1 ORDER BY fqdn"
+                ))
+                .unwrap()
+                .query_map([scan_id], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert_eq!(
+                rows,
+                vec![
+                    ("exhausted.example.com".to_owned(), "done".to_owned()),
+                    ("retry.example.com".to_owned(), "queued".to_owned()),
+                ],
+                "resume state mismatch for {table}"
+            );
+        }
+    }
+
+    #[test]
+    fn live_outcome_wins_over_duplicate_negative_and_error_in_one_commit() {
+        let db = Database::in_memory().unwrap();
+        let scan_id = db.create_scan("example.com", &json!({})).unwrap();
+        let fqdn = "api.example.com".to_owned();
+        let answer = ResolvedHost {
+            fqdn: fqdn.clone(),
+            records: vec![DnsRecord {
+                record_type: "A".to_owned(),
+                value: "192.0.2.10".to_owned(),
+                ttl: 60,
+            }],
+            from_cache: false,
+            last_verified_at: Some(now_epoch()),
+            resolver_count: 2,
+            authoritative_validation: false,
+        };
+        let finding = Finding {
+            fqdn: fqdn.clone(),
+            records: answer.records.clone(),
+            sources: BTreeSet::from(["dns:test".to_owned()]),
+            wildcard: false,
+            state: ObservationState::Live,
+            last_verified_at: answer.last_verified_at,
+            ..Finding::default()
+        };
+        db.persist_findings(scan_id, "example.com", &[finding], 60)
+            .unwrap();
+        db.update_cache_outcomes(
+            Some(scan_id),
+            &[answer],
+            std::slice::from_ref(&fqdn),
+            std::slice::from_ref(&fqdn),
+            60,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            db.fresh_cache(std::slice::from_ref(&fqdn))
+                .unwrap()
+                .get(&fqdn),
+            Some(CachedAnswer::Positive(_))
+        ));
+        let connection = db.lock().unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT active, verification_state FROM subdomains WHERE fqdn=?1",
+                    [&fqdn],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                )
+                .unwrap(),
+            (1, "live".to_owned())
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT group_concat(outcome, ',') FROM dns_verifications WHERE scan_id=?1 AND fqdn=?2",
+                    params![scan_id, fqdn],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "live"
+        );
+    }
+
+    #[test]
+    fn off_zone_wildcard_ambiguity_cannot_delete_an_unrelated_cache_entry() {
+        let db = Database::in_memory().unwrap();
+        let scan_id = db.create_scan("example.com", &json!({})).unwrap();
+        let fqdn = "api.other.example".to_owned();
+        let answer = ResolvedHost {
+            fqdn: fqdn.clone(),
+            records: vec![DnsRecord {
+                record_type: "A".to_owned(),
+                value: "192.0.2.20".to_owned(),
+                ttl: 60,
+            }],
+            from_cache: false,
+            last_verified_at: Some(now_epoch()),
+            resolver_count: 2,
+            authoritative_validation: false,
+        };
+        db.update_cache_outcomes(Some(scan_id), std::slice::from_ref(&answer), &[], &[], 60)
+            .unwrap();
+        assert!(
+            db.record_current_wildcard_ambiguities(
+                scan_id,
+                "example.com",
+                std::slice::from_ref(&answer),
+            )
+            .is_err()
+        );
+        assert!(matches!(
+            db.fresh_cache(std::slice::from_ref(&fqdn))
+                .unwrap()
+                .get(&fqdn),
+            Some(CachedAnswer::Positive(_))
+        ));
+    }
+
+    #[test]
+    fn live_wildcard_finding_is_audited_but_never_materialized_as_live() {
+        let db = Database::in_memory().unwrap();
+        let scan_id = db.create_scan("example.com", &json!({})).unwrap();
+        let fqdn = "random.example.com".to_owned();
+        let answer = ResolvedHost {
+            fqdn: fqdn.clone(),
+            records: vec![DnsRecord {
+                record_type: "A".to_owned(),
+                value: "192.0.2.30".to_owned(),
+                ttl: 60,
+            }],
+            from_cache: false,
+            last_verified_at: Some(now_epoch()),
+            resolver_count: 2,
+            authoritative_validation: false,
+        };
+        db.update_cache_outcomes(Some(scan_id), std::slice::from_ref(&answer), &[], &[], 60)
+            .unwrap();
+        db.persist_findings(
+            scan_id,
+            "example.com",
+            &[Finding {
+                fqdn: fqdn.clone(),
+                records: answer.records.clone(),
+                sources: BTreeSet::from(["dns:initial-live".to_owned()]),
+                wildcard: false,
+                state: ObservationState::Live,
+                last_verified_at: answer.last_verified_at,
+                ..Finding::default()
+            }],
+            60,
+        )
+        .unwrap();
+        assert!(
+            db.lock()
+                .unwrap()
+                .query_row(
+                    "SELECT last_verified_at FROM subdomains WHERE fqdn=?1",
+                    [&fqdn],
+                    |row| row.get::<_, Option<i64>>(0),
+                )
+                .unwrap()
+                .is_some()
+        );
+        assert!(matches!(
+            db.fresh_cache(std::slice::from_ref(&fqdn))
+                .unwrap()
+                .get(&fqdn),
+            Some(CachedAnswer::Positive(_))
+        ));
+        let finding = Finding {
+            fqdn: fqdn.clone(),
+            records: answer.records,
+            sources: BTreeSet::from(["dns:wildcard".to_owned()]),
+            wildcard: true,
+            state: ObservationState::Live,
+            last_verified_at: answer.last_verified_at,
+            ..Finding::default()
+        };
+        db.persist_findings(scan_id, "example.com", &[finding], 60)
+            .unwrap();
+
+        assert!(
+            !db.fresh_cache(std::slice::from_ref(&fqdn))
+                .unwrap()
+                .contains_key(&fqdn),
+            "a wildcard finding must purge the provisional positive cache"
+        );
+
+        let connection = db.lock().unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT active, verification_state, last_verified_at FROM subdomains WHERE fqdn=?1",
+                    [&fqdn],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, Option<i64>>(2)?,
+                        ))
+                    },
+                )
+                .unwrap(),
+            (0, "unverified".to_owned(), None)
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT active FROM dns_records WHERE fqdn=?1",
+                    [&fqdn],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT state, wildcard FROM scan_findings WHERE scan_id=?1 AND fqdn=?2",
+                    params![scan_id, fqdn],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .unwrap(),
+            ("live".to_owned(), 1)
+        );
+    }
+
+    #[test]
+    fn ordinary_historical_finding_keeps_its_positive_cache_history() {
+        let db = Database::in_memory().unwrap();
+        let scan_id = db.create_scan("example.com", &json!({})).unwrap();
+        let fqdn = "old.example.com".to_owned();
+        let answer = ResolvedHost {
+            fqdn: fqdn.clone(),
+            records: vec![DnsRecord {
+                record_type: "A".to_owned(),
+                value: "192.0.2.31".to_owned(),
+                ttl: 60,
+            }],
+            from_cache: false,
+            last_verified_at: Some(now_epoch()),
+            resolver_count: 2,
+            authoritative_validation: false,
+        };
+        db.update_cache_outcomes(Some(scan_id), std::slice::from_ref(&answer), &[], &[], 60)
+            .unwrap();
+        db.persist_findings(
+            scan_id,
+            "example.com",
+            &[Finding {
+                fqdn: fqdn.clone(),
+                records: answer.records,
+                sources: BTreeSet::from(["history:test".to_owned()]),
+                wildcard: false,
+                state: ObservationState::Historical,
+                last_verified_at: answer.last_verified_at,
+                ..Finding::default()
+            }],
+            60,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            db.fresh_cache(std::slice::from_ref(&fqdn))
+                .unwrap()
+                .get(&fqdn),
+            Some(CachedAnswer::Positive(_))
+        ));
+        assert_eq!(
+            db.lock()
+                .unwrap()
+                .query_row(
+                    "SELECT active, verification_state FROM subdomains WHERE fqdn=?1",
+                    [&fqdn],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                )
+                .unwrap(),
+            (0, "historical".to_owned())
+        );
+    }
+
+    #[test]
+    fn persistent_counters_and_legacy_bandits_tolerate_extreme_values() {
+        let db = Database::in_memory().unwrap();
+        let metric = ResolverMetric {
+            resolver: "resolver.test:53".to_owned(),
+            requests: u64::MAX,
+            successes: u64::MAX,
+            failures: u64::MAX,
+            average_ms: u64::MAX,
+            consecutive_failures: u64::MAX,
+        };
+        db.store_resolver_metrics(std::slice::from_ref(&metric))
+            .unwrap();
+        db.store_resolver_metrics(&[metric]).unwrap();
+        let history = db.resolver_history().unwrap();
+        let stored = &history["resolver.test:53"];
+        assert_eq!(stored.requests, i64::MAX as u64);
+        assert_eq!(stored.successes, i64::MAX as u64);
+        assert_eq!(stored.failures, i64::MAX as u64);
+        assert_eq!(stored.consecutive_failures, i64::MAX as u64);
+
+        db.record_source_result_with_counts(
+            "overflow-source",
+            usize::MAX,
+            usize::MAX,
+            u128::MAX,
+            None,
+        )
+        .unwrap();
+        db.record_source_result_with_counts(
+            "overflow-source",
+            usize::MAX,
+            usize::MAX,
+            u128::MAX,
+            None,
+        )
+        .unwrap();
+        let source_counters = db
+            .lock()
+            .unwrap()
+            .query_row(
+                r#"SELECT requests, successes, names, novel_names,
+                          novel_requests, novel_total_ms, total_ms
+                   FROM source_stats WHERE source='overflow-source'"#,
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            source_counters,
+            (2, 2, i64::MAX, i64::MAX, 2, i64::MAX, i64::MAX)
+        );
+
+        db.lock()
+            .unwrap()
+            .execute(
+                r#"INSERT INTO generator_bandits(
+                       context, generator, alpha, beta, pulls, rewards, last_seen
+                   ) VALUES ('suffix:com', 'number-neighbor', -1.0e308, -1.0e308,
+                             -9223372036854775808, -1, 1)"#,
+                [],
+            )
+            .unwrap();
+        let scores = db.generator_scores("example.com").unwrap();
+        assert!((650..=2_650).contains(&scores["number-neighbor"]));
+    }
+
+    #[test]
+    fn scan_summary_counts_saturate_instead_of_wrapping_negative() {
+        let db = Database::in_memory().unwrap();
+        let scan_id = db.create_scan("example.com", &json!({})).unwrap();
+        db.finish_scan(
+            scan_id,
+            "interrupted",
+            usize::MAX,
+            usize::MAX,
+            usize::MAX,
+            u128::MAX,
+            &[],
+        )
+        .unwrap();
+        let stored = db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT candidates, found, cache_hits, duration_ms FROM scans WHERE id=?1",
+                [scan_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .unwrap();
+        let expected = usize_to_i64_saturating(usize::MAX);
+        assert_eq!(stored, (expected, expected, expected, i64::MAX));
     }
 }

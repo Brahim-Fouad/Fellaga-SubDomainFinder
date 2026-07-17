@@ -18,6 +18,8 @@ use openssl::x509::X509;
 use reqwest::Client;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
+use std::future::Future;
+use tokio::time::Instant as TokioInstant;
 use url::Url;
 
 const TILE_WIDTH: usize = 256;
@@ -25,6 +27,12 @@ const MAX_CHECKPOINT_BYTES: usize = 64 * 1024;
 const MAX_TILE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_BATCH_BYTES: usize = 64 * 1024 * 1024;
 const MAX_TILES_PER_SYNC: usize = 64;
+const MAX_LOG_URL_BYTES: usize = 2_048;
+const MAX_LOG_PATH_BYTES: usize = 1_024;
+const MAX_CHECKPOINT_ORIGIN_BYTES: usize = 512;
+const MAX_CERTIFICATE_NAME_FIELDS: usize = 8_192;
+const MAX_NAMES_PER_CERTIFICATE: usize = 4_096;
+const MAX_NAMES_PER_BATCH: usize = 250_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StaticCheckpoint {
@@ -132,6 +140,7 @@ pub fn parse_checkpoint(body: &[u8]) -> Result<StaticCheckpoint> {
     let mut lines = payload.lines();
     let origin = lines.next().unwrap_or_default().trim().to_owned();
     if origin.is_empty()
+        || origin.len() > MAX_CHECKPOINT_ORIGIN_BYTES
         || origin.contains(char::is_whitespace)
         || origin.contains("..")
         || origin.starts_with("http://")
@@ -251,30 +260,87 @@ fn parse_data_tile(payload: &[u8], expected_entries: usize) -> Result<Vec<Parsed
 fn certificate_names(der: &[u8]) -> Result<BTreeSet<String>> {
     let certificate = X509::from_der(der).context("certificat X509 de tuile CT invalide")?;
     let mut names = BTreeSet::new();
+    let mut inspected = 0_usize;
     if let Some(subject_alt_names) = certificate.subject_alt_names() {
         for general_name in subject_alt_names {
+            inspected = inspected.saturating_add(1);
+            if inspected > MAX_CERTIFICATE_NAME_FIELDS {
+                bail!("certificat CT contenant trop de champs SAN");
+            }
             if let Some(name) = general_name.dnsname()
                 && let Some(name) = normalize_hostname(name)
             {
                 names.insert(name);
+                if names.len() > MAX_NAMES_PER_CERTIFICATE {
+                    bail!("certificat CT contenant trop de noms DNS");
+                }
             }
         }
     }
     for entry in certificate.subject_name().entries_by_nid(Nid::COMMONNAME) {
+        inspected = inspected.saturating_add(1);
+        if inspected > MAX_CERTIFICATE_NAME_FIELDS {
+            bail!("certificat CT contenant trop de champs de nom");
+        }
         if let Ok(name) = entry.data().to_string()
             && let Some(name) = normalize_hostname(&name)
         {
             names.insert(name);
+            if names.len() > MAX_NAMES_PER_CERTIFICATE {
+                bail!("certificat CT contenant trop de noms DNS");
+            }
         }
     }
     Ok(names)
 }
 
-fn expected_checkpoint_origin(log_url: &str) -> Result<String> {
-    let parsed = Url::parse(log_url).context("URL de journal CT invalide")?;
-    if parsed.scheme() != "https" || parsed.host_str().is_none() {
-        bail!("un journal CT statique doit utiliser HTTPS");
+pub(crate) fn validated_log_url(log_url: &str) -> Result<Url> {
+    if log_url.len() > MAX_LOG_URL_BYTES {
+        bail!("URL de journal CT trop longue");
     }
+    let mut parsed = Url::parse(log_url).context("URL de journal CT invalide")?;
+    if parsed.scheme() != "https"
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || parsed.port().is_some_and(|port| port != 443)
+    {
+        bail!("URL de journal CT non sûre");
+    }
+    let host = match parsed.host().context("hôte de journal CT absent")? {
+        url::Host::Domain(host) => host,
+        url::Host::Ipv4(_) | url::Host::Ipv6(_) => {
+            bail!("hôte de journal CT littéral interdit")
+        }
+    };
+    if host.len() > 253 || parsed.path().len() > MAX_LOG_PATH_BYTES {
+        bail!("hôte ou chemin de journal CT trop long");
+    }
+    if host.eq_ignore_ascii_case("localhost")
+        || [
+            ".localhost",
+            ".local",
+            ".internal",
+            ".lan",
+            ".home",
+            ".onion",
+        ]
+        .iter()
+        .any(|suffix| host.ends_with(suffix))
+    {
+        bail!("hôte de journal CT local ou littéral interdit");
+    }
+    parsed
+        .set_port(None)
+        .map_err(|_| anyhow::anyhow!("port de journal CT invalide"))?;
+    let normalized_path = format!("{}/", parsed.path().trim_end_matches('/'));
+    parsed.set_path(&normalized_path);
+    Ok(parsed)
+}
+
+fn expected_checkpoint_origin(log_url: &str) -> Result<String> {
+    let parsed = validated_log_url(log_url)?;
     let mut origin = format!("{}{}", parsed.host_str().unwrap_or_default(), parsed.path());
     while origin.ends_with('/') {
         origin.pop();
@@ -288,10 +354,7 @@ fn expected_checkpoint_origin(log_url: &str) -> Result<String> {
 /// `mon` host mapping.  The original URL remains a standards-compatible
 /// fallback for operators serving both APIs on one origin.
 pub fn monitoring_prefixes(log_url: &str) -> Result<Vec<String>> {
-    let parsed = Url::parse(log_url).context("URL de journal CT invalide")?;
-    if parsed.scheme() != "https" {
-        bail!("un journal CT statique doit utiliser HTTPS");
-    }
+    let parsed = validated_log_url(log_url)?;
     let host = parsed.host_str().context("hôte de journal CT absent")?;
     let mut prefixes = Vec::new();
     if let Some(rest) = host.strip_prefix("log.")
@@ -310,15 +373,56 @@ pub fn monitoring_prefixes(log_url: &str) -> Result<Vec<String>> {
     Ok(prefixes)
 }
 
-async fn fetch_checkpoint(client: &Client, prefix: &str) -> Result<StaticCheckpoint> {
-    let url = format!("{}/checkpoint", prefix.trim_end_matches('/'));
-    let response = client
-        .get(&url)
-        .send()
-        .await
-        .with_context(|| format!("connexion au checkpoint CT statique {url}"))?;
-    let (status, body) =
-        response_bytes_limited_to(response, "checkpoint CT statique", MAX_CHECKPOINT_BYTES).await?;
+fn ensure_static_deadline(deadline: Option<TokioInstant>, operation: &str) -> Result<()> {
+    if deadline.is_some_and(|deadline| deadline <= TokioInstant::now()) {
+        bail!("budget CT statique atteint pendant {operation}");
+    }
+    Ok(())
+}
+
+async fn before_static_deadline<T, F>(
+    deadline: Option<TokioInstant>,
+    operation: &str,
+    future: F,
+) -> Result<T>
+where
+    F: Future<Output = Result<T>>,
+{
+    match deadline {
+        Some(deadline) if deadline <= TokioInstant::now() => {
+            bail!("budget CT statique atteint avant {operation}")
+        }
+        Some(deadline) => tokio::time::timeout_at(deadline, future)
+            .await
+            .with_context(|| format!("budget CT statique atteint pendant {operation}"))?,
+        None => future.await,
+    }
+}
+
+async fn fetch_checkpoint(
+    client: &Client,
+    prefix: &str,
+    deadline: Option<TokioInstant>,
+) -> Result<StaticCheckpoint> {
+    let url = Url::parse(prefix)
+        .context("préfixe CT statique invalide")?
+        .join("checkpoint")
+        .context("URL de checkpoint CT statique invalide")?;
+    let response = before_static_deadline(deadline, "la connexion au checkpoint", async {
+        client
+            .get(url.clone())
+            .send()
+            .await
+            .with_context(|| format!("connexion au checkpoint CT statique {url}"))
+    })
+    .await?;
+    if response.url() != &url {
+        bail!("redirection interdite du checkpoint CT statique");
+    }
+    let (status, body) = before_static_deadline(deadline, "la lecture du checkpoint", async {
+        response_bytes_limited_to(response, "checkpoint CT statique", MAX_CHECKPOINT_BYTES).await
+    })
+    .await?;
     if !status.is_success() {
         bail!("checkpoint CT statique: HTTP {status}");
     }
@@ -335,12 +439,13 @@ pub async fn fetch_static_delta(
     entry_budget: usize,
     initial_backfill: usize,
 ) -> Result<StaticCtBatch> {
-    fetch_static_delta_with_cache(
+    fetch_static_delta_with_cache_until(
         client,
         log_url,
         stored_cursor,
         entry_budget,
         initial_backfill,
+        None,
         |_, _, _| Ok(None),
     )
     .await
@@ -357,16 +462,43 @@ pub async fn fetch_static_delta_with_cache<F>(
     stored_cursor: Option<u64>,
     entry_budget: usize,
     initial_backfill: usize,
+    cached_tile: F,
+) -> Result<StaticCtBatch>
+where
+    F: FnMut(&str, u64, &str) -> Result<Option<CachedStaticTile>>,
+{
+    fetch_static_delta_with_cache_until(
+        client,
+        log_url,
+        stored_cursor,
+        entry_budget,
+        initial_backfill,
+        None,
+        cached_tile,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn fetch_static_delta_with_cache_until<F>(
+    client: &Client,
+    log_url: &str,
+    stored_cursor: Option<u64>,
+    entry_budget: usize,
+    initial_backfill: usize,
+    deadline: Option<TokioInstant>,
     mut cached_tile: F,
 ) -> Result<StaticCtBatch>
 where
     F: FnMut(&str, u64, &str) -> Result<Option<CachedStaticTile>>,
 {
+    ensure_static_deadline(deadline, "la validation du journal")?;
     let expected_origin = expected_checkpoint_origin(log_url)?;
     let mut selected = None;
     let mut errors = Vec::new();
     for prefix in monitoring_prefixes(log_url)? {
-        match fetch_checkpoint(client, &prefix).await {
+        ensure_static_deadline(deadline, "la sélection du checkpoint")?;
+        match fetch_checkpoint(client, &prefix, deadline).await {
             Ok(checkpoint) if checkpoint.origin == expected_origin => {
                 selected = Some((prefix, checkpoint));
                 break;
@@ -380,6 +512,7 @@ where
     }
     let (monitoring_prefix, checkpoint) = selected
         .with_context(|| format!("aucune API CT statique compatible ({})", errors.join(" | ")))?;
+    let monitoring_url = Url::parse(&monitoring_prefix).context("préfixe CT statique invalide")?;
     let checkpoint_hash = base64::engine::general_purpose::STANDARD.encode(checkpoint.root_hash);
     let backfill = checkpoint
         .tree_size
@@ -407,6 +540,7 @@ where
         && batch.entries_processed < entry_budget
         && batch.tiles.len() < MAX_TILES_PER_SYNC
     {
+        ensure_static_deadline(deadline, "la pagination des tuiles")?;
         let tile_index = cursor / TILE_WIDTH as u64;
         let tile_start = tile_index * TILE_WIDTH as u64;
         let full_tiles = checkpoint.tree_size / TILE_WIDTH as u64;
@@ -419,17 +553,29 @@ where
             format!("{:x}", Sha256::digest(&cached.payload)) == cached.content_hash
                 && cached.payload.len() <= MAX_TILE_BYTES
         });
+        ensure_static_deadline(deadline, "la lecture du cache de tuiles")?;
         let (payload, content_hash) = if let Some(cached) = cached {
             (cached.payload, cached.content_hash)
         } else {
-            let url = format!("{}/{}", monitoring_prefix.trim_end_matches('/'), path);
-            let response = client
-                .get(&url)
-                .send()
-                .await
-                .with_context(|| format!("connexion à la tuile CT statique {url}"))?;
+            let url = monitoring_url
+                .join(&path)
+                .context("URL de tuile CT statique invalide")?;
+            let response = before_static_deadline(deadline, "la connexion à une tuile", async {
+                client
+                    .get(url.clone())
+                    .send()
+                    .await
+                    .with_context(|| format!("connexion à la tuile CT statique {url}"))
+            })
+            .await?;
+            if response.url() != &url {
+                bail!("redirection interdite de la tuile CT statique {path}");
+            }
             let (status, payload) =
-                response_bytes_limited_to(response, "tuile CT statique", MAX_TILE_BYTES).await?;
+                before_static_deadline(deadline, "la lecture d'une tuile", async {
+                    response_bytes_limited_to(response, "tuile CT statique", MAX_TILE_BYTES).await
+                })
+                .await?;
             if !status.is_success() {
                 bail!("tuile CT statique {path}: HTTP {status}");
             }
@@ -442,6 +588,8 @@ where
         let payload_len = payload.len();
         let entries = parse_data_tile(&payload, expected_entries)
             .with_context(|| format!("décodage de la tuile CT statique {path}"))?;
+        tokio::task::yield_now().await;
+        ensure_static_deadline(deadline, "le décodage d'une tuile")?;
         let offset = cursor.saturating_sub(tile_start) as usize;
         let remaining_budget = entry_budget.saturating_sub(batch.entries_processed);
         let take = entries
@@ -452,10 +600,16 @@ where
         if take == 0 {
             bail!("la tuile CT statique {path} ne permet pas d'avancer le curseur");
         }
-        for entry in entries.iter().skip(offset).take(take) {
-            batch
-                .names
-                .extend(certificate_names(&entry.certificate_der)?);
+        for (index, entry) in entries.iter().skip(offset).take(take).enumerate() {
+            if index.is_multiple_of(8) {
+                tokio::task::yield_now().await;
+                ensure_static_deadline(deadline, "le décodage des certificats")?;
+            }
+            let certificate_names = certificate_names(&entry.certificate_der)?;
+            if batch.names.len().saturating_add(certificate_names.len()) > MAX_NAMES_PER_BATCH {
+                bail!("lot CT statique contenant trop de noms DNS");
+            }
+            batch.names.extend(certificate_names);
         }
         batch.tiles.push(StaticTile {
             path,
@@ -529,6 +683,54 @@ mod tests {
             "https://mon.sycamore.ct.letsencrypt.org/2026h2/"
         );
         assert!(prefixes.iter().any(|prefix| prefix.contains("://log.")));
+    }
+
+    #[test]
+    fn log_urls_are_canonical_and_reject_ssrf_primitives() {
+        assert_eq!(
+            validated_log_url("https://log.example.test:443/ct/2026h2")
+                .unwrap()
+                .as_str(),
+            "https://log.example.test/ct/2026h2/"
+        );
+        for unsafe_url in [
+            "http://log.example.test/ct/",
+            "https://user@log.example.test/ct/",
+            "https://log.example.test:8443/ct/",
+            "https://log.example.test/ct/?next=https://127.0.0.1/",
+            "https://log.example.test/ct/#fragment",
+            "https://127.0.0.1/ct/",
+            "https://[::1]/ct/",
+            "https://metadata.internal/ct/",
+            "https://service.local/ct/",
+        ] {
+            assert!(
+                validated_log_url(unsafe_url).is_err(),
+                "URL non sûre acceptée: {unsafe_url}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn expired_static_deadline_stops_before_network_or_cache() {
+        let client = reqwest::Client::new();
+        let mut cache_called = false;
+        let error = fetch_static_delta_with_cache_until(
+            &client,
+            "https://log.example.test/ct/",
+            None,
+            1,
+            1,
+            Some(TokioInstant::now()),
+            |_, _, _| {
+                cache_called = true;
+                Ok(None)
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("budget CT statique"));
+        assert!(!cache_called);
     }
 
     #[test]

@@ -6,6 +6,29 @@ Published releases and downloadable artifacts are available on [GitHub Releases]
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-07-17
+
+### Changed
+
+- charge DNS retry counters only after the transport accepts a packet, so pre-send cancellation remains resumable while post-send cancellation is accounted for;
+- validate and canonicalize Chrome CT log URLs, resolve and pin only public addresses, disable proxy and redirect handling, and apply one cumulative deadline across RFC 6962 and Static CT operations;
+- select mutation inputs from a deterministic 20,000-observation window, retain at most 5,000 diverse high-value names, and materialize that window once per resumable scan;
+- reject inconsistent provider pagination instead of treating schema drift or repeated cursors as a successful end of results.
+
+### Fixed
+
+- include UDP and TCP admission queues, sends, retries, and fallback work in the caller-owned DNS timeout; bound authoritative resolver caches, sockets, nameservers, and address fan-out;
+- feed trusted consensus, authoritative checks, fast-path failures, and Hickory fallbacks into accurate resolver metrics and the shared adaptive network governor;
+- revalidate fresh cache entries shaped by a confirmed wildcard, quarantine only current exact matches backed by resolver consensus or authoritative validation, and prevent `--include-wildcard` from restoring reusable positive state;
+- preserve existing live cache and inventory state when wildcard profiling is incomplete, indeterminate, a record superset, or supported by only one non-authoritative resolver, while retaining non-destructive audit evidence for later refreshes;
+- prevent conventional NSEC3 range evidence from authorizing destructive wildcard cleanup and canonicalize escaped ASCII octets during DNSSEC name ordering;
+- separate SQLite seed reservation from sent DNS attempts, requeue unfinished work safely, enforce the three-attempt ceiling across seed, active, named, and recursive claims, claim late CT seeds atomically, and make resume/checkpoint transitions idempotent;
+- keep live outcomes stronger than duplicate negative or error outcomes in one persistence wave, scope wildcard cleanup to the requested root, and prevent wildcard findings from materializing as reusable live records;
+- back up unversioned legacy SQLite databases before migration, preserve immutable checkpoint domains, and saturate persistent counters and legacy scheduler values instead of wrapping or propagating invalid floats;
+- prevent detached CT materialization or refresh-marker workers from outliving cancellation, make tile/name/cursor commits atomically cancellable under SQLite contention, and retain a CT result that completes at the final join boundary;
+- reject mismatched or truncated Common Crawl byte ranges, repeated Cert Spotter cursors, unsafe VirusTotal pagination ports, and inconsistent BinaryEdge, Brave, Driftnet, MerkleMap, and Shodan progress fields;
+- accept provider envelopes with `error: false`, `error: 0`, or `error: 0.0`, reject impossible generated FQDNs, bound mutation and grammar cross-products, keep cancelled candidates out of adaptive learning, saturate scores and counters, and return CLI errors instead of panicking on pathological duration values.
+
 ## [0.9.0] - 2026-07-16
 
 ### Added
@@ -212,7 +235,8 @@ Initial public release of Fellaga.
 - public MIT repository with security policy, contribution guide, third-party notices, and verifiable corpus provenance;
 - verifiable v0.8.0 release with x86-64 and ARM64 GNU/Linux archives, an amd64 Debian package, architecture SBOMs, checksums, a keyless Sigstore signature over the checksum manifest, and GitHub attestations.
 
-[Unreleased]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/compare/v0.9.1...HEAD
+[0.9.1]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/tag/v0.9.1
 [0.9.0]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/tag/v0.9.0
 [0.8.6]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/tag/v0.8.6
 [0.8.5]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/tag/v0.8.5

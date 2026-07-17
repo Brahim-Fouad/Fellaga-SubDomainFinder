@@ -61,24 +61,19 @@ struct HostsResponse {
 #[derive(Deserialize)]
 struct ShodanDomainResponse {
     subdomains: Vec<String>,
-    #[serde(default)]
     more: bool,
 }
 
 #[derive(Deserialize)]
 struct BinaryEdgeSubdomainPage {
-    #[serde(default)]
     total: usize,
-    #[serde(default)]
     page: usize,
-    #[serde(default)]
     pagesize: usize,
     events: Vec<String>,
 }
 
 #[derive(Deserialize)]
 struct MerkleMapSearchPage {
-    #[serde(default)]
     count: usize,
     results: Vec<MerkleMapSearchResult>,
 }
@@ -97,7 +92,6 @@ struct BraveSearchPage {
 
 #[derive(Deserialize, Default)]
 struct BraveSearchQuery {
-    #[serde(default)]
     more_results_available: bool,
 }
 
@@ -246,21 +240,48 @@ fn brave_page_names(page: &BraveSearchPage, domain: &str) -> BTreeSet<String> {
     names
 }
 
-fn binaryedge_has_more(page: &BinaryEdgeSubdomainPage, requested_page: usize) -> bool {
-    let event_count = page.events.len();
-    let page_number = page.page.max(requested_page);
-    let page_size = page.pagesize.max(event_count).max(1);
-    event_count > 0 && page_number.saturating_mul(page_size) < page.total
+fn binaryedge_has_more(page: &BinaryEdgeSubdomainPage, requested_page: usize) -> Result<bool> {
+    if requested_page == 0 || page.page != requested_page {
+        bail!(
+            "BinaryEdge: page inattendue {}, page {requested_page} demandée",
+            page.page
+        );
+    }
+    if page.pagesize == 0 || page.events.len() > page.pagesize {
+        bail!("BinaryEdge: taille de page incohérente");
+    }
+    let page_start = requested_page
+        .saturating_sub(1)
+        .checked_mul(page.pagesize)
+        .context("BinaryEdge: pagination trop grande")?;
+    if page.events.is_empty() && page_start < page.total {
+        bail!("BinaryEdge: page vide avant la fin annoncée");
+    }
+    if !page.events.is_empty() && page_start >= page.total {
+        bail!("BinaryEdge: résultats au-delà du total annoncé");
+    }
+    Ok(requested_page
+        .checked_mul(page.pagesize)
+        .context("BinaryEdge: pagination trop grande")?
+        < page.total)
 }
 
-fn brave_has_more(page: &BraveSearchPage) -> bool {
-    page.web.as_ref().is_some_and(|web| !web.results.is_empty())
-        && page.query.more_results_available
+fn brave_has_more(page: &BraveSearchPage) -> Result<bool> {
+    let result_count = page.web.as_ref().map_or(0, |web| web.results.len());
+    if page.query.more_results_available && result_count == 0 {
+        bail!("Brave Search: pagination annoncée sans aucun résultat");
+    }
+    Ok(page.query.more_results_available)
 }
 
-fn merklemap_has_more(page: &MerkleMapSearchPage, page_number: usize) -> bool {
-    let result_count = page.results.len();
-    result_count > 0 && page.count > (page_number + 1).saturating_mul(result_count)
+fn merklemap_has_more(page: &MerkleMapSearchPage, seen_results: usize) -> Result<bool> {
+    if seen_results > page.count {
+        bail!("MerkleMap: nombre de résultats supérieur au total annoncé");
+    }
+    if page.results.is_empty() && seen_results < page.count {
+        bail!("MerkleMap: page vide avant la fin annoncée");
+    }
+    Ok(seen_results < page.count)
 }
 
 fn driftnet_page_number(value: Option<&Value>, field: &str) -> Result<Option<usize>> {
@@ -279,12 +300,13 @@ fn driftnet_page_number(value: Option<&Value>, field: &str) -> Result<Option<usi
 }
 
 fn driftnet_pagination(page: &DriftnetPage, requested_page: usize) -> Result<(usize, usize)> {
-    let returned_page = driftnet_page_number(page.page.as_ref(), "page")?.unwrap_or(requested_page);
+    let returned_page = driftnet_page_number(page.page.as_ref(), "page")?
+        .context("Driftnet: champ de pagination page absent")?;
     if returned_page != requested_page {
         bail!("Driftnet: page inattendue {returned_page}, page {requested_page} demandée");
     }
     let pages = driftnet_page_number(page.pages.as_ref(), "pages")?
-        .unwrap_or_else(|| returned_page.saturating_add(1));
+        .context("Driftnet: champ de pagination pages absent")?;
     if !page.results.is_empty() && pages <= returned_page {
         bail!("Driftnet: pagination incohérente (page {returned_page}, pages {pages})");
     }
@@ -361,7 +383,7 @@ pub(super) async fn binaryedge(
         };
         let page_names = binaryedge_page_names(&response, domain);
         commit_result_page(&mut names, page_names);
-        let has_more = binaryedge_has_more(&response, requested_page);
+        let has_more = binaryedge_has_more(&response, requested_page)?;
         if !has_more {
             break;
         }
@@ -393,7 +415,7 @@ pub(super) async fn brave(
         };
         let page_names = brave_page_names(&response, domain);
         commit_result_page(&mut names, page_names);
-        let has_more = brave_has_more(&response);
+        let has_more = brave_has_more(&response)?;
         if !has_more {
             break;
         }
@@ -870,6 +892,7 @@ pub(super) async fn merklemap(
     let token = keys.pick("merklemap")?;
     let http = client(timeout)?;
     let mut names = BTreeSet::new();
+    let mut seen_results = 0_usize;
     for page in 0..MERKLEMAP_MAX_PAGES {
         let request = merklemap_request(&http, domain, page, &token);
         let response = match send_external("merklemap", request, domain).await {
@@ -881,9 +904,12 @@ pub(super) async fn merklemap(
             }
             Err(error) => return Err(error).context("connexion à MerkleMap"),
         };
+        seen_results = seen_results
+            .checked_add(response.results.len())
+            .context("MerkleMap: compteur de pagination trop grand")?;
         let page_names = merklemap_page_names(&response, domain);
         commit_result_page(&mut names, page_names);
-        let has_more = merklemap_has_more(&response, page);
+        let has_more = merklemap_has_more(&response, seen_results)?;
         if !has_more {
             break;
         }
@@ -1310,7 +1336,7 @@ mod tests {
         }))
         .unwrap();
         assert!(binaryedge_page_names(&binaryedge, "example.com").is_empty());
-        assert!(binaryedge_has_more(&binaryedge, 1));
+        assert!(binaryedge_has_more(&binaryedge, 1).unwrap());
 
         let brave: BraveSearchPage = serde_json::from_value(serde_json::json!({
             "query": {"more_results_available": true},
@@ -1318,7 +1344,7 @@ mod tests {
         }))
         .unwrap();
         assert!(brave_page_names(&brave, "example.com").is_empty());
-        assert!(brave_has_more(&brave));
+        assert!(brave_has_more(&brave).unwrap());
 
         let merklemap: MerkleMapSearchPage = serde_json::from_value(serde_json::json!({
             "count": 2,
@@ -1326,7 +1352,72 @@ mod tests {
         }))
         .unwrap();
         assert!(merklemap_page_names(&merklemap, "example.com").is_empty());
-        assert!(merklemap_has_more(&merklemap, 0));
+        assert!(merklemap_has_more(&merklemap, 1).unwrap());
+    }
+
+    #[test]
+    fn pagination_schema_drift_and_inconsistent_progress_are_rejected() {
+        assert!(
+            serde_json::from_value::<BinaryEdgeSubdomainPage>(serde_json::json!({
+                "events": ["api.example.com"]
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<MerkleMapSearchPage>(serde_json::json!({
+                "results": []
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<BraveSearchPage>(serde_json::json!({
+                "query": {},
+                "web": {"results": []}
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<ShodanDomainResponse>(serde_json::json!({
+                "subdomains": []
+            }))
+            .is_err()
+        );
+
+        let missing_driftnet_pagination: DriftnetPage =
+            serde_json::from_value(serde_json::json!({"results": []})).unwrap();
+        assert!(driftnet_pagination(&missing_driftnet_pagination, 0).is_err());
+
+        let wrong_binaryedge_page: BinaryEdgeSubdomainPage =
+            serde_json::from_value(serde_json::json!({
+                "page": 2,
+                "pagesize": 100,
+                "total": 250,
+                "events": ["api.example.com"]
+            }))
+            .unwrap();
+        assert!(binaryedge_has_more(&wrong_binaryedge_page, 1).is_err());
+
+        let empty_brave_page: BraveSearchPage = serde_json::from_value(serde_json::json!({
+            "query": {"more_results_available": true},
+            "web": {"results": []}
+        }))
+        .unwrap();
+        assert!(brave_has_more(&empty_brave_page).is_err());
+    }
+
+    #[test]
+    fn merklemap_uses_cumulative_raw_results_for_a_short_final_page() {
+        let final_page = MerkleMapSearchPage {
+            count: 125,
+            results: (0..25)
+                .map(|index| MerkleMapSearchResult {
+                    hostname: Some(format!("host-{index}.example.com")),
+                    subject_common_name: None,
+                })
+                .collect(),
+        };
+        assert!(!merklemap_has_more(&final_page, 125).unwrap());
+        assert!(merklemap_has_more(&final_page, 100).unwrap());
     }
 
     #[test]

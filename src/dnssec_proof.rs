@@ -635,7 +635,12 @@ fn parse_presentation_name(name: &str) -> Result<Vec<Vec<u8>>, ProofInputError> 
                     if value > u16::from(u8::MAX) {
                         return Err(ProofInputError::InvalidDnsName);
                     }
-                    label.push(value as u8);
+                    // DNSSEC canonical name ordering lowercases ASCII octets
+                    // regardless of whether presentation syntax wrote them
+                    // literally or as a decimal escape. Treating `A` and
+                    // `\065` differently could move a QNAME across an NSEC
+                    // interval and turn valid evidence into a false denial.
+                    label.push((value as u8).to_ascii_lowercase());
                     cursor += 3;
                 } else {
                     label.push(bytes[cursor].to_ascii_lowercase());

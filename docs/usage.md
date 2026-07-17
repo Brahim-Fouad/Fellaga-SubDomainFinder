@@ -79,7 +79,7 @@ If a scan reaches its time limit or is interrupted with Ctrl+C, the latest check
 fellaga scan your-domain.example --resume latest
 ```
 
-`--resume latest` restores the two candidate queues, feed cursors, merged seed provenance, attempt counts, and durable learning counters. It is also the continuation path after the shared active budget pauses unfinished work. Transient DNS failures are attempted no more than three times in total, including attempts made before an interruption. A definitive negative answer is terminal for that queue item. Previously validated positive cache entries are reclassified through the normal wildcard and freshness rules instead of being downgraded merely because the scan restarted.
+`--resume latest` restores the two candidate queues, feed cursors, merged seed provenance, attempt counts, and durable learning counters. It is also the continuation path after the shared active budget pauses unfinished work. Transient DNS failures are attempted no more than three times in total, including packets sent before an interruption. Work cancelled while waiting for rate, concurrency, or socket admission remains queued without consuming an attempt, while cancellation after a send remains charged. A definitive negative answer is terminal for that queue item. Previously validated positive cache entries are reclassified through the normal wildcard and freshness rules instead of being downgraded merely because the scan restarted.
 
 ### Large wordlists
 

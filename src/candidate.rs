@@ -1,4 +1,4 @@
-use crate::util::{learnable_label, valid_relative_name};
+use crate::util::{learnable_label, valid_fqdn, valid_relative_name};
 use anyhow::{Context, Result, bail};
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
@@ -48,6 +48,8 @@ const REGIONS: &[&str] = &[
 ];
 
 const CLOUDS: &[&str] = &["aws", "azure", "gcp", "cloud", "do", "ovh", "cf", "edge"];
+const MAX_CONTEXTUAL_OBSERVATIONS: usize = 20_000;
+const MAX_CONTEXTUAL_WORKING_SET: usize = 100_000;
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct MutationRule {
@@ -126,7 +128,10 @@ pub fn load_mutation_rules(path: &Path) -> Result<Vec<MutationRule>> {
     Ok(rules)
 }
 
-fn expand_mutation_pattern(pattern: &str, word: &str, parent: &str) -> Vec<String> {
+fn expand_mutation_pattern(pattern: &str, word: &str, parent: &str, limit: usize) -> Vec<String> {
+    if limit == 0 {
+        return Vec::new();
+    }
     let mut expanded = vec![
         pattern
             .replace("{{word}}", word)
@@ -138,23 +143,30 @@ fn expand_mutation_pattern(pattern: &str, word: &str, parent: &str) -> Vec<Strin
         ("{{cloud}}", CLOUDS),
     ] {
         if expanded.iter().any(|value| value.contains(placeholder)) {
-            expanded = expanded
-                .into_iter()
-                .flat_map(|value| {
-                    values
-                        .iter()
-                        .map(move |replacement| value.replace(placeholder, replacement))
-                })
-                .collect();
+            let mut next =
+                Vec::with_capacity(limit.min(expanded.len().saturating_mul(values.len())));
+            'expand: for value in expanded {
+                for replacement in values {
+                    next.push(value.replace(placeholder, replacement));
+                    if next.len() >= limit {
+                        break 'expand;
+                    }
+                }
+            }
+            expanded = next;
         }
     }
     if expanded.iter().any(|value| value.contains("{{n}}")) {
-        expanded = expanded
-            .into_iter()
-            .flat_map(|value| {
-                (0..=20).map(move |number| value.replace("{{n}}", &number.to_string()))
-            })
-            .collect();
+        let mut next = Vec::with_capacity(limit.min(expanded.len().saturating_mul(21)));
+        'expand: for value in expanded {
+            for number in 0..=20 {
+                next.push(value.replace("{{n}}", &number.to_string()));
+                if next.len() >= limit {
+                    break 'expand;
+                }
+            }
+        }
+        expanded = next;
     }
     expanded
         .into_iter()
@@ -184,8 +196,23 @@ fn proposal(
     valid_relative_name(&relative_name).then(|| CandidateProposal {
         relative_name,
         generator: generator.to_owned(),
-        score: base_score + learned_scores.get(generator).copied().unwrap_or_default(),
+        score: base_score
+            .saturating_add(learned_scores.get(generator).copied().unwrap_or_default()),
     })
+}
+
+fn compact_proposals(proposals: &mut Vec<CandidateProposal>, domain: &str, limit: usize) {
+    proposals.retain(|candidate| valid_fqdn(&format!("{}.{}", candidate.relative_name, domain)));
+    proposals.sort_by(|left, right| {
+        right
+            .score
+            .cmp(&left.score)
+            .then_with(|| left.relative_name.cmp(&right.relative_name))
+            .then_with(|| left.generator.cmp(&right.generator))
+    });
+    let mut seen = BTreeSet::new();
+    proposals.retain(|candidate| seen.insert(candidate.relative_name.clone()));
+    proposals.truncate(limit);
 }
 
 fn replace_token(label: &str, old: &str, new: &str) -> Option<String> {
@@ -236,9 +263,17 @@ pub fn generate_contextual_with_rules(
     mutation_rules: &[MutationRule],
     limit: usize,
 ) -> Vec<CandidateProposal> {
+    if limit == 0 {
+        return Vec::new();
+    }
     let suffix = format!(".{domain}");
+    let working_limit = limit.saturating_mul(4).clamp(1, MAX_CONTEXTUAL_WORKING_SET);
+    // The library API accepts any iterator, including an untrusted or
+    // effectively infinite source. Bound it before filtering, cloning
+    // relatives, or building the deduplication tree.
     let relatives = observed_names
         .into_iter()
+        .take(MAX_CONTEXTUAL_OBSERVATIONS)
         .filter_map(|name| name.strip_suffix(&suffix).map(ToOwned::to_owned))
         .filter(|relative| valid_relative_name(relative))
         .collect::<BTreeSet<_>>();
@@ -318,31 +353,36 @@ pub fn generate_contextual_with_rules(
         }
 
         for rule in mutation_rules {
+            // Once the shared working cap is full, still inspect one expansion
+            // from every later rule so a high-scoring custom rule can compete
+            // with built-ins without materializing its full cross-product.
+            let remaining = working_limit.saturating_sub(proposals.len()).max(1);
             for candidate in
-                expand_mutation_pattern(&rule.pattern, label, parent.unwrap_or_default())
+                expand_mutation_pattern(&rule.pattern, label, parent.unwrap_or_default(), remaining)
             {
                 let generator = format!("dsl:{}", rule.name);
                 if let Some(candidate) = proposal(candidate, &generator, rule.score, learned_scores)
                 {
                     proposals.push(candidate);
                 }
-                if proposals.len() >= limit.saturating_mul(4) {
+                if proposals.len() >= working_limit {
                     break;
                 }
             }
+            if proposals.len() >= working_limit.saturating_mul(2) {
+                compact_proposals(&mut proposals, domain, working_limit);
+            }
+        }
+        if proposals.len() >= working_limit.saturating_mul(2) {
+            compact_proposals(&mut proposals, domain, working_limit);
         }
     }
 
-    proposals.sort_by(|left, right| {
-        right
-            .score
-            .cmp(&left.score)
-            .then_with(|| left.relative_name.cmp(&right.relative_name))
-            .then_with(|| left.generator.cmp(&right.generator))
-    });
-    let mut seen = BTreeSet::new();
-    proposals.retain(|candidate| seen.insert(candidate.relative_name.clone()));
-    proposals.truncate(limit);
+    compact_proposals(
+        &mut proposals,
+        domain,
+        limit.min(MAX_CONTEXTUAL_WORKING_SET),
+    );
     proposals
 }
 
@@ -376,6 +416,40 @@ mod tests {
     }
 
     #[test]
+    fn mutation_scores_saturate_and_zero_limit_does_no_work() {
+        let learned = HashMap::from([("number-neighbor".to_owned(), i64::MAX)]);
+        let candidates = generate_contextual(
+            "example.com",
+            ["node9.example.com".to_owned()],
+            &learned,
+            10,
+        );
+        assert!(
+            candidates
+                .iter()
+                .filter(|candidate| candidate.generator == "number-neighbor")
+                .all(|candidate| candidate.score == i64::MAX)
+        );
+        assert!(
+            generate_contextual("example.com", ["node9.example.com".to_owned()], &learned, 0,)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn contextual_candidates_never_exceed_the_fqdn_wire_limit() {
+        let domain = [
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(60),
+        ]
+        .join(".");
+        let observed = format!("node9.{domain}");
+        assert!(generate_contextual(&domain, [observed], &HashMap::new(), 100).is_empty());
+    }
+
+    #[test]
     fn mutation_dsl_expands_cloud_region_and_parent() {
         let rules = vec![MutationRule {
             name: "cloud-region".to_owned(),
@@ -394,5 +468,53 @@ mod tests {
                 .iter()
                 .any(|candidate| candidate.relative_name == "api-aws-eu.internal")
         );
+    }
+
+    #[test]
+    fn mutation_dsl_cross_products_are_materialized_only_up_to_the_working_cap() {
+        let expanded = expand_mutation_pattern(
+            "{{word}}-{{env}}-{{region}}-{{cloud}}-{{n}}.{{parent}}",
+            "api",
+            "internal",
+            7,
+        );
+        assert_eq!(expanded.len(), 7);
+        assert!(expanded.iter().all(|candidate| !candidate.contains("{{")));
+
+        let rules = vec![MutationRule {
+            name: "cross-product".to_owned(),
+            score: i64::MAX,
+            pattern: "{{word}}-{{env}}-{{region}}-{{cloud}}-{{n}}.{{parent}}".to_owned(),
+        }];
+        let candidates = generate_contextual_with_rules(
+            "example.com",
+            ["api.internal.example.com".to_owned()],
+            &HashMap::new(),
+            &rules,
+            1,
+        );
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].score, i64::MAX);
+    }
+
+    #[test]
+    fn contextual_library_input_is_bounded_before_materialization() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let polls = Arc::new(AtomicUsize::new(0));
+        let observed_polls = Arc::clone(&polls);
+        let observed = (0..1_000_000).map(move |index| {
+            observed_polls.fetch_add(1, Ordering::Relaxed);
+            if index == 0 {
+                "api.example.com".to_owned()
+            } else {
+                format!("outside-{index}.invalid")
+            }
+        });
+
+        let candidates = generate_contextual("example.com", observed, &HashMap::new(), 16);
+        assert_eq!(polls.load(Ordering::Relaxed), MAX_CONTEXTUAL_OBSERVATIONS);
+        assert!(candidates.len() <= 16);
     }
 }

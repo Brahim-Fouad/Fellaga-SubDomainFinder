@@ -137,6 +137,18 @@ fn nsec_canonical_order_handles_wrap_and_escaped_octets() {
 }
 
 #[test]
+fn escaped_ascii_letters_have_the_same_dnssec_canonical_order() {
+    assert_eq!(
+        nsec_interval_covers("a.example", "c.example", "\\065.example"),
+        nsec_interval_covers("a.example", "c.example", "A.example")
+    );
+    assert_eq!(
+        nsec_interval_covers("\\065.example", "c.example", "b.example"),
+        nsec_interval_covers("A.example", "c.example", "b.example")
+    );
+}
+
+#[test]
 fn ambiguous_compact_nodata_is_not_promoted() {
     let result = classify_dnssec_proof(&DnssecProofInput {
         qname: "maybe.example.com".to_owned(),

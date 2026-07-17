@@ -977,6 +977,47 @@ fn wait_label(seconds: i64) -> String {
     }
 }
 
+fn positive_duration_seconds(value: f64, option: &str) -> Result<Duration> {
+    if value <= 0.0 || !value.is_finite() {
+        bail!("{option} doit être un nombre positif");
+    }
+    // Floating-point durations are per-operation network timeouts, not global
+    // scan budgets. A one-day ceiling prevents accidental multi-year hangs
+    // while remaining far above every practical DNS/HTTP/TLS timeout.
+    if value > 86_400.0 {
+        bail!("{option} ne peut pas dépasser 86400 secondes");
+    }
+    let duration = Duration::try_from_secs_f64(value)
+        .map_err(|_| anyhow::anyhow!("{option} dépasse la durée maximale prise en charge"))?;
+    if duration.is_zero() {
+        bail!("{option} est trop petit pour être représenté");
+    }
+    if std::time::Instant::now().checked_add(duration).is_none()
+        || tokio::time::Instant::now().checked_add(duration).is_none()
+    {
+        bail!("{option} dépasse la durée maximale prise en charge");
+    }
+    Ok(duration)
+}
+
+fn bounded_duration_seconds(value: u64, option: &str) -> Result<Duration> {
+    let duration = Duration::from_secs(value);
+    if value > 0
+        && (std::time::Instant::now().checked_add(duration).is_none()
+            || tokio::time::Instant::now().checked_add(duration).is_none())
+    {
+        bail!("{option} dépasse la durée maximale prise en charge");
+    }
+    Ok(duration)
+}
+
+fn bounded_duration_hours(value: u64, option: &str) -> Result<Duration> {
+    let seconds = value
+        .checked_mul(3_600)
+        .ok_or_else(|| anyhow::anyhow!("{option} dépasse la durée maximale prise en charge"))?;
+    bounded_duration_seconds(seconds, option)
+}
+
 fn default_database_path() -> PathBuf {
     if let Some(path) = std::env::var_os("FELLAGA_DB") {
         return PathBuf::from(path);
@@ -1028,9 +1069,7 @@ fn collect_targets(args: &ScanArgs) -> Result<Vec<String>> {
 }
 
 fn make_dns(args: &DnsArgs) -> Result<DnsEngine> {
-    if args.timeout <= 0.0 || !args.timeout.is_finite() {
-        bail!("--timeout doit être un nombre positif");
-    }
+    let timeout = positive_duration_seconds(args.timeout, "--timeout")?;
     if !(1..=4_096).contains(&args.concurrency) {
         bail!("--concurrency doit être compris entre 1 et 4096");
     }
@@ -1039,7 +1078,7 @@ fn make_dns(args: &DnsArgs) -> Result<DnsEngine> {
     }
     DnsEngine::new_with_rate_and_control(
         args.concurrency,
-        Duration::from_secs_f64(args.timeout),
+        timeout,
         &args.resolvers,
         args.dns_rate_limit,
         args.network_control.into(),
@@ -1704,7 +1743,7 @@ async fn main() -> Result<()> {
             } else {
                 let trusted = DnsEngine::new_with_rate_and_control(
                     args.dns.concurrency.min(256),
-                    Duration::from_secs_f64(args.dns.timeout),
+                    positive_duration_seconds(args.dns.timeout, "--timeout")?,
                     &args.dns.trusted_resolvers,
                     args.dns.dns_rate_limit,
                     args.dns.network_control.into(),
@@ -1717,35 +1756,47 @@ async fn main() -> Result<()> {
                 wordlist: args.wordlist.clone(),
                 mutation_rules,
                 max_words,
-                active_phase_timeout: Duration::from_secs(active_max_runtime),
+                active_phase_timeout: bounded_duration_seconds(
+                    active_max_runtime,
+                    "--active-max-runtime",
+                )?,
                 passive: !args.no_passive,
                 passive_sources,
                 api_keys: api_keys.clone(),
                 automatic_source_selection,
-                passive_refresh: Duration::from_secs(
-                    args.passive_refresh_hours.saturating_mul(3_600),
-                ),
-                passive_phase_timeout: Duration::from_secs(passive_max_runtime),
+                passive_refresh: bounded_duration_hours(
+                    args.passive_refresh_hours,
+                    "--passive-refresh-hours",
+                )?,
+                passive_phase_timeout: bounded_duration_seconds(
+                    passive_max_runtime,
+                    "--passive-max-runtime",
+                )?,
                 passive_zone_concurrency,
                 passive_concurrency: args.passive_concurrency,
                 max_passive,
                 passive_only,
                 axfr: !args.no_axfr && !profile_passive,
-                axfr_timeout: Duration::from_secs_f64(args.axfr_timeout),
+                axfr_timeout: positive_duration_seconds(args.axfr_timeout, "--axfr-timeout")?,
                 refresh_cache: args.refresh_cache,
-                verification_max_age: Duration::from_secs(
-                    args.verification_max_age.saturating_mul(3_600),
-                ),
+                verification_max_age: bounded_duration_hours(
+                    args.verification_max_age,
+                    "--verification-max-age",
+                )?,
                 only_live: args.only_live,
                 profile: format!("{:?}", args.profile).to_ascii_lowercase(),
-                checkpoint_every: Duration::from_secs(args.checkpoint_every),
+                checkpoint_every: bounded_duration_seconds(
+                    args.checkpoint_every,
+                    "--checkpoint-every",
+                )?,
                 resume: args.resume.clone(),
                 ttl_cap: args.ttl_cap,
                 negative_ttl: args.negative_ttl,
                 include_wildcard: args.include_wildcard,
-                wildcard_refresh: Duration::from_secs(
-                    args.wildcard_refresh_hours.saturating_mul(3_600),
-                ),
+                wildcard_refresh: bounded_duration_hours(
+                    args.wildcard_refresh_hours,
+                    "--wildcard-refresh-hours",
+                )?,
                 recursive_depth: depth,
                 recursive_words,
                 recursive_hosts,
@@ -1755,8 +1806,8 @@ async fn main() -> Result<()> {
                 pipeline_budget,
                 tls_certificates: !args.no_tls && !profile_passive,
                 tls_port: args.tls_port,
-                tls_timeout: Duration::from_secs_f64(args.tls_timeout),
-                tls_refresh: Duration::from_secs(args.tls_refresh_hours.saturating_mul(3_600)),
+                tls_timeout: positive_duration_seconds(args.tls_timeout, "--tls-timeout")?,
+                tls_refresh: bounded_duration_hours(args.tls_refresh_hours, "--tls-refresh-hours")?,
                 tls_max_hosts: tls_hosts,
                 tls_concurrency: args.tls_concurrency,
                 dns_graph: !args.no_dns_graph && !profile_passive,
@@ -1765,13 +1816,19 @@ async fn main() -> Result<()> {
                 ptr_pivot: !args.no_ptr && !profile_passive,
                 ptr_max_ips: ptr_ips,
                 dnssec_nsec: !args.no_nsec && !profile_passive,
-                nsec_timeout: Duration::from_secs_f64(args.nsec_timeout),
-                nsec_refresh: Duration::from_secs(args.nsec_refresh_hours.saturating_mul(3_600)),
+                nsec_timeout: positive_duration_seconds(args.nsec_timeout, "--nsec-timeout")?,
+                nsec_refresh: bounded_duration_hours(
+                    args.nsec_refresh_hours,
+                    "--nsec-refresh-hours",
+                )?,
                 nsec_max_names,
-                nsec_phase_timeout: Duration::from_secs(nsec_max_runtime),
+                nsec_phase_timeout: bounded_duration_seconds(
+                    nsec_max_runtime,
+                    "--nsec-max-runtime",
+                )?,
                 ct_monitor: !args.no_ct_monitor,
-                ct_timeout: Duration::from_secs_f64(args.ct_timeout),
-                ct_phase_timeout: Duration::from_secs(ct_max_runtime),
+                ct_timeout: positive_duration_seconds(args.ct_timeout, "--ct-timeout")?,
+                ct_phase_timeout: bounded_duration_seconds(ct_max_runtime, "--ct-max-runtime")?,
                 ct_max_logs: ct_logs,
                 ct_entries_per_log: ct_entries,
                 ct_initial_backfill: ct_backfill,
@@ -1788,9 +1845,9 @@ async fn main() -> Result<()> {
                 },
                 web_discovery: !args.no_web && !profile_passive,
                 web_max_hosts: web_hosts,
-                web_timeout: Duration::from_secs_f64(args.web_timeout),
-                web_phase_timeout: Duration::from_secs(web_max_runtime),
-                web_refresh: Duration::from_secs(args.web_refresh_hours.saturating_mul(3_600)),
+                web_timeout: positive_duration_seconds(args.web_timeout, "--web-timeout")?,
+                web_phase_timeout: bounded_duration_seconds(web_max_runtime, "--web-max-runtime")?,
+                web_refresh: bounded_duration_hours(args.web_refresh_hours, "--web-refresh-hours")?,
                 web_concurrency: args.web_concurrency,
                 web_max_bytes: args.web_max_bytes,
                 web_assets_per_host: web_assets,
@@ -1815,8 +1872,9 @@ async fn main() -> Result<()> {
             } else {
                 None
             };
-            let max_runtime =
-                (max_runtime_seconds > 0).then(|| Duration::from_secs(max_runtime_seconds));
+            let max_runtime = (max_runtime_seconds > 0)
+                .then(|| bounded_duration_seconds(max_runtime_seconds, "--max-runtime"))
+                .transpose()?;
             let domain_concurrency = args.domain_concurrency.min(targets.len()).max(1);
             let mut pending = stream::iter(targets)
                 .map(|target| {
@@ -1960,7 +2018,7 @@ async fn main() -> Result<()> {
             dns.seed_metrics(&database.resolver_history()?);
             let trusted_dns = DnsEngine::new_with_rate_and_control(
                 args.dns.concurrency.min(256),
-                Duration::from_secs_f64(args.dns.timeout),
+                positive_duration_seconds(args.dns.timeout, "--timeout")?,
                 &args.dns.trusted_resolvers,
                 args.dns.dns_rate_limit,
                 args.dns.network_control.into(),
@@ -1993,7 +2051,7 @@ async fn main() -> Result<()> {
                 args.ttl_cap,
                 args.negative_ttl,
                 RefreshOptions {
-                    max_runtime: Duration::from_secs(args.max_runtime),
+                    max_runtime: bounded_duration_seconds(args.max_runtime, "--max-runtime")?,
                     wildcard_phase_timeout: Duration::from_secs(30),
                     batch_size: args.batch_size,
                 },
@@ -2068,7 +2126,7 @@ async fn main() -> Result<()> {
                 }
                 validate_source_check_concurrency(args.concurrency)?;
                 let target = util::normalize_domain(&args.target)?;
-                let timeout = Duration::from_secs_f64(args.timeout);
+                let timeout = positive_duration_seconds(args.timeout, "--timeout")?;
                 let mut pending_checks = stream::iter(statuses.iter().cloned())
                     .map(|source| {
                         let api_keys = api_keys.clone();
@@ -2293,7 +2351,7 @@ async fn main() -> Result<()> {
                     candidates: args.candidates,
                     batch_size: args.batch_size,
                     concurrency: args.concurrency,
-                    timeout: Duration::from_secs_f64(args.timeout),
+                    timeout: positive_duration_seconds(args.timeout, "--timeout")?,
                     campaign_id: args.campaign_id,
                 })
                 .await?;
@@ -2319,9 +2377,11 @@ async fn main() -> Result<()> {
                 } else {
                     args.resolvers
                 };
-                let results =
-                    DnsEngine::test_resolvers(&resolvers, Duration::from_secs_f64(args.timeout))
-                        .await;
+                let results = DnsEngine::test_resolvers(
+                    &resolvers,
+                    positive_duration_seconds(args.timeout, "--timeout")?,
+                )
+                .await;
                 if args.json {
                     println!("{}", serde_json::to_string_pretty(&results)?);
                 } else {
@@ -2350,7 +2410,7 @@ async fn main() -> Result<()> {
                 let result = DnsEngine::benchmark_loopback(
                     args.queries,
                     args.concurrency,
-                    Duration::from_secs_f64(args.timeout),
+                    positive_duration_seconds(args.timeout, "--timeout")?,
                 )
                 .await?;
                 let serialized = serde_json::to_string_pretty(&result)?;
@@ -2444,6 +2504,38 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn floating_point_timeouts_are_converted_without_panicking() {
+        assert_eq!(
+            positive_duration_seconds(0.25, "--timeout").unwrap(),
+            Duration::from_millis(250)
+        );
+        for invalid in [
+            0.0,
+            -1.0,
+            f64::NAN,
+            f64::INFINITY,
+            f64::MIN_POSITIVE,
+            1.0e18,
+            f64::MAX,
+        ] {
+            assert!(
+                positive_duration_seconds(invalid, "--timeout").is_err(),
+                "unexpectedly accepted {invalid:?}"
+            );
+        }
+        assert_eq!(
+            bounded_duration_hours(2, "--refresh-hours").unwrap(),
+            Duration::from_secs(7_200)
+        );
+        assert_eq!(
+            bounded_duration_seconds(0, "--max-runtime").unwrap(),
+            Duration::ZERO
+        );
+        assert!(bounded_duration_seconds(u64::MAX, "--max-runtime").is_err());
+        assert!(bounded_duration_hours(u64::MAX, "--refresh-hours").is_err());
+    }
 
     #[test]
     fn stream_jsonl_mode_defers_only_live_findings_until_final_classification() {

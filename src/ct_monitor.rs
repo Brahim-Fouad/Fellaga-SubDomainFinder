@@ -1,4 +1,6 @@
-use crate::ct_static::{CachedStaticTile, fetch_static_delta_with_cache};
+use crate::ct_static::{
+    CachedStaticTile, fetch_static_delta_with_cache_until, monitoring_prefixes, validated_log_url,
+};
 use crate::db::Database;
 use crate::model::CtMonitorResult;
 use crate::passive::{compact_external_error, external_user_agent, response_bytes_limited_to};
@@ -10,19 +12,27 @@ use openssl::nid::Nid;
 use openssl::x509::X509;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::future::Future;
-use std::sync::Arc;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 use tokio::time::Instant as TokioInstant;
+use url::Url;
 
 const CHROME_LOG_LIST: &str = "https://www.gstatic.com/ct/log_list/v3/log_list.json";
 const CT_GLOBAL_REFRESH: Duration = Duration::from_secs(10 * 60);
 const DEFAULT_CT_MATERIALIZATION_LIMIT: usize = 100_000;
 const CT_LOG_LIST_MAX_BYTES: usize = 4 * 1024 * 1024;
 const CT_ENTRIES_MAX_BYTES: usize = 32 * 1024 * 1024;
+const CT_MAX_CERTIFICATE_NAME_FIELDS: usize = 8_192;
+const CT_MAX_NAMES_PER_CERTIFICATE: usize = 4_096;
+const CT_MAX_NAMES_PER_BATCH: usize = 250_000;
 static CT_GLOBAL_GATE: Semaphore = Semaphore::const_new(1);
 
 /// Fine-grained progress emitted by the raw CT-log indexer.  The scanner can
@@ -361,20 +371,35 @@ fn names_from_entry(entry: &CtEntry) -> Result<BTreeSet<String>> {
     let der = certificate_der(entry)?;
     let certificate = X509::from_der(&der).context("certificat X509 CT invalide")?;
     let mut names = BTreeSet::new();
+    let mut inspected = 0_usize;
     if let Some(subject_alt_names) = certificate.subject_alt_names() {
         for general_name in subject_alt_names {
+            inspected = inspected.saturating_add(1);
+            if inspected > CT_MAX_CERTIFICATE_NAME_FIELDS {
+                bail!("certificat CT contenant trop de champs SAN");
+            }
             if let Some(name) = general_name.dnsname()
                 && let Some(name) = normalize_hostname(name)
             {
                 names.insert(name);
+                if names.len() > CT_MAX_NAMES_PER_CERTIFICATE {
+                    bail!("certificat CT contenant trop de noms DNS");
+                }
             }
         }
     }
     for entry in certificate.subject_name().entries_by_nid(Nid::COMMONNAME) {
+        inspected = inspected.saturating_add(1);
+        if inspected > CT_MAX_CERTIFICATE_NAME_FIELDS {
+            bail!("certificat CT contenant trop de champs de nom");
+        }
         if let Ok(name) = entry.data().to_string()
             && let Some(name) = normalize_hostname(&name)
         {
             names.insert(name);
+            if names.len() > CT_MAX_NAMES_PER_CERTIFICATE {
+                bail!("certificat CT contenant trop de noms DNS");
+            }
         }
     }
     Ok(names)
@@ -382,6 +407,134 @@ fn names_from_entry(entry: &CtEntry) -> Result<BTreeSet<String>> {
 
 fn endpoint(log_url: &str, path: &str) -> String {
     format!("{}/{}", log_url.trim_end_matches('/'), path)
+}
+
+fn is_public_ipv4(address: Ipv4Addr) -> bool {
+    let [a, b, c, _] = address.octets();
+    !(a == 0
+        || a == 10
+        || a == 127
+        || (a == 100 && (64..=127).contains(&b))
+        || (a == 169 && b == 254)
+        || (a == 172 && (16..=31).contains(&b))
+        || (a == 192 && b == 0 && c == 0)
+        || (a == 192 && b == 0 && c == 2)
+        || (a == 192 && b == 88 && c == 99)
+        || (a == 192 && b == 168)
+        || (a == 198 && (b == 18 || b == 19))
+        || (a == 198 && b == 51 && c == 100)
+        || (a == 203 && b == 0 && c == 113)
+        || a >= 224)
+}
+
+fn is_public_ipv6(address: Ipv6Addr) -> bool {
+    if let Some(embedded) = address.to_ipv4() {
+        return is_public_ipv4(embedded);
+    }
+    let segments = address.segments();
+    !(address.is_unspecified()
+        || address.is_loopback()
+        || address.is_multicast()
+        || segments[0] & 0xfe00 == 0xfc00
+        || segments[0] & 0xffc0 == 0xfe80
+        || segments[0] & 0xffc0 == 0xfec0
+        || (segments[0] == 0x0064 && segments[1] == 0xff9b && matches!(segments[2], 0 | 1))
+        || segments[0] == 0x2002
+        || (segments[0] == 0x2001 && segments[1] == 0)
+        || (segments[0] == 0x2001 && segments[1] == 0x0db8)
+        || (segments[0] == 0x2001 && segments[1] == 0x0002)
+        || (segments[0] == 0x2001 && matches!(segments[1] & 0xfff0, 0x0010 | 0x0020))
+        || (segments[0] == 0x0100 && segments[1..4] == [0, 0, 0]))
+}
+
+fn is_public_address(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => is_public_ipv4(address),
+        IpAddr::V6(address) => is_public_ipv6(address),
+    }
+}
+
+fn hardened_ct_client_builder(timeout: Duration) -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .connect_timeout(timeout)
+        .timeout(timeout)
+        .pool_idle_timeout(Duration::from_secs(30))
+        .pool_max_idle_per_host(2)
+        .redirect(reqwest::redirect::Policy::none())
+        .referer(false)
+        .https_only(true)
+        .no_proxy()
+        .user_agent(external_user_agent())
+}
+
+async fn pinned_ct_client(
+    urls: &[Url],
+    timeout: Duration,
+    deadline: Option<TokioInstant>,
+) -> Result<reqwest::Client> {
+    let mut hosts = BTreeMap::<String, u16>::new();
+    for url in urls {
+        if url.scheme() != "https"
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.port().is_some_and(|port| port != 443)
+        {
+            bail!("endpoint CT non sûr");
+        }
+        let host = url.host_str().context("hôte CT absent")?.to_owned();
+        hosts.insert(host, url.port_or_known_default().unwrap_or(443));
+    }
+    if hosts.is_empty() {
+        bail!("aucun endpoint CT à résoudre");
+    }
+
+    let mut resolved = BTreeMap::<String, Vec<SocketAddr>>::new();
+    for (host, port) in hosts {
+        let budget = ct_request_budget(timeout, deadline, TokioInstant::now())?;
+        let operation = format!("la résolution DNS CT de {host}");
+        let addresses = await_ct_request(budget, &operation, async {
+            let mut addresses = tokio::net::lookup_host((host.as_str(), port))
+                .await
+                .with_context(|| format!("résolution DNS de {host}"))?
+                .take(17)
+                .collect::<Vec<_>>();
+            addresses.sort();
+            addresses.dedup();
+            if addresses.is_empty() || addresses.len() > 16 {
+                bail!("résolution DNS CT vide ou excessive pour {host}");
+            }
+            if addresses
+                .iter()
+                .any(|address| !is_public_address(address.ip()))
+            {
+                bail!("résolution DNS CT non publique pour {host}");
+            }
+            Ok(addresses)
+        })
+        .await?;
+        resolved.insert(host, addresses);
+    }
+
+    let mut builder = hardened_ct_client_builder(timeout);
+    for (host, addresses) in &resolved {
+        builder = builder.resolve_to_addrs(host, addresses);
+    }
+    builder.build().context("construction du client CT durci")
+}
+
+async fn pinned_log_client(
+    log_url: &str,
+    timeout: Duration,
+    deadline: Option<TokioInstant>,
+) -> Result<reqwest::Client> {
+    let mut urls = monitoring_prefixes(log_url)?
+        .into_iter()
+        .map(|prefix| Url::parse(&prefix).context("préfixe CT statique invalide"))
+        .collect::<Result<Vec<_>>>()?;
+    urls.push(validated_log_url(log_url)?);
+    urls.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    urls.dedup();
+    pinned_ct_client(&urls, timeout, deadline).await
 }
 
 async fn before_ct_deadline<T, F>(deadline: Option<TokioInstant>, future: F) -> Result<T>
@@ -396,6 +549,93 @@ where
             .await
             .context("budget de temps cumulé CT atteint")?,
         None => future.await,
+    }
+}
+
+struct CancelCtBlockingOnDrop {
+    cancellation: Arc<AtomicBool>,
+    completion: Option<std::sync::mpsc::Receiver<()>>,
+}
+
+impl CancelCtBlockingOnDrop {
+    fn new(cancellation: Arc<AtomicBool>, completion: std::sync::mpsc::Receiver<()>) -> Self {
+        Self {
+            cancellation,
+            completion: Some(completion),
+        }
+    }
+
+    fn cancel(&self) {
+        self.cancellation.store(true, Ordering::Release);
+    }
+}
+
+impl Drop for CancelCtBlockingOnDrop {
+    fn drop(&mut self) {
+        self.cancel();
+        // Dropping a Tokio JoinHandle detaches spawn_blocking. Wait on a
+        // synchronous completion signal instead, so an outer task abort can
+        // never leave a worker owning Fellaga's shared SQLite mutex.
+        if let Some(completion) = self.completion.take() {
+            let _ = completion.recv();
+        }
+    }
+}
+
+struct SignalCtBlockingCompletion(Option<std::sync::mpsc::SyncSender<()>>);
+
+impl Drop for SignalCtBlockingCompletion {
+    fn drop(&mut self) {
+        if let Some(completion) = self.0.take() {
+            let _ = completion.send(());
+        }
+    }
+}
+
+async fn run_ct_blocking_until<T, F>(
+    deadline: Option<TokioInstant>,
+    operation: &str,
+    job: F,
+) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(Arc<AtomicBool>) -> Result<T> + Send + 'static,
+{
+    if deadline.is_some_and(|deadline| deadline <= TokioInstant::now()) {
+        bail!("budget de temps cumulé CT atteint avant {operation}");
+    }
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let worker_cancellation = Arc::clone(&cancellation);
+    let (completion_tx, completion_rx) = std::sync::mpsc::sync_channel(1);
+    let mut worker = tokio::task::spawn_blocking(move || {
+        let _completion = SignalCtBlockingCompletion(Some(completion_tx));
+        job(worker_cancellation)
+    });
+    // Declared after the handle so cancellation is signalled before the
+    // JoinHandle is detached if the surrounding async task is aborted.
+    let cancel_on_drop = CancelCtBlockingOnDrop::new(cancellation, completion_rx);
+
+    match deadline {
+        Some(deadline) => {
+            tokio::select! {
+                biased;
+                joined = &mut worker => {
+                    joined.with_context(|| format!("tâche bloquante CT interrompue pendant {operation}"))?
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    cancel_on_drop.cancel();
+                    // A deadline is not allowed to detach a worker that may
+                    // still own the shared SQLite mutex.
+                    let _ = worker.await.with_context(|| {
+                        format!("tâche bloquante CT interrompue après annulation de {operation}")
+                    })?;
+                    bail!("budget de temps cumulé CT atteint pendant {operation}")
+                }
+            }
+        }
+        None => worker
+            .await
+            .with_context(|| format!("tâche bloquante CT interrompue pendant {operation}"))?,
     }
 }
 
@@ -424,7 +664,9 @@ fn ct_request_budget(
     if per_request_timeout.is_zero() {
         bail!("le délai CT par requête doit être supérieur à zéro");
     }
-    let request_deadline = now + per_request_timeout;
+    let request_deadline = now
+        .checked_add(per_request_timeout)
+        .context("délai CT par requête trop grand")?;
     match phase_deadline {
         Some(phase_deadline) if phase_deadline <= now => {
             bail!("budget de temps cumulé CT atteint avant la requête")
@@ -481,11 +723,19 @@ async fn store_ct_refresh_marker(
     let database = database.clone();
     let key = key.to_owned();
     let value = crate::util::now_epoch().to_string();
-    before_ct_deadline(deadline, async move {
-        tokio::task::spawn_blocking(move || database.store_source_metadata(&key, &value))
-            .await
-            .context("tâche d'écriture du marqueur CT interrompue")?
-    })
+    let storage_deadline = deadline.map(TokioInstant::into_std);
+    run_ct_blocking_until(
+        deadline,
+        "l'écriture du marqueur de fraîcheur",
+        move |cancellation| {
+            database.store_source_metadata_until_cancelled(
+                &key,
+                &value,
+                storage_deadline,
+                &cancellation,
+            )
+        },
+    )
     .await
 }
 
@@ -508,9 +758,12 @@ async fn decode_batch_names(
                 );
             }
         }
-        names.extend(
-            names_from_entry(entry).with_context(|| format!("décodage de l'entrée CT {index}"))?,
-        );
+        let entry_names =
+            names_from_entry(entry).with_context(|| format!("décodage de l'entrée CT {index}"))?;
+        if names.len().saturating_add(entry_names.len()) > CT_MAX_NAMES_PER_BATCH {
+            bail!("lot RFC6962 contenant trop de noms DNS; curseur SQLite inchangé");
+        }
+        names.extend(entry_names);
     }
     Ok(names)
 }
@@ -520,6 +773,65 @@ struct CommittedCtBatch {
     entries: usize,
     names: BTreeSet<String>,
     next_cursor: u64,
+}
+
+#[derive(Debug)]
+struct CtLogPass {
+    entries: usize,
+    batches: usize,
+    names: BTreeSet<String>,
+    partial_error: Option<String>,
+}
+
+impl CtLogPass {
+    fn complete(entries: usize, batches: usize, names: BTreeSet<String>) -> Self {
+        Self {
+            entries,
+            batches,
+            names,
+            partial_error: None,
+        }
+    }
+
+    fn partial(
+        entries: usize,
+        batches: usize,
+        names: BTreeSet<String>,
+        error: &anyhow::Error,
+    ) -> Self {
+        Self {
+            entries,
+            batches,
+            names,
+            partial_error: Some(format!(
+                "{error:#}; {entries} entrée(s) déjà validée(s) et conservée(s)"
+            )),
+        }
+    }
+}
+
+async fn store_ct_global_batch_until(
+    database: &Database,
+    log_url: &str,
+    next_cursor: u64,
+    names: BTreeSet<String>,
+    deadline: Option<TokioInstant>,
+    operation: &str,
+) -> Result<BTreeSet<String>> {
+    let database = database.clone();
+    let storage_log_url = log_url.to_owned();
+    let storage_deadline = deadline.map(TokioInstant::into_std);
+    run_ct_blocking_until(deadline, operation, move |cancellation| {
+        database.store_ct_global_batch_until_cancelled(
+            &storage_log_url,
+            next_cursor,
+            &names,
+            storage_deadline,
+            cancellation.as_ref(),
+        )?;
+        Ok(names)
+    })
+    .await
 }
 
 async fn process_and_store_batch(
@@ -534,8 +846,19 @@ async fn process_and_store_batch(
     // cancellation or the phase deadline arrives mid-decode, this whole page
     // is replayed next time instead of silently losing unparsed certificates.
     let names = decode_batch_names(entries, deadline).await?;
+    if deadline.is_some_and(|deadline| deadline <= TokioInstant::now()) {
+        bail!("budget CT atteint avant le commit du lot; curseur SQLite inchangé");
+    }
     let next_cursor = next_batch_cursor(start, end, entries.len())?;
-    database.store_ct_global_batch(log_url, next_cursor, &names)?;
+    let names = store_ct_global_batch_until(
+        database,
+        log_url,
+        next_cursor,
+        names,
+        deadline,
+        "le commit du lot RFC6962",
+    )
+    .await?;
     Ok(CommittedCtBatch {
         entries: entries.len(),
         names,
@@ -558,12 +881,13 @@ async fn process_static_log(
     let stored_cursor = database.ct_global_cursor(log_url)?;
     let batch = before_ct_deadline(
         deadline,
-        fetch_static_delta_with_cache(
+        fetch_static_delta_with_cache_until(
             client,
             log_url,
             stored_cursor,
             entries_per_log,
             initial_backfill,
+            deadline,
             |tile_path, checkpoint_size, checkpoint_hash| {
                 database
                     .ct_static_tile(log_url, tile_path, checkpoint_size, checkpoint_hash)
@@ -595,7 +919,23 @@ async fn process_static_log(
             cursor: start_cursor,
         },
     );
-    database.store_ct_static_batch(log_url, &batch)?;
+    let database = database.clone();
+    let storage_log_url = log_url.to_owned();
+    let storage_deadline = deadline.map(TokioInstant::into_std);
+    let batch = run_ct_blocking_until(
+        deadline,
+        "le commit du lot CT statique",
+        move |cancellation| {
+            database.store_ct_static_batch_until_cancelled(
+                &storage_log_url,
+                &batch,
+                storage_deadline,
+                cancellation.as_ref(),
+            )?;
+            Ok(batch)
+        },
+    )
+    .await?;
     if batch.entries_processed > 0 {
         emit_progress(
             progress,
@@ -626,17 +966,14 @@ async fn materialize_target_names(
     let target_domain = domain.to_owned();
     let materialization_domain = target_domain.clone();
     let storage_deadline = deadline.map(TokioInstant::into_std);
-    let names = before_ct_deadline(deadline, async move {
-        tokio::task::spawn_blocking(move || {
-            database.materialize_ct_passive_cache_bounded_until(
-                &materialization_domain,
-                limit,
-                complete,
-                storage_deadline,
-            )
-        })
-        .await
-        .context("tâche de matérialisation CT interrompue")?
+    let names = run_ct_blocking_until(deadline, "la matérialisation CT", move |cancellation| {
+        database.materialize_ct_passive_cache_bounded_until_cancelled(
+            &materialization_domain,
+            limit,
+            complete,
+            storage_deadline,
+            cancellation,
+        )
     })
     .await?;
     Ok(names
@@ -743,7 +1080,15 @@ pub(crate) async fn monitor_ct_logs_bounded_with_progress_and_limit(
     materialization_limit: usize,
     progress: Option<CtProgressCallback>,
 ) -> Result<CtMonitorResult> {
-    let deadline = (!phase_timeout.is_zero()).then(|| TokioInstant::now() + phase_timeout);
+    let deadline = if phase_timeout.is_zero() {
+        None
+    } else {
+        Some(
+            TokioInstant::now()
+                .checked_add(phase_timeout)
+                .context("budget de phase CT trop grand")?,
+        )
+    };
     monitor_ct_logs_until(
         database,
         domain,
@@ -846,12 +1191,8 @@ async fn monitor_ct_logs_until(
         return Ok(result);
     }
 
-    let client = reqwest::Client::builder()
-        .connect_timeout(timeout)
-        .timeout(timeout)
-        .pool_idle_timeout(Duration::from_secs(30))
-        .user_agent(external_user_agent())
-        .build()?;
+    let list_url = Url::parse(CHROME_LOG_LIST).context("URL de liste CT Chrome invalide")?;
+    let client = pinned_ct_client(std::slice::from_ref(&list_url), timeout, deadline).await?;
     let list_budget = ct_request_budget(timeout, deadline, TokioInstant::now())?;
     emit_progress(
         &progress,
@@ -862,10 +1203,13 @@ async fn monitor_ct_logs_until(
     );
     let list = await_ct_request(list_budget, "la lecture de la liste CT Chrome", async {
         let response = client
-            .get(CHROME_LOG_LIST)
+            .get(list_url.clone())
             .send()
             .await
             .context("connexion à la liste CT de Chrome")?;
+        if response.url() != &list_url {
+            bail!("redirection interdite de la liste CT Chrome");
+        }
         ct_response_json::<LogList>(response, "liste CT Chrome", CT_LOG_LIST_MAX_BYTES).await
     })
     .await?;
@@ -873,7 +1217,8 @@ async fn monitor_ct_logs_until(
         .operators
         .into_iter()
         .flat_map(|operator| operator.logs)
-        .map(|log| log.url)
+        .filter_map(|log| validated_log_url(&log.url).ok())
+        .map(|url| url.to_string())
         .collect::<BTreeSet<_>>();
     if max_logs > 0 && all_logs.is_empty() {
         bail!("la liste CT de Chrome ne contient aucun journal");
@@ -891,12 +1236,12 @@ async fn monitor_ct_logs_until(
     let progress_for_logs = progress.clone();
     let mut pending = stream::iter(logs.into_iter().enumerate())
         .map(|(log_index, log_url)| {
-            let client = client.clone();
             let database = database.clone();
             let progress = progress_for_logs.clone();
             async move {
                 let position = log_index + 1;
                 let outcome = async {
+                    let client = pinned_log_client(&log_url, timeout, deadline).await?;
                     let sth_budget = ct_request_budget(timeout, deadline, TokioInstant::now())?;
                     emit_progress(
                         &progress,
@@ -929,7 +1274,7 @@ async fn monitor_ct_logs_until(
                             if deadline.is_some_and(|deadline| deadline <= TokioInstant::now()) {
                                 return Err(rfc_error);
                             }
-                            return process_static_log(
+                            let (entries, batches, names) = process_static_log(
                                 &database,
                                 &client,
                                 &log_url,
@@ -945,7 +1290,8 @@ async fn monitor_ct_logs_until(
                                 format!(
                                     "API RFC6962 indisponible ({rfc_error:#}); repli CT statique"
                                 )
-                            });
+                            })?;
+                            return Ok(CtLogPass::complete(entries, batches, names));
                         }
                     };
                     let stored = database.ct_global_cursor(&log_url)?;
@@ -966,8 +1312,20 @@ async fn monitor_ct_logs_until(
                                 "le journal CT {log_url} annonce une taille nulle après indexation"
                             );
                         }
-                        database.store_ct_global_batch(&log_url, 0, &BTreeSet::new())?;
-                        return Ok::<_, anyhow::Error>((0, 0, BTreeSet::new()));
+                        store_ct_global_batch_until(
+                            &database,
+                            &log_url,
+                            0,
+                            BTreeSet::new(),
+                            deadline,
+                            "le commit du journal CT vide",
+                        )
+                        .await?;
+                        return Ok::<_, anyhow::Error>(CtLogPass::complete(
+                            0,
+                            0,
+                            BTreeSet::new(),
+                        ));
                     }
                     let backfill_start = || {
                         sth.tree_size
@@ -993,8 +1351,16 @@ async fn monitor_ct_logs_until(
                         },
                     );
                     if start >= sth.tree_size || entries_per_log == 0 {
-                        database.store_ct_global_batch(&log_url, start, &BTreeSet::new())?;
-                        return Ok((0, 0, BTreeSet::new()));
+                        store_ct_global_batch_until(
+                            &database,
+                            &log_url,
+                            start,
+                            BTreeSet::new(),
+                            deadline,
+                            "le commit du curseur CT deja a jour",
+                        )
+                        .await?;
+                        return Ok(CtLogPass::complete(0, 0, BTreeSet::new()));
                     }
 
                     let mut total_processed = 0_usize;
@@ -1006,8 +1372,22 @@ async fn monitor_ct_logs_until(
                             .saturating_add(remaining.saturating_sub(1) as u64)
                             .min(sth.tree_size - 1);
                         let batch = pages + 1;
-                        let request_budget =
-                            ct_request_budget(timeout, deadline, TokioInstant::now())?;
+                        let request_budget = match ct_request_budget(
+                            timeout,
+                            deadline,
+                            TokioInstant::now(),
+                        ) {
+                            Ok(request_budget) => request_budget,
+                            Err(error) if total_processed > 0 => {
+                                return Ok(CtLogPass::partial(
+                                    total_processed,
+                                    pages,
+                                    names,
+                                    &error,
+                                ));
+                            }
+                            Err(error) => return Err(error),
+                        };
                         emit_progress(
                             &progress,
                             CtProgressEvent::BatchStarted {
@@ -1048,33 +1428,58 @@ async fn monitor_ct_logs_until(
                                 if deadline
                                     .is_some_and(|deadline| deadline <= TokioInstant::now())
                                 {
+                                    if total_processed > 0 {
+                                        return Ok(CtLogPass::partial(
+                                            total_processed,
+                                            pages,
+                                            names,
+                                            &rfc_error,
+                                        ));
+                                    }
                                     return Err(rfc_error);
                                 }
-                                let (processed, static_pages, static_names) =
-                                    process_static_log(
-                                        &database,
-                                        &client,
-                                        &log_url,
-                                        remaining,
-                                        initial_backfill,
-                                        deadline,
-                                        position,
-                                        log_count,
-                                        &progress,
+                                let static_result = process_static_log(
+                                    &database,
+                                    &client,
+                                    &log_url,
+                                    remaining,
+                                    initial_backfill,
+                                    deadline,
+                                    position,
+                                    log_count,
+                                    &progress,
+                                )
+                                .await
+                                .with_context(|| {
+                                    format!(
+                                        "API RFC6962 indisponible ({rfc_error:#}); repli CT statique"
                                     )
-                                    .await
-                                    .with_context(|| {
-                                        format!(
-                                            "API RFC6962 indisponible ({rfc_error:#}); repli CT statique"
-                                        )
-                                    })?;
-                                total_processed = total_processed.saturating_add(processed);
-                                pages = pages.saturating_add(static_pages);
-                                names.extend(static_names);
-                                return Ok((total_processed, pages, names));
+                                });
+                                match static_result {
+                                    Ok((processed, static_pages, static_names)) => {
+                                        total_processed =
+                                            total_processed.saturating_add(processed);
+                                        pages = pages.saturating_add(static_pages);
+                                        names.extend(static_names);
+                                        return Ok(CtLogPass::complete(
+                                            total_processed,
+                                            pages,
+                                            names,
+                                        ));
+                                    }
+                                    Err(error) if total_processed > 0 => {
+                                        return Ok(CtLogPass::partial(
+                                            total_processed,
+                                            pages,
+                                            names,
+                                            &error,
+                                        ));
+                                    }
+                                    Err(error) => return Err(error),
+                                }
                             }
                         };
-                        let committed = process_and_store_batch(
+                        let committed = match process_and_store_batch(
                             &database,
                             &log_url,
                             start,
@@ -1082,7 +1487,19 @@ async fn monitor_ct_logs_until(
                             &response.entries,
                             deadline,
                         )
-                        .await?;
+                        .await
+                        {
+                            Ok(committed) => committed,
+                            Err(error) if total_processed > 0 => {
+                                return Ok(CtLogPass::partial(
+                                    total_processed,
+                                    pages,
+                                    names,
+                                    &error,
+                                ));
+                            }
+                            Err(error) => return Err(error),
+                        };
                         emit_progress(
                             &progress,
                             CtProgressEvent::BatchCommitted {
@@ -1100,7 +1517,7 @@ async fn monitor_ct_logs_until(
                         pages += 1;
                         start = committed.next_cursor;
                     }
-                    Ok((total_processed, pages, names))
+                    Ok(CtLogPass::complete(total_processed, pages, names))
                 }
                 .await;
                 (log_url, outcome)
@@ -1116,20 +1533,34 @@ async fn monitor_ct_logs_until(
     while let Some((log_url, log_result)) = pending.next().await {
         completed += 1;
         match log_result {
-            Ok((processed, batches, names)) => {
-                result.entries_processed += processed;
-                emit_progress(
-                    &progress,
-                    CtProgressEvent::LogFinished {
-                        completed,
-                        total: log_count,
-                        log_url,
-                        entries: processed,
-                        batches,
-                        names: names.len(),
-                    },
-                );
-                indexed_names.extend(names);
+            Ok(pass) => {
+                result.entries_processed += pass.entries;
+                let names_len = pass.names.len();
+                indexed_names.extend(pass.names);
+                if let Some(error) = pass.partial_error {
+                    result.failures += 1;
+                    emit_progress(
+                        &progress,
+                        CtProgressEvent::LogFailed {
+                            completed,
+                            total: log_count,
+                            log_url,
+                            error,
+                        },
+                    );
+                } else {
+                    emit_progress(
+                        &progress,
+                        CtProgressEvent::LogFinished {
+                            completed,
+                            total: log_count,
+                            log_url,
+                            entries: pass.entries,
+                            batches: pass.batches,
+                            names: names_len,
+                        },
+                    );
+                }
             }
             Err(error) => {
                 result.failures += 1;
@@ -1230,6 +1661,26 @@ mod tests {
     }
 
     #[test]
+    fn a_late_log_error_preserves_committed_progress_but_marks_the_pass_partial() {
+        let names = BTreeSet::from(["api.example.com".to_owned()]);
+        let pass = CtLogPass::partial(
+            25,
+            2,
+            names.clone(),
+            &anyhow::anyhow!("échec de la page suivante"),
+        );
+
+        assert_eq!(pass.entries, 25);
+        assert_eq!(pass.batches, 2);
+        assert_eq!(pass.names, names);
+        assert!(
+            pass.partial_error
+                .as_deref()
+                .is_some_and(|error| error.contains("déjà validée(s) et conservée(s)"))
+        );
+    }
+
+    #[test]
     fn log_selection_prioritizes_unseen_then_oldest_logs() {
         let logs = BTreeSet::from([
             "https://a.example/".to_owned(),
@@ -1266,6 +1717,66 @@ mod tests {
         assert!(error.to_string().contains("budget de temps cumulé CT"));
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blocking_ct_deadline_joins_the_cancelled_worker_before_returning() {
+        let finished = Arc::new(AtomicBool::new(false));
+        let finished_by_worker = Arc::clone(&finished);
+        let started = Instant::now();
+        let error = run_ct_blocking_until(
+            Some(TokioInstant::now() + Duration::from_millis(20)),
+            "le worker de test",
+            move |cancellation| {
+                while !cancellation.load(Ordering::Acquire) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                std::thread::sleep(Duration::from_millis(20));
+                finished_by_worker.store(true, Ordering::Release);
+                Ok(())
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("budget de temps cumulé CT"));
+        assert!(finished.load(Ordering::Acquire));
+        assert!(started.elapsed() >= Duration::from_millis(35));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn aborting_the_async_wrapper_never_detaches_its_blocking_worker() {
+        let started = Arc::new(AtomicBool::new(false));
+        let finished = Arc::new(AtomicBool::new(false));
+        let started_by_worker = Arc::clone(&started);
+        let finished_by_worker = Arc::clone(&finished);
+        let task = tokio::spawn(run_ct_blocking_until(
+            None,
+            "le worker annulé de test",
+            move |cancellation| {
+                started_by_worker.store(true, Ordering::Release);
+                while !cancellation.load(Ordering::Acquire) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                std::thread::sleep(Duration::from_millis(20));
+                finished_by_worker.store(true, Ordering::Release);
+                Ok(())
+            },
+        ));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !started.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(
+            finished.load(Ordering::Acquire),
+            "le JoinHandle async a terminé avant son worker bloquant"
+        );
+    }
+
     #[test]
     fn each_request_uses_the_stricter_of_its_timeout_and_the_phase_budget() {
         let now = TokioInstant::now();
@@ -1289,6 +1800,53 @@ mod tests {
 
         assert!(ct_request_budget(Duration::ZERO, None, now).is_err());
         assert!(ct_request_budget(Duration::from_secs(1), Some(now), now).is_err());
+        assert!(ct_request_budget(Duration::MAX, None, now).is_err());
+    }
+
+    #[test]
+    fn ct_transport_accepts_only_public_addresses() {
+        for address in [
+            "127.0.0.1",
+            "10.0.0.1",
+            "100.64.0.1",
+            "169.254.169.254",
+            "192.168.1.1",
+            "198.18.0.1",
+            "::1",
+            "fe80::1",
+            "fc00::1",
+            "2001:db8::1",
+            "::ffff:127.0.0.1",
+            "::127.0.0.1",
+            "64:ff9b::7f00:1",
+            "64:ff9b:1::7f00:1",
+            "2001::1",
+            "2002:7f00:1::1",
+            "2001:20::1",
+        ] {
+            assert!(
+                !is_public_address(address.parse().unwrap()),
+                "adresse non publique acceptée: {address}"
+            );
+        }
+        for address in ["1.1.1.1", "8.8.8.8", "2606:4700:4700::1111"] {
+            assert!(
+                is_public_address(address.parse().unwrap()),
+                "adresse publique rejetée: {address}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pinned_ct_client_rejects_literal_loopback_without_http() {
+        let error = pinned_ct_client(
+            &[Url::parse("https://127.0.0.1/ct/").unwrap()],
+            Duration::from_secs(1),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("non publique"));
     }
 
     #[test]
@@ -1392,6 +1950,42 @@ mod tests {
         );
         assert_eq!(committed.next_cursor, 101);
         assert_eq!(database.ct_global_cursor(log_url).unwrap(), Some(101));
+    }
+
+    #[tokio::test]
+    async fn rfc_commit_deadline_does_not_wait_on_sqlite_or_advance_the_cursor() {
+        let temporary = tempfile::NamedTempFile::new().unwrap();
+        let database = Database::open(temporary.path()).unwrap();
+        let log_url = "https://ct.example/log/";
+        database
+            .store_ct_global_batch(log_url, 100, &BTreeSet::new())
+            .unwrap();
+        let entries = vec![valid_x509_entry("api.example.com")];
+        let locker = rusqlite::Connection::open(temporary.path()).unwrap();
+        locker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let started = Instant::now();
+
+        let error = process_and_store_batch(
+            &database,
+            log_url,
+            100,
+            100,
+            &entries,
+            Some(TokioInstant::now() + Duration::from_millis(30)),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(!error.to_string().is_empty());
+        assert!(started.elapsed() < Duration::from_millis(500));
+        locker.execute_batch("ROLLBACK").unwrap();
+        assert_eq!(database.ct_global_cursor(log_url).unwrap(), Some(100));
+        assert!(
+            database
+                .ct_names_for_domain("example.com", 10)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
