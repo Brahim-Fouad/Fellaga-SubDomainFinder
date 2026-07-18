@@ -1090,7 +1090,7 @@ def _canonical_names(path: pathlib.Path, domain: str) -> list[str]:
     return names
 
 
-def _excluded_wildcard_count(path: pathlib.Path) -> int:
+def _parser_diagnostic_count(path: pathlib.Path, key: str) -> int:
     count = 0
     seen = False
     try:
@@ -1098,16 +1098,25 @@ def _excluded_wildcard_count(path: pathlib.Path) -> int:
     except (OSError, UnicodeError) as exc:
         raise ValueError(f"cannot read parser diagnostics from {path}: {exc}") from exc
     for line in lines:
-        if not line.startswith("excluded_wildcards="):
+        prefix = f"{key}="
+        if not line.startswith(prefix):
             continue
         if seen:
-            raise ValueError("parser diagnostics contain duplicate wildcard counts")
+            raise ValueError(f"parser diagnostics contain duplicate {key} counts")
         seen = True
-        value = line.removeprefix("excluded_wildcards=")
+        value = line.removeprefix(prefix)
         if not value.isdigit():
-            raise ValueError("parser diagnostics contain an invalid wildcard count")
+            raise ValueError(f"parser diagnostics contain an invalid {key} count")
         count = int(value)
     return count
+
+
+def _excluded_wildcard_count(path: pathlib.Path) -> int:
+    return _parser_diagnostic_count(path, "excluded_wildcards")
+
+
+def _excluded_invalid_count(path: pathlib.Path) -> int:
+    return _parser_diagnostic_count(path, "excluded_invalid_or_out_of_scope")
 
 
 def _validated_discovery_timing(
@@ -1187,6 +1196,7 @@ def record_run(
     )
     names = _canonical_names(names_path, domain)
     excluded_wildcards = _excluded_wildcard_count(parser_stderr_path)
+    excluded_invalid = _excluded_invalid_count(parser_stderr_path)
     status = timing_status if timing_status != "success" else parse_status
 
     artifact_paths = {
@@ -1211,6 +1221,7 @@ def record_run(
         "max_rss_kib": max_rss,
         "name_count": len(names),
         "excluded_wildcard_patterns": excluded_wildcards,
+        "excluded_invalid_or_out_of_scope": excluded_invalid,
         "source_health": "unknown" if status == "success" else "failed",
         "names_sha256": _sha256(names_path),
         "artifacts": {
@@ -1373,6 +1384,13 @@ def _verified_names_for_row(
         or excluded_wildcards < 0
     ):
         raise ValueError("run excluded wildcard count is invalid")
+    excluded_invalid = row.get("excluded_invalid_or_out_of_scope")
+    if (
+        isinstance(excluded_invalid, bool)
+        or not isinstance(excluded_invalid, int)
+        or excluded_invalid < 0
+    ):
+        raise ValueError("run excluded invalid-name count is invalid")
     expected_source_health = "unknown" if status == "success" else "failed"
     if row.get("source_health") != expected_source_health:
         raise ValueError("run source health classification is invalid")
@@ -1410,6 +1428,8 @@ def _verified_names_for_row(
         raise ValueError("run name count does not match its artifact")
     if _excluded_wildcard_count(resolved_artifacts["parser_stderr"]) != excluded_wildcards:
         raise ValueError("run wildcard count does not match parser diagnostics")
+    if _excluded_invalid_count(resolved_artifacts["parser_stderr"]) != excluded_invalid:
+        raise ValueError("run invalid-name count does not match parser diagnostics")
     _validate_tree_manifest(campaign, resolved_artifacts["raw_tree"])
     timing = _read_json(resolved_artifacts["timing"])
     timing_status, timing_exit, timing_duration, timing_rss = _validated_discovery_timing(
@@ -1528,6 +1548,10 @@ def build_report(campaign: pathlib.Path) -> dict[str, Any]:
             "attempt_duration_seconds_total": sum(attempt_durations),
             "excluded_wildcard_patterns": sum(
                 int(row.get("excluded_wildcard_patterns", 0)) for row in tool_rows
+            ),
+            "excluded_invalid_or_out_of_scope": sum(
+                int(row.get("excluded_invalid_or_out_of_scope", 0))
+                for row in tool_rows
             ),
             "empty_successful_runs": sum(
                 1 for row in successful_rows if int(row.get("name_count", 0)) == 0

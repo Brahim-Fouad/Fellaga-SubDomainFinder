@@ -21,6 +21,23 @@ class NameError(ValueError):
     """Raised when a value is not a canonical DNS name."""
 
 
+class ObservationalLimitError(ValueError):
+    """Raised when an observational output exceeds its unique-name budget."""
+
+
+def _raise_observational_limit() -> None:
+    raise ObservationalLimitError(
+        f"observational output exceeds {MAX_OBSERVATIONAL_NAMES} unique names"
+    )
+
+
+def _merge_observational_names(target: set[str], source: set[str]) -> None:
+    unseen = source.difference(target)
+    if len(unseen) > MAX_OBSERVATIONAL_NAMES - len(target):
+        _raise_observational_limit()
+    target.update(source)
+
+
 def _ascii_name(value: str) -> str:
     candidate = value.strip().rstrip(".").lower()
     if not candidate or any(character.isspace() for character in candidate):
@@ -124,8 +141,7 @@ def observational_lines(
                     normalized not in names
                     and len(names) >= MAX_OBSERVATIONAL_NAMES
                 ):
-                    rejected += 1
-                    continue
+                    _raise_observational_limit()
                 names.add(normalized)
         except NameError:
             rejected += 1
@@ -249,8 +265,7 @@ def bbot_observational_names(
             if normalized is None:
                 continue
             if normalized not in names and len(names) >= MAX_OBSERVATIONAL_NAMES:
-                rejected += 1
-                continue
+                _raise_observational_limit()
             names.add(normalized)
     return names, rejected, excluded_wildcards
 
@@ -331,18 +346,21 @@ def main(argv: list[str] | None = None) -> int:
         rejected = 0
         excluded_wildcards = 0
         for path in args.paths:
-            normalized, path_rejected, path_wildcards = read_observational_name_file(
-                path, args.domain
-            )
-            names.update(normalized)
+            try:
+                normalized, path_rejected, path_wildcards = (
+                    read_observational_name_file(path, args.domain)
+                )
+                _merge_observational_names(names, normalized)
+            except ObservationalLimitError as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return 4
             rejected += path_rejected
             excluded_wildcards += path_wildcards
         _write_names(names)
         if excluded_wildcards:
             print(f"excluded_wildcards={excluded_wildcards}", file=sys.stderr)
         if rejected:
-            print(f"rejected {rejected} malformed or out-of-scope name(s)", file=sys.stderr)
-            return 3
+            print(f"excluded_invalid_or_out_of_scope={rejected}", file=sys.stderr)
         return 0
     if args.action == "fellaga":
         names, historical, rejected = fellaga_names(args.path, args.domain)
@@ -367,15 +385,18 @@ def main(argv: list[str] | None = None) -> int:
             return 3
         return 0
     if args.action == "bbot-observational":
-        names, rejected, excluded_wildcards = bbot_observational_names(
-            args.directory, args.domain
-        )
+        try:
+            names, rejected, excluded_wildcards = bbot_observational_names(
+                args.directory, args.domain
+            )
+        except ObservationalLimitError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 4
         _write_names(names)
         if excluded_wildcards:
             print(f"excluded_wildcards={excluded_wildcards}", file=sys.stderr)
         if rejected:
-            print(f"rejected {rejected} malformed or out-of-scope name(s)", file=sys.stderr)
-            return 3
+            print(f"excluded_invalid_or_out_of_scope={rejected}", file=sys.stderr)
         return 0
     raise AssertionError("unreachable action")
 

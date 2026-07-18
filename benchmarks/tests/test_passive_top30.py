@@ -457,6 +457,53 @@ class PassiveTop30ReportTests(unittest.TestCase):
                     parse_status="success",
                 )
 
+    def test_record_and_report_preserve_parser_exclusion_counts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            campaign = pathlib.Path(directory)
+            self._prepare(campaign)
+            timing = campaign / "timing.json"
+            names = campaign / "names.txt"
+            empty = campaign / "empty.txt"
+            parser_stderr = campaign / "parser-stderr.txt"
+            timing.write_text(
+                '{"status":"success","exit_code":0,"duration_seconds":1,'
+                '"max_rss_kib":0,"timeout_seconds":900,"grace_seconds":5,'
+                '"max_file_bytes":268435456}\n',
+                encoding="utf-8",
+            )
+            names.write_text("www.google.com\n", encoding="utf-8")
+            empty.write_text("", encoding="utf-8")
+            parser_stderr.write_text(
+                "excluded_wildcards=2\n"
+                "excluded_invalid_or_out_of_scope=3\n",
+                encoding="utf-8",
+            )
+            raw_tree = self._empty_raw_tree(campaign)
+
+            row = record_run(
+                campaign,
+                tool="fellaga",
+                domain="google.com",
+                rank=1,
+                repetition=1,
+                timing_path=timing,
+                names_path=names,
+                stdout_path=empty,
+                stderr_path=empty,
+                parser_stderr_path=parser_stderr,
+                raw_tree_path=raw_tree,
+                parse_status="success",
+            )
+            report = build_report(campaign)
+
+        self.assertEqual(row["excluded_wildcard_patterns"], 2)
+        self.assertEqual(row["excluded_invalid_or_out_of_scope"], 3)
+        self.assertEqual(report["summary"]["recorded_runs"], 1)
+        self.assertEqual(report["tools"]["fellaga"]["excluded_wildcard_patterns"], 2)
+        self.assertEqual(
+            report["tools"]["fellaga"]["excluded_invalid_or_out_of_scope"], 3
+        )
+
     def test_failed_run_names_do_not_contribute_to_coverage_metrics(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             campaign = pathlib.Path(directory)

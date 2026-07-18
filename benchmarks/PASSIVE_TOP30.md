@@ -129,7 +129,12 @@ process running after its leader exits: the supervisor terminates the process
 group and marks that run as failed. Per-run homes and Fellaga SQLite state are
 deleted immediately after their evidence is recorded. Final cleanup is bounded
 and verified before the report can be complete. Wildcard patterns are counted
-and excluded; they are never converted into concrete hosts. Tool order rotates
+and excluded; they are never converted into concrete hosts. Malformed,
+non-host, and out-of-scope output lines are also counted and excluded without
+turning an otherwise successful provider run into a parser failure. A parser
+still fails the run on malformed structured output or when a tool returns more
+than 500,000 unique in-scope names, so unbounded output cannot silently enter
+the report. Tool order rotates
 across both domains and repetitions, so a one-repetition campaign does not
 always favor the same first tool. Three consecutive failures disable only that
 tool; the other safe tools continue. The final report is regenerated after the
@@ -156,10 +161,11 @@ The corpus has no controlled ground truth and the policy prohibits direct
 validation. More returned names do not prove greater recall, accuracy, or
 superiority. Missing or skipped tools and failed runs are recorded as
 additional reason codes, never hidden. Names from failed, timed-out,
-interrupted, or parser-rejected runs remain available as evidence but are
-excluded from coverage and median-success metrics. A process exit code cannot
-normalize provider health across different tools; successful runs therefore
-retain `source_health: unknown`, and empty successes are reported explicitly.
+interrupted, or structurally unparseable runs remain available as evidence but
+are excluded from coverage and median-success metrics. A process exit code
+cannot normalize provider health across different tools; successful runs
+therefore retain `source_health: unknown`, and empty successes are reported
+explicitly.
 
 ## Attribution and data terms
 
