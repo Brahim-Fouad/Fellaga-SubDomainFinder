@@ -35,6 +35,14 @@ Low-yield adaptive stopping applies to active candidate waves. Later adaptive wa
 
 `--passive-only` skips brute-force generation but keeps active enrichment enabled. `--profile passive` disables AXFR and active Web, TLS, graph, NSEC, PTR, and pipeline stages. It still performs provider HTTP requests, CT collection, wildcard probes, and DNS validation.
 
+For provider-only collection without direct target contact, combine the passive profile with `--no-target-contact`:
+
+```bash
+fellaga scan your-domain.example --profile passive --no-target-contact --show
+```
+
+This mode queries only third-party passive-provider APIs. CT names remain available through provider connectors such as crt.sh and Cert Spotter, but the direct CT-log indexer is disabled because a public log endpoint can be hosted under the target's own domain. It issues no target DNS requests and performs no target HTTP, TLS, AXFR, wildcard probes, or other direct target connections. Every returned name is reported as `unverified` because live status and wildcard behavior were deliberately not tested. New names are stored as `unverified`; an existing `live` or `historical` inventory entry, its last verification time, and its DNS-record activity are not downgraded by a provider-only observation. The flag is rejected with any profile other than `passive`.
+
 ## Custom mutation rules
 
 Pass a mutation DSL file with `--mutations`. Blank lines and text after `#` are ignored. A rule is `score:name:pattern`; a line containing only a pattern receives a default score and an automatically generated rule name.

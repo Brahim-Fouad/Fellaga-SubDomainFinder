@@ -68,6 +68,30 @@ class NameNormalizationTests(unittest.TestCase):
         self.assertEqual(completed.stdout, "api.example.com\n")
         self.assertIn("rejected 2", completed.stderr)
 
+    def test_observational_normalizer_excludes_wildcard_patterns(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory) / "names.txt"
+            path.write_text(
+                "api.example.com\n*.cdn.example.com\n*.example.com\n",
+                encoding="utf-8",
+            )
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(BENCHMARKS / "names.py"),
+                    "normalize-observational",
+                    "example.com",
+                    str(path),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(completed.stdout, "api.example.com\n")
+        self.assertIn("excluded_wildcards=2", completed.stderr)
+
     def test_fellaga_parser_fails_closed_on_malformed_and_off_scope_findings(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)

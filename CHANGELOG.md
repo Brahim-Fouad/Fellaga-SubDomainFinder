@@ -6,6 +6,17 @@ Published releases and downloadable artifacts are available on [GitHub Releases]
 
 ## [Unreleased]
 
+### Added
+
+- add `scan --profile passive --no-target-contact` for provider-only collection that retains unverified provenance while preventing target DNS, HTTP, TLS, AXFR, wildcard, and enrichment traffic;
+- add a pinned Tranco top-30 observational campaign with isolated no-key competitor runs, executable provenance, live progress, and descriptive-only reporting.
+
+### Fixed
+
+- fail closed when BBOT's no-DNS dry run exits successfully but reports a semantic `dnsresolve` requirement.
+- disable direct CT-log indexing in `--no-target-contact` mode when a public log endpoint could belong to the target, while retaining CT provider connectors;
+- preserve existing live or historical inventory state, verification time, and DNS records when provider-only observations are merged.
+
 ## [0.9.2] - 2026-07-17
 
 ### Added

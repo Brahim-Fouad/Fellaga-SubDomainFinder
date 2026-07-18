@@ -80,6 +80,9 @@ fellaga scan your-domain.example --show --only-live
 # Passive discovery without the active enrichment pipeline
 fellaga scan your-domain.example --profile passive
 
+# Provider-only discovery with no DNS, HTTP, or TLS contact to the target
+fellaga scan your-domain.example --profile passive --no-target-contact --show
+
 # Stream each finding as JSONL when it is produced
 fellaga scan your-domain.example --stream-jsonl > findings.jsonl
 
@@ -88,6 +91,8 @@ fellaga scan your-domain.example --resume latest
 ```
 
 The default scan processes one domain at a time, caps shared DNS traffic at 250 logical queries per second, and keeps at most 128 host resolutions in flight. The rate cap remains active across validation and enrichment traffic unless `--dns-rate-limit 0` explicitly disables it. Runtime limits are profile-specific: `deep` stops after 600 seconds, `balanced` and `turbo` after 300 seconds, and `passive` after 180 seconds unless `--max-runtime` overrides the limit. The default `deep` profile also gives wildcard profiling and active candidate work a shared 120-second budget. Embedded and user wordlists, mutations, retries, and recursive candidate generation all consume that budget. At the deadline, completed outcomes are kept, unfinished names are requeued as indeterminate, and the scan can continue later with `--resume latest`. Set `--active-max-runtime 0` to disable this time bound. `--no-adaptive` disables low-yield stopping and uses the configured recursion ceilings, but it does not disable ranking, time limits, or DNS rate safeguards. Transient candidate-resolution failures receive at most three total attempts.
+
+`--profile passive` still performs wildcard probes, DNS validation, and direct CT-log indexing. Add `--no-target-contact` when the run must be limited to third-party passive-provider APIs. CT data can still arrive through providers such as crt.sh and Cert Spotter, while the direct CT-log indexer is disabled because some public logs can be hosted under the target's own domain. All names returned by this mode are intentionally `unverified`; no target DNS, HTTP, TLS, AXFR, or other direct target connection is attempted. Existing `live` or `historical` inventory state and DNS records are preserved when the same name is observed passively.
 
 Long-running phases emit periodic progress on standard error. Direct CT-log indexing reports the selected log, durable cursor, entry range, request timeout, and remaining phase budget. It runs opportunistically in the background and never gates the first DNS-validation wave; its `deep`/`balanced`/`passive`/`turbo` budgets are 30/10/30/5 seconds. One process-wide CT indexer runs at a time, and a completed global pass establishes a ten-minute SQLite freshness window that prevents duplicate raw-log work. Initial passive collection and AXFR remain bounded independently; passive budgets are 45/25/60/15 seconds and AXFR allows four concurrent transfers globally with a four-second default per nameserver. Wildcard detection starts with three randomized probes and spends two additional probes only when the first stage is ambiguous. Web and JavaScript discovery also uses one cumulative profile budget across the initial crawl and later pipeline rounds. Completed connector pages are committed to permanent SQLite observations as they arrive, while the active in-memory source set remains bounded. Web fetches are likewise retained after a later operation times out, and the affected phase is reported as partial. Final JSON records include `phase_timings` for initial discovery, candidate DNS, enrichment, and finalization.
 

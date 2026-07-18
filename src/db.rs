@@ -1,7 +1,7 @@
 use crate::confidence::evidence_family;
 use crate::model::{
     AxfrAttempt, DiscoveryEdge, EvidenceFamily, Finding, InventoryEntry, ObservationState,
-    ResolvedHost, ResolverMetric, ServiceEndpoint, Stats,
+    ResolvedHost, ResolverMetric, ServiceEndpoint, Stats, WildcardVerdict,
 };
 use crate::util::{
     domain_hash, learnable_label, learnable_relative_name, normalize_observed_name, now_epoch,
@@ -5056,6 +5056,71 @@ impl Database {
         Ok(())
     }
 
+    /// Merge provider-only observations into the permanent inventory without
+    /// treating the absence of a DNS validation as a negative validation.
+    ///
+    /// A no-target-contact scan can establish that a name was observed, but it
+    /// cannot establish that a previously live name stopped resolving.  New
+    /// names therefore start as unverified while existing live/historical
+    /// state, verification time and DNS-record activity remain unchanged.
+    pub fn persist_unverified_findings_preserving_state(
+        &self,
+        scan_id: i64,
+        domain: &str,
+        findings: &[Finding],
+    ) -> Result<()> {
+        let now = now_epoch();
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        for finding in findings {
+            if finding.state != ObservationState::Unverified
+                || finding.wildcard
+                || !finding.records.is_empty()
+                || finding.last_verified_at.is_some()
+                || finding.authoritative_validation
+                || finding.wildcard_verdict != WildcardVerdict::NotProfiled
+                || !finding.owner_proofs.is_empty()
+            {
+                bail!(
+                    "provider-only persistence requires an unverified, unprofiled finding without DNS records: {}",
+                    finding.fqdn
+                );
+            }
+            let mut combined_sources = finding.sources.clone();
+            if let Some(existing) = transaction
+                .query_row(
+                    "SELECT sources FROM subdomains WHERE fqdn=?1",
+                    [&finding.fqdn],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+            {
+                combined_sources.extend(
+                    existing
+                        .split(',')
+                        .filter(|source| !source.is_empty())
+                        .map(ToOwned::to_owned),
+                );
+            }
+            let sources = combined_sources.into_iter().collect::<Vec<_>>().join(",");
+            transaction.execute(
+                r#"INSERT INTO subdomains(
+                   fqdn, root_domain, first_seen, last_seen, first_scan_id, last_scan_id,
+                   times_seen, active, sources, verification_state, last_verified_at
+                   ) VALUES (?1, ?2, ?3, ?3, ?4, ?4, 1, 0, ?5, 'unverified', NULL)
+                   ON CONFLICT(fqdn) DO UPDATE SET
+                   last_seen=excluded.last_seen,
+                   last_scan_id=excluded.last_scan_id,
+                   times_seen=times_seen + CASE
+                       WHEN subdomains.last_scan_id<>excluded.last_scan_id THEN 1 ELSE 0 END,
+                   sources=excluded.sources"#,
+                params![finding.fqdn, domain, now, scan_id, sources],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// Stores the exact result set shown for a scan without changing the
     /// permanent inventory counters or DNS record activity.
     pub fn persist_scan_snapshot(&self, scan_id: i64, findings: &[Finding]) -> Result<()> {
@@ -9370,6 +9435,95 @@ mod tests {
             )
             .unwrap();
         assert_eq!((subdomain_active, record_active), (0, 0));
+    }
+
+    #[test]
+    fn provider_only_merge_preserves_verified_inventory_and_dns_record_state() {
+        let db = Database::in_memory().unwrap();
+        let live = "live.example.com";
+        let historical = "historical.example.com";
+        let new = "new.example.com";
+        let first_scan = db.create_scan("example.com", &json!({})).unwrap();
+        let verified = |fqdn: &str, address: &str, checked_at: i64| Finding {
+            fqdn: fqdn.to_owned(),
+            records: vec![DnsRecord {
+                record_type: "A".to_owned(),
+                value: address.to_owned(),
+                ttl: 60,
+            }],
+            sources: BTreeSet::from(["dns".to_owned()]),
+            state: ObservationState::Live,
+            last_verified_at: Some(checked_at),
+            evidence_families: BTreeSet::from([crate::model::EvidenceFamily::LiveDns]),
+            ..Finding::default()
+        };
+        db.persist_findings(
+            first_scan,
+            "example.com",
+            &[
+                verified(live, "192.0.2.10", 101),
+                verified(historical, "192.0.2.11", 102),
+            ],
+            60,
+        )
+        .unwrap();
+        db.mark_inactive(&[historical.to_owned()]).unwrap();
+
+        let second_scan = db.create_scan("example.com", &json!({})).unwrap();
+        let provider_only = |fqdn: &str| Finding {
+            fqdn: fqdn.to_owned(),
+            sources: BTreeSet::from(["passive:crtsh:cache".to_owned()]),
+            state: ObservationState::Unverified,
+            ..Finding::default()
+        };
+        db.persist_unverified_findings_preserving_state(
+            second_scan,
+            "example.com",
+            &[
+                provider_only(live),
+                provider_only(historical),
+                provider_only(new),
+            ],
+        )
+        .unwrap();
+
+        let inventory = db
+            .inventory(Some("example.com"), false)
+            .unwrap()
+            .into_iter()
+            .map(|entry| (entry.fqdn.clone(), entry))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(inventory[live].state, ObservationState::Live);
+        assert_eq!(inventory[live].last_verified_at, Some(101));
+        assert_eq!(inventory[historical].state, ObservationState::Historical);
+        assert_eq!(inventory[historical].last_verified_at, Some(102));
+        assert_eq!(inventory[new].state, ObservationState::Unverified);
+        assert_eq!(inventory[new].last_verified_at, None);
+        for fqdn in [live, historical] {
+            assert!(inventory[fqdn].sources.contains("dns"));
+            assert!(inventory[fqdn].sources.contains("passive:crtsh:cache"));
+        }
+
+        let connection = db.lock().unwrap();
+        let active = |fqdn: &str| -> i64 {
+            connection
+                .query_row(
+                    "SELECT active FROM dns_records WHERE fqdn=?1",
+                    [fqdn],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(active(live), 1);
+        assert_eq!(active(historical), 0);
+        let new_record_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM dns_records WHERE fqdn=?1",
+                [new],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(new_record_count, 0);
     }
 
     #[test]

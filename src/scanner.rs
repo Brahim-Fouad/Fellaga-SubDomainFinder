@@ -178,6 +178,7 @@ pub struct ScanOptions {
     pub passive_concurrency: usize,
     pub max_passive: usize,
     pub passive_only: bool,
+    pub no_target_contact: bool,
     pub axfr: bool,
     pub axfr_timeout: Duration,
     pub refresh_cache: bool,
@@ -3270,6 +3271,129 @@ impl Scanner {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn finalize_no_target_contact_scan(
+        &self,
+        scan_id: i64,
+        domain: &str,
+        started: Instant,
+        sources: BTreeMap<String, BTreeSet<String>>,
+        ct_monitor: CtMonitorResult,
+        pipeline_metrics: PipelineMetrics,
+        mut phase_timings: Vec<PhaseTiming>,
+        mut warnings: Vec<String>,
+    ) -> Result<ScanResult> {
+        let resolver_metrics = merge_resolver_metrics(
+            self.dns.take_metrics(),
+            self.trusted_dns
+                .as_ref()
+                .map(DnsEngine::take_metrics)
+                .unwrap_or_default(),
+        );
+        let dns_queries = resolver_metrics
+            .iter()
+            .map(|metric| metric.requests)
+            .sum::<u64>();
+        if dns_queries != 0 {
+            bail!(
+                "no-target-contact invariant violated: {dns_queries} DNS request(s) were emitted"
+            );
+        }
+
+        let finalization_started = Instant::now();
+        let candidate_count = sources.len();
+        let mut findings = sources
+            .iter()
+            .map(|(fqdn, origins)| {
+                let evidence_families = evidence_families(origins);
+                let state = crate::model::ObservationState::Unverified;
+                let confidence = assess_confidence(origins, false, state, false);
+                Finding {
+                    fqdn: fqdn.clone(),
+                    records: Vec::new(),
+                    sources: origins.clone(),
+                    wildcard: false,
+                    from_cache: origins
+                        .iter()
+                        .all(|source| source.contains(":cache") || source.contains(":stale")),
+                    discovery_score: Some(f64::from(confidence.score) / 100.0),
+                    confidence,
+                    state,
+                    last_verified_at: None,
+                    evidence_families,
+                    authoritative_validation: false,
+                    wildcard_verdict: WildcardVerdict::NotProfiled,
+                    owner_proofs: BTreeSet::new(),
+                    generation_path: vec!["passive_provider_only".to_owned()],
+                }
+            })
+            .collect::<Vec<_>>();
+        findings.sort_by(|left, right| left.fqdn.cmp(&right.fqdn));
+
+        let warning =
+            "no-target-contact: passive-provider names were retained without DNS validation"
+                .to_owned();
+        self.emit(ProgressEvent::Warning(warning.clone()));
+        warnings.push(warning);
+        self.database.store_scan_observations(domain, &sources)?;
+        self.database
+            .persist_unverified_findings_preserving_state(scan_id, domain, &findings)?;
+        if self.options.only_live {
+            findings.clear();
+        }
+        self.database.persist_scan_snapshot(scan_id, &findings)?;
+        self.database.store_resolver_metrics(&resolver_metrics)?;
+        self.database
+            .store_pipeline_metrics(scan_id, &pipeline_metrics)?;
+        self.database.finalize_scan_with_learning(
+            scan_id,
+            domain,
+            &HashMap::new(),
+            &HashMap::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            candidate_count,
+            findings.len(),
+            0,
+            started.elapsed().as_millis(),
+            &warnings,
+        )?;
+        phase_timings.push(PhaseTiming {
+            phase: "finalization".to_owned(),
+            duration_ms: finalization_started.elapsed().as_millis(),
+        });
+
+        Ok(ScanResult {
+            scan_id,
+            domain: domain.to_owned(),
+            status: "completed".to_owned(),
+            resumable: false,
+            candidates: candidate_count,
+            resolved_from_network: 0,
+            cache_hits: 0,
+            duration_ms: started.elapsed().as_millis(),
+            phase_timings,
+            wildcard_detected: false,
+            findings,
+            axfr_attempts: Vec::new(),
+            tls_certificates: Vec::new(),
+            dns_edges: Vec::new(),
+            child_zones: BTreeSet::new(),
+            service_endpoints: Vec::new(),
+            web_observations: Vec::new(),
+            dnssec_walks: Vec::new(),
+            ct_monitor,
+            pipeline: pipeline_metrics,
+            resolver_metrics,
+            scheduler_metrics: SchedulerMetrics {
+                stop_reason: Some(StopReason::QueueDrained),
+                ..SchedulerMetrics::default()
+            },
+            warnings,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn resolve_batch(
         &self,
         scan_id: i64,
@@ -3766,6 +3890,7 @@ impl Scanner {
             "passive_concurrency": self.options.passive_concurrency,
             "max_passive": self.options.max_passive,
             "passive_only": self.options.passive_only,
+            "no_target_contact": self.options.no_target_contact,
             "axfr": self.options.axfr,
             "refresh_cache": self.options.refresh_cache,
             "verification_max_age_seconds": self.options.verification_max_age.as_secs(),
@@ -4045,14 +4170,17 @@ impl Scanner {
 
         let ct_task_started = Instant::now();
         let mut ct_tasks = tokio::task::JoinSet::new();
-        if !resume_from_discovery_checkpoint && self.options.ct_monitor {
+        if !resume_from_discovery_checkpoint
+            && self.options.ct_monitor
+            && !self.options.no_target_contact
+        {
             let scanner = self.clone();
             let ct_domain = domain.to_owned();
             ct_tasks.spawn(async move { scanner.collect_incremental_ct(&ct_domain).await });
         }
 
         let axfr_phase = async {
-            if !self.options.axfr {
+            if !self.options.axfr || self.options.no_target_contact {
                 return (Vec::new(), Vec::new());
             }
             self.emit(ProgressEvent::Phase {
@@ -4126,8 +4254,16 @@ impl Scanner {
         let mut ct_task_pending = false;
         let (mut ct_monitor, ct_warnings) = if resume_from_discovery_checkpoint
             || !self.options.ct_monitor
+            || self.options.no_target_contact
         {
-            (CtMonitorResult::default(), Vec::new())
+            let ct_warnings = if self.options.no_target_contact && self.options.ct_monitor {
+                let warning = "no-target-contact: direct CT-log collection disabled; CT provider connectors remain available".to_owned();
+                self.emit(ProgressEvent::Warning(warning.clone()));
+                vec![warning]
+            } else {
+                Vec::new()
+            };
+            (CtMonitorResult::default(), ct_warnings)
         } else {
             match ct_tasks.try_join_next() {
                 Some(Ok(Ok(result))) => result,
@@ -4189,6 +4325,20 @@ impl Scanner {
             phase: "initial_discovery".to_owned(),
             duration_ms: initial_discovery_started.elapsed().as_millis(),
         });
+
+        if self.options.no_target_contact {
+            debug_assert!(!ct_task_pending);
+            return self.finalize_no_target_contact_scan(
+                scan_id,
+                domain,
+                started,
+                sources,
+                ct_monitor,
+                pipeline_metrics,
+                phase_timings,
+                warnings,
+            );
+        }
 
         let candidate_dns_started = Instant::now();
         self.emit(ProgressEvent::Phase {
@@ -7878,6 +8028,7 @@ mod tests {
             passive_concurrency: 1,
             max_passive: 1,
             passive_only: false,
+            no_target_contact: false,
             axfr: false,
             axfr_timeout: Duration::from_millis(100),
             refresh_cache: false,
@@ -7968,6 +8119,161 @@ mod tests {
             }
         });
         (address, requests, task)
+    }
+
+    #[tokio::test]
+    async fn no_target_contact_keeps_passive_names_unverified_without_dns() {
+        let domain = "example.test";
+        let fqdn = "api.example.test";
+        let new_fqdn = "new.example.test";
+        let database = Database::in_memory().unwrap();
+        let previous_scan = database.create_scan(domain, &json!({})).unwrap();
+        database
+            .persist_findings(
+                previous_scan,
+                domain,
+                &[Finding {
+                    fqdn: fqdn.to_owned(),
+                    records: vec![DnsRecord {
+                        record_type: "A".to_owned(),
+                        value: "192.0.2.44".to_owned(),
+                        ttl: 60,
+                    }],
+                    sources: BTreeSet::from(["dns".to_owned()]),
+                    state: ObservationState::Live,
+                    last_verified_at: Some(1_234),
+                    evidence_families: BTreeSet::from([crate::model::EvidenceFamily::LiveDns]),
+                    ..Finding::default()
+                }],
+                86_400,
+            )
+            .unwrap();
+        database
+            .finalize_scan(previous_scan, 1, 1, 0, 1, &[])
+            .unwrap();
+        database
+            .store_passive_cache(domain, "crtsh", &[fqdn.to_owned(), new_fqdn.to_owned()])
+            .unwrap();
+        let (resolver_address, requests, resolver_task) = wildcard_test_resolver().await;
+        let (trusted_address, trusted_requests, trusted_task) = wildcard_test_resolver().await;
+        let dns = DnsEngine::new_with_socket_addresses(
+            4,
+            Duration::from_millis(250),
+            &[resolver_address],
+            0,
+        )
+        .unwrap();
+        let trusted_dns = DnsEngine::new_with_socket_addresses(
+            4,
+            Duration::from_millis(250),
+            &[trusted_address],
+            0,
+        )
+        .unwrap();
+        let mut options = scanner_test_options(false);
+        options.passive = true;
+        options.passive_sources = vec!["crtsh".to_owned()];
+        options.max_passive = 10;
+        options.passive_only = true;
+        options.no_target_contact = true;
+        options.profile = "passive".to_owned();
+        options.ct_monitor = true;
+        // The core barrier must remain safe even if a library caller leaves
+        // active feature flags enabled instead of going through CLI policy.
+        options.axfr = true;
+        options.pipeline = true;
+        options.tls_certificates = true;
+        options.dns_graph = true;
+        options.service_discovery = true;
+        options.ptr_pivot = true;
+        options.dnssec_nsec = true;
+        options.metadata_discovery = true;
+        options.web_discovery = true;
+
+        let result = Scanner::new(database.clone(), dns, options)
+            .with_trusted_dns(trusted_dns)
+            .scan(domain)
+            .await
+            .unwrap();
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+        assert_eq!(trusted_requests.load(Ordering::SeqCst), 0);
+        assert_eq!(result.resolved_from_network, 0);
+        assert_eq!(result.scheduler_metrics.dns_queries, 0);
+        assert_eq!(
+            result
+                .resolver_metrics
+                .iter()
+                .map(|metric| metric.requests)
+                .sum::<u64>(),
+            0
+        );
+        assert_eq!(result.findings.len(), 2);
+        let finding = result
+            .findings
+            .iter()
+            .find(|finding| finding.fqdn == fqdn)
+            .unwrap();
+        assert_eq!(finding.fqdn, fqdn);
+        assert_eq!(finding.state, ObservationState::Unverified);
+        assert!(finding.records.is_empty());
+        assert!(!finding.wildcard);
+        assert_eq!(
+            finding.wildcard_verdict,
+            crate::model::WildcardVerdict::NotProfiled
+        );
+        assert!(!finding.authoritative_validation);
+        assert!(finding.owner_proofs.is_empty());
+        assert_eq!(
+            finding.generation_path,
+            vec!["passive_provider_only".to_owned()]
+        );
+
+        assert_eq!(result.ct_monitor.logs_checked, 0);
+        assert_eq!(result.ct_monitor.entries_processed, 0);
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| { warning.contains("direct CT-log collection disabled") })
+        );
+
+        let inventory = database
+            .inventory(Some(domain), false)
+            .unwrap()
+            .into_iter()
+            .map(|entry| (entry.fqdn.clone(), entry))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(inventory.len(), 2);
+        assert_eq!(inventory[fqdn].state, ObservationState::Live);
+        assert_eq!(inventory[fqdn].last_verified_at, Some(1_234));
+        assert!(inventory[fqdn].sources.contains("dns"));
+        assert!(
+            inventory[fqdn]
+                .sources
+                .iter()
+                .any(|source| source.contains("crtsh"))
+        );
+        assert_eq!(inventory[new_fqdn].state, ObservationState::Unverified);
+        assert_eq!(inventory[new_fqdn].last_verified_at, None);
+        let explanation = database.explain(fqdn).unwrap();
+        assert_eq!(explanation["inventory"]["state"], "live");
+        assert_eq!(explanation["inventory"]["last_verified_at"], 1_234);
+        assert!(
+            explanation["dns_records"]
+                .as_array()
+                .is_some_and(|records| records.iter().any(|record| record["active"] == true))
+        );
+        assert!(
+            explanation["evidence"]
+                .as_array()
+                .is_some_and(|observations| observations.iter().any(|observation| {
+                    observation["source"]
+                        .as_str()
+                        .is_some_and(|source| source.contains("crtsh"))
+                }))
+        );
+        resolver_task.abort();
+        trusted_task.abort();
     }
 
     fn proven_dnssec_denial(kind: DnssecProofKind) -> DnssecProofAssessment {

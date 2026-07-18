@@ -108,8 +108,10 @@ jobs:
           test "$(zstd -dc data/candidates-1m.txt.zst | wc -l)" -eq 1000000
           echo "cde7d80ff87e21ef2c6d3021b09931a469e4ca965f2bc7816e4c143682681d9b  data/candidates-1m.txt.zst" | sha256sum -c -
           bash -n benchmarks/run.sh
+          bash -n benchmarks/run-passive-top30.sh
           shellcheck benchmarks/run.sh
-          python3 -m py_compile benchmarks/names.py benchmarks/preflight.py benchmarks/redact.py benchmarks/report.py benchmarks/timed.py
+          shellcheck benchmarks/run-passive-top30.sh
+          python3 -m py_compile benchmarks/names.py benchmarks/passive_top30_report.py benchmarks/preflight.py benchmarks/redact.py benchmarks/report.py benchmarks/timed.py
           python3 -m py_compile packaging/check_release_consistency.py packaging/generate_supply_chain.py
           python3 packaging/check_release_consistency.py
           python3 -m unittest discover -s benchmarks/tests -v

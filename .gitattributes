@@ -10,6 +10,7 @@ Cargo.lock text eol=lf
 *.yaml text eol=lf
 *.sh text eol=lf
 *.txt text eol=lf
+*.csv text eol=lf
 *.py text eol=lf
 Dockerfile text eol=lf
 *.zone text eol=lf

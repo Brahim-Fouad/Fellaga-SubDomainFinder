@@ -1,5 +1,12 @@
 # Fellaga benchmark suite
 
+For the pinned worldwide Tranco top-30 corpus, use the separate
+[no-target-contact passive observation](PASSIVE_TOP30.md). It permits an
+available safe subset of Fellaga, Subfinder, Amass, and BBOT, records missing
+or policy-incompatible tools, isolates every run in no-key mode, and reports
+observational counts without a ranking. Do not pass that third-party corpus
+to the active runner described below.
+
 The suite produces separate `no-key` and `equal-keys` campaigns. Every campaign runs at least three repetitions and rotates tool order between repetitions. Each Fellaga repetition starts with a fresh SQLite database and configuration file. Each `summary.jsonl` row records discovery, validation, and end-to-end status and duration, peak memory, raw names, names validated by `dnsx`, DNS-query count, and log paths.
 
 The manifest binds the campaign ID, repository commit, executable hashes and versions, input hashes, credential mode, resolver set, DNS controls, and capacity preflights. The runner refuses an existing output directory so an earlier artifact cannot be reused accidentally.

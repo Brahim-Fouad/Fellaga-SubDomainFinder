@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "dataset": "Tranco standard daily list top 30",
+  "list_id": "74J5X",
+  "generated_on": "2026-07-17",
+  "created_on": "2026-07-17T22:00:02.288104",
+  "aggregation": {
+    "start_date": "2026-06-18",
+    "end_date": "2026-07-17",
+    "combination_method": "dowdall",
+    "filter_pay_level_domains": true,
+    "providers": [
+      "crux",
+      "farsight",
+      "majestic",
+      "radar",
+      "umbrella"
+    ],
+    "source_prefix_size": 1000000
+  },
+  "retrieval": {
+    "permanent_list_page": "https://tranco-list.eu/list/74J5X/1000000",
+    "metadata_api": "https://tranco-list.eu/api/lists/id/74J5X",
+    "dated_metadata_api": "https://tranco-list.eu/api/lists/date/20260717",
+    "permanent_csv": "https://tranco-list.eu/download/74J5X/1000000",
+    "retrieved_on": "2026-07-18",
+    "source_csv_bytes": 22705808,
+    "source_csv_sha256": "9d8bd78b8d291ba18ac1f91758515d2d7013b83b42d0c73d751d79f5b1475f43",
+    "top30_csv_path": "tranco-74J5X-top30.csv",
+    "top30_csv_sha256": "245ac9b15356107a52cb3a2e1ed7555481aad323bc71fe903e20d8ed7a798d5f",
+    "top30_domains_path": "tranco-74J5X-top30.txt",
+    "top30_domains_sha256": "ce448455f26ad0649ac0151d7aa0aadf5ed5bcd48b1f6dbdf62f9412e181a3c3"
+  },
+  "attribution": {
+    "requested_citation": "Victor Le Pochat, Tom Van Goethem, Samaneh Tajalizadehkhoob, Maciej Korczynski, and Wouter Joosen. 2019. Tranco: A Research-Oriented Top Sites Ranking Hardened Against Manipulation. NDSS 2019.",
+    "doi": "https://doi.org/10.14722/ndss.2019.23386",
+    "list_reference": "https://tranco-list.eu/list/74J5X"
+  },
+  "licensing": {
+    "aggregate_license_asserted": false,
+    "fellaga_mit_license_applies_to_excerpt": false,
+    "notice": "No single license is asserted here for the Tranco aggregate or this factual excerpt. The excerpt is not represented as covered by Fellaga's MIT license. Tranco documents mixed terms for its upstream providers; preserve attribution and review those terms before redistribution or commercial use.",
+    "upstream_terms_page": "https://tranco-list.eu/",
+    "documented_provider_terms": {
+      "majestic": "CC BY 3.0",
+      "crux": "CC BY-SA 4.0",
+      "radar": "CC BY-NC 4.0",
+      "umbrella": "available free of charge",
+      "farsight": "included only in the default list"
+    }
+  }
+}

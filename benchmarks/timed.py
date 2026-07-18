@@ -25,6 +25,7 @@ except ImportError:  # pragma: no cover - Windows compatibility
 
 
 TIMEOUT_EXIT_CODE = 124
+LINGERING_PROCESS_EXIT_CODE = 125
 SPAWN_ERROR_EXIT_CODE = 126
 
 
@@ -101,6 +102,17 @@ def _group_still_exists(process: subprocess.Popen[Any]) -> bool:
     return True
 
 
+def _wait_group_exit(process: subprocess.Popen[Any], timeout: float) -> bool:
+    """Wait briefly for signalled descendants to leave the process group."""
+
+    deadline = time.monotonic() + timeout
+    while _group_still_exists(process):
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.01)
+    return True
+
+
 def _stop_group(process: subprocess.Popen[Any], grace: float) -> bool:
     """Interrupt, kill if needed, and reap a complete child process group."""
 
@@ -113,7 +125,7 @@ def _stop_group(process: subprocess.Popen[Any], grace: float) -> bool:
         _kill_group(process)
     else:
         # The group leader may exit while a descendant ignores the interrupt.
-        if _group_still_exists(process):
+        if not _wait_group_exit(process, grace):
             forced = True
             _kill_group(process)
     try:
@@ -122,16 +134,24 @@ def _stop_group(process: subprocess.Popen[Any], grace: float) -> bool:
         forced = True
         process.kill()
         process.wait()
+    _wait_group_exit(process, max(grace, 1.0))
     return forced
 
 
-def run_bounded(command: list[str], timeout: float, grace: float) -> dict[str, Any]:
+def run_bounded(
+    command: list[str],
+    timeout: float,
+    grace: float,
+    max_file_bytes: int | None = None,
+) -> dict[str, Any]:
     if not command:
         raise ValueError("a command is required")
     if timeout <= 0:
         raise ValueError("timeout must be greater than zero")
     if grace < 0:
         raise ValueError("grace must not be negative")
+    if max_file_bytes is not None and max_file_bytes <= 0:
+        raise ValueError("maximum file size must be greater than zero")
 
     started = time.monotonic()
     process: subprocess.Popen[Any] | None = None
@@ -145,12 +165,29 @@ def run_bounded(command: list[str], timeout: float, grace: float) -> dict[str, A
         popen_options: dict[str, Any] = {}
         if os.name == "posix":
             popen_options["start_new_session"] = True
+            if max_file_bytes is not None and resource is not None:
+                def set_file_limit() -> None:
+                    resource.setrlimit(
+                        resource.RLIMIT_FSIZE, (max_file_bytes, max_file_bytes)
+                    )
+
+                popen_options["preexec_fn"] = set_file_limit
         else:  # pragma: no cover - exercised on Windows only
             popen_options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
         process = subprocess.Popen(command, **popen_options)
         try:
             exit_code = process.wait(timeout=timeout)
             status = "success" if exit_code == 0 else "error"
+            if _group_still_exists(process):
+                # A successful group leader can otherwise hide background
+                # descendants from the benchmark harness. Treat that as a
+                # supervision failure, clean the complete group, and return a
+                # non-zero code so callers cannot mistake it for success.
+                forced = _stop_group(process, grace)
+                status = "error"
+                exit_code = LINGERING_PROCESS_EXIT_CODE
+                interrupted = True
+                error = "process group still contained descendants after leader exit"
         except subprocess.TimeoutExpired:
             status = "timeout"
             exit_code = TIMEOUT_EXIT_CODE
@@ -179,6 +216,7 @@ def run_bounded(command: list[str], timeout: float, grace: float) -> dict[str, A
         "interrupted": interrupted,
         "forced_kill": forced,
         "error": error,
+        "max_file_bytes": max_file_bytes,
     }
 
 
@@ -188,6 +226,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument("--timeout", type=float, default=1800.0)
     parser.add_argument("--grace", type=float, default=5.0)
+    parser.add_argument("--max-file-bytes", type=int)
     parser.add_argument("output", type=pathlib.Path)
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
@@ -199,6 +238,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error("--timeout must be greater than zero")
     if args.grace < 0:
         parser.error("--grace must not be negative")
+    if args.max_file_bytes is not None and args.max_file_bytes <= 0:
+        parser.error("--max-file-bytes must be greater than zero")
     return args
 
 
@@ -219,7 +260,9 @@ def main(argv: list[str] | None = None) -> int:
         previous_handlers[int(signum)] = signal.getsignal(signum)
         signal.signal(signum, raise_interruption)
     try:
-        result = run_bounded(args.command, args.timeout, args.grace)
+        result = run_bounded(
+            args.command, args.timeout, args.grace, args.max_file_bytes
+        )
     finally:
         for signum, handler in previous_handlers.items():
             signal.signal(signum, handler)

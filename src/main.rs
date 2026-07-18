@@ -203,6 +203,13 @@ fn validate_scan_concurrency(domain: usize, web: usize, tls: usize) -> Result<()
     Ok(())
 }
 
+fn validate_no_target_contact(profile: ScanProfile, enabled: bool) -> Result<()> {
+    if enabled && profile != ScanProfile::Passive {
+        bail!("--no-target-contact requires --profile passive");
+    }
+    Ok(())
+}
+
 fn validate_source_check_concurrency(value: usize) -> Result<()> {
     if !(1..=MAX_SOURCE_CHECK_CONCURRENCY).contains(&value) {
         bail!("--concurrency doit être compris entre 1 et {MAX_SOURCE_CHECK_CONCURRENCY}");
@@ -498,6 +505,11 @@ struct ScanArgs {
         help = "Skip brute-force generation; active enrichment may still run"
     )]
     passive_only: bool,
+    #[arg(
+        long,
+        help = "Query passive providers only; disable target DNS and every direct target connection (requires --profile passive)"
+    )]
+    no_target_contact: bool,
     #[arg(long, help = "Disable automatic AXFR attempts")]
     no_axfr: bool,
     #[arg(
@@ -1635,6 +1647,8 @@ async fn main() -> Result<()> {
             let profile_passive = args.profile == ScanProfile::Passive;
             let passive_only = args.passive_only || profile_passive;
 
+            validate_no_target_contact(args.profile, args.no_target_contact)?;
+
             if !passive_only && max_words == 0 {
                 bail!("--max-words doit être supérieur à zéro hors profil passif");
             }
@@ -1766,7 +1780,7 @@ async fn main() -> Result<()> {
             let database = Database::open(&database_path)?;
             let dns = make_dns(&args.dns)?;
             dns.seed_metrics(&database.resolver_history()?);
-            let trusted_dns = if args.no_trusted_validation {
+            let trusted_dns = if args.no_trusted_validation || args.no_target_contact {
                 None
             } else {
                 let trusted = DnsEngine::new_with_rate_and_control(
@@ -1804,6 +1818,7 @@ async fn main() -> Result<()> {
                 passive_concurrency: args.passive_concurrency,
                 max_passive,
                 passive_only,
+                no_target_contact: args.no_target_contact,
                 axfr: !args.no_axfr && !profile_passive,
                 axfr_timeout: positive_duration_seconds(args.axfr_timeout, "--axfr-timeout")?,
                 refresh_cache: args.refresh_cache,
@@ -2650,6 +2665,28 @@ mod tests {
             true,
             false
         ));
+    }
+
+    #[test]
+    fn no_target_contact_requires_the_passive_profile() {
+        let parsed = Cli::try_parse_from([
+            "fellaga",
+            "scan",
+            "example.com",
+            "--profile",
+            "passive",
+            "--no-target-contact",
+        ])
+        .unwrap();
+        let Command::Scan(parsed) = parsed.command else {
+            panic!("scan command expected");
+        };
+        assert!(parsed.no_target_contact);
+        assert!(validate_no_target_contact(parsed.profile, true).is_ok());
+        for profile in [ScanProfile::Deep, ScanProfile::Balanced, ScanProfile::Turbo] {
+            assert!(validate_no_target_contact(profile, true).is_err());
+        }
+        assert!(validate_no_target_contact(ScanProfile::Deep, false).is_ok());
     }
 
     #[test]

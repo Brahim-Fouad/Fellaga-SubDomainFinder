@@ -24,8 +24,10 @@ jobs:
       - name: Validate benchmark scripts
         run: |
           bash -n benchmarks/run.sh
+          bash -n benchmarks/run-passive-top30.sh
           shellcheck benchmarks/run.sh
-          python3 -m py_compile benchmarks/names.py benchmarks/preflight.py benchmarks/redact.py benchmarks/report.py benchmarks/timed.py
+          shellcheck benchmarks/run-passive-top30.sh
+          python3 -m py_compile benchmarks/names.py benchmarks/passive_top30_report.py benchmarks/preflight.py benchmarks/redact.py benchmarks/report.py benchmarks/timed.py
           python3 -m py_compile packaging/check_release_consistency.py packaging/generate_supply_chain.py
           python3 packaging/check_release_consistency.py
       - name: Run deterministic benchmark harness tests
