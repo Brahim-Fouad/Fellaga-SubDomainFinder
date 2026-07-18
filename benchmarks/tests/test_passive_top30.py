@@ -126,6 +126,8 @@ class PassiveTop30PolicyTests(unittest.TestCase):
             "[passive-top30] complete",
             'cleanup-run "$OUT"',
             'quota-check "$OUT"',
+            ".posix-mode-probe",
+            "output must be on a POSIX-permission filesystem",
         ):
             with self.subTest(fragment=fragment):
                 self.assertIn(fragment, script)

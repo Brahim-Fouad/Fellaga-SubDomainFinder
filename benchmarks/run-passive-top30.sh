@@ -77,6 +77,39 @@ fi
 python3 "$REPORT" verify-source >/dev/null
 mkdir -p "$OUT"/{logs,names,preflight,raw,state}
 
+# Fellaga and Amass protect their private configuration with POSIX modes.
+# Windows-mounted WSL filesystems can reject chmod even though normal writes
+# succeed, so fail before any real-domain provider request is attempted.
+if ! python3 - "$OUT" <<'PY'
+import pathlib
+import stat
+import sys
+
+root = pathlib.Path(sys.argv[1])
+probe = root / ".posix-mode-probe"
+compatible = True
+try:
+    probe.mkdir(mode=0o700)
+    probe.chmod(0o700)
+    if stat.S_IMODE(probe.stat().st_mode) != 0o700:
+        raise OSError("output filesystem does not preserve mode 0700")
+    probe.chmod(0o750)
+    if stat.S_IMODE(probe.stat().st_mode) != 0o750:
+        raise OSError("output filesystem does not preserve mode 0750")
+except OSError:
+    compatible = False
+finally:
+    try:
+        probe.rmdir()
+    except OSError:
+        pass
+raise SystemExit(0 if compatible else 1)
+PY
+then
+  echo "passive top-30 output must be on a POSIX-permission filesystem; use a Linux path under WSL" >&2
+  exit 6
+fi
+
 # Invoked through the EXIT trap below.
 # shellcheck disable=SC2329
 finalize_campaign() {

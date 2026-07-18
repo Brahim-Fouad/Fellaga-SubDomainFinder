@@ -75,6 +75,18 @@ FELLAGA_PASSIVE_TOP30_OUT=benchmarks/results/passive-top30-74J5X \
   bash benchmarks/run-passive-top30.sh
 ```
 
+Fellaga and Amass require real POSIX permissions for their isolated private
+configuration. When the repository is under `/mnt/c` in WSL, place the output
+on the Linux filesystem instead:
+
+```bash
+FELLAGA_PASSIVE_TOP30_OUT="$HOME/fellaga-results/passive-top30-74J5X" \
+  bash benchmarks/run-passive-top30.sh
+```
+
+The runner verifies `chmod` semantics before any listed domain is sent to a
+provider and exits with a clear error on an incompatible output filesystem.
+
 Optional controls:
 
 - `FELLAGA_PASSIVE_TOP30_REPETITIONS`: `1` to `10`, default `1`.
