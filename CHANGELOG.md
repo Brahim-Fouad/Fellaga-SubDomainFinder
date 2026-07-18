@@ -9,13 +9,22 @@ Published releases and downloadable artifacts are available on [GitHub Releases]
 ### Added
 
 - add `scan --profile passive --no-target-contact` for provider-only collection that retains unverified provenance while preventing target DNS, HTTP, TLS, AXFR, wildcard, and enrichment traffic;
-- add a pinned Tranco top-30 observational campaign with isolated no-key competitor runs, executable provenance, live progress, and descriptive-only reporting.
+- add a pinned Tranco top-30 observational campaign with isolated no-key competitor runs, executable provenance, live progress, and descriptive-only reporting;
+- expand the passive registry to 65 connector names with 55 canonical integrations, six Fellaga-native connectors, four compatibility names, capability metadata, bounded pagination, and incremental page persistence;
+- add current provider contracts for Censys Platform v3, Netlas streamed downloads, SecurityTrails scrolling, four-family Driftnet summaries, and full code-search content extraction.
+
+### Changed
+
+- select all 61 locally accessible unique canonical and Fellaga-native connectors in the default deep profile while keeping duplicate compatibility names opt-in;
+- walk five yearly Common Crawl indexes breadth-first, follow Wayback resume keys, rotate code-search credentials on quota responses, and retain completed pages before later failures;
+- use generic `json`, `jsonl`, `text`, and `dns-text` import format names without coupling the runtime interface to another enumeration product.
 
 ### Fixed
 
-- fail closed when BBOT's no-DNS dry run exits successfully but reports a semantic `dnsresolve` requirement.
+- fail closed when an external benchmark tool's no-DNS dry run exits successfully but still reports a semantic DNS-resolution requirement;
 - disable direct CT-log indexing in `--no-target-contact` mode when a public log endpoint could belong to the target, while retaining CT provider connectors;
-- preserve existing live or historical inventory state, verification time, and DNS records when provider-only observations are merged.
+- preserve existing live or historical inventory state, verification time, and DNS records when provider-only observations are merged;
+- treat empty no-result provider payloads as empty results, keep mixed Driftnet evidence in the aggregator family, and reject repeated cursors, unsafe pagination destinations, oversized streams, or truncated records without discarding completed checkpoints.
 
 ## [0.9.2] - 2026-07-17
 

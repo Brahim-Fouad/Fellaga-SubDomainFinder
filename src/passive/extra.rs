@@ -1,14 +1,16 @@
 use super::{
     ApiKeyStore, client, commit_result_page, compact_external_error, hostname_from_url,
-    response_bytes_limited, response_json, response_text, send_external,
+    response_bytes_limited, response_json, send_external, send_external_streaming,
     send_with_retry_for_source, source_policy,
 };
 use crate::util::normalize_observed_name;
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
+use futures_util::{StreamExt, stream};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
+use url::Url;
 
 fn normalize_many<I, S>(values: I, domain: &str) -> BTreeSet<String>
 where
@@ -32,6 +34,116 @@ fn extract_from_text(text: &str, domain: &str) -> BTreeSet<String> {
     .collect()
 }
 
+const CODE_SEARCH_TEXT_MAX_BYTES: usize = 16 * 1024 * 1024;
+
+fn bounded_text_prefix(text: &str, max_bytes: usize) -> &str {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let mut end = max_bytes;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn percent_decode_hostname_sequences(text: &str, max_bytes: usize) -> String {
+    let text = bounded_text_prefix(text, max_bytes);
+    let input = text.as_bytes();
+    let mut decoded = Vec::with_capacity(input.len());
+    let mut index = 0;
+    while index < input.len() {
+        if input[index] == b'%'
+            && index + 2 < input.len()
+            && let (Some(high), Some(low)) =
+                (hex_value(input[index + 1]), hex_value(input[index + 2]))
+        {
+            let value = (high << 4) | low;
+            if value.is_ascii_alphanumeric() || matches!(value, b'.' | b'-' | b'*') {
+                decoded.push(value);
+                index += 3;
+                continue;
+            }
+        }
+        decoded.push(input[index]);
+        index += 1;
+    }
+    String::from_utf8(decoded).expect("le décodage prudent conserve un UTF-8 valide")
+}
+
+fn extract_from_code_text(text: &str, domain: &str) -> BTreeSet<String> {
+    let text = bounded_text_prefix(text, CODE_SEARCH_TEXT_MAX_BYTES);
+    let mut names = extract_from_text(text, domain);
+    let decoded = percent_decode_hostname_sequences(text, CODE_SEARCH_TEXT_MAX_BYTES);
+    if decoded != text {
+        names.extend(extract_from_text(&decoded, domain));
+    }
+    names
+}
+
+const PARTIAL_FAILURE_EXAMPLE_LIMIT: usize = 8;
+
+#[derive(Debug, Default)]
+struct PartialFailureSummary {
+    count: usize,
+    examples: Vec<String>,
+}
+
+impl PartialFailureSummary {
+    fn record(&mut self, message: impl AsRef<str>) {
+        self.count = self.count.saturating_add(1);
+        let message = compact_external_error(message.as_ref());
+        if !message.is_empty()
+            && self.examples.len() < PARTIAL_FAILURE_EXAMPLE_LIMIT
+            && !self.examples.contains(&message)
+        {
+            self.examples.push(message);
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    fn detail(&self) -> String {
+        if self.examples.is_empty() {
+            return format!("{} échec(s)", self.count);
+        }
+        let mut detail = format!("{} échec(s); premier: {}", self.count, self.examples[0]);
+        let mut others = self.examples.iter().skip(1).cloned().collect::<Vec<_>>();
+        others.sort();
+        if !others.is_empty() {
+            detail.push_str(" | autres exemples: ");
+            detail.push_str(&others.join(" | "));
+        }
+        detail
+    }
+}
+
+fn finish_code_search(
+    provider: &str,
+    names: BTreeSet<String>,
+    raw_failures: &PartialFailureSummary,
+) -> Result<BTreeSet<String>> {
+    if raw_failures.is_empty() {
+        Ok(names)
+    } else {
+        bail!(
+            "{provider}: résultats partiels; téléchargements de contenu brut: {}",
+            raw_failures.detail()
+        )
+    }
+}
+
 fn extract_from_json(value: &Value, domain: &str, names: &mut BTreeSet<String>) {
     match value {
         Value::String(value) => {
@@ -52,6 +164,110 @@ fn extract_from_json(value: &Value, domain: &str, names: &mut BTreeSet<String>) 
     }
 }
 
+fn next_link(headers: &reqwest::header::HeaderMap) -> Result<Option<String>> {
+    let Some(header) = headers.get(reqwest::header::LINK) else {
+        return Ok(None);
+    };
+    let header = header.to_str().context("pagination Link non ASCII")?;
+    for entry in header.split(',') {
+        let mut parts = entry.trim().split(';');
+        let Some(target) = parts.next() else {
+            continue;
+        };
+        let is_next = parts.any(|parameter| {
+            let parameter = parameter.trim();
+            parameter == "rel=\"next\"" || parameter == "rel=next"
+        });
+        if is_next {
+            let target = target
+                .trim()
+                .strip_prefix('<')
+                .and_then(|value| value.strip_suffix('>'))
+                .context("lien de pagination next mal formé")?;
+            return Ok(Some(target.to_owned()));
+        }
+    }
+    Ok(None)
+}
+
+fn github_raw_url(html_url: &str) -> Result<Url> {
+    let parsed = Url::parse(html_url).context("GitHub: html_url invalide")?;
+    if parsed.scheme() != "https"
+        || parsed.host_str() != Some("github.com")
+        || parsed.port_or_known_default() != Some(443)
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || !parsed.path().contains("/blob/")
+    {
+        bail!("GitHub: html_url de contenu non fiable");
+    }
+    let raw = html_url
+        .replacen(
+            "https://github.com/",
+            "https://raw.githubusercontent.com/",
+            1,
+        )
+        .replacen("/blob/", "/", 1);
+    let raw = Url::parse(&raw).context("GitHub: URL raw invalide")?;
+    if raw.scheme() != "https"
+        || raw.host_str() != Some("raw.githubusercontent.com")
+        || raw.port_or_known_default() != Some(443)
+        || !raw.username().is_empty()
+        || raw.password().is_some()
+    {
+        bail!("GitHub: URL raw non fiable");
+    }
+    Ok(raw)
+}
+
+fn gitlab_raw_url(item: &GitlabSearchItem) -> Result<Url> {
+    if item.project_id == 0 || item.path.is_empty() || item.reference.is_empty() {
+        bail!("GitLab: résultat de blob incomplet");
+    }
+    let encoded_path =
+        url::form_urlencoded::byte_serialize(item.path.as_bytes()).collect::<String>();
+    let mut url = Url::parse(&format!(
+        "https://gitlab.com/api/v4/projects/{}/repository/files/{encoded_path}/raw",
+        item.project_id
+    ))
+    .context("GitLab: URL raw invalide")?;
+    url.query_pairs_mut().append_pair("ref", &item.reference);
+    Ok(url)
+}
+
+fn validate_intelx_host(host: &str) -> Result<&str> {
+    let host = host.trim();
+    if matches!(host, "public.intelx.io" | "free.intelx.io" | "2.intelx.io") {
+        Ok(host)
+    } else {
+        bail!("Intelligence X: API host must be public.intelx.io, free.intelx.io, or 2.intelx.io")
+    }
+}
+
+async fn code_content_names(
+    source: &'static str,
+    request: reqwest::RequestBuilder,
+    domain: &str,
+) -> Result<BTreeSet<String>> {
+    let response = send_external(source, request, domain).await?;
+    let (status, body) = response_bytes_limited(response, source).await?;
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Ok(BTreeSet::new());
+    }
+    if !status.is_success() {
+        bail!(
+            "{source}: HTTP {status}: {}",
+            compact_external_error(&String::from_utf8_lossy(&body))
+        );
+    }
+    Ok(extract_from_code_text(
+        &String::from_utf8_lossy(&body),
+        domain,
+    ))
+}
+
 #[derive(Deserialize)]
 struct HostsResponse {
     hosts: Option<Vec<String>>,
@@ -62,6 +278,173 @@ struct HostsResponse {
 struct ShodanDomainResponse {
     subdomains: Vec<String>,
     more: bool,
+}
+
+#[derive(Deserialize)]
+struct GithubSearchPage {
+    #[serde(default)]
+    items: Vec<GithubSearchItem>,
+}
+
+#[derive(Deserialize)]
+struct GithubSearchItem {
+    html_url: String,
+    #[serde(default)]
+    text_matches: Vec<GithubTextMatch>,
+}
+
+#[derive(Deserialize)]
+struct GithubTextMatch {
+    fragment: String,
+}
+
+fn rotate_tokens_to_preferred(mut tokens: Vec<String>, preferred: &str) -> Vec<String> {
+    if let Some(index) = tokens.iter().position(|token| token == preferred) {
+        tokens.rotate_left(index);
+    }
+    tokens
+}
+
+fn github_tokens_for_page(keys: &ApiKeyStore) -> Result<Vec<String>> {
+    let preferred = keys.pick("github")?;
+    Ok(rotate_tokens_to_preferred(
+        keys.values("github"),
+        &preferred,
+    ))
+}
+
+fn github_limit_message(body: &[u8]) -> bool {
+    const MAX_DIAGNOSTIC_BYTES: usize = 8 * 1024;
+    let prefix = &body[..body.len().min(MAX_DIAGNOSTIC_BYTES)];
+    let message = String::from_utf8_lossy(prefix).to_ascii_lowercase();
+    [
+        "rate limit",
+        "secondary limit",
+        "abuse detection",
+        "quota exceeded",
+        "quota exhausted",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
+}
+
+fn github_token_rejected(
+    status: reqwest::StatusCode,
+    exhausted_rate_limit: bool,
+    body: &[u8],
+) -> bool {
+    matches!(
+        status,
+        reqwest::StatusCode::UNAUTHORIZED
+            | reqwest::StatusCode::FORBIDDEN
+            | reqwest::StatusCode::TOO_MANY_REQUESTS
+    ) || exhausted_rate_limit
+        || github_limit_message(body)
+}
+
+fn github_quota_observed(
+    status: reqwest::StatusCode,
+    exhausted_rate_limit: bool,
+    body: &[u8],
+) -> bool {
+    status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || exhausted_rate_limit
+        || github_limit_message(body)
+}
+
+fn github_tokens_exhausted_message(
+    attempts: usize,
+    last_status: Option<reqwest::StatusCode>,
+    quota_observed: bool,
+) -> String {
+    let last_status = last_status
+        .map(|status| status.to_string())
+        .unwrap_or_else(|| "inconnu".to_owned());
+    if quota_observed {
+        format!(
+            "GitHub Code Search: quota observé après {attempts} jeton(s) configuré(s); dernier HTTP {last_status}"
+        )
+    } else {
+        format!(
+            "GitHub Code Search: authentification refusée pour {attempts} jeton(s) configuré(s); dernier HTTP {last_status}"
+        )
+    }
+}
+
+async fn github_search_page(
+    http: &reqwest::Client,
+    url: &str,
+    keys: &ApiKeyStore,
+) -> Result<(GithubSearchPage, Option<String>)> {
+    let tokens = github_tokens_for_page(keys)?;
+    let attempts = tokens.len();
+    let mut last_status = None;
+    let mut quota_observed = false;
+    for token in tokens {
+        let request = http
+            .get(url)
+            .bearer_auth(token)
+            .header("Accept", "application/vnd.github.v3.text-match+json");
+        super::throttle_external_source("github").await;
+        super::throttle_external_host(&request).await;
+        let response = request
+            .send()
+            .await
+            .context("connexion à GitHub Code Search")?;
+        let status = response.status();
+        let exhausted_rate_limit = super::exhausted_rate_limit(&response);
+        let next = status
+            .is_success()
+            .then(|| next_link(response.headers()))
+            .transpose()?
+            .flatten();
+        let quota_from_headers = github_quota_observed(status, exhausted_rate_limit, b"");
+        if !status.is_success()
+            && (status == reqwest::StatusCode::UNAUTHORIZED || quota_from_headers)
+        {
+            quota_observed |= quota_from_headers;
+            last_status = Some(status);
+            continue;
+        }
+        let body = match response_bytes_limited(response, "GitHub Code Search").await {
+            Ok((_, body)) => body,
+            Err(_) if status == reqwest::StatusCode::FORBIDDEN => {
+                last_status = Some(status);
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        if status.is_success() {
+            let page = serde_json::from_slice::<GithubSearchPage>(&body)
+                .context("JSON GitHub Code Search invalide")?;
+            return Ok((page, next));
+        }
+        quota_observed |= github_quota_observed(status, exhausted_rate_limit, &body);
+        if github_token_rejected(status, false, &body) {
+            last_status = Some(status);
+            continue;
+        }
+        let detail = super::sanitize_external_error(
+            &compact_external_error(&String::from_utf8_lossy(&body)),
+            keys,
+        );
+        bail!("GitHub Code Search: HTTP {status}: {detail}");
+    }
+    bail!(github_tokens_exhausted_message(
+        attempts,
+        last_status,
+        quota_observed
+    ))
+}
+
+#[derive(Deserialize)]
+struct GitlabSearchItem {
+    #[serde(default)]
+    data: String,
+    project_id: u64,
+    path: String,
+    #[serde(rename = "ref")]
+    reference: String,
 }
 
 #[derive(Deserialize)]
@@ -110,33 +493,137 @@ struct BraveWebResult {
     extra_snippets: Vec<String>,
 }
 
-#[derive(Deserialize)]
-struct DriftnetPage {
-    #[serde(default)]
-    page: Option<Value>,
-    #[serde(default)]
-    pages: Option<Value>,
-    results: Vec<DriftnetReport>,
-    #[serde(default)]
-    timed_out: bool,
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CensysCredential {
+    Platform {
+        pat: String,
+        organization_id: Option<String>,
+        legacy_fallback: Option<(String, String)>,
+    },
+    Legacy {
+        identifier: String,
+        secret: String,
+    },
 }
 
-#[derive(Deserialize)]
-struct DriftnetReport {
-    #[serde(default)]
-    items: Vec<DriftnetItem>,
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct CensysPlatformRequest {
+    query: String,
+    fields: Vec<&'static str>,
+    page_size: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cursor: Option<String>,
 }
 
-#[derive(Deserialize)]
-struct DriftnetItem {
+#[derive(Debug, Deserialize)]
+struct CensysPlatformResponse {
+    result: CensysPlatformResult,
+}
+
+#[derive(Debug, Deserialize)]
+struct CensysPlatformResult {
+    hits: Vec<CensysPlatformHit>,
     #[serde(default)]
-    value: Value,
+    next_page_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CensysPlatformHit {
+    certificate_v1: CensysCertificateV1,
+}
+
+#[derive(Debug, Deserialize)]
+struct CensysCertificateV1 {
+    resource: CensysCertificateResource,
+}
+
+#[derive(Debug, Deserialize)]
+struct CensysCertificateResource {
+    names: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CensysLegacyResponse {
+    result: CensysLegacyResult,
+}
+
+#[derive(Debug, Deserialize)]
+struct CensysLegacyResult {
+    hits: Vec<CensysLegacyHit>,
+    #[serde(default)]
+    links: CensysLegacyLinks,
+}
+
+#[derive(Debug, Deserialize)]
+struct CensysLegacyHit {
+    names: Vec<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct CensysLegacyLinks {
+    #[serde(default)]
+    next: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DriftnetEndpoint {
+    path: &'static str,
+    query_name: &'static str,
+    query_prefix: &'static str,
+    summary_context: &'static str,
+}
+
+#[derive(Debug, Deserialize)]
+struct DriftnetSummaryResponse {
+    summary: DriftnetSummary,
+}
+
+#[derive(Debug, Deserialize)]
+struct DriftnetSummary {
+    #[serde(default)]
+    other: usize,
+    #[serde(default)]
+    values: BTreeMap<String, usize>,
 }
 
 const BINARYEDGE_MAX_PAGES: usize = 2;
-const MERKLEMAP_MAX_PAGES: usize = 2;
+const MERKLEMAP_MAX_PAGES: usize = 1_000;
 const BRAVE_MAX_PAGES: usize = 2;
-const DRIFTNET_MAX_PAGES: usize = 10;
+const CENSYS_MAX_PAGES: usize = 10;
+const CENSYS_PAGE_SIZE: usize = 100;
+const CENSYS_MAX_CURSOR_BYTES: usize = 8 * 1024;
+const CIRCL_MAX_STREAM_BYTES: usize = 128 * 1024 * 1024;
+const CIRCL_MAX_LINE_BYTES: usize = 64 * 1024;
+const CIRCL_MAX_LINES: usize = 100_000;
+const CIRCL_CHECKPOINT_EVERY_LINES: usize = 1_000;
+const DRIFTNET_SUMMARY_LIMIT: usize = 10_000;
+const DRIFTNET_CONCURRENCY: usize = 4;
+const DRIFTNET_ENDPOINTS: [DriftnetEndpoint; 4] = [
+    DriftnetEndpoint {
+        path: "ct/log",
+        query_name: "field",
+        query_prefix: "host:",
+        summary_context: "cert-dns-name",
+    },
+    DriftnetEndpoint {
+        path: "scan/protocols",
+        query_name: "field",
+        query_prefix: "host:",
+        summary_context: "cert-dns-name",
+    },
+    DriftnetEndpoint {
+        path: "scan/domains",
+        query_name: "field",
+        query_prefix: "host:",
+        summary_context: "cert-dns-name",
+    },
+    DriftnetEndpoint {
+        path: "domain/rdns",
+        query_name: "host",
+        query_prefix: "",
+        summary_context: "dns-ptr",
+    },
+];
 
 fn binaryedge_request(
     client: &reqwest::Client,
@@ -186,18 +673,149 @@ fn merklemap_request(
         ])
 }
 
+fn parse_censys_credential(raw: &str) -> Result<CensysCredential> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        bail!("Censys: identifiant vide");
+    }
+
+    if let Some(value) = raw.strip_prefix("legacy:") {
+        let (identifier, secret) = value
+            .split_once(':')
+            .context("CENSYS_API_KEY legacy doit être au format legacy:API_ID:API_SECRET")?;
+        if identifier.trim().is_empty() || secret.trim().is_empty() {
+            bail!("CENSYS_API_KEY legacy contient un identifiant ou un secret vide");
+        }
+        return Ok(CensysCredential::Legacy {
+            identifier: identifier.trim().to_owned(),
+            secret: secret.trim().to_owned(),
+        });
+    }
+
+    let (raw, explicit_platform) = raw
+        .strip_prefix("platform:")
+        .map_or((raw, false), |value| (value, true));
+    let (pat, organization_id) = raw
+        .split_once(':')
+        .map_or((raw, None), |(pat, organization_id)| {
+            (pat, Some(organization_id))
+        });
+    let pat = pat.trim();
+    if pat.is_empty() {
+        bail!("CENSYS_API_KEY contient un PAT vide");
+    }
+    let organization_id = organization_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    if raw.contains(':') && organization_id.is_none() {
+        bail!("CENSYS_API_KEY contient un identifiant d'organisation vide");
+    }
+    let legacy_fallback = (!explicit_platform)
+        .then(|| organization_id.clone().map(|value| (pat.to_owned(), value)))
+        .flatten();
+    Ok(CensysCredential::Platform {
+        pat: pat.to_owned(),
+        organization_id,
+        legacy_fallback,
+    })
+}
+
+fn censys_platform_request(
+    client: &reqwest::Client,
+    domain: &str,
+    credential: &CensysCredential,
+    cursor: Option<&str>,
+) -> Result<reqwest::RequestBuilder> {
+    let CensysCredential::Platform {
+        pat,
+        organization_id,
+        ..
+    } = credential
+    else {
+        bail!("Censys: identifiant Platform requis");
+    };
+    let mut request = client
+        .post("https://api.platform.censys.io/v3/global/search/query")
+        .bearer_auth(pat)
+        .json(&CensysPlatformRequest {
+            query: format!("cert.names: {domain}"),
+            fields: vec!["cert.names"],
+            page_size: CENSYS_PAGE_SIZE,
+            cursor: cursor.map(ToOwned::to_owned),
+        });
+    if let Some(organization_id) = organization_id {
+        request = request.header("X-Organization-ID", organization_id);
+    }
+    Ok(request)
+}
+
+fn censys_legacy_request(
+    client: &reqwest::Client,
+    domain: &str,
+    identifier: &str,
+    secret: &str,
+    cursor: Option<&str>,
+) -> reqwest::RequestBuilder {
+    let mut request = client
+        .get("https://search.censys.io/api/v2/certificates/search")
+        .basic_auth(identifier, Some(secret))
+        .query(&[("q", domain), ("per_page", "100")]);
+    if let Some(cursor) = cursor {
+        request = request.query(&[("cursor", cursor)]);
+    }
+    request
+}
+
+fn censys_platform_page_names(page: &CensysPlatformResponse, domain: &str) -> BTreeSet<String> {
+    page.result
+        .hits
+        .iter()
+        .flat_map(|hit| &hit.certificate_v1.resource.names)
+        .filter_map(|name| normalize_observed_name(name, domain))
+        .collect()
+}
+
+fn censys_legacy_page_names(page: &CensysLegacyResponse, domain: &str) -> BTreeSet<String> {
+    page.result
+        .hits
+        .iter()
+        .flat_map(|hit| &hit.names)
+        .filter_map(|name| normalize_observed_name(name, domain))
+        .collect()
+}
+
+fn checked_censys_cursor(
+    next: Option<&str>,
+    seen: &mut BTreeSet<String>,
+) -> Result<Option<String>> {
+    let Some(next) = next.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    if next.len() > CENSYS_MAX_CURSOR_BYTES {
+        bail!("Censys: curseur de pagination trop long");
+    }
+    if !seen.insert(next.to_owned()) {
+        bail!("Censys: curseur de pagination répété");
+    }
+    Ok(Some(next.to_owned()))
+}
+
 fn driftnet_request(
     client: &reqwest::Client,
     domain: &str,
-    page: usize,
+    endpoint: DriftnetEndpoint,
     token: &str,
 ) -> reqwest::RequestBuilder {
+    let filter = format!("{}{}", endpoint.query_prefix, domain);
     client
-        .get("https://api.driftnet.io/v1/ct/log")
+        .get(format!("https://api.driftnet.io/v1/{}", endpoint.path))
         .bearer_auth(token)
         .query(&[
-            ("field", format!("host:{domain}")),
-            ("page", page.to_string()),
+            (endpoint.query_name, filter),
+            ("summarize", "host".to_owned()),
+            ("summary_context", endpoint.summary_context.to_owned()),
+            ("summary_limit", DRIFTNET_SUMMARY_LIMIT.to_string()),
         ])
 }
 
@@ -284,41 +902,181 @@ fn merklemap_has_more(page: &MerkleMapSearchPage, seen_results: usize) -> Result
     Ok(seen_results < page.count)
 }
 
-fn driftnet_page_number(value: Option<&Value>, field: &str) -> Result<Option<usize>> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    let parsed = match value {
-        Value::Number(value) => value.as_u64().and_then(|value| usize::try_from(value).ok()),
-        Value::String(value) => value.trim().parse::<usize>().ok(),
-        Value::Null => return Ok(None),
-        _ => None,
-    };
-    parsed
-        .map(Some)
-        .ok_or_else(|| anyhow::anyhow!("Driftnet: champ de pagination {field} invalide"))
+fn driftnet_summary_names(response: &DriftnetSummaryResponse, domain: &str) -> BTreeSet<String> {
+    response
+        .summary
+        .values
+        .keys()
+        .filter_map(|name| normalize_observed_name(name, domain))
+        .collect()
 }
 
-fn driftnet_pagination(page: &DriftnetPage, requested_page: usize) -> Result<(usize, usize)> {
-    let returned_page = driftnet_page_number(page.page.as_ref(), "page")?
-        .context("Driftnet: champ de pagination page absent")?;
-    if returned_page != requested_page {
-        bail!("Driftnet: page inattendue {returned_page}, page {requested_page} demandée");
-    }
-    let pages = driftnet_page_number(page.pages.as_ref(), "pages")?
-        .context("Driftnet: champ de pagination pages absent")?;
-    if !page.results.is_empty() && pages <= returned_page {
-        bail!("Driftnet: pagination incohérente (page {returned_page}, pages {pages})");
-    }
-    Ok((returned_page, pages))
+#[derive(Debug, Clone, Copy)]
+struct CirclStreamLimits {
+    max_bytes: usize,
+    max_line_bytes: usize,
+    max_nonempty_lines: usize,
+    checkpoint_every: usize,
 }
 
-fn driftnet_page_names(page: &DriftnetPage, domain: &str) -> BTreeSet<String> {
-    let mut names = BTreeSet::new();
-    for item in page.results.iter().flat_map(|report| &report.items) {
-        extract_from_json(&item.value, domain, &mut names);
+const CIRCL_STREAM_LIMITS: CirclStreamLimits = CirclStreamLimits {
+    max_bytes: CIRCL_MAX_STREAM_BYTES,
+    max_line_bytes: CIRCL_MAX_LINE_BYTES,
+    max_nonempty_lines: CIRCL_MAX_LINES,
+    checkpoint_every: CIRCL_CHECKPOINT_EVERY_LINES,
+};
+
+fn trim_ascii_whitespace(mut value: &[u8]) -> &[u8] {
+    while value.first().is_some_and(u8::is_ascii_whitespace) {
+        value = &value[1..];
     }
-    names
+    while value.last().is_some_and(u8::is_ascii_whitespace) {
+        value = &value[..value.len() - 1];
+    }
+    value
+}
+
+#[derive(Debug)]
+struct CirclStreamDecoder<'a> {
+    domain: &'a str,
+    limits: CirclStreamLimits,
+    names: BTreeSet<String>,
+    batch: BTreeSet<String>,
+    carry: Vec<u8>,
+    bytes_seen: usize,
+    nonempty_lines: usize,
+}
+
+impl<'a> CirclStreamDecoder<'a> {
+    fn new(domain: &'a str, mut limits: CirclStreamLimits) -> Self {
+        limits.checkpoint_every = limits.checkpoint_every.max(1);
+        Self {
+            domain,
+            limits,
+            names: BTreeSet::new(),
+            batch: BTreeSet::new(),
+            carry: Vec::new(),
+            bytes_seen: 0,
+            nonempty_lines: 0,
+        }
+    }
+
+    fn checkpoint(&mut self) {
+        commit_result_page(&mut self.names, std::mem::take(&mut self.batch));
+    }
+
+    fn process_line(&mut self, line: &[u8], at_eof: bool) -> Result<()> {
+        let line = trim_ascii_whitespace(line);
+        if line.is_empty() {
+            return Ok(());
+        }
+        if self.nonempty_lines >= self.limits.max_nonempty_lines {
+            bail!(
+                "CIRCL Passive DNS: plus de {} lignes non vides; résultats partiels enregistrés",
+                self.limits.max_nonempty_lines
+            );
+        }
+        self.nonempty_lines = self.nonempty_lines.saturating_add(1);
+        match serde_json::from_slice::<Value>(line) {
+            Ok(value) => extract_from_json(&value, self.domain, &mut self.batch),
+            Err(error) if matches!(line.first().copied(), Some(b'{') | Some(b'[')) => {
+                if at_eof {
+                    bail!("CIRCL Passive DNS: enregistrement NDJSON final tronqué: {error}");
+                }
+                bail!("CIRCL Passive DNS: enregistrement NDJSON invalide: {error}");
+            }
+            Err(_) => {
+                let line = std::str::from_utf8(line)
+                    .context("CIRCL Passive DNS: enregistrement texte non UTF-8")?;
+                self.batch.extend(extract_from_text(line, self.domain));
+            }
+        }
+        if self
+            .nonempty_lines
+            .is_multiple_of(self.limits.checkpoint_every)
+        {
+            self.checkpoint();
+        }
+        Ok(())
+    }
+
+    fn process_carried_line(&mut self, at_eof: bool) -> Result<()> {
+        let mut complete = std::mem::take(&mut self.carry);
+        let line = complete.strip_suffix(b"\r").unwrap_or(&complete);
+        let result = self.process_line(line, at_eof);
+        complete.clear();
+        self.carry = complete;
+        result
+    }
+
+    fn push_chunk(&mut self, chunk: &[u8]) -> Result<()> {
+        self.bytes_seen = self
+            .bytes_seen
+            .checked_add(chunk.len())
+            .context("CIRCL Passive DNS: compteur de taille dépassé")?;
+        if self.bytes_seen > self.limits.max_bytes {
+            self.checkpoint();
+            bail!(
+                "CIRCL Passive DNS: flux supérieur à la limite de {} Mio; résultats partiels enregistrés",
+                self.limits.max_bytes / 1024 / 1024
+            );
+        }
+
+        let mut offset = 0_usize;
+        while offset < chunk.len() {
+            let remaining = &chunk[offset..];
+            let Some(newline) = remaining.iter().position(|byte| *byte == b'\n') else {
+                let pending = self
+                    .carry
+                    .len()
+                    .checked_add(remaining.len())
+                    .context("CIRCL Passive DNS: longueur de ligne dépassée")?;
+                if pending > self.limits.max_line_bytes {
+                    self.checkpoint();
+                    bail!(
+                        "CIRCL Passive DNS: ligne supérieure à {} octets; résultats partiels enregistrés",
+                        self.limits.max_line_bytes
+                    );
+                }
+                self.carry.extend_from_slice(remaining);
+                break;
+            };
+            let segment = &remaining[..newline];
+            let line_length = self
+                .carry
+                .len()
+                .checked_add(segment.len())
+                .context("CIRCL Passive DNS: longueur de ligne dépassée")?;
+            if line_length > self.limits.max_line_bytes {
+                self.checkpoint();
+                bail!(
+                    "CIRCL Passive DNS: ligne supérieure à {} octets; résultats partiels enregistrés",
+                    self.limits.max_line_bytes
+                );
+            }
+            self.carry.extend_from_slice(segment);
+            if let Err(error) = self.process_carried_line(false) {
+                self.checkpoint();
+                return Err(error);
+            }
+            offset = offset.saturating_add(newline).saturating_add(1);
+        }
+        // This checkpoint is synchronous and happens before the caller awaits
+        // the next transport chunk, preserving every complete record.
+        self.checkpoint();
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<BTreeSet<String>> {
+        if !self.carry.is_empty()
+            && let Err(error) = self.process_carried_line(true)
+        {
+            self.checkpoint();
+            return Err(error);
+        }
+        self.checkpoint();
+        Ok(self.names)
+    }
 }
 
 fn driftnet_http_error(status: reqwest::StatusCode, body: &[u8]) -> Option<String> {
@@ -333,6 +1091,57 @@ fn driftnet_http_error(status: reqwest::StatusCode, body: &[u8]) -> Option<Strin
         format!("Driftnet: {reason} (HTTP {})", status.as_u16())
     } else {
         format!("Driftnet: {reason} (HTTP {}): {detail}", status.as_u16())
+    })
+}
+
+#[derive(Debug)]
+struct DriftnetEndpointResult {
+    names: BTreeSet<String>,
+    truncated: usize,
+}
+
+async fn query_driftnet_endpoint(
+    http: &reqwest::Client,
+    domain: &str,
+    token: &str,
+    endpoint: DriftnetEndpoint,
+    attempts: usize,
+    base_backoff: Duration,
+) -> Result<DriftnetEndpointResult> {
+    let response = send_with_retry_for_source(
+        "driftnet",
+        driftnet_request(http, domain, endpoint, token),
+        attempts,
+        base_backoff,
+        domain,
+    )
+    .await
+    .with_context(|| format!("connexion à Driftnet {}", endpoint.path))?;
+    if response.status() == reqwest::StatusCode::NO_CONTENT {
+        return Ok(DriftnetEndpointResult {
+            names: BTreeSet::new(),
+            truncated: 0,
+        });
+    }
+    if matches!(response.status().as_u16(), 401 | 403 | 524) {
+        let (status, body) = response_bytes_limited(response, "Driftnet").await?;
+        bail!(
+            "{}",
+            driftnet_http_error(status, &body)
+                .unwrap_or_else(|| format!("Driftnet: HTTP {status}"))
+        );
+    }
+    let page = response_json::<DriftnetSummaryResponse>(response, "Driftnet").await?;
+    if page.summary.values.len() > DRIFTNET_SUMMARY_LIMIT {
+        bail!(
+            "Driftnet {}: résumé supérieur à la limite demandée de {} valeurs",
+            endpoint.path,
+            DRIFTNET_SUMMARY_LIMIT
+        );
+    }
+    Ok(DriftnetEndpointResult {
+        names: driftnet_summary_names(&page, domain),
+        truncated: page.summary.other,
     })
 }
 
@@ -476,66 +1285,92 @@ pub(super) async fn builtwith(
     Ok(names)
 }
 
+async fn censys_platform(
+    domain: &str,
+    timeout: Duration,
+    credential: &CensysCredential,
+) -> Result<BTreeSet<String>> {
+    let http = client(timeout)?;
+    let mut cursor: Option<String> = None;
+    let mut seen_cursors = BTreeSet::new();
+    let mut names = BTreeSet::new();
+    for iteration in 0..CENSYS_MAX_PAGES {
+        let request = censys_platform_request(&http, domain, credential, cursor.as_deref())?;
+        let response = match send_external("censys", request, domain).await {
+            Ok(response) => response,
+            Err(error) => return Err(error).context("connexion à Censys Platform v3"),
+        };
+        if iteration == 0
+            && response.status() == reqwest::StatusCode::UNAUTHORIZED
+            && let CensysCredential::Platform {
+                legacy_fallback: Some((identifier, secret)),
+                ..
+            } = credential
+        {
+            return censys_legacy(domain, timeout, identifier, secret)
+                .await
+                .context("Censys Platform v3 a rejeté l'identifiant; repli legacy v2");
+        }
+        let page = response_json::<CensysPlatformResponse>(response, "Censys Platform v3").await?;
+        commit_result_page(&mut names, censys_platform_page_names(&page, domain));
+        let next_cursor =
+            checked_censys_cursor(page.result.next_page_token.as_deref(), &mut seen_cursors)?;
+        let Some(next_cursor) = next_cursor else {
+            break;
+        };
+        if iteration + 1 == CENSYS_MAX_PAGES {
+            bail!("Censys Platform v3: limite de pagination atteinte avec un curseur suivant");
+        }
+        cursor = Some(next_cursor);
+    }
+    Ok(names)
+}
+
+async fn censys_legacy(
+    domain: &str,
+    timeout: Duration,
+    identifier: &str,
+    secret: &str,
+) -> Result<BTreeSet<String>> {
+    let http = client(timeout)?;
+    let mut cursor: Option<String> = None;
+    let mut seen_cursors = BTreeSet::new();
+    let mut names = BTreeSet::new();
+    for iteration in 0..CENSYS_MAX_PAGES {
+        let response = send_external(
+            "censys",
+            censys_legacy_request(&http, domain, identifier, secret, cursor.as_deref()),
+            domain,
+        )
+        .await
+        .context("connexion à Censys legacy v2")?;
+        let page = response_json::<CensysLegacyResponse>(response, "Censys legacy v2").await?;
+        commit_result_page(&mut names, censys_legacy_page_names(&page, domain));
+        let next_cursor =
+            checked_censys_cursor(page.result.links.next.as_deref(), &mut seen_cursors)?;
+        let Some(next_cursor) = next_cursor else {
+            break;
+        };
+        if iteration + 1 == CENSYS_MAX_PAGES {
+            bail!("Censys legacy v2: limite de pagination atteinte avec un curseur suivant");
+        }
+        cursor = Some(next_cursor);
+    }
+    Ok(names)
+}
+
 pub(super) async fn censys(
     domain: &str,
     timeout: Duration,
     keys: &ApiKeyStore,
 ) -> Result<BTreeSet<String>> {
-    let token = keys.pick("censys")?;
-    let (identifier, secret) = token
-        .split_once(':')
-        .context("CENSYS_API_KEY doit être au format API_ID:API_SECRET")?;
-    let http = client(timeout)?;
-    let mut cursor: Option<String> = None;
-    let mut names = BTreeSet::new();
-    for iteration in 0..10 {
-        let mut request = http
-            .get("https://search.censys.io/api/v2/certificates/search")
-            .basic_auth(identifier, Some(secret))
-            .query(&[("q", domain), ("per_page", "100")]);
-        if let Some(value) = &cursor {
-            request = request.query(&[("cursor", value)]);
+    let credential = parse_censys_credential(&keys.pick("censys")?)?;
+    match &credential {
+        CensysCredential::Platform { .. } => censys_platform(domain, timeout, &credential).await,
+        CensysCredential::Legacy { identifier, secret } => {
+            censys_legacy(domain, timeout, identifier, secret).await
         }
-        let response = match send_external("censys", request, domain).await {
-            Ok(response) => match response_json::<Value>(response, "Censys").await {
-                Ok(response) => response,
-                Err(error) => return Err(error),
-            },
-            Err(error) => return Err(error).context("connexion à Censys"),
-        };
-        let mut page_names = BTreeSet::new();
-        let hits = response
-            .pointer("/result/hits")
-            .and_then(Value::as_array)
-            .context("Censys: tableau result.hits absent")?;
-        for hit in hits {
-            if let Some(values) = hit.get("names").and_then(Value::as_array) {
-                page_names.extend(
-                    values
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .filter_map(|name| normalize_observed_name(name, domain)),
-                );
-            }
-        }
-        commit_result_page(&mut names, page_names);
-        let next_cursor = response
-            .pointer("/result/links/next")
-            .and_then(Value::as_str)
-            .filter(|value| !value.is_empty())
-            .map(ToOwned::to_owned);
-        let Some(next_cursor) = next_cursor else {
-            break;
-        };
-        if cursor.as_deref() == Some(next_cursor.as_str()) {
-            bail!("Censys: curseur de pagination répété");
-        }
-        if iteration + 1 == 10 {
-            bail!("Censys: limite de pagination atteinte avec un curseur suivant");
-        }
-        cursor = Some(next_cursor);
     }
-    Ok(names)
 }
 
 pub(super) async fn circl(
@@ -547,7 +1382,7 @@ pub(super) async fn circl(
     let (username, password) = credentials
         .split_once(':')
         .context("CIRCL_PDNS_CREDENTIALS doit être au format utilisateur:mot-de-passe")?;
-    let response = send_external(
+    let mut response = send_external_streaming(
         "circl",
         client(timeout)?
             .get(format!("https://www.circl.lu/pdns/query/{domain}"))
@@ -557,16 +1392,41 @@ pub(super) async fn circl(
     )
     .await
     .context("connexion à CIRCL Passive DNS")?;
-    let response = response_text(response, "CIRCL Passive DNS").await?;
-    let mut names = BTreeSet::new();
-    for line in response.lines().take(100_000) {
-        if let Ok(value) = serde_json::from_str::<Value>(line) {
-            extract_from_json(&value, domain, &mut names);
-        } else {
-            names.extend(extract_from_text(line, domain));
+    if !response.status().is_success() {
+        let status = response.status();
+        let (_, body) = response_bytes_limited(response, "CIRCL Passive DNS").await?;
+        bail!(
+            "CIRCL Passive DNS: HTTP {status}: {}",
+            compact_external_error(&String::from_utf8_lossy(&body))
+        );
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > CIRCL_MAX_STREAM_BYTES as u64)
+    {
+        bail!(
+            "CIRCL Passive DNS: réponse supérieure à la limite de {} Mio",
+            CIRCL_MAX_STREAM_BYTES / 1024 / 1024
+        );
+    }
+
+    let mut decoder = CirclStreamDecoder::new(domain, CIRCL_STREAM_LIMITS);
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) => decoder.push_chunk(&chunk)?,
+            Ok(None) => return decoder.finish(),
+            Err(error) => {
+                let incomplete = !decoder.carry.is_empty();
+                decoder.checkpoint();
+                let context = if incomplete {
+                    "CIRCL Passive DNS: flux interrompu avec une ligne inachevée; résultats partiels enregistrés"
+                } else {
+                    "CIRCL Passive DNS: flux interrompu; résultats partiels enregistrés"
+                };
+                return Err(error).context(context);
+            }
         }
     }
-    Ok(names)
 }
 
 pub(super) async fn certificate_details(
@@ -580,7 +1440,16 @@ pub(super) async fn certificate_details(
     )
     .await
     .context("connexion à CertificateDetails")?;
-    let text = response_text(response, "CertificateDetails").await?;
+    let (status, body) = response_bytes_limited(response, "CertificateDetails").await?;
+    if !status.is_success() && status != reqwest::StatusCode::NOT_FOUND {
+        bail!(
+            "CertificateDetails: HTTP {status}: {}",
+            compact_external_error(&String::from_utf8_lossy(&body))
+        );
+    }
+    // The provider intentionally embeds its certificate inventory in the
+    // branded 404 page when a direct per-domain route is not available.
+    let text = String::from_utf8(body).context("CertificateDetails: réponse non UTF-8")?;
     Ok(extract_from_text(&text, domain))
 }
 
@@ -622,42 +1491,56 @@ pub(super) async fn driftnet(
     let http = client(timeout)?;
     let policy = source_policy("driftnet");
     let mut names = BTreeSet::new();
-    for requested_page in 0..DRIFTNET_MAX_PAGES {
-        let response = send_with_retry_for_source(
-            "driftnet",
-            driftnet_request(&http, domain, requested_page, token),
-            policy.attempts,
-            policy.base_backoff,
-            domain,
-        )
-        .await
-        .context("connexion à Driftnet Certificate Transparency")?;
-        if response.status() == reqwest::StatusCode::NO_CONTENT {
-            break;
+    let mut failures = PartialFailureSummary::default();
+    let mut truncated_endpoints = Vec::new();
+    let mut requests = stream::iter(DRIFTNET_ENDPOINTS.into_iter().map(|endpoint| {
+        let http = http.clone();
+        async move {
+            (
+                endpoint,
+                query_driftnet_endpoint(
+                    &http,
+                    domain,
+                    token,
+                    endpoint,
+                    policy.attempts,
+                    policy.base_backoff,
+                )
+                .await,
+            )
         }
-        if matches!(response.status().as_u16(), 401 | 403 | 524) {
-            let (status, body) = response_bytes_limited(response, "Driftnet").await?;
-            bail!(
-                "{}",
-                driftnet_http_error(status, &body)
-                    .unwrap_or_else(|| format!("Driftnet: HTTP {status}"))
-            );
-        }
-        let page = response_json::<DriftnetPage>(response, "Driftnet").await?;
-        let (returned_page, pages) = driftnet_pagination(&page, requested_page)?;
-        let has_results = !page.results.is_empty();
-        commit_result_page(&mut names, driftnet_page_names(&page, domain));
-        if page.timed_out {
-            bail!("Driftnet: délai interne du fournisseur atteint à la page {returned_page}");
-        }
-        if !has_results || returned_page.saturating_add(1) >= pages {
-            break;
-        }
-        if requested_page + 1 == DRIFTNET_MAX_PAGES {
-            bail!("Driftnet: limite de pagination atteinte avant la dernière page");
+    }))
+    .buffer_unordered(DRIFTNET_CONCURRENCY);
+    while let Some((endpoint, result)) = requests.next().await {
+        match result {
+            Ok(result) => {
+                commit_result_page(&mut names, result.names);
+                if result.truncated > 0 {
+                    truncated_endpoints.push(format!("{} (+{})", endpoint.path, result.truncated));
+                }
+            }
+            Err(error) => {
+                let error =
+                    super::sanitize_external_message(&format!("{error:#}"), &[token.to_owned()]);
+                failures.record(format!("{}: {error}", endpoint.path));
+            }
         }
     }
-    Ok(names)
+    if failures.is_empty() && truncated_endpoints.is_empty() {
+        return Ok(names);
+    }
+    truncated_endpoints.sort();
+    let mut problems = Vec::new();
+    if !failures.is_empty() {
+        problems.push(failures.detail());
+    }
+    if !truncated_endpoints.is_empty() {
+        problems.push(format!(
+            "résumés tronqués: {}",
+            truncated_endpoints.join(", ")
+        ));
+    }
+    bail!("Driftnet: résultats partiels; {}", problems.join("; "))
 }
 
 pub(super) async fn fullhunt(
@@ -691,50 +1574,60 @@ pub(super) async fn github(
 ) -> Result<BTreeSet<String>> {
     let http = client(timeout)?;
     let mut names = BTreeSet::new();
-    for page in 1..=3 {
-        let token = keys.pick("github")?;
-        let request = http
-            .get("https://api.github.com/search/code")
-            .bearer_auth(token)
-            .header("Accept", "application/vnd.github.text-match+json")
-            .query(&[
-                ("q", format!("\"{domain}\"")),
-                ("per_page", "100".to_owned()),
-                ("page", page.to_string()),
-            ]);
-        let response = match send_external("github", request, domain).await {
-            Ok(response) => match response_json::<Value>(response, "GitHub Code Search").await {
-                Ok(response) => response,
-                Err(error) => return Err(error),
-            },
-            Err(error) => return Err(error).context("connexion à GitHub Code Search"),
+    let mut initial = Url::parse("https://api.github.com/search/code")?;
+    initial
+        .query_pairs_mut()
+        .append_pair("per_page", "100")
+        .append_pair("q", domain)
+        .append_pair("sort", "created")
+        .append_pair("order", "asc");
+    let mut next = Some(initial.to_string());
+    let mut visited = BTreeSet::new();
+    let mut raw_failures = PartialFailureSummary::default();
+    for _ in 0..1_000 {
+        let Some(url) = next.take() else {
+            return finish_code_search("GitHub Code Search", names, &raw_failures);
         };
-        let items = response
-            .get("items")
-            .and_then(Value::as_array)
-            .context("GitHub Code Search: tableau items absent")?;
-        if items.is_empty() {
-            break;
+        if !super::trusted_pagination_url(&url, "api.github.com", "/search/code") {
+            bail!("GitHub Code Search: URL de pagination non fiable");
         }
+        if !visited.insert(url.clone()) {
+            bail!("GitHub Code Search: URL de pagination répétée");
+        }
+        let (page, page_next) = github_search_page(&http, &url, keys).await?;
+        next = page_next;
         let mut page_names = BTreeSet::new();
-        for item in items {
-            if let Some(matches) = item.get("text_matches").and_then(Value::as_array) {
-                for text_match in matches {
-                    if let Some(fragment) = text_match.get("fragment").and_then(Value::as_str) {
-                        page_names.extend(extract_from_text(fragment, domain));
-                    }
+        let mut raw_urls = BTreeSet::new();
+        for item in page.items {
+            for text_match in item.text_matches {
+                page_names.extend(extract_from_code_text(&text_match.fragment, domain));
+            }
+            raw_urls.insert(github_raw_url(&item.html_url)?);
+        }
+        commit_result_page(&mut names, page_names);
+
+        let mut content = stream::iter(raw_urls.into_iter().map(|url| {
+            let http = http.clone();
+            async move { code_content_names("github-content", http.get(url), domain).await }
+        }))
+        .buffer_unordered(8);
+        while let Some(result) = content.next().await {
+            match result {
+                Ok(page_names) => commit_result_page(&mut names, page_names),
+                Err(error) => {
+                    let error = super::sanitize_external_error(&format!("{error:#}"), keys);
+                    raw_failures.record(error);
                 }
             }
         }
-        commit_result_page(&mut names, page_names);
-        if items.len() < 100 {
-            break;
-        }
-        if page == 3 {
-            bail!("GitHub Code Search: limite de pagination atteinte avec une page complète");
-        }
     }
-    Ok(names)
+    if !raw_failures.is_empty() {
+        bail!(
+            "GitHub Code Search: résultats partiels; {}; limite de pagination atteinte avec une page suivante",
+            raw_failures.detail()
+        );
+    }
+    bail!("GitHub Code Search: limite de pagination atteinte avec une page suivante")
 }
 
 pub(super) async fn gitlab(
@@ -745,51 +1638,77 @@ pub(super) async fn gitlab(
     let token = keys.pick("gitlab")?;
     let http = client(timeout)?;
     let mut names = BTreeSet::new();
-    let mut page = "1".to_owned();
-    for iteration in 0..3 {
+    let mut initial = Url::parse("https://gitlab.com/api/v4/search")?;
+    initial
+        .query_pairs_mut()
+        .append_pair("scope", "blobs")
+        .append_pair("search", domain)
+        .append_pair("per_page", "100");
+    let mut next = Some(initial.to_string());
+    let mut visited = BTreeSet::new();
+    let mut raw_failures = PartialFailureSummary::default();
+    for _ in 0..1_000 {
+        let Some(url) = next.take() else {
+            return finish_code_search("GitLab Code Search", names, &raw_failures);
+        };
+        if !super::trusted_pagination_url(&url, "gitlab.com", "/api/v4/search") {
+            bail!("GitLab Code Search: URL de pagination non fiable");
+        }
+        if !visited.insert(url.clone()) {
+            bail!("GitLab Code Search: URL de pagination répétée");
+        }
         let request = http
-            .get("https://gitlab.com/api/v4/search")
+            .get(url)
             .header("PRIVATE-TOKEN", &token)
-            .query(&[
-                ("scope", "blobs".to_owned()),
-                ("search", domain.to_owned()),
-                ("per_page", "100".to_owned()),
-                ("page", page.clone()),
-            ]);
+            .header("Accept", "application/json");
         let response = match send_external("gitlab", request, domain).await {
             Ok(response) => response,
             Err(error) => return Err(error).context("connexion à GitLab Code Search"),
         };
-        let next_page = response
-            .headers()
-            .get("x-next-page")
-            .and_then(|value| value.to_str().ok())
-            .filter(|value| !value.is_empty())
-            .map(ToOwned::to_owned);
-        let values = match response_json::<Vec<Value>>(response, "GitLab Code Search").await {
-            Ok(values) => values,
-            Err(error) => return Err(error),
-        };
+        next = next_link(response.headers())?;
+        let items =
+            match response_json::<Vec<GitlabSearchItem>>(response, "GitLab Code Search").await {
+                Ok(values) => values,
+                Err(error) => return Err(error),
+            };
         let mut page_names = BTreeSet::new();
-        for value in &values {
-            extract_from_json(value, domain, &mut page_names);
+        let mut raw_urls = BTreeSet::new();
+        for item in &items {
+            page_names.extend(extract_from_code_text(&item.data, domain));
+            raw_urls.insert(gitlab_raw_url(item)?);
         }
         commit_result_page(&mut names, page_names);
-        if values.is_empty() {
-            break;
+
+        let mut content = stream::iter(raw_urls.into_iter().map(|url| {
+            let http = http.clone();
+            let token = token.clone();
+            async move {
+                code_content_names(
+                    "gitlab-content",
+                    http.get(url).header("PRIVATE-TOKEN", token),
+                    domain,
+                )
+                .await
+            }
+        }))
+        .buffer_unordered(8);
+        while let Some(result) = content.next().await {
+            match result {
+                Ok(page_names) => commit_result_page(&mut names, page_names),
+                Err(error) => {
+                    let error = super::sanitize_external_error(&format!("{error:#}"), keys);
+                    raw_failures.record(error);
+                }
+            }
         }
-        let Some(next_page) = next_page else {
-            break;
-        };
-        if next_page == page {
-            bail!("GitLab Code Search: page suivante répétée ({page})");
-        }
-        if iteration + 1 == 3 {
-            bail!("GitLab Code Search: limite de pagination atteinte avant la dernière page");
-        }
-        page = next_page;
     }
-    Ok(names)
+    if !raw_failures.is_empty() {
+        bail!(
+            "GitLab Code Search: résultats partiels; {}; limite de pagination atteinte avec une page suivante",
+            raw_failures.detail()
+        );
+    }
+    bail!("GitLab Code Search: limite de pagination atteinte avec une page suivante")
 }
 
 pub(super) async fn intelx(
@@ -801,6 +1720,11 @@ pub(super) async fn intelx(
     let (host, key) = token
         .split_once(':')
         .context("INTELX_API_KEY doit être au format api-host:clé")?;
+    let host = validate_intelx_host(host)?;
+    let key = key.trim();
+    if key.is_empty() {
+        bail!("Intelligence X: clé API vide");
+    }
     let http = client(timeout)?;
     let search = send_external(
         "intelx",
@@ -823,7 +1747,7 @@ pub(super) async fn intelx(
         .and_then(Value::as_str)
         .context("ID Intelligence X absent")?;
     let mut names = BTreeSet::new();
-    for iteration in 0..10 {
+    for iteration in 0..1_000 {
         let request = http
             .get(format!("https://{host}/phonebook/search/result"))
             .query(&[("k", key), ("id", id), ("limit", "10000")]);
@@ -854,7 +1778,7 @@ pub(super) async fn intelx(
         if status != 0 && status != 3 {
             break;
         }
-        if iteration + 1 == 10 {
+        if iteration + 1 == 1_000 {
             bail!("Intelligence X: recherche encore active après la limite de scrutation");
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -922,8 +1846,12 @@ pub(super) async fn merklemap(
 
 #[derive(Deserialize)]
 struct OtxResponse {
+    #[serde(default)]
     passive_dns: Vec<OtxRecord>,
+    #[serde(default)]
     error: Option<String>,
+    #[serde(default)]
+    detail: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -967,7 +1895,11 @@ pub(super) async fn otx(
         bail!("OTX limite la clé fournie (HTTP 429): {}", detail.trim());
     }
     let response = response_json::<OtxResponse>(response, "OTX").await?;
-    if let Some(error) = response.error {
+    if let Some(error) = response
+        .error
+        .or(response.detail)
+        .filter(|error| !error.trim().is_empty())
+    {
         bail!("OTX: {error}");
     }
     Ok(normalize_many(
@@ -987,7 +1919,7 @@ pub(super) async fn shodan(
     let token = keys.pick("shodan")?;
     let http = client(timeout)?;
     let mut names = BTreeSet::new();
-    for page in 1..=10 {
+    for page in 1..=1_000 {
         let request = http
             .get(format!("https://api.shodan.io/dns/domain/{domain}"))
             .query(&[
@@ -1011,7 +1943,7 @@ pub(super) async fn shodan(
         if !response.more {
             break;
         }
-        if page == 10 {
+        if page == 1_000 {
             bail!("Shodan: limite de pagination atteinte avec des résultats supplémentaires");
         }
     }
@@ -1053,6 +1985,185 @@ mod tests {
     }
 
     #[test]
+    fn code_search_decodes_only_hostname_safe_percent_sequences_with_a_bound() {
+        let encoded = "api%2Edev%2Dblue%2Eexample%2Ecom+mail%2eexample%2ecom/path%2Fignored";
+        let decoded = percent_decode_hostname_sequences(encoded, encoded.len());
+        assert_eq!(
+            decoded,
+            "api.dev-blue.example.com+mail.example.com/path%2Fignored"
+        );
+        assert!(decoded.contains('+'));
+        assert_eq!(
+            extract_from_code_text(encoded, "example.com"),
+            BTreeSet::from([
+                "api.dev-blue.example.com".to_owned(),
+                "mail.example.com".to_owned()
+            ])
+        );
+
+        let bounded = percent_decode_hostname_sequences("ééapi%2Eexample%2Ecom", 5);
+        assert_eq!(bounded, "ééa");
+        assert!(bounded.len() <= 5);
+    }
+
+    #[test]
+    fn github_token_rotation_is_finite_and_classifies_quota_responses() {
+        assert_eq!(
+            rotate_tokens_to_preferred(
+                vec![
+                    "token-a".to_owned(),
+                    "token-b".to_owned(),
+                    "token-c".to_owned()
+                ],
+                "token-b"
+            ),
+            vec!["token-b", "token-c", "token-a"]
+        );
+        assert!(github_token_rejected(
+            reqwest::StatusCode::UNAUTHORIZED,
+            false,
+            b""
+        ));
+        assert!(github_token_rejected(
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+            false,
+            br#"{"message":"API rate limit exceeded"}"#
+        ));
+        assert!(github_token_rejected(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            true,
+            b""
+        ));
+        assert!(!github_token_rejected(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            false,
+            b"temporary outage"
+        ));
+
+        let quota =
+            github_tokens_exhausted_message(3, Some(reqwest::StatusCode::TOO_MANY_REQUESTS), true);
+        assert!(quota.contains("quota"));
+        assert!(quota.contains("3 jeton(s)"));
+        let authentication =
+            github_tokens_exhausted_message(2, Some(reqwest::StatusCode::UNAUTHORIZED), false);
+        assert!(authentication.contains("authentification refusée"));
+        assert!(!authentication.contains("quota"));
+    }
+
+    #[test]
+    fn partial_content_failures_are_bounded_and_reported_only_after_successes() {
+        let mut failures = PartialFailureSummary::default();
+        failures.record("first raw failure");
+        for index in 0..20 {
+            failures.record(format!("raw failure {index}"));
+        }
+        assert_eq!(failures.count, 21);
+        assert_eq!(failures.examples.len(), PARTIAL_FAILURE_EXAMPLE_LIMIT);
+        assert!(failures.detail().contains("premier: first raw failure"));
+
+        let names = BTreeSet::from(["api.example.com".to_owned()]);
+        let error = finish_code_search("Code Search", names, &failures)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("résultats partiels"));
+        assert!(error.contains("21 échec(s)"));
+
+        let names = BTreeSet::from(["api.example.com".to_owned()]);
+        assert_eq!(
+            finish_code_search(
+                "Code Search",
+                names.clone(),
+                &PartialFailureSummary::default()
+            )
+            .unwrap(),
+            names
+        );
+    }
+
+    #[test]
+    fn circl_stream_reassembles_fragmented_lines_and_checkpoints_each_chunk() {
+        let limits = CirclStreamLimits {
+            max_bytes: 1_024,
+            max_line_bytes: 128,
+            max_nonempty_lines: 10,
+            checkpoint_every: 10,
+        };
+        let mut decoder = CirclStreamDecoder::new("example.com", limits);
+        decoder.push_chunk(br#"{"rrname":"api.ex"#).unwrap();
+        assert!(decoder.names.is_empty());
+        decoder
+            .push_chunk(b"ample.com\"}\r\nmail.example.")
+            .unwrap();
+        assert!(decoder.names.contains("api.example.com"));
+        decoder.push_chunk(b"com\n\n   \n").unwrap();
+        assert!(decoder.names.contains("mail.example.com"));
+        let names = decoder.finish().unwrap();
+        assert_eq!(names.len(), 2);
+    }
+
+    #[test]
+    fn circl_stream_detects_truncated_structured_records_after_checkpointing() {
+        let limits = CirclStreamLimits {
+            max_bytes: 1_024,
+            max_line_bytes: 256,
+            max_nonempty_lines: 10,
+            checkpoint_every: 1_000,
+        };
+        let mut decoder = CirclStreamDecoder::new("example.com", limits);
+        decoder
+            .push_chunk(b"{\"rrname\":\"api.example.com\"}\n{\"rrname\":\"broken.example.com\"")
+            .unwrap();
+        assert!(decoder.names.contains("api.example.com"));
+        let error = decoder.finish().unwrap_err().to_string();
+        assert!(error.contains("final tronqué"));
+    }
+
+    #[test]
+    fn circl_stream_limits_preserve_previously_committed_results() {
+        let line_limits = CirclStreamLimits {
+            max_bytes: 1_024,
+            max_line_bytes: 16,
+            max_nonempty_lines: 10,
+            checkpoint_every: 1_000,
+        };
+        let mut decoder = CirclStreamDecoder::new("example.com", line_limits);
+        decoder.push_chunk(b"a.example.com\n").unwrap();
+        let error = decoder.push_chunk(&[b'x'; 17]).unwrap_err().to_string();
+        assert!(error.contains("ligne supérieure"));
+        assert!(decoder.names.contains("a.example.com"));
+
+        let count_limits = CirclStreamLimits {
+            max_bytes: 1_024,
+            max_line_bytes: 64,
+            max_nonempty_lines: 2,
+            checkpoint_every: 1_000,
+        };
+        let mut decoder = CirclStreamDecoder::new("example.com", count_limits);
+        let error = decoder
+            .push_chunk(b"a.example.com\n\n b.example.com\n   \nc.example.com\n")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("plus de 2 lignes non vides"));
+        assert_eq!(decoder.names.len(), 2);
+
+        let byte_limits = CirclStreamLimits {
+            max_bytes: 16,
+            max_line_bytes: 64,
+            max_nonempty_lines: 10,
+            checkpoint_every: 1_000,
+        };
+        let mut decoder = CirclStreamDecoder::new("example.com", byte_limits);
+        decoder.push_chunk(b"a.example.com\n").unwrap();
+        let error = decoder.push_chunk(b"overflow").unwrap_err().to_string();
+        assert!(error.contains("flux supérieur"));
+        assert!(decoder.names.contains("a.example.com"));
+
+        assert_eq!(CIRCL_MAX_STREAM_BYTES, 128 * 1024 * 1024);
+        assert_eq!(CIRCL_MAX_LINE_BYTES, 64 * 1024);
+        assert_eq!(CIRCL_MAX_LINES, 100_000);
+    }
+
+    #[test]
     fn otx_authentication_uses_the_documented_header() {
         let request = otx_request(
             &client(Duration::from_secs(1)).unwrap(),
@@ -1068,107 +2179,220 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("secret-test")
         );
+
+        let empty: OtxResponse = serde_json::from_str(r#"{"error":""}"#).unwrap();
+        assert!(empty.passive_dns.is_empty());
+        assert_eq!(empty.error.as_deref(), Some(""));
+        assert!(empty.detail.is_none());
+
+        let detailed: OtxResponse =
+            serde_json::from_str(r#"{"detail":"authentication failed"}"#).unwrap();
+        assert_eq!(detailed.detail.as_deref(), Some("authentication failed"));
     }
 
     #[test]
-    fn driftnet_request_uses_the_documented_ct_contract() {
-        assert_eq!(DRIFTNET_MAX_PAGES, 10);
-        let request = driftnet_request(
+    fn censys_platform_credentials_and_request_follow_the_v3_contract() {
+        let credential = parse_censys_credential("pat-token:organization-id").unwrap();
+        assert_eq!(
+            credential,
+            CensysCredential::Platform {
+                pat: "pat-token".to_owned(),
+                organization_id: Some("organization-id".to_owned()),
+                legacy_fallback: Some(("pat-token".to_owned(), "organization-id".to_owned())),
+            }
+        );
+        let request = censys_platform_request(
             &client(Duration::from_secs(1)).unwrap(),
             "example.com",
-            3,
-            "driftnet-token",
+            &credential,
+            Some("cursor-1"),
         )
+        .unwrap()
         .build()
         .unwrap();
-        assert_eq!(request.url().host_str(), Some("api.driftnet.io"));
-        assert_eq!(request.url().path(), "/v1/ct/log");
+        assert_eq!(request.method(), reqwest::Method::POST);
+        assert_eq!(request.url().host_str(), Some("api.platform.censys.io"));
+        assert_eq!(request.url().path(), "/v3/global/search/query");
         assert_eq!(
             request
                 .headers()
                 .get("Authorization")
                 .and_then(|value| value.to_str().ok()),
-            Some("Bearer driftnet-token")
+            Some("Bearer pat-token")
         );
-        let query = request.url().query_pairs().collect::<Vec<_>>();
-        assert!(query.contains(&("field".into(), "host:example.com".into())));
-        assert!(query.contains(&("page".into(), "3".into())));
-        assert!(!query.iter().any(|(name, _)| name == "summary_limit"));
-    }
-
-    #[test]
-    fn driftnet_pages_accept_numeric_strings_and_extract_only_in_scope_names() {
-        let page: DriftnetPage = serde_json::from_value(serde_json::json!({
-            "page": "0",
-            "pages": "2",
-            "result_count": 101,
-            "results": [{
-                "date": "2026-07-16",
-                "id": "fixture-report",
-                "items": [
-                    {"context": "cert-dns-name", "type": "host", "value": "api.example.com"},
-                    {"context": "cert-dns-name", "type": "host", "value": "*.wild.example.com"},
-                    {"context": "ct-log", "type": "url", "value": "https://cdn.example.com/log/"},
-                    {"context": "cert-dns-name", "type": "host", "value": "outside.test"},
-                    {"context": "ct-log", "type": "index", "value": 42}
-                ]
-            }]
-        }))
-        .unwrap();
-        assert_eq!(driftnet_pagination(&page, 0).unwrap(), (0, 2));
-        assert!(!page.timed_out);
         assert_eq!(
-            driftnet_page_names(&page, "example.com"),
-            BTreeSet::from([
-                "api.example.com".to_owned(),
-                "cdn.example.com".to_owned(),
-                "wild.example.com".to_owned()
-            ])
+            request
+                .headers()
+                .get("X-Organization-ID")
+                .and_then(|value| value.to_str().ok()),
+            Some("organization-id")
+        );
+        let body: Value =
+            serde_json::from_slice(request.body().unwrap().as_bytes().unwrap()).unwrap();
+        assert_eq!(body["query"], "cert.names: example.com");
+        assert_eq!(body["fields"], serde_json::json!(["cert.names"]));
+        assert_eq!(body["page_size"], 100);
+        assert_eq!(body["cursor"], "cursor-1");
+    }
+
+    #[test]
+    fn censys_supports_pat_only_explicit_platform_and_legacy_credentials() {
+        let pat_only = parse_censys_credential("pat-only").unwrap();
+        assert_eq!(
+            pat_only,
+            CensysCredential::Platform {
+                pat: "pat-only".to_owned(),
+                organization_id: None,
+                legacy_fallback: None,
+            }
+        );
+        assert_eq!(
+            parse_censys_credential("platform:pat-token:org-id").unwrap(),
+            CensysCredential::Platform {
+                pat: "pat-token".to_owned(),
+                organization_id: Some("org-id".to_owned()),
+                legacy_fallback: None,
+            }
+        );
+        assert_eq!(
+            parse_censys_credential("legacy:api-id:api-secret").unwrap(),
+            CensysCredential::Legacy {
+                identifier: "api-id".to_owned(),
+                secret: "api-secret".to_owned(),
+            }
+        );
+        assert!(parse_censys_credential("platform:pat-token:").is_err());
+
+        let http = client(Duration::from_secs(1)).unwrap();
+        let platform_request = censys_platform_request(&http, "example.com", &pat_only, None)
+            .unwrap()
+            .build()
+            .unwrap();
+        assert!(!platform_request.headers().contains_key("X-Organization-ID"));
+        let legacy_request = censys_legacy_request(
+            &http,
+            "example.com",
+            "api-id",
+            "api-secret",
+            Some("legacy-cursor"),
+        )
+        .build()
+        .unwrap();
+        assert_eq!(legacy_request.method(), reqwest::Method::GET);
+        assert_eq!(legacy_request.url().host_str(), Some("search.censys.io"));
+        assert_eq!(legacy_request.url().path(), "/api/v2/certificates/search");
+        assert!(
+            legacy_request
+                .headers()
+                .get("Authorization")
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.starts_with("Basic "))
+        );
+        let legacy_query = legacy_request
+            .url()
+            .query_pairs()
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            legacy_query.get("cursor").map(|value| value.as_ref()),
+            Some("legacy-cursor")
         );
     }
 
     #[test]
-    fn driftnet_schema_and_pagination_fail_explicitly() {
+    fn censys_platform_fixture_is_scoped_and_cursor_progress_is_bounded() {
+        let page: CensysPlatformResponse = serde_json::from_str(include_str!(
+            "../../tests/fixtures/censys-platform-v3-page.json"
+        ))
+        .unwrap();
+        assert_eq!(
+            censys_platform_page_names(&page, "example.com"),
+            BTreeSet::from(["api.example.com".to_owned(), "wild.example.com".to_owned(),])
+        );
+        let mut seen = BTreeSet::new();
+        assert_eq!(
+            checked_censys_cursor(page.result.next_page_token.as_deref(), &mut seen).unwrap(),
+            Some("cursor-2".to_owned())
+        );
+        assert!(checked_censys_cursor(Some("cursor-3"), &mut seen).is_ok());
+        assert!(checked_censys_cursor(Some("cursor-2"), &mut seen).is_err());
         assert!(
-            serde_json::from_value::<DriftnetPage>(serde_json::json!({
-                "page": 0,
-                "pages": 1,
-                "error": "quota exceeded"
-            }))
+            checked_censys_cursor(
+                Some(&"x".repeat(CENSYS_MAX_CURSOR_BYTES + 1)),
+                &mut BTreeSet::new()
+            )
             .is_err()
         );
+    }
 
-        let invalid_page: DriftnetPage = serde_json::from_value(serde_json::json!({
-            "page": [],
-            "pages": 1,
-            "results": []
-        }))
-        .unwrap();
-        assert!(
-            format!("{:#}", driftnet_pagination(&invalid_page, 0).unwrap_err())
-                .contains("champ de pagination page invalide")
+    #[test]
+    fn driftnet_requests_all_four_upstream_summary_families() {
+        assert_eq!(DRIFTNET_ENDPOINTS.len(), 4);
+        assert_eq!(DRIFTNET_CONCURRENCY, DRIFTNET_ENDPOINTS.len());
+        let http = client(Duration::from_secs(1)).unwrap();
+        let expected = [
+            ("/v1/ct/log", "field", "host:example.com", "cert-dns-name"),
+            (
+                "/v1/scan/protocols",
+                "field",
+                "host:example.com",
+                "cert-dns-name",
+            ),
+            (
+                "/v1/scan/domains",
+                "field",
+                "host:example.com",
+                "cert-dns-name",
+            ),
+            ("/v1/domain/rdns", "host", "example.com", "dns-ptr"),
+        ];
+        for (endpoint, expected) in DRIFTNET_ENDPOINTS.into_iter().zip(expected) {
+            let request = driftnet_request(&http, "example.com", endpoint, "driftnet-token")
+                .build()
+                .unwrap();
+            assert_eq!(request.url().host_str(), Some("api.driftnet.io"));
+            assert_eq!(request.url().path(), expected.0);
+            assert_eq!(
+                request
+                    .headers()
+                    .get("Authorization")
+                    .and_then(|value| value.to_str().ok()),
+                Some("Bearer driftnet-token")
+            );
+            let query = request.url().query_pairs().collect::<BTreeMap<_, _>>();
+            assert_eq!(
+                query.get(expected.1).map(|value| value.as_ref()),
+                Some(expected.2)
+            );
+            assert_eq!(
+                query.get("summarize").map(|value| value.as_ref()),
+                Some("host")
+            );
+            assert_eq!(
+                query.get("summary_context").map(|value| value.as_ref()),
+                Some(expected.3)
+            );
+            assert_eq!(
+                query.get("summary_limit").map(|value| value.as_ref()),
+                Some("10000")
+            );
+        }
+    }
+
+    #[test]
+    fn driftnet_summary_fixture_extracts_only_normalized_in_scope_names() {
+        let response: DriftnetSummaryResponse =
+            serde_json::from_str(include_str!("../../tests/fixtures/driftnet-summary.json"))
+                .unwrap();
+        assert_eq!(response.summary.other, 0);
+        assert_eq!(
+            driftnet_summary_names(&response, "example.com"),
+            BTreeSet::from(["api.example.com".to_owned(), "wild.example.com".to_owned(),])
         );
+        assert!(serde_json::from_value::<DriftnetSummaryResponse>(serde_json::json!({})).is_err());
+    }
 
-        let repeated_page: DriftnetPage = serde_json::from_value(serde_json::json!({
-            "page": 1,
-            "pages": 2,
-            "results": []
-        }))
-        .unwrap();
-        assert!(
-            format!("{:#}", driftnet_pagination(&repeated_page, 0).unwrap_err())
-                .contains("page inattendue 1")
-        );
-
-        let timed_out: DriftnetPage = serde_json::from_value(serde_json::json!({
-            "page": 0,
-            "pages": 2,
-            "timed_out": true,
-            "results": []
-        }))
-        .unwrap();
-        assert!(timed_out.timed_out);
-
+    #[test]
+    fn driftnet_errors_remain_bounded_and_specific() {
         assert!(
             driftnet_http_error(
                 reqwest::StatusCode::UNAUTHORIZED,
@@ -1261,10 +2485,49 @@ mod tests {
     }
 
     #[test]
+    fn code_search_pagination_and_content_urls_are_vendor_pinned() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::LINK,
+            reqwest::header::HeaderValue::from_static(
+                "<https://api.github.com/search/code?q=example.com&page=2>; rel=\"next\", <https://api.github.com/search/code?q=example.com&page=10>; rel=\"last\"",
+            ),
+        );
+        assert_eq!(
+            next_link(&headers).unwrap().as_deref(),
+            Some("https://api.github.com/search/code?q=example.com&page=2")
+        );
+        assert_eq!(
+            github_raw_url("https://github.com/acme/repo/blob/main/config/app.txt")
+                .unwrap()
+                .as_str(),
+            "https://raw.githubusercontent.com/acme/repo/main/config/app.txt"
+        );
+        assert!(github_raw_url("https://attacker.test/acme/repo/blob/main/x").is_err());
+
+        let item = GitlabSearchItem {
+            data: String::new(),
+            project_id: 42,
+            path: "config/app file.txt".to_owned(),
+            reference: "main".to_owned(),
+        };
+        let raw = gitlab_raw_url(&item).unwrap();
+        assert_eq!(raw.host_str(), Some("gitlab.com"));
+        assert!(
+            raw.path()
+                .starts_with("/api/v4/projects/42/repository/files/")
+        );
+        assert!(
+            raw.query_pairs()
+                .any(|pair| pair.0 == "ref" && pair.1 == "main")
+        );
+    }
+
+    #[test]
     fn targeted_connector_requests_follow_provider_contracts() {
         assert_eq!(BINARYEDGE_MAX_PAGES, 2);
         assert_eq!(BRAVE_MAX_PAGES, 2);
-        assert_eq!(MERKLEMAP_MAX_PAGES, 2);
+        assert_eq!(MERKLEMAP_MAX_PAGES, 1_000);
         let http = client(Duration::from_secs(1)).unwrap();
 
         let binaryedge = binaryedge_request(&http, "example.com", 2, "binaryedge-key")
@@ -1383,9 +2646,10 @@ mod tests {
             .is_err()
         );
 
-        let missing_driftnet_pagination: DriftnetPage =
-            serde_json::from_value(serde_json::json!({"results": []})).unwrap();
-        assert!(driftnet_pagination(&missing_driftnet_pagination, 0).is_err());
+        let empty_driftnet_summary: DriftnetSummaryResponse =
+            serde_json::from_value(serde_json::json!({"summary": {}})).unwrap();
+        assert!(empty_driftnet_summary.summary.values.is_empty());
+        assert_eq!(empty_driftnet_summary.summary.other, 0);
 
         let wrong_binaryedge_page: BinaryEdgeSubdomainPage =
             serde_json::from_value(serde_json::json!({

@@ -28,11 +28,11 @@ read nor copied. The manifest records this allowlist policy.
 
 The runner recognizes four tools and invokes only these modes:
 
-- Fellaga: `scan --profile passive --no-target-contact --show` with a fresh
-  state database for every run. Direct CT-log indexing is disabled; CT names
-  can still be returned by third-party provider connectors.
-- Subfinder: its passive source workflow with update checks disabled, without
-  its active switch or a resolver override.
+- Fellaga: `scan --profile passive --no-target-contact --all-sources --show`
+  with a fresh state database for every run. Direct CT-log indexing is
+  disabled; CT names can still be returned by third-party provider connectors.
+- Subfinder: its `-all` passive source workflow with update checks disabled,
+  without its active switch or a resolver override.
 - Amass: `enum -passive` with an explicit empty configuration file, without a
   resolver override or inherited system credentials.
 - BBOT: passive subdomain modules with `dns.disable=true` and
@@ -52,6 +52,17 @@ requests per second, Fellaga at four passive connector tasks, and every tool is
 run serially with a one-second cooldown. Amass and BBOT do not expose equivalent
 global HTTP controls, so wall times are recorded observations, not comparable
 performance measurements.
+
+The Fellaga/Subfinder comparison is symmetric at the source-selection level:
+both commands explicitly request every source registered by that installed
+binary. This does not make their provider catalogs, credentials, pagination,
+rate policies, or runtime availability equivalent. In this no-key campaign,
+required-key Fellaga connectors are skipped locally without a request, and
+Subfinder applies its own no-key availability rules. Optional and public
+connectors can still return authentication failures, anti-bot pages, retired
+API responses, schema changes, rate limits, or timeouts. Those outcomes remain
+part of the evidence; the runner does not bypass authentication, CAPTCHA, or
+provider controls.
 
 Tools that are not installed are recorded as missing. The available safe
 subset still runs. Executable paths can be pinned with these optional
@@ -119,8 +130,10 @@ The output directory must not already exist. It contains a campaign manifest,
 per-run timings and normalized names, a JSON-lines run ledger, the BBOT
 preflight evidence when applicable, and `report.json`. The manifest records
 each runnable executable's resolved path, SHA-256 hash, bounded version probe,
-the repository commit and worktree state, and every wall-time limit. The
-executable is hashed immediately before every launch and again when each run
+the repository commit and worktree state, and every wall-time limit. It also
+records that Fellaga `--all-sources` and Subfinder `-all` request all locally
+registered sources while runtime source availability remains non-comparable.
+The executable is hashed immediately before every launch and again when each run
 is recorded. BBOT also binds and rechecks its installed Python distribution
 tree. Retained preflight and
 per-run artifacts are hash-verified during report generation, including an
@@ -165,7 +178,9 @@ interrupted, or structurally unparseable runs remain available as evidence but
 are excluded from coverage and median-success metrics. A process exit code
 cannot normalize provider health across different tools; successful runs
 therefore retain `source_health: unknown`, and empty successes are reported
-explicitly.
+explicitly. Source-tree coverage and an all-source command flag are
+implementation properties, not proof that every provider was reachable or
+productive during a campaign.
 
 ## Attribution and data terms
 

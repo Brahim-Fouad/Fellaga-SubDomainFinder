@@ -3,7 +3,7 @@ use crate::model::EvidenceFamily;
 use crate::util::normalize_observed_name;
 use anyhow::{Context, Result, bail};
 use flate2::read::GzDecoder;
-use futures_util::{StreamExt, stream};
+use futures_util::{StreamExt, TryStreamExt, stream};
 use reqwest::ResponseBuilderExt;
 use reqwest::header::{
     ACCEPT, ACCEPT_LANGUAGE, CONTENT_LENGTH, CONTENT_RANGE, HeaderMap, HeaderValue, RANGE,
@@ -26,6 +26,8 @@ use tokio::sync::{Mutex as TokioMutex, Semaphore};
 use url::Url;
 
 mod extra;
+mod keyed_sources;
+mod public_sources;
 
 #[derive(Clone, Default)]
 pub struct ApiKeyStore {
@@ -100,6 +102,7 @@ const SOURCE_DEFINITIONS: &[SourceDefinition] = &[
         name: "anubisdb",
         requires_key: false,
         key_environment: None,
+        // Fellaga-native AnubisDB endpoint, distinct from the `anubis` provider.
         automatic: true,
     },
     SourceDefinition {
@@ -195,7 +198,7 @@ const SOURCE_DEFINITIONS: &[SourceDefinition] = &[
     SourceDefinition {
         name: "hackertarget",
         requires_key: false,
-        key_environment: None,
+        key_environment: Some("HACKERTARGET_API_KEY"),
         automatic: true,
     },
     SourceDefinition {
@@ -226,7 +229,8 @@ const SOURCE_DEFINITIONS: &[SourceDefinition] = &[
         name: "otx",
         requires_key: true,
         key_environment: Some("OTX_API_KEY"),
-        automatic: true,
+        // Backward-compatible alias for the canonical `alienvault` name.
+        automatic: false,
     },
     SourceDefinition {
         name: "securitytrails",
@@ -244,7 +248,7 @@ const SOURCE_DEFINITIONS: &[SourceDefinition] = &[
         name: "subdomaincenter",
         requires_key: false,
         key_environment: None,
-        automatic: false,
+        automatic: true,
     },
     SourceDefinition {
         name: "subdomainapp",
@@ -268,12 +272,228 @@ const SOURCE_DEFINITIONS: &[SourceDefinition] = &[
         name: "whoisxml",
         requires_key: true,
         key_environment: Some("WHOISXML_API_KEY"),
-        automatic: true,
+        // Backward-compatible alias for the canonical `whoisxmlapi` name.
+        automatic: false,
     },
     SourceDefinition {
         name: "wayback",
         requires_key: false,
         key_environment: None,
+        // Backward-compatible alias for the canonical `waybackarchive` name.
+        automatic: false,
+    },
+    // Complete provider coverage for every module in the pinned upstream
+    // audit set. Providers disabled
+    // upstream remain explicitly selectable here so a remote outage or bot
+    // challenge never makes a connector silently disappear from the registry.
+    SourceDefinition {
+        name: "alienvault",
+        requires_key: true,
+        key_environment: Some("ALIENVAULT_API_KEY"),
+        automatic: true,
+    },
+    SourceDefinition {
+        name: "anubis",
+        requires_key: false,
+        key_environment: None,
+        automatic: true,
+    },
+    SourceDefinition {
+        name: "bufferover",
+        requires_key: true,
+        key_environment: Some("BUFFEROVER_API_KEY"),
+        automatic: true,
+    },
+    SourceDefinition {
+        name: "c99",
+        requires_key: true,
+        key_environment: Some("C99_API_KEY"),
+        automatic: true,
+    },
+    SourceDefinition {
+        name: "chinaz",
+        requires_key: true,
+        key_environment: Some("CHINAZ_API_KEY"),
+        automatic: true,
+    },
+    SourceDefinition {
+        name: "digitalyama",
+        requires_key: true,
+        key_environment: Some("DIGITALYAMA_API_KEY"),
+        automatic: true,
+    },
+    SourceDefinition {
+        name: "digitorus",
+        requires_key: false,
+        key_environment: None,
+        automatic: true,
+    },
+    SourceDefinition {
+        name: "dnsdb",
+        requires_key: true,
+        key_environment: Some("DNSDB_API_KEY"),
+        automatic: true,
+    },
+    SourceDefinition {
+        name: "dnsdumpster",
+        requires_key: true,
+        key_environment: Some("DNSDUMPSTER_API_KEY"),
+        automatic: true,
+    },
+    SourceDefinition {
+        name: "dnsrepo",
+        requires_key: true,
+        key_environment: Some("DNSREPO_API_KEY"),
+        automatic: true,
+    },
+    SourceDefinition {
+        name: "domainsproject",
+        requires_key: true,
+        key_environment: Some("DOMAINSPROJECT_API_KEY"),
+        automatic: true,
+    },
+    SourceDefinition {
+        name: "fofa",
+        requires_key: true,
+        key_environment: Some("FOFA_API_KEY"),
+        automatic: true,
+    },
+    SourceDefinition {
+        name: "hudsonrock",
+        requires_key: false,
+        key_environment: None,
+        automatic: true,
+    },
+    SourceDefinition {
+        name: "onyphe",
+        requires_key: true,
+        key_environment: Some("ONYPHE_API_KEY"),
+        automatic: true,
+    },
+    SourceDefinition {
+        name: "profundis",
+        requires_key: true,
+        key_environment: Some("PROFUNDIS_API_KEY"),
+        automatic: true,
+    },
+    SourceDefinition {
+        name: "pugrecon",
+        requires_key: true,
+        key_environment: Some("PUGRECON_API_KEY"),
+        automatic: true,
+    },
+    SourceDefinition {
+        name: "quake",
+        requires_key: true,
+        key_environment: Some("QUAKE_API_KEY"),
+        automatic: true,
+    },
+    SourceDefinition {
+        name: "rapiddns",
+        requires_key: false,
+        key_environment: None,
+        automatic: true,
+    },
+    SourceDefinition {
+        name: "reconcloud",
+        requires_key: false,
+        key_environment: None,
+        automatic: true,
+    },
+    SourceDefinition {
+        name: "reconeer",
+        requires_key: false,
+        key_environment: Some("RECONEER_API_KEY"),
+        automatic: true,
+    },
+    SourceDefinition {
+        name: "redhuntlabs",
+        requires_key: true,
+        key_environment: Some("REDHUNTLABS_API_KEY"),
+        automatic: true,
+    },
+    SourceDefinition {
+        name: "riddler",
+        requires_key: false,
+        key_environment: None,
+        automatic: true,
+    },
+    SourceDefinition {
+        name: "robtex",
+        requires_key: true,
+        key_environment: Some("ROBTEX_API_KEY"),
+        automatic: true,
+    },
+    SourceDefinition {
+        name: "rsecloud",
+        requires_key: true,
+        key_environment: Some("RSECLOUD_API_KEY"),
+        automatic: true,
+    },
+    SourceDefinition {
+        name: "shodanct",
+        requires_key: false,
+        key_environment: None,
+        automatic: true,
+    },
+    SourceDefinition {
+        name: "sitedossier",
+        requires_key: false,
+        key_environment: None,
+        automatic: true,
+    },
+    SourceDefinition {
+        name: "submd",
+        requires_key: false,
+        key_environment: Some("SUBMD_API_KEY"),
+        automatic: true,
+    },
+    SourceDefinition {
+        name: "thc",
+        requires_key: false,
+        key_environment: None,
+        automatic: true,
+    },
+    SourceDefinition {
+        name: "threatbook",
+        requires_key: true,
+        key_environment: Some("THREATBOOK_API_KEY"),
+        automatic: true,
+    },
+    SourceDefinition {
+        name: "threatcrowd",
+        requires_key: false,
+        key_environment: None,
+        automatic: true,
+    },
+    SourceDefinition {
+        name: "threatminer",
+        requires_key: false,
+        key_environment: None,
+        automatic: true,
+    },
+    SourceDefinition {
+        name: "waybackarchive",
+        requires_key: false,
+        key_environment: None,
+        automatic: true,
+    },
+    SourceDefinition {
+        name: "whoisxmlapi",
+        requires_key: true,
+        key_environment: Some("WHOISXMLAPI_API_KEY"),
+        automatic: true,
+    },
+    SourceDefinition {
+        name: "windvane",
+        requires_key: true,
+        key_environment: Some("WINDVANE_API_KEY"),
+        automatic: true,
+    },
+    SourceDefinition {
+        name: "zoomeyeapi",
+        requires_key: true,
+        key_environment: Some("ZOOMEYEAPI_API_KEY"),
         automatic: true,
     },
 ];
@@ -432,14 +652,26 @@ impl ApiKeyStore {
     }
 
     fn values(&self, source: &str) -> Vec<String> {
-        let mut values = self
-            .keys
-            .get(&source.to_ascii_lowercase())
-            .cloned()
-            .unwrap_or_default();
-        for variable in environment_names(source) {
-            if let Ok(value) = std::env::var(variable) {
-                values.extend(split_keys(&value));
+        let source = source.to_ascii_lowercase();
+        let aliases: &[&str] = match source.as_str() {
+            "alienvault" | "otx" => &["alienvault", "otx"],
+            "whoisxml" | "whoisxmlapi" => &["whoisxml", "whoisxmlapi"],
+            _ => &[],
+        };
+        let names = if aliases.is_empty() {
+            vec![source.as_str()]
+        } else {
+            aliases.to_vec()
+        };
+        let mut values = Vec::new();
+        for name in names {
+            if let Some(configured) = self.keys.get(name) {
+                values.extend(configured.iter().cloned());
+            }
+            for variable in environment_names(name) {
+                if let Ok(value) = std::env::var(variable) {
+                    values.extend(split_keys(&value));
+                }
             }
         }
         values.sort();
@@ -738,28 +970,52 @@ fn definition(source: &str) -> Option<SourceDefinition> {
 
 fn environment_names(source: &str) -> &'static [&'static str] {
     match source {
+        "alienvault" => &["ALIENVAULT_API_KEY", "OTX_API_KEY", "X_OTX_API_KEY"],
         "bevigil" => &["BEVIGIL_API_KEY"],
         "binaryedge" => &["BINARYEDGE_API_KEY"],
         "brave" => &["BRAVE_SEARCH_API_KEY"],
+        "bufferover" => &["BUFFEROVER_API_KEY"],
         "builtwith" => &["BUILTWITH_API_KEY"],
+        "c99" => &["C99_API_KEY"],
         "censys" => &["CENSYS_API_KEY"],
+        "chinaz" => &["CHINAZ_API_KEY"],
         "circl" => &["CIRCL_PDNS_CREDENTIALS"],
-        "certspotter" => &["CERTSPOTTER_API_TOKEN"],
+        "certspotter" => &["CERTSPOTTER_API_TOKEN", "CERTSPOTTER_API_KEY"],
         "chaos" => &["CHAOS_API_KEY"],
+        "digitalyama" => &["DIGITALYAMA_API_KEY"],
+        "dnsdb" => &["DNSDB_API_KEY"],
+        "dnsdumpster" => &["DNSDUMPSTER_API_KEY"],
+        "dnsrepo" => &["DNSREPO_API_KEY"],
+        "domainsproject" => &["DOMAINSPROJECT_API_KEY"],
         "driftnet" => &["DRIFTNET_API_KEY"],
+        "fofa" => &["FOFA_API_KEY"],
         "fullhunt" => &["FULLHUNT_API_KEY"],
         "github" => &["GITHUB_TOKEN", "GITHUB_TOKENS"],
         "gitlab" => &["GITLAB_TOKEN"],
+        "hackertarget" => &["HACKERTARGET_API_KEY"],
         "intelx" => &["INTELX_API_KEY"],
         "leakix" => &["LEAKIX_API_KEY"],
-        "merklemap" => &["MERKLEMAP_API_TOKEN"],
+        "merklemap" => &["MERKLEMAP_API_TOKEN", "MERKLEMAP_API_KEY"],
         "netlas" => &["NETLAS_API_KEY"],
+        "onyphe" => &["ONYPHE_API_KEY"],
         "otx" => &["OTX_API_KEY", "X_OTX_API_KEY"],
+        "profundis" => &["PROFUNDIS_API_KEY"],
+        "pugrecon" => &["PUGRECON_API_KEY"],
+        "quake" => &["QUAKE_API_KEY"],
+        "reconeer" => &["RECONEER_API_KEY"],
+        "redhuntlabs" => &["REDHUNTLABS_API_KEY"],
+        "robtex" => &["ROBTEX_API_KEY"],
+        "rsecloud" => &["RSECLOUD_API_KEY"],
         "securitytrails" => &["SECURITYTRAILS_API_KEY"],
         "shodan" => &["SHODAN_API_KEY"],
+        "submd" => &["SUBMD_API_KEY"],
+        "threatbook" => &["THREATBOOK_API_KEY"],
         "urlscan" => &["URLSCAN_API_KEY"],
         "virustotal" => &["VIRUSTOTAL_API_KEY"],
+        "whoisxmlapi" => &["WHOISXMLAPI_API_KEY", "WHOISXML_API_KEY"],
         "whoisxml" => &["WHOISXML_API_KEY"],
+        "windvane" => &["WINDVANE_API_KEY"],
+        "zoomeyeapi" => &["ZOOMEYEAPI_API_KEY", "ZOOMEYE_API_KEY"],
         _ => &[],
     }
 }
@@ -783,7 +1039,21 @@ pub fn source_metadata(name: &str) -> SourceMetadata {
         .unwrap_or(EvidenceFamily::Aggregator);
     let experimental = matches!(
         name,
-        "anubisdb" | "certificatedetails" | "driftnet" | "subdomainapp" | "subdomaincenter"
+        "anubis"
+            | "anubisdb"
+            | "certificatedetails"
+            | "digitorus"
+            | "driftnet"
+            | "hudsonrock"
+            | "rapiddns"
+            | "reconcloud"
+            | "reconeer"
+            | "riddler"
+            | "sitedossier"
+            | "subdomainapp"
+            | "subdomaincenter"
+            | "threatcrowd"
+            | "threatminer"
     );
     let requires_key = definition(name).is_some_and(|definition| definition.requires_key);
     let authentication = if requires_key {
@@ -794,7 +1064,8 @@ pub fn source_metadata(name: &str) -> SourceMetadata {
         "none"
     };
     let cost = match name {
-        "commoncrawl" | "wayback" | "github" | "gitlab" | "urlscan" | "netlas" => "high",
+        "commoncrawl" | "dnsdb" | "github" | "gitlab" | "netlas" | "robtex" | "submd" | "thc"
+        | "urlscan" | "wayback" | "waybackarchive" => "high",
         "crtsh" | "certspotter" | "virustotal" | "shodan" | "censys" | "whoisxml"
         | "binaryedge" | "brave" | "merklemap" => "medium",
         _ => "low",
@@ -803,7 +1074,11 @@ pub fn source_metadata(name: &str) -> SourceMetadata {
         "crtsh" => 6,
         "certspotter" => 12,
         "hackertarget" => 5,
-        "commoncrawl" | "wayback" => 10,
+        "commoncrawl" | "wayback" | "waybackarchive" => 10,
+        "hudsonrock" | "rapiddns" | "reconcloud" | "riddler" | "sitedossier" | "threatcrowd"
+        | "threatminer" => 5,
+        "submd" | "thc" => 60,
+        "github-content" | "gitlab-content" => 600,
         "urlscan" => 12,
         "binaryedge" | "brave" | "merklemap" => 20,
         _ if requires_key => 30,
@@ -812,15 +1087,32 @@ pub fn source_metadata(name: &str) -> SourceMetadata {
     SourceMetadata {
         name: name.to_owned(),
         evidence_family,
-        // Most connectors already search an entire suffix (for example CT,
-        // archives, search engines, and `*.domain` APIs). Re-running them on
-        // every inferred child only duplicates traffic. VirusTotal exposes a
-        // direct domain -> subdomains relationship, so querying a discovered
-        // child can reveal the next level without repeating a subtree query.
+        // Match the recursive capabilities declared by the audited provider
+        // connectors. The scanner still applies zone-yield ranking, global
+        // connector budgets, and suffix filtering before querying child zones.
         // Parent lookup remains available to evidence families that can cover
         // a target which is itself a delegated sub-zone; scanner-side scope
         // filtering discards sibling names.
-        recursive_children: name == "virustotal",
+        recursive_children: matches!(
+            name,
+            "alienvault"
+                | "otx"
+                | "bufferover"
+                | "certspotter"
+                | "crtsh"
+                | "digitorus"
+                | "certificatedetails"
+                | "dnsdb"
+                | "driftnet"
+                | "hackertarget"
+                | "leakix"
+                | "merklemap"
+                | "reconcloud"
+                | "securitytrails"
+                | "shodanct"
+                | "urlscan"
+                | "virustotal"
+        ),
         recursive_parents: matches!(
             evidence_family,
             EvidenceFamily::CertificateTransparency
@@ -833,7 +1125,18 @@ pub fn source_metadata(name: &str) -> SourceMetadata {
         experimental,
         documented: !matches!(
             name,
-            "certificatedetails" | "subdomainapp" | "subdomaincenter"
+            "certificatedetails"
+                | "digitorus"
+                | "hudsonrock"
+                | "rapiddns"
+                | "reconcloud"
+                | "riddler"
+                | "shodanct"
+                | "sitedossier"
+                | "subdomainapp"
+                | "subdomaincenter"
+                | "threatcrowd"
+                | "threatminer"
         ),
     }
 }
@@ -877,19 +1180,13 @@ static EXTERNAL_CLIENTS: OnceLock<ExternalClients> = OnceLock::new();
 const MAX_EXTERNAL_BODY_BYTES: usize = 16 * 1024 * 1024;
 const COMMONCRAWL_INDEX_COUNT: usize = 5;
 const COMMONCRAWL_BLOCKS_PER_REQUEST: usize = 15;
+const COMMONCRAWL_MAX_PAGES: usize = 1_000;
 const COMMONCRAWL_MAX_RESULT_LINES: usize = 150_000;
 const COMMONCRAWL_MAX_BODY_BYTES: usize = 3 * MAX_EXTERNAL_BODY_BYTES;
 const COMMONCRAWL_WARC_SAMPLE_LIMIT: usize = 2;
 const COMMONCRAWL_MAX_WARC_MEMBER_BYTES: usize = 2 * 1024 * 1024;
 const COMMONCRAWL_MAX_WARC_DECOMPRESSED_BYTES: usize = 4 * 1024 * 1024;
 const MAX_INLINE_RETRY_AFTER: Duration = Duration::from_secs(5);
-
-fn commoncrawl_page_plan() -> [(usize, usize); 1] {
-    // The Common Crawl CDX API measures `pageSize` in compressed index blocks.
-    // One 15-block request covers the same index window as the previous three
-    // sequential 5-block pages, while avoiding two rate-limited round trips.
-    [(0, COMMONCRAWL_BLOCKS_PER_REQUEST)]
-}
 
 fn defer_retry_after(delay: Duration) -> bool {
     delay > MAX_INLINE_RETRY_AFTER
@@ -1088,11 +1385,24 @@ pub fn source_policy(source: &str) -> SourcePolicy {
             attempts: 2,
             base_backoff: Duration::from_secs(1),
         },
-        "wayback" => SourcePolicy {
+        "wayback" | "waybackarchive" => SourcePolicy {
             timeout: Duration::from_secs(45),
             total_timeout: Duration::from_secs(45),
             attempts: 1,
             base_backoff: Duration::from_secs(1),
+        },
+        "submd" | "thc" => SourcePolicy {
+            timeout: Duration::from_secs(30),
+            total_timeout: Duration::from_secs(45),
+            attempts: 2,
+            base_backoff: Duration::from_millis(750),
+        },
+        "hudsonrock" | "rapiddns" | "reconcloud" | "reconeer" | "riddler" | "shodanct"
+        | "sitedossier" | "threatcrowd" | "threatminer" => SourcePolicy {
+            timeout: Duration::from_secs(15),
+            total_timeout: Duration::from_secs(30),
+            attempts: 2,
+            base_backoff: Duration::from_millis(500),
         },
         "otx" => SourcePolicy {
             timeout: Duration::from_secs(20),
@@ -1209,8 +1519,52 @@ fn certspotter_next_after(
 
 #[derive(Debug, Deserialize)]
 struct CommonCrawlCollection {
+    #[serde(default)]
+    id: String,
     #[serde(rename = "cdx-api")]
     cdx_api: String,
+}
+
+fn commoncrawl_collection_year(id: &str) -> Option<&str> {
+    id.split(|character: char| !character.is_ascii_digit())
+        .find(|part| {
+            part.len() == 4
+                && part
+                    .parse::<u16>()
+                    .is_ok_and(|year| (2000..=2100).contains(&year))
+        })
+}
+
+fn select_commoncrawl_endpoints(collections: Vec<CommonCrawlCollection>) -> Vec<String> {
+    let mut years = BTreeSet::new();
+    let mut endpoints = Vec::new();
+    let mut fallback = Vec::new();
+    for collection in collections {
+        let Ok(endpoint) = validate_commoncrawl_endpoint(&collection.cdx_api) else {
+            continue;
+        };
+        let endpoint = endpoint.to_string();
+        if let Some(year) = commoncrawl_collection_year(&collection.id)
+            && years.insert(year.to_owned())
+        {
+            endpoints.push(endpoint.clone());
+        }
+        fallback.push(endpoint);
+        if endpoints.len() == COMMONCRAWL_INDEX_COUNT {
+            break;
+        }
+    }
+    if endpoints.len() < COMMONCRAWL_INDEX_COUNT {
+        for endpoint in fallback {
+            if !endpoints.contains(&endpoint) {
+                endpoints.push(endpoint);
+            }
+            if endpoints.len() == COMMONCRAWL_INDEX_COUNT {
+                break;
+            }
+        }
+    }
+    endpoints
 }
 
 #[derive(Debug, Deserialize)]
@@ -1254,11 +1608,14 @@ struct CommonCrawlRecordRef {
 struct CommonCrawlPage {
     names: BTreeSet<String>,
     records: BTreeSet<CommonCrawlRecordRef>,
+    truncated: bool,
 }
 
 #[derive(Debug, Deserialize)]
 struct UrlscanResponse {
     results: Vec<UrlscanResult>,
+    #[serde(default)]
+    has_more: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1296,8 +1653,24 @@ struct VirusTotalLinks {
     next: Option<String>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct SecurityTrailsMeta {
+    #[serde(default)]
+    scroll_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SecurityTrailsRecord {
+    hostname: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct SecurityTrailsResponse {
+    #[serde(default)]
+    meta: SecurityTrailsMeta,
+    #[serde(default)]
+    records: Vec<SecurityTrailsRecord>,
+    #[serde(default)]
     subdomains: Vec<String>,
 }
 
@@ -1320,11 +1693,6 @@ struct WhoisXmlRecord {
 }
 
 #[derive(Debug, Deserialize)]
-struct NetlasResponse {
-    items: Vec<NetlasItem>,
-}
-
-#[derive(Debug, Deserialize)]
 struct NetlasItem {
     data: NetlasDomain,
 }
@@ -1332,6 +1700,179 @@ struct NetlasItem {
 #[derive(Debug, Deserialize)]
 struct NetlasDomain {
     domain: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct NetlasCountResponse {
+    count: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct NetlasDownloadRequest<'a> {
+    q: &'a str,
+    fields: [&'static str; 1],
+    source_type: &'static str,
+    size: usize,
+}
+
+const NETLAS_COMMUNITY_DOWNLOAD_CAP: usize = 200;
+const NETLAS_DOWNLOAD_MAX_BYTES: usize = 16 * 1024 * 1024;
+const NETLAS_DOWNLOAD_MAX_ITEM_BYTES: usize = 1024 * 1024;
+const NETLAS_CHECKPOINT_RECORDS: usize = 50;
+const SECURITYTRAILS_MAX_SCROLL_PAGES: usize = 1000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NetlasArrayState {
+    Start,
+    FirstItemOrEnd,
+    NextItem,
+    Item,
+    CommaOrEnd,
+    Done,
+}
+
+/// Incrementally decodes Netlas' top-level JSON array without retaining the
+/// complete download in memory. Each record is still decoded strictly by
+/// serde_json before it reaches the connector.
+struct NetlasArrayDecoder {
+    state: NetlasArrayState,
+    item: Vec<u8>,
+    depth: usize,
+    in_string: bool,
+    escaped: bool,
+    decoded: usize,
+    max_items: usize,
+    max_item_bytes: usize,
+}
+
+impl NetlasArrayDecoder {
+    fn new(max_items: usize, max_item_bytes: usize) -> Self {
+        Self {
+            state: NetlasArrayState::Start,
+            item: Vec::new(),
+            depth: 0,
+            in_string: false,
+            escaped: false,
+            decoded: 0,
+            max_items,
+            max_item_bytes,
+        }
+    }
+
+    fn push<F>(&mut self, bytes: &[u8], visit: &mut F) -> Result<()>
+    where
+        F: FnMut(NetlasItem) -> Result<()>,
+    {
+        for &byte in bytes {
+            match self.state {
+                NetlasArrayState::Start => {
+                    if byte.is_ascii_whitespace() {
+                        continue;
+                    }
+                    if byte != b'[' {
+                        bail!("Netlas: download is not a JSON array");
+                    }
+                    self.state = NetlasArrayState::FirstItemOrEnd;
+                }
+                NetlasArrayState::FirstItemOrEnd => {
+                    if byte.is_ascii_whitespace() {
+                        continue;
+                    }
+                    if byte == b']' {
+                        self.state = NetlasArrayState::Done;
+                    } else {
+                        self.start_item(byte)?;
+                    }
+                }
+                NetlasArrayState::NextItem => {
+                    if byte.is_ascii_whitespace() {
+                        continue;
+                    }
+                    self.start_item(byte)?;
+                }
+                NetlasArrayState::Item => self.push_item_byte(byte, visit)?,
+                NetlasArrayState::CommaOrEnd => {
+                    if byte.is_ascii_whitespace() {
+                        continue;
+                    }
+                    match byte {
+                        b',' => self.state = NetlasArrayState::NextItem,
+                        b']' => self.state = NetlasArrayState::Done,
+                        _ => bail!("Netlas: invalid delimiter in download array"),
+                    }
+                }
+                NetlasArrayState::Done => {
+                    if !byte.is_ascii_whitespace() {
+                        bail!("Netlas: trailing data after download array");
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn start_item(&mut self, byte: u8) -> Result<()> {
+        if byte != b'{' {
+            bail!("Netlas: download array contains a non-object item");
+        }
+        self.item.clear();
+        self.item.push(byte);
+        self.depth = 1;
+        self.in_string = false;
+        self.escaped = false;
+        self.state = NetlasArrayState::Item;
+        Ok(())
+    }
+
+    fn push_item_byte<F>(&mut self, byte: u8, visit: &mut F) -> Result<()>
+    where
+        F: FnMut(NetlasItem) -> Result<()>,
+    {
+        if self.item.len() >= self.max_item_bytes {
+            bail!("Netlas: one download record exceeds the size limit");
+        }
+        self.item.push(byte);
+        if self.in_string {
+            if self.escaped {
+                self.escaped = false;
+            } else if byte == b'\\' {
+                self.escaped = true;
+            } else if byte == b'"' {
+                self.in_string = false;
+            }
+            return Ok(());
+        }
+        match byte {
+            b'"' => self.in_string = true,
+            b'{' | b'[' => self.depth = self.depth.saturating_add(1),
+            b'}' | b']' => {
+                self.depth = self
+                    .depth
+                    .checked_sub(1)
+                    .context("Netlas: unbalanced JSON download record")?;
+                if self.depth == 0 {
+                    self.decoded = self.decoded.saturating_add(1);
+                    if self.decoded > self.max_items {
+                        bail!("Netlas: download returned more records than requested");
+                    }
+                    let item = serde_json::from_slice(&self.item)
+                        .context("Netlas: invalid JSON download record")?;
+                    visit(item)?;
+                    self.item.clear();
+                    self.state = NetlasArrayState::CommaOrEnd;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn finish(&self) -> Result<()> {
+        if self.state != NetlasArrayState::Done {
+            bail!("Netlas: truncated JSON download array");
+        }
+        Ok(())
+    }
 }
 
 fn valid_user_agent_override(value: &str) -> bool {
@@ -1956,6 +2497,26 @@ pub(super) async fn send_external(
     send_with_retry_for_source(source, request, policy.attempts, policy.base_backoff, seed).await
 }
 
+/// Sends a provider request without first buffering its complete body.  This
+/// is reserved for newline-delimited high-volume feeds whose decoded records
+/// are checkpointed to SQLite in bounded batches while the response arrives.
+pub(super) async fn send_external_streaming(
+    source: &str,
+    request: reqwest::RequestBuilder,
+    seed: &str,
+) -> Result<reqwest::Response> {
+    let policy = source_policy(source);
+    send_with_retry_scoped(
+        Some(source),
+        request,
+        policy.attempts,
+        policy.base_backoff,
+        seed,
+        false,
+    )
+    .await
+}
+
 pub(super) async fn send_with_retry_for_source(
     source: &str,
     request: reqwest::RequestBuilder,
@@ -1963,7 +2524,7 @@ pub(super) async fn send_with_retry_for_source(
     base_backoff: Duration,
     seed: &str,
 ) -> Result<reqwest::Response> {
-    send_with_retry_scoped(Some(source), request, attempts, base_backoff, seed).await
+    send_with_retry_scoped(Some(source), request, attempts, base_backoff, seed, true).await
 }
 
 #[cfg(test)]
@@ -1973,7 +2534,7 @@ pub(super) async fn send_with_retry(
     base_backoff: Duration,
     seed: &str,
 ) -> Result<reqwest::Response> {
-    send_with_retry_scoped(None, request, attempts, base_backoff, seed).await
+    send_with_retry_scoped(None, request, attempts, base_backoff, seed, true).await
 }
 
 async fn send_with_retry_scoped(
@@ -1982,6 +2543,7 @@ async fn send_with_retry_scoped(
     attempts: usize,
     base_backoff: Duration,
     seed: &str,
+    buffer_response_body: bool,
 ) -> Result<reqwest::Response> {
     let method = request
         .try_clone()
@@ -2005,7 +2567,11 @@ async fn send_with_retry_scoped(
         match response {
             Ok(response) => {
                 let retry_after = server_retry_delay(&response);
-                let rate_limited_forbidden = response.status() == reqwest::StatusCode::FORBIDDEN
+                // SecurityTrails uses an exact 403 from its scroll-capable
+                // endpoint to select the documented legacy API. Return that
+                // response to the connector even when quota headers exist.
+                let rate_limited_forbidden = source != Some("securitytrails")
+                    && response.status() == reqwest::StatusCode::FORBIDDEN
                     && exhausted_rate_limit(&response);
                 let retryable = retryable_status(response.status()) || rate_limited_forbidden;
                 if retryable {
@@ -2041,6 +2607,9 @@ async fn send_with_retry_scoped(
                             delay.as_secs()
                         );
                     }
+                }
+                if !buffer_response_body {
+                    return Ok(response);
                 }
                 let response = match buffer_external_response(
                     response,
@@ -2174,14 +2743,15 @@ async fn fetch_detailed_with_total_budget(
         match source {
             "crtsh" => crtsh(domain, timeout).await,
             "certspotter" => certspotter(domain, timeout, keys).await,
-            "hackertarget" => hackertarget(domain, timeout).await,
+            "hackertarget" => hackertarget(domain, timeout, keys).await,
             "commoncrawl" => commoncrawl(domain, timeout).await,
-            "wayback" => wayback(domain, timeout).await,
+            "wayback" | "waybackarchive" => wayback(domain, timeout).await,
             "urlscan" => urlscan(domain, timeout, keys).await,
+            "anubis" => public_sources::anubis(domain, timeout).await,
             "anubisdb" => anubisdb(domain, timeout).await,
             "subdomainapp" => subdomainapp(domain, timeout).await,
             "virustotal" => virustotal(domain, timeout, keys).await,
-            "whoisxml" => whoisxml(domain, timeout, keys).await,
+            "whoisxml" | "whoisxmlapi" => whoisxml(domain, timeout, keys).await,
             "securitytrails" => securitytrails(domain, timeout, keys).await,
             "bevigil" => extra::bevigil(domain, timeout, keys).await,
             "binaryedge" => extra::binaryedge(domain, timeout, keys).await,
@@ -2189,7 +2759,7 @@ async fn fetch_detailed_with_total_budget(
             "builtwith" => extra::builtwith(domain, timeout, keys).await,
             "censys" => extra::censys(domain, timeout, keys).await,
             "circl" => extra::circl(domain, timeout, keys).await,
-            "certificatedetails" => extra::certificate_details(domain, timeout).await,
+            "certificatedetails" | "digitorus" => extra::certificate_details(domain, timeout).await,
             "chaos" => extra::chaos(domain, timeout, keys).await,
             "driftnet" => {
                 let token = keys.pick("driftnet")?;
@@ -2202,9 +2772,39 @@ async fn fetch_detailed_with_total_budget(
             "leakix" => extra::leakix(domain, timeout, keys).await,
             "merklemap" => extra::merklemap(domain, timeout, keys).await,
             "netlas" => netlas(domain, timeout, keys).await,
-            "otx" => extra::otx(domain, timeout, keys).await,
+            "alienvault" | "otx" => extra::otx(domain, timeout, keys).await,
             "shodan" => extra::shodan(domain, timeout, keys).await,
             "subdomaincenter" => extra::subdomain_center(domain, timeout).await,
+            "bufferover" => keyed_sources::bufferover(domain, timeout, keys).await,
+            "c99" => keyed_sources::c99(domain, timeout, keys).await,
+            "chinaz" => keyed_sources::chinaz(domain, timeout, keys).await,
+            "digitalyama" => keyed_sources::digitalyama(domain, timeout, keys).await,
+            "dnsdb" => keyed_sources::dnsdb(domain, timeout, keys).await,
+            "dnsdumpster" => keyed_sources::dnsdumpster(domain, timeout, keys).await,
+            "dnsrepo" => keyed_sources::dnsrepo(domain, timeout, keys).await,
+            "domainsproject" => keyed_sources::domainsproject(domain, timeout, keys).await,
+            "fofa" => keyed_sources::fofa(domain, timeout, keys).await,
+            "hudsonrock" => public_sources::hudsonrock(domain, timeout).await,
+            "onyphe" => keyed_sources::onyphe(domain, timeout, keys).await,
+            "profundis" => keyed_sources::profundis(domain, timeout, keys).await,
+            "pugrecon" => keyed_sources::pugrecon(domain, timeout, keys).await,
+            "quake" => keyed_sources::quake(domain, timeout, keys).await,
+            "rapiddns" => public_sources::rapiddns(domain, timeout).await,
+            "reconcloud" => public_sources::reconcloud(domain, timeout).await,
+            "reconeer" => public_sources::reconeer(domain, timeout, keys).await,
+            "redhuntlabs" => keyed_sources::redhuntlabs(domain, timeout, keys).await,
+            "riddler" => public_sources::riddler(domain, timeout).await,
+            "robtex" => keyed_sources::robtex(domain, timeout, keys).await,
+            "rsecloud" => keyed_sources::rsecloud(domain, timeout, keys).await,
+            "shodanct" => public_sources::shodanct(domain, timeout).await,
+            "sitedossier" => public_sources::sitedossier(domain, timeout).await,
+            "submd" => public_sources::submd(domain, timeout, keys).await,
+            "thc" => public_sources::thc(domain, timeout).await,
+            "threatbook" => keyed_sources::threatbook(domain, timeout, keys).await,
+            "threatcrowd" => public_sources::threatcrowd(domain, timeout).await,
+            "threatminer" => public_sources::threatminer(domain, timeout).await,
+            "windvane" => keyed_sources::windvane(domain, timeout, keys).await,
+            "zoomeyeapi" => keyed_sources::zoomeyeapi(domain, timeout, keys).await,
             _ => Err(anyhow::anyhow!("source passive inconnue: {source}")),
         }
     };
@@ -2270,6 +2870,29 @@ pub async fn fetch_detailed_bounded(
     .await
 }
 
+/// Runs a connector check with a caller-defined retained-name ceiling.  The
+/// decoder may process more records, reported through `decoded_names`, while
+/// preventing diagnostics from building a multi-million-name in-memory set.
+pub async fn fetch_detailed_bounded_with_limit(
+    source: &str,
+    domain: &str,
+    timeout: Duration,
+    keys: &ApiKeyStore,
+    total_budget: Duration,
+    working_set_limit: usize,
+) -> Result<PassiveFetchResult> {
+    fetch_detailed_with_total_budget(
+        source,
+        domain,
+        timeout,
+        keys,
+        total_budget.min(source_policy(source).total_timeout),
+        working_set_limit.max(1),
+        None,
+    )
+    .await
+}
+
 /// Runs a connector with a bounded in-memory working set. Fully decoded pages
 /// are delivered to `page_sink` before the cap is applied so callers can keep
 /// permanent observations without retaining the entire provider response.
@@ -2303,7 +2926,51 @@ pub async fn fetch(
     Ok(fetch_detailed(source, domain, timeout, keys).await?.names)
 }
 
-async fn crtsh(domain: &str, timeout: Duration) -> Result<BTreeSet<String>> {
+async fn crtsh_postgres(domain: &str, timeout: Duration) -> Result<BTreeSet<String>> {
+    let mut config = tokio_postgres::Config::new();
+    config
+        .host("crt.sh")
+        .user("guest")
+        .dbname("certwatch")
+        .connect_timeout(timeout.min(Duration::from_secs(10)));
+    let statement_timeout_ms = timeout.as_millis().clamp(1, 30_000);
+    config.options(format!("-c statement_timeout={statement_timeout_ms}"));
+    let (database, connection) = config
+        .connect(tokio_postgres::NoTls)
+        .await
+        .context("connexion PostgreSQL publique crt.sh")?;
+    let connection_task = tokio::spawn(connection);
+    let query = r#"SELECT DISTINCT cai.NAME_VALUE
+        FROM certificate_and_identities cai
+        WHERE plainto_tsquery('certwatch', $1) @@ identities(cai.CERTIFICATE)
+          AND cai.NAME_VALUE ILIKE ('%' || $1 || '%')"#;
+    let search = domain.to_owned();
+    let parameter: &(dyn tokio_postgres::types::ToSql + Sync) = &search;
+    let rows = database
+        .query_raw(query, std::iter::once(parameter))
+        .await
+        .context("requête PostgreSQL crt.sh")?;
+    futures_util::pin_mut!(rows);
+    let mut names = BTreeSet::new();
+    let mut batch = BTreeSet::new();
+    while let Some(row) = rows.try_next().await.context("flux PostgreSQL crt.sh")? {
+        let values: String = row.try_get(0).context("ligne PostgreSQL crt.sh")?;
+        for value in values.lines() {
+            if let Some(name) = normalize_observed_name(value, domain) {
+                batch.insert(name);
+            }
+        }
+        if batch.len() >= 1_000 {
+            commit_result_page(&mut names, std::mem::take(&mut batch));
+        }
+    }
+    commit_result_page(&mut names, batch);
+    drop(database);
+    connection_task.abort();
+    Ok(names)
+}
+
+async fn crtsh_http(domain: &str, timeout: Duration) -> Result<BTreeSet<String>> {
     let client = client(timeout)?;
     let policy = source_policy("crtsh");
     let response = send_with_retry_for_source(
@@ -2329,6 +2996,17 @@ async fn crtsh(domain: &str, timeout: Duration) -> Result<BTreeSet<String>> {
         .collect())
 }
 
+async fn crtsh(domain: &str, timeout: Duration) -> Result<BTreeSet<String>> {
+    let postgres_error = match crtsh_postgres(domain, timeout).await {
+        Ok(names) if !names.is_empty() => return Ok(names),
+        Ok(_) => "PostgreSQL returned no in-scope names".to_owned(),
+        Err(error) => compact_external_error(&format!("{error:#}")),
+    };
+    crtsh_http(domain, timeout)
+        .await
+        .with_context(|| format!("fallback HTTP crt.sh après échec PostgreSQL: {postgres_error}"))
+}
+
 async fn certspotter(
     domain: &str,
     timeout: Duration,
@@ -2338,7 +3016,7 @@ async fn certspotter(
     let token = keys.optional("certspotter");
     let mut after: Option<String> = None;
     let mut names = BTreeSet::new();
-    for page_index in 0..25 {
+    for page_index in 0..1_000 {
         let mut request = client
             .get("https://api.certspotter.com/v1/issuances")
             .query(&[
@@ -2375,23 +3053,28 @@ async fn certspotter(
             }
         }
         commit_result_page(&mut names, page_names);
-        if page_index + 1 == 25 {
+        if page_index + 1 == 1_000 {
             bail!("Cert Spotter: limite de pagination atteinte avec une page supplémentaire");
         }
     }
     Ok(names)
 }
 
-async fn hackertarget(domain: &str, timeout: Duration) -> Result<BTreeSet<String>> {
-    let response = send_external(
-        "hackertarget",
-        client(timeout)?
-            .get("https://api.hackertarget.com/hostsearch/")
-            .query(&[("q", domain)]),
-        domain,
-    )
-    .await
-    .context("connexion à HackerTarget")?;
+async fn hackertarget(
+    domain: &str,
+    timeout: Duration,
+    keys: &ApiKeyStore,
+) -> Result<BTreeSet<String>> {
+    let client = client(timeout)?;
+    let mut request = client
+        .get("https://api.hackertarget.com/hostsearch/")
+        .query(&[("q", domain)]);
+    if let Some(token) = keys.optional("hackertarget") {
+        request = request.query(&[("apikey", token)]);
+    }
+    let response = send_external("hackertarget", request, domain)
+        .await
+        .context("connexion à HackerTarget")?;
     let response = response_text(response, "HackerTarget").await?;
     let lowered = response.to_ascii_lowercase();
     if lowered.starts_with("error") || lowered.contains("api count exceeded") {
@@ -2464,12 +3147,24 @@ fn commoncrawl_content_range_matches(value: &str, expected_start: u64, expected_
 }
 
 fn parse_commoncrawl_page(body: &str, domain: &str) -> Result<CommonCrawlPage> {
+    parse_commoncrawl_page_bounded(body, domain, COMMONCRAWL_MAX_RESULT_LINES)
+}
+
+fn parse_commoncrawl_page_bounded(
+    body: &str,
+    domain: &str,
+    max_result_lines: usize,
+) -> Result<CommonCrawlPage> {
     let mut page = CommonCrawlPage::default();
     let mut valid = 0_usize;
     let mut invalid = 0_usize;
-    for line in body.lines().take(COMMONCRAWL_MAX_RESULT_LINES) {
+    for line in body.lines() {
         if line.trim().is_empty() {
             continue;
+        }
+        if valid.saturating_add(invalid) >= max_result_lines {
+            page.truncated = true;
+            break;
         }
         match serde_json::from_str::<CommonCrawlRow>(line) {
             Ok(row) => {
@@ -2533,15 +3228,7 @@ async fn load_commoncrawl_endpoints(
     .await
     .context("connexion à Common Crawl")?;
     let collections = response_json::<Vec<CommonCrawlCollection>>(response, "Common Crawl").await?;
-    let endpoints = collections
-        .into_iter()
-        .filter_map(|collection| {
-            validate_commoncrawl_endpoint(&collection.cdx_api)
-                .ok()
-                .map(|url| url.to_string())
-        })
-        .take(COMMONCRAWL_INDEX_COUNT)
-        .collect::<Vec<_>>();
+    let endpoints = select_commoncrawl_endpoints(collections);
     let endpoint = endpoints
         .first()
         .context("aucune collection Common Crawl")?;
@@ -2675,24 +3362,43 @@ async fn commoncrawl(domain: &str, timeout: Duration) -> Result<BTreeSet<String>
     let mut warc_records = BTreeSet::new();
     let mut successful_requests = 0_usize;
     let mut errors = Vec::new();
-    for endpoint in endpoints {
-        for (page, page_size) in commoncrawl_page_plan() {
+    // Walk the selected yearly indexes breadth-first. This gives every year a
+    // useful first page before the source wall-clock budget is spent on deeper
+    // blocks from a single collection.
+    let mut endpoints = endpoints
+        .into_iter()
+        .map(|endpoint| (endpoint, true))
+        .collect::<Vec<_>>();
+    for page in 0..COMMONCRAWL_MAX_PAGES {
+        let mut queried = false;
+        for (endpoint, active) in &mut endpoints {
+            if !*active {
+                continue;
+            }
+            queried = true;
             let response = match query_commoncrawl(
-                &client, &endpoint, domain, policy, page, page_size,
+                &client,
+                endpoint,
+                domain,
+                policy,
+                page,
+                COMMONCRAWL_BLOCKS_PER_REQUEST,
             )
             .await
             {
                 Ok(response) => response,
                 Err(error) => {
                     errors.push(format!("{endpoint} page {page}: {error:#}"));
-                    break;
+                    *active = false;
+                    continue;
                 }
             };
             if matches!(
                 response.status(),
                 reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::GONE
             ) {
-                break;
+                *active = false;
+                continue;
             }
             match response_text_limited(response, "index Common Crawl", COMMONCRAWL_MAX_BODY_BYTES)
                 .await
@@ -2700,28 +3406,45 @@ async fn commoncrawl(domain: &str, timeout: Duration) -> Result<BTreeSet<String>
                 Ok(body) => {
                     if body.trim().is_empty() {
                         successful_requests += 1;
-                        break;
+                        *active = false;
+                        continue;
                     }
                     match parse_commoncrawl_page(&body, domain) {
-                        Ok(page) => {
+                        Ok(parsed_page) => {
                             successful_requests += 1;
-                            commit_result_page(&mut names, page.names);
+                            let truncated = parsed_page.truncated;
+                            commit_result_page(&mut names, parsed_page.names);
                             let remaining = COMMONCRAWL_WARC_SAMPLE_LIMIT
                                 .saturating_mul(4)
                                 .saturating_sub(warc_records.len());
-                            warc_records.extend(page.records.into_iter().take(remaining));
+                            warc_records.extend(parsed_page.records.into_iter().take(remaining));
+                            if truncated {
+                                errors.push(format!(
+                                    "{endpoint} page {page}: plus de {COMMONCRAWL_MAX_RESULT_LINES} lignes de résultats"
+                                ));
+                                *active = false;
+                            }
                         }
                         Err(error) => {
                             errors.push(format!("{endpoint} page {page}: {error:#}"));
-                            break;
+                            *active = false;
                         }
                     }
                 }
                 Err(error) => {
                     errors.push(format!("{endpoint} page {page}: {error:#}"));
-                    break;
+                    *active = false;
                 }
             }
+        }
+        if !queried || endpoints.iter().all(|(_, active)| !*active) {
+            break;
+        }
+        if page + 1 == COMMONCRAWL_MAX_PAGES {
+            errors.push(
+                "Common Crawl: limite de pagination atteinte avec des index encore actifs"
+                    .to_owned(),
+            );
         }
     }
     let mut sampled_urls = BTreeSet::new();
@@ -2744,21 +3467,51 @@ async fn commoncrawl(domain: &str, timeout: Duration) -> Result<BTreeSet<String>
     Ok(names)
 }
 
+#[cfg(test)]
 fn parse_wayback_rows(rows: Vec<Vec<String>>, domain: &str) -> BTreeSet<String> {
-    rows.into_iter()
-        .skip(1)
-        .filter_map(|row| row.into_iter().next())
-        .filter_map(|url| hostname_from_url(&url, domain))
-        .collect()
+    parse_wayback_page(rows, domain).names
 }
 
-async fn query_wayback(
+#[derive(Debug, Default)]
+struct WaybackPage {
+    names: BTreeSet<String>,
+    resume_key: Option<String>,
+}
+
+fn parse_wayback_page(rows: Vec<Vec<String>>, domain: &str) -> WaybackPage {
+    let mut page = WaybackPage::default();
+    let mut resume_follows = false;
+    for row in rows.into_iter().skip(1) {
+        if row.is_empty() {
+            resume_follows = true;
+            continue;
+        }
+        if resume_follows {
+            if let Some(encoded) = row.first() {
+                let parameter = format!("resume={encoded}");
+                page.resume_key = url::form_urlencoded::parse(parameter.as_bytes())
+                    .next()
+                    .map(|(_, value)| value.into_owned());
+            }
+            break;
+        }
+        if let Some(url) = row.first()
+            && let Some(host) = hostname_from_url(url, domain)
+        {
+            page.names.insert(host);
+        }
+    }
+    page
+}
+
+async fn query_wayback_page(
     client: &reqwest::Client,
     domain: &str,
     from: Option<&str>,
     to: Option<&str>,
+    resume_key: Option<&str>,
     limit: usize,
-) -> Result<BTreeSet<String>> {
+) -> Result<WaybackPage> {
     let mut query = vec![
         ("url", domain.to_owned()),
         ("matchType", "domain".to_owned()),
@@ -2767,6 +3520,7 @@ async fn query_wayback(
         ("collapse", "urlkey".to_owned()),
         ("filter", "statuscode:200".to_owned()),
         ("limit", limit.to_string()),
+        ("showResumeKey", "true".to_owned()),
         ("gzip", "false".to_owned()),
     ];
     if let Some(from) = from {
@@ -2774,6 +3528,9 @@ async fn query_wayback(
     }
     if let Some(to) = to {
         query.push(("to", to.to_owned()));
+    }
+    if let Some(resume_key) = resume_key {
+        query.push(("resumeKey", resume_key.to_owned()));
     }
     let response = send_with_retry_for_source(
         "wayback",
@@ -2787,11 +3544,38 @@ async fn query_wayback(
     .await
     .context("connexion à Wayback CDX")?;
     let rows = response_json::<Vec<Vec<String>>>(response, "Wayback CDX").await?;
-    Ok(parse_wayback_rows(rows, domain))
+    Ok(parse_wayback_page(rows, domain))
+}
+
+async fn query_wayback_window(
+    client: &reqwest::Client,
+    domain: &str,
+    from: Option<&str>,
+    to: Option<&str>,
+) -> Result<BTreeSet<String>> {
+    let mut names = BTreeSet::new();
+    let mut resume_key = None;
+    let mut seen = BTreeSet::new();
+    for page_index in 0..1_000 {
+        let page =
+            query_wayback_page(client, domain, from, to, resume_key.as_deref(), 10_000).await?;
+        commit_result_page(&mut names, page.names);
+        let Some(next) = page.resume_key else {
+            return Ok(names);
+        };
+        if next.len() > 4_096 || !seen.insert(next.clone()) {
+            bail!("Wayback CDX: clé de reprise invalide ou répétée");
+        }
+        if page_index + 1 == 1_000 {
+            bail!("Wayback CDX: limite de pagination atteinte avec une clé de reprise");
+        }
+        resume_key = Some(next);
+    }
+    Ok(names)
 }
 
 async fn wayback(domain: &str, timeout: Duration) -> Result<BTreeSet<String>> {
-    let primary = query_wayback(&client(timeout)?, domain, None, None, 2_000).await;
+    let primary = query_wayback_window(&client(timeout)?, domain, None, None).await;
     let primary_error = match primary {
         Ok(names) => return Ok(names),
         Err(error) => format!("{error:#}"),
@@ -2810,7 +3594,7 @@ async fn wayback(domain: &str, timeout: Duration) -> Result<BTreeSet<String>> {
         .map(|(from, to)| {
             let client = fallback_client.clone();
             let domain = domain_owned.clone();
-            async move { query_wayback(&client, &domain, from, to, 1_000).await }
+            async move { query_wayback_window(&client, &domain, from, to).await }
         })
         .buffer_unordered(4);
     let mut names = BTreeSet::new();
@@ -2846,7 +3630,7 @@ async fn urlscan(domain: &str, timeout: Duration, keys: &ApiKeyStore) -> Result<
     let token = keys.optional("urlscan");
     let mut names = BTreeSet::new();
     let mut search_after: Option<String> = None;
-    for page_index in 0..5 {
+    for page_index in 0..1_000 {
         let mut query = vec![
             (
                 "q",
@@ -2870,7 +3654,7 @@ async fn urlscan(domain: &str, timeout: Duration, keys: &ApiKeyStore) -> Result<
             },
             Err(error) => return Err(error).context("connexion à urlscan"),
         };
-        let page_len = response.results.len();
+        let has_more = response.has_more;
         let next = response.results.last().and_then(urlscan_search_after);
         let mut page_names = BTreeSet::new();
         for result in response.results {
@@ -2890,13 +3674,16 @@ async fn urlscan(domain: &str, timeout: Duration, keys: &ApiKeyStore) -> Result<
             }
         }
         commit_result_page(&mut names, page_names);
-        if page_len < 1_000 || next.is_none() {
-            break;
+        if !has_more {
+            return Ok(names);
+        }
+        if next.is_none() {
+            bail!("urlscan: has_more=true sans curseur search_after");
         }
         if next == search_after {
             bail!("urlscan: curseur de pagination répété");
         }
-        if page_index + 1 == 5 {
+        if page_index + 1 == 1_000 {
             bail!("urlscan: limite de pagination atteinte avec un curseur suivant");
         }
         search_after = next;
@@ -2962,7 +3749,7 @@ async fn virustotal(
     ));
     let mut visited = BTreeSet::new();
     let mut names = BTreeSet::new();
-    for _ in 0..5 {
+    for _ in 0..1_000 {
         let Some(url) = next.take() else {
             break;
         };
@@ -3017,7 +3804,7 @@ async fn whoisxml(domain: &str, timeout: Duration, keys: &ApiKeyStore) -> Result
     let key = keys.pick("whoisxml")?;
     let mut search_after = String::new();
     let mut names = BTreeSet::new();
-    for page_index in 0..100 {
+    for page_index in 0..1_000 {
         let mut query = vec![
             ("apiKey", key.clone()),
             ("domainName", domain.to_owned()),
@@ -3051,7 +3838,7 @@ async fn whoisxml(domain: &str, timeout: Duration, keys: &ApiKeyStore) -> Result
         if result.next_page_search_after == search_after {
             bail!("WhoisXML: curseur de pagination répété");
         }
-        if page_index + 1 == 100 {
+        if page_index + 1 == 1_000 {
             bail!("WhoisXML: limite de pagination atteinte avec un curseur suivant");
         }
         search_after = result.next_page_search_after;
@@ -3060,43 +3847,157 @@ async fn whoisxml(domain: &str, timeout: Duration, keys: &ApiKeyStore) -> Result
 }
 
 async fn netlas(domain: &str, timeout: Duration, keys: &ApiKeyStore) -> Result<BTreeSet<String>> {
-    let client = client(timeout)?;
+    let http = client(timeout)?;
     let key = keys.pick("netlas")?;
-    let mut names = BTreeSet::new();
-    for (page_index, start) in (0..10_000).step_by(20).take(50).enumerate() {
-        let response = send_external(
-            "netlas",
-            client
-                .get("https://app.netlas.io/api/domains/")
-                .bearer_auth(&key)
-                .query(&[
-                    ("q", format!("domain:*.{domain}")),
-                    ("fields", "domain".to_owned()),
-                    ("start", start.to_string()),
-                ]),
-            domain,
-        )
-        .await
-        .context("connexion à Netlas Domains Search")?;
-        let page = response_json::<NetlasResponse>(response, "Netlas").await?;
-        let page_len = page.items.len();
-        if page_len == 0 {
-            break;
-        }
-        let page_names = page
-            .items
-            .into_iter()
-            .filter_map(|item| normalize_observed_name(&item.data.domain, domain))
-            .collect();
-        commit_result_page(&mut names, page_names);
-        if page_len < 20 {
-            break;
-        }
-        if page_index + 1 == 50 {
-            bail!("Netlas: limite de pagination atteinte avec une page complète");
-        }
+    let query = format!("domain:*.{domain} AND NOT domain:{domain}");
+
+    let count_response = send_external(
+        "netlas",
+        http.get("https://app.netlas.io/api/domains_count/")
+            .query(&[("q", query.as_str())])
+            .header("X-API-Key", &key),
+        domain,
+    )
+    .await
+    .context("connexion au compteur de domaines Netlas")?;
+    let count = response_json::<NetlasCountResponse>(count_response, "Netlas count")
+        .await?
+        .count;
+    let requested = count.min(NETLAS_COMMUNITY_DOWNLOAD_CAP);
+    if requested == 0 {
+        return Ok(BTreeSet::new());
     }
+
+    let request = NetlasDownloadRequest {
+        q: &query,
+        fields: ["*"],
+        source_type: "include",
+        size: requested,
+    };
+    let mut response = send_external_streaming(
+        "netlas",
+        http.post("https://app.netlas.io/api/domains/download/")
+            .header("X-API-Key", &key)
+            .json(&request),
+        domain,
+    )
+    .await
+    .context("connexion au téléchargement de domaines Netlas")?;
+    if !response.status().is_success() {
+        let (status, body) =
+            response_bytes_limited_to(response, "Netlas download", 64 * 1024).await?;
+        bail!(
+            "Netlas download: HTTP {status}: {}",
+            compact_external_error(&String::from_utf8_lossy(&body))
+        );
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > NETLAS_DOWNLOAD_MAX_BYTES as u64)
+    {
+        bail!("Netlas: download response exceeds the size limit");
+    }
+
+    let mut names = BTreeSet::new();
+    let mut page_names = BTreeSet::new();
+    let mut records_since_checkpoint = 0_usize;
+    let mut decoder = NetlasArrayDecoder::new(requested, NETLAS_DOWNLOAD_MAX_ITEM_BYTES);
+    let mut total_bytes = 0_usize;
+    {
+        let mut visit = |item: NetlasItem| -> Result<()> {
+            records_since_checkpoint = records_since_checkpoint.saturating_add(1);
+            if let Some(name) = normalize_observed_name(&item.data.domain, domain) {
+                page_names.insert(name);
+            }
+            if records_since_checkpoint >= NETLAS_CHECKPOINT_RECORDS {
+                commit_result_page(&mut names, std::mem::take(&mut page_names));
+                records_since_checkpoint = 0;
+            }
+            Ok(())
+        };
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .context("lecture du téléchargement Netlas")?
+        {
+            total_bytes = total_bytes.saturating_add(chunk.len());
+            if total_bytes > NETLAS_DOWNLOAD_MAX_BYTES {
+                bail!("Netlas: download response exceeds the size limit");
+            }
+            decoder.push(&chunk, &mut visit)?;
+        }
+        decoder.finish()?;
+    }
+    commit_result_page(&mut names, page_names);
     Ok(names)
+}
+
+fn securitytrails_page_names(page: &SecurityTrailsResponse, domain: &str) -> BTreeSet<String> {
+    let records = page
+        .records
+        .iter()
+        .filter_map(|record| normalize_observed_name(&record.hostname, domain));
+    let labels = page.subdomains.iter().filter_map(|label| {
+        let label = label.trim();
+        if label.is_empty() {
+            return None;
+        }
+        let candidate = if label.ends_with('.') {
+            format!("{label}{domain}")
+        } else {
+            format!("{label}.{domain}")
+        };
+        normalize_observed_name(&candidate, domain)
+    });
+    records.chain(labels).collect()
+}
+
+fn securitytrails_scroll_url(scroll_id: &str) -> Result<Url> {
+    const MAX_SCROLL_ID_BYTES: usize = 4096;
+    if scroll_id.is_empty()
+        || scroll_id.len() > MAX_SCROLL_ID_BYTES
+        || scroll_id.chars().any(char::is_control)
+    {
+        bail!("SecurityTrails: invalid scroll identifier");
+    }
+    let origin = Url::parse("https://api.securitytrails.com/")?;
+    let mut next = origin.join("v1/scroll/")?;
+    next.path_segments_mut()
+        .map_err(|_| anyhow::anyhow!("SecurityTrails: invalid scroll endpoint"))?
+        .pop_if_empty()
+        .push(scroll_id);
+    let strict_scroll_path = next
+        .path()
+        .strip_prefix("/v1/scroll/")
+        .is_some_and(|encoded_id| !encoded_id.is_empty() && !encoded_id.contains('/'));
+    if !same_http_origin(&origin, &next)
+        || !strict_scroll_path
+        || !next.username().is_empty()
+        || next.password().is_some()
+        || next.query().is_some()
+        || next.fragment().is_some()
+    {
+        bail!("SecurityTrails: rejected cross-origin scroll endpoint");
+    }
+    Ok(next)
+}
+
+fn securitytrails_use_legacy_fallback(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::FORBIDDEN
+}
+
+fn securitytrails_next_scroll(
+    scroll_id: String,
+    seen_scroll_ids: &mut BTreeSet<String>,
+) -> Result<Option<String>> {
+    if scroll_id.is_empty() {
+        return Ok(None);
+    }
+    securitytrails_scroll_url(&scroll_id)?;
+    if !seen_scroll_ids.insert(scroll_id.clone()) {
+        bail!("SecurityTrails: repeated scroll identifier");
+    }
+    Ok(Some(scroll_id))
 }
 
 async fn securitytrails(
@@ -3105,23 +4006,62 @@ async fn securitytrails(
     keys: &ApiKeyStore,
 ) -> Result<BTreeSet<String>> {
     let token = keys.pick("securitytrails")?;
-    let response = send_external(
-        "securitytrails",
-        client(timeout)?
-            .get(format!(
-                "https://api.securitytrails.com/v1/domain/{domain}/subdomains"
-            ))
-            .header("APIKEY", token),
-        domain,
-    )
-    .await
-    .context("connexion à SecurityTrails")?;
-    let response = response_json::<SecurityTrailsResponse>(response, "SecurityTrails").await?;
-    Ok(response
-        .subdomains
-        .into_iter()
-        .filter_map(|label| normalize_observed_name(&format!("{label}.{domain}"), domain))
-        .collect())
+    let http = client(timeout)?;
+    let mut names = BTreeSet::new();
+    let mut scroll_id: Option<String> = None;
+    let mut seen_scroll_ids = BTreeSet::new();
+
+    for page_index in 0..SECURITYTRAILS_MAX_SCROLL_PAGES {
+        let request = if let Some(scroll_id) = scroll_id.as_deref() {
+            http.get(securitytrails_scroll_url(scroll_id)?)
+                .header("APIKEY", &token)
+        } else {
+            http.post(
+                "https://api.securitytrails.com/v1/domains/list?include_ips=false&scroll=true",
+            )
+            .header("APIKEY", &token)
+            .json(&serde_json::json!({
+                "query": format!("apex_domain='{domain}'")
+            }))
+        };
+        let response =
+            send_external_streaming("securitytrails", request, &format!("{domain}:{page_index}"))
+                .await
+                .context("connexion à SecurityTrails domains/list")?;
+
+        // The domains/list endpoint is not available on every subscription.
+        // SecurityTrails documents the legacy endpoint through an exact 403;
+        // no other status is treated as permission to change workflows.
+        let (response, used_legacy_fallback) =
+            if securitytrails_use_legacy_fallback(response.status()) {
+                let fallback = send_external_streaming(
+                    "securitytrails",
+                    http.get(format!(
+                        "https://api.securitytrails.com/v1/domain/{domain}/subdomains"
+                    ))
+                    .header("APIKEY", &token),
+                    domain,
+                )
+                .await
+                .context("connexion au repli SecurityTrails subdomains")?;
+                (fallback, true)
+            } else {
+                (response, false)
+            };
+
+        let page = response_json::<SecurityTrailsResponse>(response, "SecurityTrails").await?;
+        commit_result_page(&mut names, securitytrails_page_names(&page, domain));
+        if used_legacy_fallback {
+            return Ok(names);
+        }
+        let Some(next_scroll_id) =
+            securitytrails_next_scroll(page.meta.scroll_id, &mut seen_scroll_ids)?
+        else {
+            return Ok(names);
+        };
+        scroll_id = Some(next_scroll_id);
+    }
+    bail!("SecurityTrails: pagination exceeded {SECURITYTRAILS_MAX_SCROLL_PAGES} pages")
 }
 
 #[cfg(test)]
@@ -3164,6 +4104,29 @@ mod tests {
             assert!(!debug.contains("runtime-super-secret"));
             assert!(!debug.contains("shodan"));
         }
+    }
+
+    #[test]
+    fn canonical_names_share_legacy_provider_credentials() {
+        let legacy = key_store(&[("otx", &["otx-secret"]), ("whoisxml", &["whoisxml-secret"])]);
+        assert_eq!(legacy.values("alienvault"), vec!["otx-secret".to_owned()]);
+        assert_eq!(
+            legacy.values("whoisxmlapi"),
+            vec!["whoisxml-secret".to_owned()]
+        );
+
+        let canonical = key_store(&[
+            ("alienvault", &["alienvault-secret"]),
+            ("whoisxmlapi", &["whoisxmlapi-secret"]),
+        ]);
+        assert_eq!(
+            canonical.values("otx"),
+            vec!["alienvault-secret".to_owned()]
+        );
+        assert_eq!(
+            canonical.values("whoisxml"),
+            vec!["whoisxmlapi-secret".to_owned()]
+        );
     }
 
     #[test]
@@ -3269,30 +4232,166 @@ mod tests {
     }
 
     #[test]
-    fn netlas_contract_fixture_ignores_out_of_scope_names() {
-        let page: NetlasResponse =
-            serde_json::from_str(include_str!("../tests/fixtures/netlas-page.json")).unwrap();
-        let names = page
-            .items
-            .into_iter()
-            .filter_map(|item| normalize_observed_name(&item.data.domain, "example.com"))
-            .collect::<BTreeSet<_>>();
+    fn netlas_download_stream_handles_chunk_boundaries_and_scope() {
+        let fixture = include_bytes!("../tests/fixtures/netlas-page.json");
+        let mut decoder = NetlasArrayDecoder::new(2, 1024);
+        let mut names = BTreeSet::new();
+        {
+            let mut visit = |item: NetlasItem| -> Result<()> {
+                if let Some(name) = normalize_observed_name(&item.data.domain, "example.com") {
+                    names.insert(name);
+                }
+                Ok(())
+            };
+            for byte in fixture.chunks(1) {
+                decoder.push(byte, &mut visit).unwrap();
+            }
+        }
+        decoder.finish().unwrap();
         assert_eq!(names, BTreeSet::from(["edge.example.com".to_owned()]));
     }
 
     #[test]
-    fn deep_profile_only_enables_automatic_accessible_experimental_connectors() {
+    fn netlas_download_stream_rejects_truncation_trailing_data_and_excess_records() {
+        let mut noop = |_item: NetlasItem| Ok(());
+
+        let mut truncated = NetlasArrayDecoder::new(1, 1024);
+        truncated
+            .push(br#"[{"data":{"domain":"a.example.com"}}"#, &mut noop)
+            .unwrap();
+        assert!(truncated.finish().is_err());
+
+        let mut trailing = NetlasArrayDecoder::new(1, 1024);
+        assert!(trailing.push(b"[] false", &mut noop).is_err());
+
+        let mut excessive = NetlasArrayDecoder::new(1, 1024);
+        assert!(
+            excessive
+                .push(
+                    br#"[{"data":{"domain":"a.example.com"}},{"data":{"domain":"b.example.com"}}]"#,
+                    &mut noop,
+                )
+                .is_err()
+        );
+
+        let mut oversized = NetlasArrayDecoder::new(1, 8);
+        assert!(
+            oversized
+                .push(br#"[{"data":{"domain":"a.example.com"}}]"#, &mut noop)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn netlas_download_request_matches_current_api_contract_and_caps() {
+        let query = "domain:*.example.com AND NOT domain:example.com";
+        let request = NetlasDownloadRequest {
+            q: query,
+            fields: ["*"],
+            source_type: "include",
+            size: NETLAS_COMMUNITY_DOWNLOAD_CAP,
+        };
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            serde_json::json!({
+                "q": query,
+                "fields": ["*"],
+                "source_type": "include",
+                "size": 200
+            })
+        );
+        assert_eq!(NETLAS_DOWNLOAD_MAX_BYTES, 16 * 1024 * 1024);
+        assert_eq!(NETLAS_CHECKPOINT_RECORDS, 50);
+    }
+
+    #[test]
+    fn securitytrails_contract_supports_scroll_and_legacy_shapes() {
+        let list: SecurityTrailsResponse = serde_json::from_str(
+            r#"{
+                "meta":{"scroll_id":"opaque-next"},
+                "records":[
+                    {"hostname":"api.example.com"},
+                    {"hostname":"outside.example.net"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            securitytrails_page_names(&list, "example.com"),
+            BTreeSet::from(["api.example.com".to_owned()])
+        );
+
+        let legacy: SecurityTrailsResponse =
+            serde_json::from_str(r#"{"subdomains":["www","deep.api","mail."]}"#).unwrap();
+        assert_eq!(
+            securitytrails_page_names(&legacy, "example.com"),
+            BTreeSet::from([
+                "deep.api.example.com".to_owned(),
+                "mail.example.com".to_owned(),
+                "www.example.com".to_owned(),
+            ])
+        );
+    }
+
+    #[test]
+    fn securitytrails_scroll_is_same_origin_bounded_and_non_repeating() {
+        let url = securitytrails_scroll_url("//evil.test/a?key=value#fragment").unwrap();
+        assert_eq!(url.scheme(), "https");
+        assert_eq!(url.host_str(), Some("api.securitytrails.com"));
+        assert!(url.query().is_none());
+        assert!(url.fragment().is_none());
+
+        assert!(securitytrails_scroll_url("line\nbreak").is_err());
+        assert!(securitytrails_scroll_url(&"x".repeat(4097)).is_err());
+
+        let mut seen = BTreeSet::new();
+        assert_eq!(
+            securitytrails_next_scroll("cursor".to_owned(), &mut seen).unwrap(),
+            Some("cursor".to_owned())
+        );
+        assert!(securitytrails_next_scroll("cursor".to_owned(), &mut seen).is_err());
+        assert_eq!(
+            securitytrails_next_scroll(String::new(), &mut seen).unwrap(),
+            None
+        );
+        assert_eq!(SECURITYTRAILS_MAX_SCROLL_PAGES, 1000);
+    }
+
+    #[test]
+    fn securitytrails_falls_back_only_for_exact_forbidden_status() {
+        assert!(securitytrails_use_legacy_fallback(
+            reqwest::StatusCode::FORBIDDEN
+        ));
+        for status in [
+            reqwest::StatusCode::UNAUTHORIZED,
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+        ] {
+            assert!(!securitytrails_use_legacy_fallback(status));
+        }
+    }
+
+    #[test]
+    fn deep_profile_enables_every_accessible_unique_connector_but_not_duplicate_aliases() {
         let keys = ApiKeyStore::default();
         let balanced = automatic_sources_for_profile(&keys, false);
         let deep = automatic_sources_for_profile(&keys, true);
         assert!(!balanced.contains(&"anubisdb".to_owned()));
+        assert!(!balanced.contains(&"anubis".to_owned()));
         assert!(!balanced.contains(&"subdomainapp".to_owned()));
         assert!(!balanced.contains(&"driftnet".to_owned()));
         assert!(deep.contains(&"anubisdb".to_owned()));
+        assert!(deep.contains(&"anubis".to_owned()));
         assert!(deep.contains(&"subdomainapp".to_owned()));
+        assert!(deep.contains(&"subdomaincenter".to_owned()));
+        assert!(deep.contains(&"hudsonrock".to_owned()));
+        assert!(deep.contains(&"threatminer".to_owned()));
+        assert!(deep.contains(&"digitorus".to_owned()));
+        assert!(deep.contains(&"waybackarchive".to_owned()));
         assert!(!deep.contains(&"driftnet".to_owned()));
         assert!(!deep.contains(&"otx".to_owned()));
-        assert!(!deep.contains(&"subdomaincenter".to_owned()));
+        assert!(!deep.contains(&"wayback".to_owned()));
+        assert!(!deep.contains(&"whoisxml".to_owned()));
         assert!(!deep.contains(&"certificatedetails".to_owned()));
         assert!(!deep.contains(&"bevigil".to_owned()));
     }
@@ -3302,9 +4401,85 @@ mod tests {
         let keys = key_store(&[("driftnet", &["driftnet-key"]), ("otx", &["otx-key"])]);
         let deep = automatic_sources_for_profile(&keys, true);
         assert!(deep.contains(&"driftnet".to_owned()));
-        assert!(deep.contains(&"otx".to_owned()));
+        assert!(!deep.contains(&"otx".to_owned()));
+        assert!(deep.contains(&"alienvault".to_owned()));
         assert!(source_metadata("driftnet").documented);
-        assert_eq!(source_metadata("otx").authentication, "required");
+        assert_eq!(source_metadata("alienvault").authentication, "required");
+    }
+
+    #[test]
+    fn registry_contains_every_audited_provider_without_duplicates() {
+        let expected = BTreeSet::from([
+            "alienvault",
+            "anubis",
+            "bevigil",
+            "bufferover",
+            "builtwith",
+            "c99",
+            "censys",
+            "certspotter",
+            "chaos",
+            "chinaz",
+            "commoncrawl",
+            "crtsh",
+            "digitalyama",
+            "digitorus",
+            "dnsdb",
+            "dnsdumpster",
+            "dnsrepo",
+            "domainsproject",
+            "driftnet",
+            "fofa",
+            "fullhunt",
+            "github",
+            "gitlab",
+            "hackertarget",
+            "hudsonrock",
+            "intelx",
+            "leakix",
+            "merklemap",
+            "netlas",
+            "onyphe",
+            "profundis",
+            "pugrecon",
+            "quake",
+            "rapiddns",
+            "reconcloud",
+            "reconeer",
+            "redhuntlabs",
+            "riddler",
+            "robtex",
+            "rsecloud",
+            "securitytrails",
+            "shodan",
+            "shodanct",
+            "sitedossier",
+            "submd",
+            "thc",
+            "threatbook",
+            "threatcrowd",
+            "threatminer",
+            "urlscan",
+            "virustotal",
+            "waybackarchive",
+            "whoisxmlapi",
+            "windvane",
+            "zoomeyeapi",
+        ]);
+        let registered = SOURCE_DEFINITIONS
+            .iter()
+            .map(|source| source.name)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(registered.len(), SOURCE_DEFINITIONS.len());
+        let missing = expected
+            .difference(&registered)
+            .copied()
+            .collect::<Vec<_>>();
+        assert!(
+            missing.is_empty(),
+            "audited providers missing from the registry: {missing:?}"
+        );
+        assert_eq!(expected.len(), 55);
     }
 
     #[test]
@@ -3347,7 +4522,7 @@ mod tests {
             assert_eq!(status.metadata.cost, "medium");
             assert_eq!(status.metadata.authentication, "required");
             assert!(!status.metadata.experimental);
-            assert!(!status.metadata.recursive_children);
+            assert_eq!(status.metadata.recursive_children, source == "merklemap");
             assert_eq!(status.metadata.recursive_parents, recursive_parent);
             assert_eq!(source_policy(source).timeout, Duration::from_secs(10));
             assert_eq!(source_policy(source).total_timeout, Duration::from_secs(20));
@@ -3355,15 +4530,27 @@ mod tests {
     }
 
     #[test]
-    fn subtree_connectors_are_not_repeated_on_inferred_children() {
+    fn recursive_connector_metadata_matches_the_pinned_provider_capabilities() {
         for source in [
             "crtsh",
             "certspotter",
-            "commoncrawl",
-            "wayback",
             "merklemap",
-            "brave",
+            "alienvault",
+            "bufferover",
+            "digitorus",
+            "dnsdb",
+            "driftnet",
+            "hackertarget",
+            "leakix",
+            "reconcloud",
+            "securitytrails",
+            "shodanct",
+            "urlscan",
+            "virustotal",
         ] {
+            assert!(source_metadata(source).recursive_children, "{source}");
+        }
+        for source in ["commoncrawl", "waybackarchive", "brave", "submd", "thc"] {
             assert!(!source_metadata(source).recursive_children, "{source}");
         }
     }
@@ -3379,16 +4566,36 @@ mod tests {
     }
 
     #[test]
-    fn commoncrawl_coalesces_the_same_index_window_into_one_request() {
-        let plan = commoncrawl_page_plan();
-        assert_eq!(plan, [(0, 15)]);
-        assert_eq!(
-            plan.iter().map(|(_, blocks)| blocks).sum::<usize>(),
-            COMMONCRAWL_BLOCKS_PER_REQUEST
-        );
+    fn commoncrawl_uses_bounded_multi_page_index_windows() {
+        assert_eq!(COMMONCRAWL_BLOCKS_PER_REQUEST, 15);
+        assert_eq!(COMMONCRAWL_MAX_PAGES, 1_000);
         assert_eq!(COMMONCRAWL_MAX_RESULT_LINES, 3 * 50_000);
         assert_eq!(COMMONCRAWL_MAX_BODY_BYTES, 3 * MAX_EXTERNAL_BODY_BYTES);
         assert_eq!(COMMONCRAWL_INDEX_COUNT, 5);
+    }
+
+    #[test]
+    fn commoncrawl_selects_one_collection_per_year_before_recent_fallbacks() {
+        let collections = [
+            ("CC-MAIN-2026-30", "2026-a"),
+            ("CC-MAIN-2026-26", "2026-b"),
+            ("CC-MAIN-2025-51", "2025"),
+            ("CC-MAIN-2024-51", "2024"),
+            ("CC-MAIN-2023-50", "2023"),
+            ("CC-MAIN-2022-49", "2022"),
+        ]
+        .into_iter()
+        .map(|(id, suffix)| CommonCrawlCollection {
+            id: id.to_owned(),
+            cdx_api: format!("https://index.commoncrawl.org/{suffix}-index"),
+        })
+        .collect();
+        let endpoints = select_commoncrawl_endpoints(collections);
+        assert_eq!(endpoints.len(), 5);
+        assert!(endpoints[0].contains("2026-a"));
+        assert!(endpoints[1].contains("2025"));
+        assert!(endpoints[4].contains("2022"));
+        assert!(!endpoints.iter().any(|endpoint| endpoint.contains("2026-b")));
     }
 
     #[test]
@@ -3744,15 +4951,20 @@ mod tests {
 
     #[test]
     fn wayback_windows_keep_only_in_scope_hosts() {
-        let names = parse_wayback_rows(
-            vec![
-                vec!["original".to_owned()],
-                vec!["https://api.example.com/path".to_owned()],
-                vec!["https://evil.test/".to_owned()],
-            ],
-            "example.com",
-        );
+        let rows = vec![
+            vec!["original".to_owned()],
+            vec!["https://api.example.com/path".to_owned()],
+            vec!["https://evil.test/".to_owned()],
+            vec![],
+            vec!["com%2Cexample%29%2F+20260718000000%21".to_owned()],
+        ];
+        let page = parse_wayback_page(rows.clone(), "example.com");
+        let names = parse_wayback_rows(rows, "example.com");
         assert_eq!(names, BTreeSet::from(["api.example.com".to_owned()]));
+        assert_eq!(
+            page.resume_key.as_deref(),
+            Some("com,example)/ 20260718000000!")
+        );
     }
 
     #[test]
@@ -3770,6 +4982,24 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(error.contains("format NDJSON incohérent"));
+    }
+
+    #[test]
+    fn commoncrawl_marks_an_over_limit_page_instead_of_silently_truncating_it() {
+        let body = concat!(
+            r#"{"url":"https://one.example.com/"}"#,
+            "\n\n",
+            r#"{"url":"https://two.example.com/"}"#,
+            "\n",
+            r#"{"url":"https://three.example.com/"}"#,
+            "\n",
+        );
+        let page = parse_commoncrawl_page_bounded(body, "example.com", 2).unwrap();
+        assert!(page.truncated);
+        assert_eq!(
+            page.names,
+            BTreeSet::from(["one.example.com".to_owned(), "two.example.com".to_owned()])
+        );
     }
 
     #[test]

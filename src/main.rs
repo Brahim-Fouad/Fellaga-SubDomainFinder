@@ -941,10 +941,10 @@ struct ResolverBenchmarkArgs {
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum ImportFormat {
     Auto,
-    Subfinder,
-    Amass,
-    Bbot,
-    Massdns,
+    Json,
+    Jsonl,
+    Text,
+    DnsText,
 }
 
 #[derive(Debug, Args)]
@@ -1553,10 +1553,8 @@ fn collect_names_from_json(value: &serde_json::Value, names: &mut Vec<String>) {
 
 fn parse_import_names(content: &str, format: ImportFormat, domain: &str) -> BTreeSet<String> {
     let mut raw_names = Vec::new();
-    if matches!(
-        format,
-        ImportFormat::Amass | ImportFormat::Bbot | ImportFormat::Auto
-    ) && let Ok(value) = serde_json::from_str::<serde_json::Value>(content)
+    if matches!(format, ImportFormat::Json | ImportFormat::Auto)
+        && let Ok(value) = serde_json::from_str::<serde_json::Value>(content)
     {
         collect_names_from_json(&value, &mut raw_names);
     } else {
@@ -1565,7 +1563,7 @@ fn parse_import_names(content: &str, format: ImportFormat, domain: &str) -> BTre
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            if !matches!(format, ImportFormat::Massdns)
+            if matches!(format, ImportFormat::Jsonl | ImportFormat::Auto)
                 && let Ok(value) = serde_json::from_str::<serde_json::Value>(line)
             {
                 collect_names_from_json(&value, &mut raw_names);
@@ -2188,12 +2186,13 @@ async fn main() -> Result<()> {
                                 });
                             }
                             let started = std::time::Instant::now();
-                            match passive::fetch_detailed_bounded(
+                            match passive::fetch_detailed_bounded_with_limit(
                                 &source.name,
                                 &target,
                                 timeout,
                                 &api_keys,
                                 timeout,
+                                100_000,
                             )
                             .await
                             {
@@ -2204,6 +2203,8 @@ async fn main() -> Result<()> {
                                         result.partial_warning.as_deref()
                                     ),
                                     "names": result.names.len(),
+                                    "decoded_names": result.decoded_names,
+                                    "working_set_truncated": result.working_set_truncated,
                                     "duration_ms": started.elapsed().as_millis(),
                                     "warning": result.partial_warning,
                                     "metadata": source.metadata
@@ -2227,7 +2228,7 @@ async fn main() -> Result<()> {
                 while let Some(check) = pending_checks.next().await {
                     if !args.json {
                         println!(
-                            "{:<22} {:<20} {:>6} name(s) {:>7} ms{}",
+                            "{:<22} {:<20} {:>6} name(s) {:>7} ms{}{}",
                             check["name"].as_str().unwrap_or("?"),
                             check["status"].as_str().unwrap_or("?"),
                             check["names"].as_u64().unwrap_or_default(),
@@ -2236,7 +2237,12 @@ async fn main() -> Result<()> {
                                 .as_str()
                                 .or_else(|| check["warning"].as_str())
                                 .map(|error| format!(" — {}", compact_error(error, 120)))
-                                .unwrap_or_default()
+                                .unwrap_or_default(),
+                            if check["working_set_truncated"].as_bool() == Some(true) {
+                                " — diagnostic set capped at 100000 names"
+                            } else {
+                                ""
+                            }
                         );
                     }
                     checks.push(check);
@@ -2687,6 +2693,34 @@ mod tests {
             assert!(validate_no_target_contact(profile, true).is_err());
         }
         assert!(validate_no_target_contact(ScanProfile::Deep, false).is_ok());
+    }
+
+    #[test]
+    fn generic_import_formats_extract_only_in_scope_names() {
+        assert_eq!(
+            parse_import_names(
+                r#"{"results":[{"host":"api.example.com"},{"host":"evil.test"}]}"#,
+                ImportFormat::Json,
+                "example.com",
+            ),
+            BTreeSet::from(["api.example.com".to_owned()])
+        );
+        assert_eq!(
+            parse_import_names(
+                "{\"name\":\"www.example.com\"}\n{\"fqdn\":\"dev.example.com\"}\n",
+                ImportFormat::Jsonl,
+                "example.com",
+            ),
+            BTreeSet::from(["dev.example.com".to_owned(), "www.example.com".to_owned()])
+        );
+        assert_eq!(
+            parse_import_names(
+                "# ignored\nmail.example.com A 192.0.2.1\noutside.test\n",
+                ImportFormat::DnsText,
+                "example.com",
+            ),
+            BTreeSet::from(["mail.example.com".to_owned()])
+        );
     }
 
     #[test]

@@ -1,0 +1,19 @@
+{
+  "result": {
+    "hits": [
+      {
+        "certificate_v1": {
+          "resource": {
+            "names": [
+              "api.example.com",
+              "*.wild.example.com",
+              "outside.test"
+            ]
+          }
+        }
+      }
+    ],
+    "total_hits": 3,
+    "next_page_token": "cursor-2"
+  }
+}

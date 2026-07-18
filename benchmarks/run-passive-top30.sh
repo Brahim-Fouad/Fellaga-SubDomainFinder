@@ -220,7 +220,7 @@ standard_preflight() {
   case "$tool" in
     fellaga)
       command=("${tool_bins[$tool]}" scan --help)
-      required_patterns=(--profile --no-target-contact --show --passive-concurrency)
+      required_patterns=(--profile --no-target-contact --all-sources --show --passive-concurrency)
       ;;
     subfinder)
       command=("${tool_bins[$tool]}" -duc -h)
@@ -388,7 +388,7 @@ run_one() {
         "$timing" -- \
         "${isolated_env[@]}" "${tool_bins[fellaga]}" \
           --db "$OUT/state/$base.sqlite" \
-          scan --profile passive --no-target-contact \
+          scan --profile passive --no-target-contact --all-sources \
           --passive-concurrency "$FELLAGA_PASSIVE_CONCURRENCY" \
           --passive-zone-concurrency 1 --show "$domain" \
         > "$stdout" 2> "$stderr" || true

@@ -24,11 +24,14 @@ pub fn evidence_family(source: &str) -> Option<EvidenceFamily> {
         || source.starts_with("passive:ct-direct")
         || source.starts_with("passive:google-ct")
         || source.starts_with("passive:merklemap")
-        || source.starts_with("passive:driftnet")
+        || source.starts_with("passive:shodanct")
+        || source.starts_with("passive:digitorus")
+        || source.starts_with("passive:certificatedetails")
+        || source.starts_with("passive:censys")
     {
         return Some(EvidenceFamily::CertificateTransparency);
     }
-    if source.starts_with("passive:wayback") {
+    if source.starts_with("passive:wayback") || source.starts_with("passive:waybackarchive") {
         return Some(EvidenceFamily::WebArchive);
     }
     if source.starts_with("web:")
@@ -43,16 +46,27 @@ pub fn evidence_family(source: &str) -> Option<EvidenceFamily> {
     }
     if [
         "otx",
+        "alienvault",
+        "bufferover",
+        "c99",
         "circl",
         "securitytrails",
         "shodan",
         "virustotal",
-        "censys",
         "chaos",
+        "dnsdb",
+        "dnsdumpster",
+        "dnsrepo",
         "fullhunt",
         "bevigil",
         "leakix",
+        "onyphe",
+        "robtex",
+        "rsecloud",
+        "thc",
+        "threatbook",
         "whoisxml",
+        "whoisxmlapi",
         "netlas",
         "binaryedge",
     ]
@@ -220,11 +234,39 @@ mod tests {
         );
         assert_eq!(
             evidence_family("passive:driftnet"),
-            Some(EvidenceFamily::CertificateTransparency)
+            Some(EvidenceFamily::Aggregator)
         );
         assert_eq!(
             evidence_family("passive:brave"),
             Some(EvidenceFamily::WebCrawl)
+        );
+        assert_eq!(
+            evidence_family("passive:shodanct"),
+            Some(EvidenceFamily::CertificateTransparency)
+        );
+        assert_eq!(
+            evidence_family("passive:digitorus"),
+            Some(EvidenceFamily::CertificateTransparency)
+        );
+        assert_eq!(
+            evidence_family("passive:censys"),
+            Some(EvidenceFamily::CertificateTransparency)
+        );
+        assert_eq!(
+            evidence_family("passive:thc"),
+            Some(EvidenceFamily::PassiveDns)
+        );
+        assert_eq!(
+            evidence_family("passive:dnsdb"),
+            Some(EvidenceFamily::PassiveDns)
+        );
+        assert_eq!(
+            evidence_family("passive:submd"),
+            Some(EvidenceFamily::Aggregator)
+        );
+        assert_eq!(
+            evidence_family("passive:waybackarchive"),
+            Some(EvidenceFamily::WebArchive)
         );
     }
 

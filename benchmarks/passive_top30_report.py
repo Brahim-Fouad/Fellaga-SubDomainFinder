@@ -81,6 +81,7 @@ COMMAND_TEMPLATES: dict[str, list[str]] = {
         "--profile",
         "passive",
         "--no-target-contact",
+        "--all-sources",
         "--passive-concurrency",
         "{fellaga_passive_concurrency}",
         "--passive-zone-concurrency",
@@ -124,6 +125,14 @@ COMMAND_TEMPLATES: dict[str, list[str]] = {
         "-o",
         "{output_directory}",
     ],
+}
+
+SOURCE_SELECTION_POLICY = {
+    "fellaga_request": "all_registered_sources",
+    "subfinder_request": "all_registered_sources",
+    "selection_mode_symmetric": True,
+    "provider_catalog_comparable": False,
+    "runtime_availability_comparable": False,
 }
 
 BASE_QUALIFICATION_FAILURES = [
@@ -936,6 +945,7 @@ def prepare_campaign(
         "domains": [{"rank": rank, "domain": domain} for rank, domain in ranked],
         "tools": tool_status,
         "command_policy": COMMAND_TEMPLATES,
+        "source_selection_policy": SOURCE_SELECTION_POLICY,
         "contact_policy": {
             "target_contact": "prohibited",
             "direct_dns_resolution": False,
@@ -985,6 +995,8 @@ def _campaign_relative(campaign: pathlib.Path, path: pathlib.Path) -> str:
 def _validate_campaign_policy(manifest: dict[str, Any]) -> None:
     if manifest.get("command_policy") != COMMAND_TEMPLATES:
         raise ValueError("campaign command policy does not match the passive allowlist")
+    if manifest.get("source_selection_policy") != SOURCE_SELECTION_POLICY:
+        raise ValueError("campaign source-selection policy is not symmetric")
     contact = manifest.get("contact_policy")
     if not isinstance(contact, dict) or any(
         (

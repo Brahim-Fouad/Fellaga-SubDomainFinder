@@ -43,6 +43,14 @@ fellaga scan your-domain.example --profile passive --no-target-contact --show
 
 This mode queries only third-party passive-provider APIs. CT names remain available through provider connectors such as crt.sh and Cert Spotter, but the direct CT-log indexer is disabled because a public log endpoint can be hosted under the target's own domain. It issues no target DNS requests and performs no target HTTP, TLS, AXFR, wildcard probes, or other direct target connections. Every returned name is reported as `unverified` because live status and wildcard behavior were deliberately not tested. New names are stored as `unverified`; an existing `live` or `historical` inventory entry, its last verification time, and its DNS-record activity are not downgraded by a provider-only observation. The flag is rejected with any profile other than `passive`.
 
+Add `--all-sources` when the purpose is to request every registered name, including experimental providers and duplicate compatibility names:
+
+```bash
+fellaga scan your-domain.example --profile passive --no-target-contact --all-sources --show
+```
+
+This is broader than the default `deep` selection only because it also runs the four duplicate compatibility names. Missing required credentials are skipped before network contact, while public and optional-key providers may still report runtime authentication, anti-bot, schema, upstream, rate-limit, or timeout failures.
+
 ## Custom mutation rules
 
 Pass a mutation DSL file with `--mutations`. Blank lines and text after `#` are ignored. A rule is `score:name:pattern`; a line containing only a pattern receives a default score and an automatically generated rule name.
@@ -166,7 +174,11 @@ fellaga sources --json
 fellaga sources --check --target your-domain.example
 ```
 
-Use `--passive-sources` for an explicit comma-separated allowlist and `--exclude-sources` to remove providers. `--all-sources` includes every registered connector, but a connector whose required credential is absent is skipped during local preflight without making a network request. `sources --check` reports that condition as `skipped_missing_key`; scans retain any permanent cached observations from the connector and report it as unavailable for refresh.
+Use `--passive-sources` for an explicit comma-separated allowlist and `--exclude-sources` to remove providers. The registry currently exposes 65 connector names: 55 canonical provider integrations, six Fellaga-native connectors, and four compatibility names. This is implementation coverage, not a provider-availability claim.
+
+`--all-sources` includes every registered name, but a connector whose required credential is absent is skipped during local preflight without making a network request. `sources --check` reports that condition as `skipped_missing_key`; scans retain any permanent cached observations from the connector and report it as unavailable for refresh. Experimental sources can return explicit runtime failures, and compatibility names duplicate a canonical provider request. Use an explicit allowlist for minimum traffic and `--all-sources` for diagnostics or a symmetric all-source benchmark policy.
+
+Provider environment aliases, composite credential formats, and connector-specific pagination or stream ceilings are documented in [Passive sources and credentials](sources.md). Those page ceilings are hard safety bounds; each connector also obeys the shorter remaining passive-phase and per-source wall deadlines.
 
 Initial passive collection and AXFR checks run concurrently, while the direct CT-log monitor runs as an opportunistic background task. DNS validation can begin without waiting for unfinished raw CT indexing. The passive budget is charged only for elapsed passive phases, not for CT, AXFR, DNS validation, or other unrelated work. Each connector receives a deadline bounded by the remaining phase budget. If a paginated connector returns valid pages and then times out, Fellaga saves the names already collected, marks the source result as partial/degraded, and reports the condition in progress output and scan warnings.
 
@@ -188,7 +200,7 @@ The resolver test reports whether each candidate passes NXDOMAIN, DNSSEC, and an
 | `fellaga stats` | Show local cache and learning statistics. |
 | `fellaga knowledge` | Show high-yield words and patterns learned locally. |
 | `fellaga refresh <domain>` | Revalidate known names without erasing history. |
-| `fellaga import` | Import Subfinder, Amass, BBOT, or massdns data as unverified observations. |
+| `fellaga import` | Import JSON, JSONL, plain-text, or DNS-text data as unverified observations. |
 | `fellaga export` | Export retained inventory as JSONL or CSV. |
 | `fellaga cache prune` | Remove expired negative DNS cache entries and abandoned temporary candidate queues. |
 

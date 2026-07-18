@@ -107,6 +107,7 @@ class PassiveTop30PolicyTests(unittest.TestCase):
 
         for fragment in (
             "scan --profile passive --no-target-contact",
+            "--no-target-contact --all-sources",
             "--passive-zone-concurrency 1 --show",
             "-silent -duc -all -rl",
             "enum -passive -config /dev/null -d",
@@ -161,10 +162,12 @@ class PassiveTop30PolicyTests(unittest.TestCase):
         }
 
         self.assertIn("--no-target-contact", flattened["fellaga"])
+        self.assertIn("--all-sources", flattened["fellaga"])
         self.assertIn("--profile passive", flattened["fellaga"])
         self.assertNotIn("--active", flattened["subfinder"])
         self.assertNotIn("--resolvers", flattened["subfinder"])
         self.assertIn("-duc", flattened["subfinder"])
+        self.assertIn("-all", flattened["subfinder"])
         self.assertIn("enum -passive", flattened["amass"])
         self.assertIn("-config /dev/null", flattened["amass"])
         self.assertIn("dns.disable=true", flattened["bbot"])
@@ -187,7 +190,7 @@ class PassiveTop30PolicyTests(unittest.TestCase):
                     f"capture={shlex.quote(str(capture))}\n"
                     f"tool={shlex.quote(tool)}\n"
                     "if [[ \"$tool\" == fellaga && \"$*\" == \"scan --help\" ]]; then\n"
-                    "  echo --profile --no-target-contact --show --passive-concurrency\n"
+                    "  echo --profile --no-target-contact --all-sources --show --passive-concurrency\n"
                     "  exit 0\n"
                     "fi\n"
                     "if [[ \"$tool\" == subfinder && \"$*\" == \"-duc -h\" ]]; then\n"
@@ -270,6 +273,7 @@ class PassiveTop30PolicyTests(unittest.TestCase):
         self.assertFalse((output / "isolation").exists())
         self.assertFalse((output / "state").exists())
         self.assertIn("--no-target-contact", captured_arguments["fellaga"])
+        self.assertIn("--all-sources", captured_arguments["fellaga"])
         self.assertIn("--passive-concurrency 4", captured_arguments["fellaga"])
         self.assertIn("-duc -all -rl 5", captured_arguments["subfinder"])
         self.assertIn("-config /dev/null", captured_arguments["amass"])
@@ -352,6 +356,16 @@ class PassiveTop30ReportTests(unittest.TestCase):
         self.assertIn("skipped_tools", summary["qualification_failures"])
         self.assertNotIn("best_tool", report)
         self.assertEqual(manifest["credential_policy"]["mode"], "no-key")
+        self.assertEqual(
+            manifest["source_selection_policy"],
+            {
+                "fellaga_request": "all_registered_sources",
+                "subfinder_request": "all_registered_sources",
+                "selection_mode_symmetric": True,
+                "provider_catalog_comparable": False,
+                "runtime_availability_comparable": False,
+            },
+        )
         self.assertIs(manifest["credential_policy"]["isolated_per_run"], True)
         self.assertEqual(
             manifest["credential_policy"]["environment_mode"], "allowlist"
