@@ -4651,6 +4651,82 @@ impl Database {
             .collect()
     }
 
+    /// Return the supplied names that may still be materialized as current
+    /// scan results. Append-only DNS history is authoritative here: a retained
+    /// positive cache row cannot override a later decisive negative verdict.
+    pub fn current_output_names(&self, hosts: &[String]) -> Result<BTreeSet<String>> {
+        self.current_output_names_filtered(None, hosts)
+    }
+
+    /// Apply the current-result DNS rule plus the root-scoped wildcard
+    /// quarantine used for passive seed candidates.
+    pub fn current_seed_output_names(
+        &self,
+        root_domain: &str,
+        hosts: &[String],
+    ) -> Result<BTreeSet<String>> {
+        self.current_output_names_filtered(Some(root_domain), hosts)
+    }
+
+    fn current_output_names_filtered(
+        &self,
+        root_domain: Option<&str>,
+        hosts: &[String],
+    ) -> Result<BTreeSet<String>> {
+        const QUERY_BATCH_SIZE: usize = 400;
+
+        let connection = self.lock()?;
+        let mut current = BTreeSet::new();
+        for chunk in hosts.chunks(QUERY_BATCH_SIZE) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let candidate_values = std::iter::repeat_n("(?)", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let quarantine_clause = if root_domain.is_some() {
+                r#"AND NOT EXISTS (
+                       SELECT 1 FROM wildcard_quarantine quarantine
+                       WHERE quarantine.root_domain=?
+                         AND quarantine.fqdn=candidates.fqdn
+                   )"#
+            } else {
+                ""
+            };
+            let sql = format!(
+                r#"WITH candidates(fqdn) AS (VALUES {candidate_values})
+                   SELECT candidates.fqdn FROM candidates
+                   WHERE COALESCE((
+                       SELECT verification.outcome
+                       FROM dns_verifications AS verification
+                            INDEXED BY idx_dns_verifications_name
+                       WHERE verification.fqdn=candidates.fqdn
+                         AND verification.outcome IN ('live','negative')
+                       ORDER BY verification.checked_at DESC, verification.id DESC
+                       LIMIT 1
+                   ), '')<>'negative'
+                   {quarantine_clause}"#
+            );
+            let mut values = chunk
+                .iter()
+                .cloned()
+                .map(rusqlite::types::Value::from)
+                .collect::<Vec<_>>();
+            if let Some(root_domain) = root_domain {
+                values.push(root_domain.to_owned().into());
+            }
+            let mut statement = connection.prepare(&sql)?;
+            current.extend(
+                statement
+                    .query_map(rusqlite::params_from_iter(values), |row| {
+                        row.get::<_, String>(0)
+                    })?
+                    .collect::<rusqlite::Result<BTreeSet<_>>>()?,
+            );
+        }
+        Ok(current)
+    }
+
     pub fn live_scan_finding_names(&self, scan_id: i64) -> Result<BTreeSet<String>> {
         let connection = self.lock()?;
         let mut statement = connection.prepare(
@@ -9335,6 +9411,14 @@ impl Database {
         }
         if only_live {
             conditions.push("subdomains.verification_state='live'");
+            conditions.push(
+                "COALESCE((SELECT verification.outcome \
+                 FROM dns_verifications AS verification \
+                      INDEXED BY idx_dns_verifications_name \
+                 WHERE verification.fqdn=subdomains.fqdn \
+                   AND verification.outcome IN ('live','negative') \
+                 ORDER BY verification.checked_at DESC, verification.id DESC LIMIT 1), '')<>'negative'",
+            );
         }
         let where_clause = if conditions.is_empty() {
             String::new()
@@ -9390,11 +9474,50 @@ impl Database {
         after: Option<&str>,
         limit: usize,
     ) -> Result<Vec<InventoryEntry>> {
+        self.inventory_page_filtered(domain, only_live, after, limit, false)
+    }
+
+    /// Returns the inventory that is safe to merge into current scan results.
+    ///
+    /// A retained historical or unverified name whose latest decisive DNS
+    /// observation is negative stays available to `inventory`/`explain`, but
+    /// is not presented as a current discovery. A later live observation makes
+    /// the name visible again without deleting or rewriting history.
+    pub fn current_inventory_page(
+        &self,
+        domain: &str,
+        only_live: bool,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<InventoryEntry>> {
+        self.inventory_page_filtered(domain, only_live, after, limit, true)
+    }
+
+    fn inventory_page_filtered(
+        &self,
+        domain: &str,
+        only_live: bool,
+        after: Option<&str>,
+        limit: usize,
+        hide_current_negatives: bool,
+    ) -> Result<Vec<InventoryEntry>> {
         if limit == 0 {
             return Ok(Vec::new());
         }
         let live_clause = if only_live {
             " AND subdomains.verification_state='live'"
+        } else {
+            ""
+        };
+        let current_clause = if hide_current_negatives {
+            r#" AND COALESCE((
+                     SELECT verification.outcome
+                     FROM dns_verifications AS verification
+                          INDEXED BY idx_dns_verifications_name
+                     WHERE verification.fqdn=subdomains.fqdn
+                       AND verification.outcome IN ('live','negative')
+                     ORDER BY verification.checked_at DESC, verification.id DESC LIMIT 1
+                 ), '')<>'negative'"#
         } else {
             ""
         };
@@ -9408,6 +9531,7 @@ impl Database {
                      WHERE quarantine.root_domain=subdomains.root_domain
                        AND quarantine.fqdn=subdomains.fqdn
                  )
+                 {current_clause}
                  AND (?2 IS NULL OR subdomains.fqdn>?2){live_clause}
                ORDER BY subdomains.fqdn LIMIT ?3"#
         );
@@ -13496,6 +13620,235 @@ mod tests {
             vec!["cache-only.example.com"]
         );
         assert_eq!(db.positive_cache_only_count("example.com").unwrap(), 1);
+    }
+
+    #[test]
+    fn current_negative_inventory_is_hidden_but_preserved_and_can_return_live() {
+        let db = Database::in_memory().unwrap();
+        let fqdn = "retired.example.com".to_owned();
+        db.import_inventory(
+            "example.com",
+            &BTreeSet::from([fqdn.clone()]),
+            "passive:test",
+        )
+        .unwrap();
+        let scan_id = db.create_scan("example.com", &json!({})).unwrap();
+
+        db.record_discovery_negatives(scan_id, std::slice::from_ref(&fqdn))
+            .unwrap();
+
+        let retained = db.inventory(Some("example.com"), false).unwrap();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].fqdn, fqdn);
+        assert!(
+            db.current_inventory_page("example.com", false, None, 10)
+                .unwrap()
+                .is_empty()
+        );
+        let explanation = db.explain(&fqdn).unwrap();
+        assert_eq!(explanation["known"], true);
+        assert_eq!(explanation["inventory"]["state"], "unverified");
+        assert_eq!(
+            explanation["dns_verifications"]
+                .as_array()
+                .and_then(|entries| entries.first())
+                .and_then(|entry| entry["outcome"].as_str()),
+            Some("negative")
+        );
+
+        let answer = ResolvedHost {
+            fqdn: fqdn.clone(),
+            records: vec![DnsRecord {
+                record_type: "A".to_owned(),
+                value: "192.0.2.90".to_owned(),
+                ttl: 60,
+            }],
+            from_cache: false,
+            last_verified_at: Some(now_epoch()),
+            authoritative_validation: true,
+            resolver_count: 2,
+        };
+        db.update_cache_outcomes(Some(scan_id), std::slice::from_ref(&answer), &[], &[], 300)
+            .unwrap();
+        let sources = BTreeSet::from(["live_dns".to_owned()]);
+        db.persist_findings(
+            scan_id,
+            "example.com",
+            &[Finding {
+                fqdn: fqdn.clone(),
+                records: answer.records,
+                sources: sources.clone(),
+                wildcard: false,
+                from_cache: false,
+                confidence: crate::confidence::assess(&sources, false, true),
+                state: ObservationState::Live,
+                last_verified_at: answer.last_verified_at,
+                evidence_families: BTreeSet::from([crate::model::EvidenceFamily::LiveDns]),
+                authoritative_validation: true,
+                ..Finding::default()
+            }],
+            86_400,
+        )
+        .unwrap();
+
+        let inventory = db.inventory(Some("example.com"), false).unwrap();
+        assert_eq!(inventory.len(), 1);
+        assert_eq!(inventory[0].fqdn, fqdn);
+        assert_eq!(inventory[0].state, ObservationState::Live);
+    }
+
+    #[test]
+    fn later_negative_overrides_old_positive_cache_and_live_inventory_for_current_output() {
+        let db = Database::in_memory().unwrap();
+        let fqdn = "stale-live.example.com".to_owned();
+        let scan_id = db.create_scan("example.com", &json!({})).unwrap();
+        let answer = ResolvedHost {
+            fqdn: fqdn.clone(),
+            records: vec![DnsRecord {
+                record_type: "A".to_owned(),
+                value: "192.0.2.91".to_owned(),
+                ttl: 60,
+            }],
+            from_cache: false,
+            last_verified_at: Some(now_epoch()),
+            authoritative_validation: true,
+            resolver_count: 2,
+        };
+        let sources = BTreeSet::from(["live_dns".to_owned()]);
+        db.persist_findings(
+            scan_id,
+            "example.com",
+            &[Finding {
+                fqdn: fqdn.clone(),
+                records: answer.records.clone(),
+                sources: sources.clone(),
+                state: ObservationState::Live,
+                last_verified_at: answer.last_verified_at,
+                evidence_families: BTreeSet::from([crate::model::EvidenceFamily::LiveDns]),
+                authoritative_validation: true,
+                ..Finding::default()
+            }],
+            86_400,
+        )
+        .unwrap();
+        db.update_cache_outcomes(Some(scan_id), std::slice::from_ref(&answer), &[], &[], 300)
+            .unwrap();
+        db.record_discovery_negatives(scan_id, std::slice::from_ref(&fqdn))
+            .unwrap();
+
+        assert!(matches!(
+            db.fresh_cache(std::slice::from_ref(&fqdn))
+                .unwrap()
+                .get(&fqdn),
+            Some(CachedAnswer::Positive(_))
+        ));
+        assert_eq!(
+            db.inventory(Some("example.com"), false).unwrap()[0].state,
+            ObservationState::Live,
+            "the append-only audit preserves the prior materialized state"
+        );
+        assert!(db.inventory(Some("example.com"), true).unwrap().is_empty());
+        assert!(
+            db.current_output_names(std::slice::from_ref(&fqdn))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            db.current_inventory_page("example.com", false, None, 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            db.explain(&fqdn).unwrap()["dns_verifications"][0]["outcome"],
+            "negative"
+        );
+    }
+
+    #[test]
+    fn final_seed_filter_rejects_negative_and_quarantined_names_without_deleting_audit() {
+        let db = Database::in_memory().unwrap();
+        let scan_id = db.create_scan("example.com", &json!({})).unwrap();
+        let allowed = "allowed.example.com".to_owned();
+        let negative = "negative.example.com".to_owned();
+        let quarantined = "quarantined.example.com".to_owned();
+        let candidates = [
+            (
+                allowed.clone(),
+                BTreeSet::from(["passive:test".to_owned()]),
+                10,
+            ),
+            (
+                negative.clone(),
+                BTreeSet::from(["passive:test".to_owned()]),
+                10,
+            ),
+            (
+                quarantined.clone(),
+                BTreeSet::from(["passive:test".to_owned()]),
+                10,
+            ),
+        ];
+        db.persist_scan_seed_candidates(scan_id, &candidates, candidates.len())
+            .unwrap();
+        db.record_discovery_negatives(scan_id, std::slice::from_ref(&negative))
+            .unwrap();
+        db.import_inventory(
+            "example.com",
+            &BTreeSet::from([quarantined.clone()]),
+            "passive:test",
+        )
+        .unwrap();
+        let wildcard_answer = ResolvedHost {
+            fqdn: quarantined.clone(),
+            records: vec![DnsRecord {
+                record_type: "A".to_owned(),
+                value: "192.0.2.92".to_owned(),
+                ttl: 60,
+            }],
+            from_cache: false,
+            last_verified_at: Some(now_epoch()),
+            authoritative_validation: false,
+            resolver_count: 2,
+        };
+        db.record_current_wildcard_matches(scan_id, &[wildcard_answer])
+            .unwrap();
+        assert_eq!(
+            db.purge_confirmed_wildcard_false_positives(
+                scan_id,
+                "example.com",
+                std::slice::from_ref(&quarantined),
+            )
+            .unwrap(),
+            vec![quarantined.as_str()]
+        );
+
+        let all_seeds = db.scan_seed_candidates_for_output(scan_id).unwrap();
+        assert_eq!(all_seeds.len(), 3, "the durable audit queue is retained");
+        let current = db
+            .current_seed_output_names(
+                "example.com",
+                &all_seeds
+                    .iter()
+                    .map(|(fqdn, _)| fqdn.clone())
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        assert_eq!(current, BTreeSet::from([allowed]));
+        assert!(
+            db.inventory(Some("example.com"), false)
+                .unwrap()
+                .iter()
+                .all(|entry| entry.fqdn != quarantined),
+            "quarantined wildcard names stay out of every inventory listing"
+        );
+        assert!(db.inventory(Some("example.com"), true).unwrap().is_empty());
+        assert_eq!(
+            db.explain(&quarantined).unwrap()["quarantine"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]

@@ -1,10 +1,15 @@
+mod console;
+
 use anyhow::{Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use console::{ConsoleProgress, print_scan_findings, print_scan_summary, sanitize_terminal_text};
 use fellaga_core::benchmark::{CandidatePipelineOptions, run_candidate_pipeline};
 use fellaga_core::candidate::{default_mutation_rules, load_mutation_rules};
 use fellaga_core::db::Database;
 use fellaga_core::dns::DnsEngine;
-use fellaga_core::model::{AxfrStatus, Finding, ObservationState, ScanResult};
+#[cfg(test)]
+use fellaga_core::model::AxfrStatus;
+use fellaga_core::model::{Finding, ObservationState, ScanResult};
 use fellaga_core::network_governor::NetworkControl;
 use fellaga_core::passive::{
     ApiKeyStore, all_unique_sources, automatic_sources_for_profile, source_statuses,
@@ -158,20 +163,18 @@ enum MetadataDiscoveryArg {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StreamJsonlMode {
     Disabled,
-    Realtime,
     FinalOnly,
 }
 
-const fn stream_jsonl_mode(enabled: bool, only_live: bool) -> StreamJsonlMode {
-    match (enabled, only_live) {
-        (false, _) => StreamJsonlMode::Disabled,
-        (true, false) => StreamJsonlMode::Realtime,
-        (true, true) => StreamJsonlMode::FinalOnly,
+const fn stream_jsonl_mode(enabled: bool, _only_live: bool) -> StreamJsonlMode {
+    match enabled {
+        false => StreamJsonlMode::Disabled,
+        true => StreamJsonlMode::FinalOnly,
     }
 }
 
-const fn scan_progress_enabled(quiet: bool, _show: bool, stream_jsonl: bool) -> bool {
-    !quiet || stream_jsonl
+const fn scan_progress_enabled(quiet: bool, _show: bool, _stream_jsonl: bool) -> bool {
+    !quiet
 }
 
 const fn raw_output_diagnostic_event(event: &ProgressEvent) -> bool {
@@ -224,7 +227,9 @@ fn validate_source_check_concurrency(value: usize) -> Result<()> {
 
 fn source_check_error_status(message: &str) -> &'static str {
     let message = message.to_ascii_lowercase();
-    if message.contains("budget total de") && message.contains("dépassé") {
+    if (message.contains("budget total de") && message.contains("dépassé"))
+        || (message.contains("limite cumulative configurée") && message.contains("atteinte"))
+    {
         "deferred_budget"
     } else if [
         "http 500", "http 502", "http 503", "http 504", "http 520", "http 521", "http 522",
@@ -328,61 +333,61 @@ impl ScanProfile {
     const fn defaults(self) -> ProfileDefaults {
         match self {
             Self::Deep => ProfileDefaults {
-                max_runtime: 600,
+                max_runtime: 0,
                 max_words: 1_000_000,
-                active_max_runtime: 120,
+                active_max_runtime: 0,
                 max_passive: 25_000,
                 depth: 5,
                 recursive_words: 1_000,
                 recursive_hosts: 1_000,
                 pipeline_rounds: 10,
-                pipeline_budget: 100_000,
+                pipeline_budget: 0,
                 tls_hosts: 250,
                 graph_hosts: 1_000,
                 ptr_ips: 512,
                 internetdb_ips: 16,
-                internetdb_max_runtime: 20,
+                internetdb_max_runtime: 0,
                 nsec_max_names: 10_000,
-                nsec_max_runtime: 180,
+                nsec_max_runtime: 0,
                 ct_logs: 8,
                 ct_entries: 4_096,
                 ct_backfill: 4_096,
-                ct_max_runtime: 30,
+                ct_max_runtime: 0,
                 web_hosts: 100,
-                web_max_runtime: 90,
+                web_max_runtime: 0,
                 web_assets: 8,
-                passive_max_runtime: 45,
+                passive_max_runtime: 0,
                 passive_zone_concurrency: 4,
             },
             Self::Balanced => ProfileDefaults {
-                max_runtime: 300,
+                max_runtime: 0,
                 max_words: 5_000,
-                active_max_runtime: 45,
+                active_max_runtime: 0,
                 max_passive: 10_000,
                 depth: 3,
                 recursive_words: 100,
                 recursive_hosts: 50,
                 pipeline_rounds: 2,
-                pipeline_budget: 5_000,
+                pipeline_budget: 0,
                 tls_hosts: 100,
                 graph_hosts: 250,
                 ptr_ips: 64,
                 internetdb_ips: 8,
-                internetdb_max_runtime: 10,
+                internetdb_max_runtime: 0,
                 nsec_max_names: 10_000,
-                nsec_max_runtime: 90,
+                nsec_max_runtime: 0,
                 ct_logs: 2,
                 ct_entries: 256,
                 ct_backfill: 256,
-                ct_max_runtime: 10,
+                ct_max_runtime: 0,
                 web_hosts: 30,
-                web_max_runtime: 45,
+                web_max_runtime: 0,
                 web_assets: 5,
-                passive_max_runtime: 25,
+                passive_max_runtime: 0,
                 passive_zone_concurrency: 4,
             },
             Self::Passive => ProfileDefaults {
-                max_runtime: 180,
+                max_runtime: 0,
                 max_words: 0,
                 active_max_runtime: 0,
                 max_passive: 250_000,
@@ -390,49 +395,49 @@ impl ScanProfile {
                 recursive_words: 1,
                 recursive_hosts: 1,
                 pipeline_rounds: 1,
-                pipeline_budget: 250_000,
+                pipeline_budget: 0,
                 tls_hosts: 1,
                 graph_hosts: 1,
                 ptr_ips: 1,
                 internetdb_ips: 1,
-                internetdb_max_runtime: 1,
+                internetdb_max_runtime: 0,
                 nsec_max_names: 1,
-                nsec_max_runtime: 1,
+                nsec_max_runtime: 0,
                 ct_logs: 8,
                 ct_entries: 4_096,
                 ct_backfill: 4_096,
-                ct_max_runtime: 30,
+                ct_max_runtime: 0,
                 web_hosts: 1,
                 web_max_runtime: 0,
                 web_assets: 1,
-                passive_max_runtime: 60,
+                passive_max_runtime: 0,
                 passive_zone_concurrency: 6,
             },
             Self::Turbo => ProfileDefaults {
-                max_runtime: 300,
+                max_runtime: 0,
                 max_words: 1_000_000,
-                active_max_runtime: 60,
+                active_max_runtime: 0,
                 max_passive: 50_000,
                 depth: 3,
                 recursive_words: 1_000,
                 recursive_hosts: 1_000,
                 pipeline_rounds: 4,
-                pipeline_budget: 250_000,
+                pipeline_budget: 0,
                 tls_hosts: 100,
                 graph_hosts: 500,
                 ptr_ips: 128,
                 internetdb_ips: 4,
-                internetdb_max_runtime: 5,
+                internetdb_max_runtime: 0,
                 nsec_max_names: 10_000,
-                nsec_max_runtime: 60,
+                nsec_max_runtime: 0,
                 ct_logs: 2,
                 ct_entries: 512,
                 ct_backfill: 512,
-                ct_max_runtime: 5,
+                ct_max_runtime: 0,
                 web_hosts: 50,
-                web_max_runtime: 45,
+                web_max_runtime: 0,
                 web_assets: 5,
-                passive_max_runtime: 15,
+                passive_max_runtime: 0,
                 passive_zone_concurrency: 8,
             },
         }
@@ -469,7 +474,7 @@ struct ScanArgs {
     max_words: Option<usize>,
     #[arg(
         long,
-        help = "Cumulative runtime budget for adaptive generated candidates in seconds; 0 disables it"
+        help = "Optional cumulative deadline for generated candidates in seconds; 0 runs to convergence"
     )]
     active_max_runtime: Option<u64>,
     #[arg(long, help = "Disable passive-provider discovery")]
@@ -499,7 +504,7 @@ struct ScanArgs {
     passive_refresh_hours: u64,
     #[arg(
         long,
-        help = "Cumulative passive-source budget per target in seconds; 0 disables the safeguard"
+        help = "Optional cumulative passive-source deadline per target in seconds; 0 waits for completion"
     )]
     passive_max_runtime: Option<u64>,
     #[arg(
@@ -541,8 +546,18 @@ struct ScanArgs {
         help = "Maximum cached-validation age in hours for a finding to remain live"
     )]
     verification_max_age: u64,
-    #[arg(long, help = "Output only names whose final DNS state is live")]
+    #[arg(
+        long,
+        conflicts_with = "include_non_live",
+        help = "Compatibility option; final live non-wildcard findings are already the default"
+    )]
     only_live: bool,
+    #[arg(
+        long,
+        conflicts_with = "only_live",
+        help = "Include retained historical and unverified names in final output"
+    )]
+    include_non_live: bool,
     #[arg(
         long,
         default_value_t = 86_400,
@@ -578,8 +593,12 @@ struct ScanArgs {
     no_pipeline: bool,
     #[arg(long, help = "Maximum event-pipeline rounds")]
     pipeline_rounds: Option<usize>,
-    #[arg(long, help = "Global budget for new pipeline events")]
-    pipeline_budget: Option<usize>,
+    #[arg(
+        long = "pipeline-limit",
+        alias = "pipeline-budget",
+        help = "Optional maximum number of new pipeline events; 0 drains the finite event queue"
+    )]
+    pipeline_limit: Option<usize>,
     #[arg(
         long,
         help = "Disable hostname extraction from presented TLS certificates"
@@ -629,7 +648,7 @@ struct ScanArgs {
     internetdb_ips: Option<usize>,
     #[arg(
         long,
-        help = "Cumulative Shodan InternetDB phase budget in seconds (1-60)"
+        help = "Optional cumulative Shodan InternetDB deadline in seconds (0 waits for completion, maximum 60)"
     )]
     internetdb_max_runtime: Option<u64>,
     #[arg(
@@ -656,7 +675,7 @@ struct ScanArgs {
     nsec_max_names: Option<usize>,
     #[arg(
         long,
-        help = "Cumulative NSEC budget per target in seconds; 0 disables the safeguard"
+        help = "Optional cumulative NSEC deadline per target in seconds; 0 waits for completion"
     )]
     nsec_max_runtime: Option<u64>,
     #[arg(
@@ -668,7 +687,7 @@ struct ScanArgs {
     ct_timeout: f64,
     #[arg(
         long,
-        help = "Certificate Transparency phase budget per target in seconds; 0 disables the safeguard"
+        help = "Optional Certificate Transparency deadline per target in seconds; 0 waits for completion"
     )]
     ct_max_runtime: Option<u64>,
     #[arg(long, help = "Maximum CT logs inspected per scan")]
@@ -699,7 +718,7 @@ struct ScanArgs {
     web_timeout: f64,
     #[arg(
         long,
-        help = "Cumulative Web and JavaScript budget per target in seconds; 0 disables the safeguard"
+        help = "Optional cumulative Web and JavaScript deadline per target in seconds; 0 waits for completion"
     )]
     web_max_runtime: Option<u64>,
     #[arg(
@@ -727,7 +746,7 @@ struct ScanArgs {
     web_assets: Option<usize>,
     #[arg(
         long,
-        help = "Maximum runtime per domain in seconds; profile default, 0 deliberately disables the limit"
+        help = "Optional maximum runtime per domain in seconds; 0 lets the scan finish"
     )]
     max_runtime: Option<u64>,
     #[arg(
@@ -751,7 +770,7 @@ struct ScanArgs {
     jsonl: bool,
     #[arg(
         long,
-        help = "Stream each finding as JSONL; --only-live defers until final classification"
+        help = "Write finalized finding events as JSONL after each domain completes classification"
     )]
     stream_jsonl: bool,
     #[arg(
@@ -765,10 +784,19 @@ struct ScanArgs {
     #[arg(long, help = "Write one final result file per domain")]
     output_dir: Option<PathBuf>,
     #[arg(
+        short = 'v',
+        long,
+        action = clap::ArgAction::Count,
+        conflicts_with = "quiet",
+        help = "Show degraded source details; use -vv for every technical source status"
+    )]
+    verbose: u8,
+    #[arg(
         short,
         long,
         visible_alias = "silent",
-        help = "Suppress human progress and summary output"
+        conflicts_with = "verbose",
+        help = "Suppress all human findings, progress, and summary output"
     )]
     quiet: bool,
 }
@@ -779,11 +807,16 @@ struct ListArgs {
     domain: Option<String>,
     #[arg(
         long,
-        hide = true,
-        help = "Compatibility option; every state is already included"
+        visible_alias = "all-states",
+        conflicts_with = "only_live",
+        help = "Include retained historical and unverified inventory rows"
     )]
     all: bool,
-    #[arg(long, help = "Restrict inventory to live validations")]
+    #[arg(
+        long,
+        conflicts_with = "all",
+        help = "Compatibility option; live validations are already the default"
+    )]
     only_live: bool,
     #[arg(long, help = "Write pretty JSON")]
     json: bool,
@@ -809,8 +842,8 @@ struct RefreshArgs {
     negative_ttl: u32,
     #[arg(
         long,
-        default_value_t = 300,
-        help = "Global refresh limit in seconds; 0 disables the safeguard"
+        default_value_t = 0,
+        help = "Optional global refresh deadline in seconds; 0 waits for completion"
     )]
     max_runtime: u64,
     #[arg(
@@ -1015,13 +1048,8 @@ struct ExportArgs {
     output: Option<PathBuf>,
 }
 
-fn compact_error(error: &str, limit: usize) -> String {
-    let compact = error.split_whitespace().collect::<Vec<_>>().join(" ");
-    let mut shortened = compact.chars().take(limit).collect::<String>();
-    if compact.chars().count() > limit {
-        shortened.push('…');
-    }
-    shortened
+fn compact_error(error: &str) -> String {
+    sanitize_terminal_text(error)
 }
 
 fn wait_label(seconds: i64) -> String {
@@ -1143,342 +1171,41 @@ fn make_dns(args: &DnsArgs) -> Result<DnsEngine> {
     )
 }
 
-fn finding_line(finding: &Finding) -> String {
-    let records = finding
-        .records
-        .iter()
-        .map(|record| format!("{}={}", record.record_type, record.value))
-        .collect::<Vec<_>>()
-        .join(" ");
-    let sources = finding
-        .sources
-        .iter()
-        .cloned()
-        .collect::<Vec<_>>()
-        .join(",");
-    let cache = if finding.from_cache { " cache" } else { "" };
-    let wildcard = if finding.wildcard { " wildcard" } else { "" };
-    format!(
-        "[+] {:<45} {:<42} [{} {} | {}] ({sources}{cache}{wildcard})",
-        finding.fqdn, records, finding.confidence.label, finding.confidence.score, finding.state
-    )
-}
-
 fn stream_finding_line(finding: &Finding) -> String {
     serde_json::json!({"type": "finding", "finding": finding}).to_string()
 }
 
-struct ConsoleProgress {
-    interactive: bool,
+fn finding_selected_for_output(
+    finding: &Finding,
+    include_non_live: bool,
+    include_wildcard: bool,
+) -> bool {
+    if finding.wildcard {
+        include_wildcard
+    } else {
+        include_non_live || is_strict_live(finding.state, false)
+    }
+}
+
+fn scan_result_for_output(
+    result: &ScanResult,
+    include_non_live: bool,
+    include_wildcard: bool,
+) -> ScanResult {
+    let mut output = result.clone();
+    output
+        .findings
+        .retain(|finding| finding_selected_for_output(finding, include_non_live, include_wildcard));
+    output
+}
+
+fn write_scan(
+    path: &PathBuf,
+    result: &ScanResult,
     json_output: bool,
-    raw_output: bool,
-    line_active: bool,
-    last_log_bucket: Option<(String, usize)>,
-}
-
-impl ConsoleProgress {
-    fn new(json_output: bool, raw_output: bool) -> Self {
-        Self {
-            interactive: std::io::stderr().is_terminal(),
-            json_output,
-            raw_output,
-            line_active: false,
-            last_log_bucket: None,
-        }
-    }
-
-    fn clear_progress_line(&mut self) {
-        if self.interactive && self.line_active {
-            eprint!("\r\x1b[2K");
-            let _ = std::io::stderr().flush();
-        }
-        self.line_active = false;
-    }
-
-    fn write_streamed(&mut self, line: &str) {
-        self.clear_progress_line();
-        if self.json_output || self.raw_output {
-            eprintln!("{line}");
-        } else {
-            println!("{line}");
-            let _ = std::io::stdout().flush();
-        }
-    }
-
-    fn handle(&mut self, event: ProgressEvent) {
-        match event {
-            ProgressEvent::Started { scan_id, domain } => {
-                self.clear_progress_line();
-                eprintln!("[>] Scan #{scan_id} démarré pour {domain}");
-            }
-            ProgressEvent::Phase { name, detail } => {
-                self.clear_progress_line();
-                self.last_log_bucket = None;
-                eprintln!("[>] {name}: {detail}");
-            }
-            ProgressEvent::PassiveSource {
-                source,
-                status,
-                names,
-            } => {
-                self.clear_progress_line();
-                eprintln!("[P] {source}: {names} nom(s) ({status})");
-            }
-            ProgressEvent::AxfrAttempt(attempt) => {
-                let line = if attempt.status == AxfrStatus::Success {
-                    format!(
-                        "[AXFR] SUCCÈS {} ({}) : {} enregistrements, {} noms",
-                        attempt.nameserver,
-                        attempt.address,
-                        attempt.records.len(),
-                        attempt.names.len()
-                    )
-                } else {
-                    format!(
-                        "[AXFR] refus/échec {} ({}) : {}",
-                        attempt.nameserver,
-                        attempt.address,
-                        attempt.error.as_deref().unwrap_or("réponse vide")
-                    )
-                };
-                self.write_streamed(&line);
-            }
-            ProgressEvent::TlsCertificates {
-                endpoints,
-                network,
-                successes,
-                failures,
-                cache_hits,
-                names,
-                duration_ms,
-            } => {
-                self.clear_progress_line();
-                eprintln!(
-                    "[TLS] {endpoints} endpoint(s), {network} réseau, {successes} succès, {failures} échec(s), {cache_hits} cache, {names} nom(s), {:.1}s",
-                    duration_ms as f64 / 1_000.0
-                );
-            }
-            ProgressEvent::DnsGraph {
-                queries,
-                edges,
-                names,
-                child_zones,
-                services,
-                duration_ms,
-            } => {
-                self.clear_progress_line();
-                eprintln!(
-                    "[DNS+] {queries} requête(s), {edges} relation(s), {names} nom(s), {child_zones} zone(s) enfant, {services} service(s), {:.1}s",
-                    duration_ms as f64 / 1_000.0
-                );
-            }
-            ProgressEvent::WebDiscovery {
-                hosts,
-                requests,
-                cache_hits,
-                failures,
-                names,
-                duration_ms,
-            } => {
-                self.clear_progress_line();
-                eprintln!(
-                    "[WEB] {hosts} hôte(s), {requests} requête(s), {cache_hits} cache, {failures} échec(s), {names} nom(s), {:.1}s",
-                    duration_ms as f64 / 1_000.0
-                );
-            }
-            ProgressEvent::Dnssec {
-                zones,
-                walked,
-                protected,
-                queries,
-                names,
-            } => {
-                self.clear_progress_line();
-                eprintln!(
-                    "[NSEC] {zones} zone(s), {walked} parcourue(s), {protected} protégée(s), {queries} requête(s), {names} nom(s)"
-                );
-            }
-            ProgressEvent::CtMonitor {
-                logs,
-                entries,
-                failures,
-                names,
-                duration_ms,
-            } => {
-                self.clear_progress_line();
-                eprintln!(
-                    "[CT] {logs} journal(aux), {entries} entrée(s), {failures} échec(s), {names} nom(s) cumulé(s), {:.1}s",
-                    duration_ms as f64 / 1_000.0
-                );
-            }
-            ProgressEvent::DnsProgress {
-                phase,
-                processed,
-                total,
-                found,
-                cache_hits,
-                rate,
-                elapsed_ms,
-            } => {
-                let percent = processed
-                    .saturating_mul(100)
-                    .checked_div(total)
-                    .unwrap_or(100);
-                if !self.interactive {
-                    let bucket = percent / 10;
-                    let already_logged = self.last_log_bucket.as_ref().is_some_and(
-                        |(previous_phase, previous_bucket)| {
-                            previous_phase == &phase && *previous_bucket == bucket
-                        },
-                    );
-                    if already_logged && processed != total {
-                        return;
-                    }
-                    self.last_log_bucket = Some((phase.clone(), bucket));
-                }
-                let filled = percent.min(100) * 20 / 100;
-                let bar = format!("{}{}", "█".repeat(filled), "░".repeat(20 - filled));
-                let line = format!(
-                    "[~] {phase:<14} [{bar}] {percent:>3}% {processed}/{total} | +{found} | cache {cache_hits} | {rate:.0}/s | {:.1}s",
-                    elapsed_ms as f64 / 1_000.0
-                );
-                if self.interactive {
-                    eprint!("\r\x1b[2K{line}");
-                    let _ = std::io::stderr().flush();
-                    self.line_active = true;
-                } else {
-                    eprintln!("{line}");
-                }
-            }
-            ProgressEvent::Finding(finding) => self.write_streamed(&finding_line(&finding)),
-            ProgressEvent::Warning(warning) => {
-                self.clear_progress_line();
-                eprintln!("[!] {warning}");
-            }
-            ProgressEvent::Complete => self.clear_progress_line(),
-        }
-    }
-}
-
-fn print_scan_summary(result: &ScanResult) {
-    println!(
-        "\nScan #{} [{}]: {} trouvés / {} candidats, {} cache hits, {} ms",
-        result.scan_id,
-        result.status,
-        result.findings.len(),
-        result.candidates,
-        result.cache_hits,
-        result.duration_ms
-    );
-    if result.resumable {
-        println!("[PAUSE] Travail actif restant conservé; reprenez avec --resume latest.");
-    }
-    if !result.phase_timings.is_empty() {
-        let timings = result
-            .phase_timings
-            .iter()
-            .map(|timing| {
-                format!(
-                    "{} {:.1}s",
-                    timing.phase.replace('_', " "),
-                    timing.duration_ms as f64 / 1_000.0
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(" | ");
-        println!("[TIME] {timings}");
-    }
-    if result.wildcard_detected {
-        println!("[!] DNS wildcard détecté; faux positifs filtrés.");
-    }
-    if !result.tls_certificates.is_empty() {
-        let names = result
-            .tls_certificates
-            .iter()
-            .flat_map(|certificate| certificate.names.iter())
-            .collect::<BTreeSet<_>>()
-            .len();
-        println!(
-            "[TLS] {} certificat(s) observé(s), {} nom(s) SAN/CN en périmètre.",
-            result.tls_certificates.len(),
-            names
-        );
-    }
-    if !result.dns_edges.is_empty() {
-        println!(
-            "[DNS+] {} relation(s), {} zone(s) enfant, {} endpoint(s) de service.",
-            result.dns_edges.len(),
-            result.child_zones.len(),
-            result.service_endpoints.len()
-        );
-    }
-    if !result.web_observations.is_empty() {
-        let names = result
-            .web_observations
-            .iter()
-            .flat_map(|observation| observation.names.iter())
-            .collect::<BTreeSet<_>>()
-            .len();
-        println!(
-            "[WEB] {} ressource(s) observée(s), {} nom(s) en périmètre.",
-            result.web_observations.len(),
-            names
-        );
-    }
-    if !result.dnssec_walks.is_empty() {
-        let names = result
-            .dnssec_walks
-            .iter()
-            .flat_map(|walk| walk.names.iter())
-            .collect::<BTreeSet<_>>()
-            .len();
-        println!(
-            "[NSEC] {} zone(s) examinée(s), {} nom(s) conservé(s).",
-            result.dnssec_walks.len(),
-            names
-        );
-    }
-    if result.ct_monitor.logs_checked > 0 || !result.ct_monitor.names.is_empty() {
-        println!(
-            "[CT] {} entrée(s) analysée(s), {} nom(s) indexé(s) globalement, {} nom(s) cumulé(s).",
-            result.ct_monitor.entries_processed,
-            result.ct_monitor.globally_indexed_names,
-            result.ct_monitor.names.len()
-        );
-    }
-    if result.pipeline.rounds > 0 || result.pipeline.events_enqueued > 0 {
-        println!(
-            "[PIPE] {} tour(s), {} événement(s), {} doublon(s) évité(s), {} nom(s) validé(s).",
-            result.pipeline.rounds,
-            result.pipeline.events_enqueued,
-            result.pipeline.duplicates_suppressed,
-            result.pipeline.names_validated
-        );
-    }
-    if !result.resolver_metrics.is_empty() {
-        let requests = result
-            .resolver_metrics
-            .iter()
-            .map(|metric| metric.requests)
-            .sum::<u64>();
-        println!(
-            "[DNS] {} résolveur(s) profilé(s), {} requête(s) mesurée(s).",
-            result.resolver_metrics.len(),
-            requests
-        );
-    }
-    if let Some(reason) = result.scheduler_metrics.stop_reason {
-        println!(
-            "[SCHED] arrêt={}, {} découverte(s) exclusive(s), {} repli(s) réseau, rendement restant ≤ {:.3}/1000.",
-            reason.as_str(),
-            result.scheduler_metrics.exclusive_discoveries,
-            result.scheduler_metrics.backoffs,
-            result.scheduler_metrics.remaining_yield_upper_bound * 1_000.0,
-        );
-    }
-}
-
-fn write_scan(path: &PathBuf, result: &ScanResult, json_output: bool) -> Result<()> {
+    include_non_live: bool,
+    include_wildcard: bool,
+) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -1487,13 +1214,15 @@ fn write_scan(path: &PathBuf, result: &ScanResult, json_output: bool) -> Result<
             .extension()
             .is_some_and(|extension| extension == "json")
     {
-        std::fs::write(path, serde_json::to_string_pretty(result)? + "\n")?;
+        let output = scan_result_for_output(result, include_non_live, include_wildcard);
+        std::fs::write(path, serde_json::to_string_pretty(&output)? + "\n")?;
     } else {
-        let text = raw_name_list(result.findings.iter().map(|finding| finding.fqdn.as_str()));
-        std::fs::write(
-            path,
-            text + if result.findings.is_empty() { "" } else { "\n" },
-        )?;
+        let text = raw_name_list(result.findings.iter().filter_map(|finding| {
+            finding_selected_for_output(finding, include_non_live, include_wildcard)
+                .then_some(finding.fqdn.as_str())
+        }));
+        let newline = if text.is_empty() { "" } else { "\n" };
+        std::fs::write(path, text + newline)?;
     }
     Ok(())
 }
@@ -1503,9 +1232,17 @@ fn write_scan_results(
     results: &[ScanResult],
     json_output: bool,
     jsonl: bool,
+    include_non_live: bool,
+    include_wildcard: bool,
 ) -> Result<()> {
     if results.len() == 1 && !jsonl {
-        return write_scan(path, &results[0], json_output);
+        return write_scan(
+            path,
+            &results[0],
+            json_output,
+            include_non_live,
+            include_wildcard,
+        );
     }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -1513,7 +1250,13 @@ fn write_scan_results(
     let text = if jsonl {
         results
             .iter()
-            .map(serde_json::to_string)
+            .map(|result| {
+                serde_json::to_string(&scan_result_for_output(
+                    result,
+                    include_non_live,
+                    include_wildcard,
+                ))
+            })
             .collect::<serde_json::Result<Vec<_>>>()?
             .join("\n")
     } else if json_output
@@ -1521,9 +1264,13 @@ fn write_scan_results(
             .extension()
             .is_some_and(|extension| extension == "json")
     {
-        serde_json::to_string_pretty(results)?
+        let output = results
+            .iter()
+            .map(|result| scan_result_for_output(result, include_non_live, include_wildcard))
+            .collect::<Vec<_>>();
+        serde_json::to_string_pretty(&output)?
     } else {
-        raw_scan_list(results)
+        raw_scan_list(results, include_non_live, include_wildcard)
     };
     let newline = if text.is_empty() { "" } else { "\n" };
     std::fs::write(path, text + newline)?;
@@ -1539,16 +1286,24 @@ fn raw_name_list<'a>(names: impl IntoIterator<Item = &'a str>) -> String {
         .join("\n")
 }
 
-fn raw_scan_list(results: &[ScanResult]) -> String {
+fn raw_scan_list(results: &[ScanResult], include_non_live: bool, include_wildcard: bool) -> String {
     raw_name_list(
         results
             .iter()
-            .flat_map(|result| result.findings.iter().map(|finding| finding.fqdn.as_str())),
+            .flat_map(|result| result.findings.iter())
+            .filter_map(|finding| {
+                finding_selected_for_output(finding, include_non_live, include_wildcard)
+                    .then_some(finding.fqdn.as_str())
+            }),
     )
 }
 
-fn write_raw_scan_list(results: &[ScanResult]) -> Result<()> {
-    let text = raw_scan_list(results);
+fn write_raw_scan_list(
+    results: &[ScanResult],
+    include_non_live: bool,
+    include_wildcard: bool,
+) -> Result<()> {
+    let text = raw_scan_list(results, include_non_live, include_wildcard);
     if text.is_empty() {
         return Ok(());
     }
@@ -1698,7 +1453,7 @@ async fn main() -> Result<()> {
             let recursive_words = args.recursive_words.unwrap_or(defaults.recursive_words);
             let recursive_hosts = args.recursive_hosts.unwrap_or(defaults.recursive_hosts);
             let pipeline_rounds = args.pipeline_rounds.unwrap_or(defaults.pipeline_rounds);
-            let pipeline_budget = args.pipeline_budget.unwrap_or(defaults.pipeline_budget);
+            let pipeline_limit = args.pipeline_limit.unwrap_or(defaults.pipeline_budget);
             let tls_hosts = args.tls_hosts.unwrap_or(defaults.tls_hosts);
             let graph_hosts = args.graph_hosts.unwrap_or(defaults.graph_hosts);
             let ptr_ips = args.ptr_ips.unwrap_or(defaults.ptr_ips);
@@ -1768,8 +1523,8 @@ async fn main() -> Result<()> {
                     "--recursive-words × --recursive-hosts ne peut pas dépasser 1000000 par niveau"
                 );
             }
-            if pipeline_budget > 1_000_000 {
-                bail!("--pipeline-budget ne peut pas dépasser 1000000");
+            if pipeline_limit > 1_000_000 {
+                bail!("--pipeline-limit ne peut pas dépasser 1000000");
             }
             validate_scan_concurrency(
                 args.domain_concurrency,
@@ -1791,8 +1546,8 @@ async fn main() -> Result<()> {
             if graph_hosts == 0 {
                 bail!("--graph-hosts doit être supérieur à zéro");
             }
-            if pipeline_rounds == 0 || pipeline_budget == 0 {
-                bail!("--pipeline-rounds et --pipeline-budget doivent être supérieurs à zéro");
+            if pipeline_rounds == 0 {
+                bail!("--pipeline-rounds doit être supérieur à zéro");
             }
             if ptr_ips == 0 {
                 bail!("--ptr-ips doit être supérieur à zéro");
@@ -1800,8 +1555,8 @@ async fn main() -> Result<()> {
             if !(1..=64).contains(&internetdb_ips) {
                 bail!("--internetdb-ips doit être compris entre 1 et 64");
             }
-            if !(1..=60).contains(&internetdb_max_runtime) {
-                bail!("--internetdb-max-runtime doit être compris entre 1 et 60");
+            if internetdb_max_runtime > 60 {
+                bail!("--internetdb-max-runtime doit être compris entre 0 et 60");
             }
             if args.internetdb_refresh_hours == 0 {
                 bail!("--internetdb-refresh-hours doit être supérieur à zéro");
@@ -1941,7 +1696,7 @@ async fn main() -> Result<()> {
                 adaptive: !args.no_adaptive,
                 pipeline: !args.no_pipeline && !profile_passive,
                 pipeline_rounds,
-                pipeline_budget,
+                pipeline_budget: pipeline_limit,
                 tls_certificates: !args.no_tls && !profile_passive,
                 tls_port: args.tls_port,
                 tls_timeout: positive_duration_seconds(args.tls_timeout, "--tls-timeout")?,
@@ -2002,30 +1757,17 @@ async fn main() -> Result<()> {
             };
             let stream_mode = stream_jsonl_mode(args.stream_jsonl, args.only_live);
             let progress_enabled = scan_progress_enabled(args.quiet, args.show, args.stream_jsonl);
-            let callback: Option<scanner::ProgressCallback> = if progress_enabled {
-                let printer = Arc::new(Mutex::new(ConsoleProgress::new(
+            let multiple_targets = targets.len() > 1;
+            let printer = (!args.quiet).then(|| {
+                Arc::new(Mutex::new(ConsoleProgress::new(
                     args.json || args.jsonl || args.stream_jsonl,
                     args.show,
-                )));
-                let quiet = args.quiet;
-                let show = args.show;
-                Some(Arc::new(move |event| {
-                    if stream_mode == StreamJsonlMode::Realtime
-                        && let ProgressEvent::Finding(finding) = &event
-                    {
-                        println!("{}", stream_finding_line(finding));
-                        let _ = std::io::stdout().flush();
-                    }
-                    if !quiet
-                        && (!show || raw_output_diagnostic_event(&event))
-                        && let Ok(mut printer) = printer.lock()
-                    {
-                        printer.handle(event);
-                    }
-                }))
-            } else {
-                None
-            };
+                    multiple_targets,
+                    args.verbose,
+                )))
+            });
+            let quiet = args.quiet;
+            let show = args.show;
             let max_runtime = (max_runtime_seconds > 0)
                 .then(|| bounded_duration_seconds(max_runtime_seconds, "--max-runtime"))
                 .transpose()?;
@@ -2035,7 +1777,20 @@ async fn main() -> Result<()> {
                     let database = database.clone();
                     let dns = dns.clone();
                     let options = options.clone();
-                    let callback = callback.clone();
+                    let callback: Option<scanner::ProgressCallback> = progress_enabled.then(|| {
+                        let printer = printer.clone();
+                        let target_context = target.clone();
+                        Arc::new(move |event| {
+                            if !quiet
+                                && (!show || raw_output_diagnostic_event(&event))
+                                && let Some(printer) = &printer
+                                && let Ok(mut printer) = printer.lock()
+                            {
+                                printer.handle(&target_context, event);
+                            }
+                        }) as scanner::ProgressCallback
+                    });
+                    let target_printer = printer.clone();
                     let trusted_dns = trusted_dns.clone();
                     async move {
                         let mut scanner = Scanner::new(database, dns, options);
@@ -2045,7 +1800,7 @@ async fn main() -> Result<()> {
                         if let Some(callback) = callback {
                             scanner = scanner.with_progress(callback);
                         }
-                        if let Some(limit) = max_runtime {
+                        let result = if let Some(limit) = max_runtime {
                             tokio::time::timeout(limit, scanner.scan(&target))
                                 .await
                                 .map_err(|_| {
@@ -2055,7 +1810,13 @@ async fn main() -> Result<()> {
                                 })?
                         } else {
                             scanner.scan(&target).await
+                        };
+                        if let Some(printer) = &target_printer
+                            && let Ok(mut printer) = printer.lock()
+                        {
+                            printer.finish_target(&target);
                         }
+                        result
                     }
                 })
                 .buffer_unordered(domain_concurrency);
@@ -2065,6 +1826,11 @@ async fn main() -> Result<()> {
             loop {
                 let next = tokio::select! {
                     signal = &mut interrupted => {
+                        if let Some(printer) = &printer
+                            && let Ok(mut printer) = printer.lock()
+                        {
+                            printer.finish();
+                        }
                         match signal {
                             Ok(()) => bail!(
                                 "scan interrompu par l'utilisateur; checkpoint conservé pour --resume latest"
@@ -2080,11 +1846,13 @@ async fn main() -> Result<()> {
                 match result {
                     Ok(result) => {
                         if stream_mode == StreamJsonlMode::FinalOnly {
-                            for finding in result
-                                .findings
-                                .iter()
-                                .filter(|finding| is_strict_live(finding.state, finding.wildcard))
-                            {
+                            for finding in result.findings.iter().filter(|finding| {
+                                finding_selected_for_output(
+                                    finding,
+                                    args.include_non_live,
+                                    args.include_wildcard,
+                                )
+                            }) {
                                 println!("{}", stream_finding_line(finding));
                             }
                             std::io::stdout().flush()?;
@@ -2098,30 +1866,62 @@ async fn main() -> Result<()> {
                     }
                 }
             }
+            if let Some(printer) = &printer
+                && let Ok(mut printer) = printer.lock()
+            {
+                printer.finish();
+            }
             results.sort_by(|left, right| left.domain.cmp(&right.domain));
             if args.stream_jsonl {
-                // Realtime events were emitted by the callback. With --only-live,
-                // final findings were emitted after each domain completed wildcard
-                // classification and final state filtering.
+                // Findings were emitted only after final DNS, wildcard and state
+                // classification for each completed domain.
             } else if args.jsonl {
                 for result in &results {
-                    println!("{}", serde_json::to_string(result)?);
+                    let output = scan_result_for_output(
+                        result,
+                        args.include_non_live,
+                        args.include_wildcard,
+                    );
+                    println!("{}", serde_json::to_string(&output)?);
                 }
             } else if args.json {
                 if results.len() == 1 {
-                    println!("{}", serde_json::to_string_pretty(&results[0])?);
+                    let output = scan_result_for_output(
+                        &results[0],
+                        args.include_non_live,
+                        args.include_wildcard,
+                    );
+                    println!("{}", serde_json::to_string_pretty(&output)?);
                 } else {
-                    println!("{}", serde_json::to_string_pretty(&results)?);
+                    let output = results
+                        .iter()
+                        .map(|result| {
+                            scan_result_for_output(
+                                result,
+                                args.include_non_live,
+                                args.include_wildcard,
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    println!("{}", serde_json::to_string_pretty(&output)?);
                 }
             } else if args.show {
-                write_raw_scan_list(&results)?;
+                write_raw_scan_list(&results, args.include_non_live, args.include_wildcard)?;
             } else if !args.quiet {
                 for result in &results {
-                    print_scan_summary(result);
+                    print_scan_findings(result, args.include_non_live, args.include_wildcard);
+                    print_scan_summary(result, args.verbose);
                 }
             }
             if let Some(path) = &args.output {
-                write_scan_results(path, &results, args.json, args.jsonl)?;
+                write_scan_results(
+                    path,
+                    &results,
+                    args.json,
+                    args.jsonl,
+                    args.include_non_live,
+                    args.include_wildcard,
+                )?;
             }
             if let Some(directory) = &args.output_dir {
                 std::fs::create_dir_all(directory)?;
@@ -2134,7 +1934,14 @@ async fn main() -> Result<()> {
                         "txt"
                     };
                     let path = directory.join(format!("{}.{}", result.domain, extension));
-                    write_scan_results(&path, std::slice::from_ref(result), args.json, args.jsonl)?;
+                    write_scan_results(
+                        &path,
+                        std::slice::from_ref(result),
+                        args.json,
+                        args.jsonl,
+                        args.include_non_live,
+                        args.include_wildcard,
+                    )?;
                 }
             }
             if let Some(error) = first_error {
@@ -2148,8 +1955,8 @@ async fn main() -> Result<()> {
                 .as_deref()
                 .map(util::normalize_domain)
                 .transpose()?;
-            let _ = args.all;
-            let hosts = database.inventory(normalized.as_deref(), args.only_live)?;
+            let only_live = !args.all || args.only_live;
+            let hosts = database.inventory(normalized.as_deref(), only_live)?;
             if args.json {
                 println!("{}", serde_json::to_string_pretty(&hosts)?);
             } else {
@@ -2194,9 +2001,14 @@ async fn main() -> Result<()> {
                 }) as RefreshProgressCallback
             });
             if !args.quiet {
+                let deadline = if args.max_runtime == 0 {
+                    "no cumulative deadline".to_owned()
+                } else {
+                    format!("{}s cumulative deadline", args.max_runtime)
+                };
                 eprintln!(
-                    "[refresh] starting {} with {}s limit and {}-name batches",
-                    args.target, args.max_runtime, args.batch_size
+                    "[refresh] starting {} with {deadline} and {}-name batches",
+                    args.target, args.batch_size
                 );
             }
             let refresh = refresh_inventory_bounded(
@@ -2208,7 +2020,7 @@ async fn main() -> Result<()> {
                 args.negative_ttl,
                 RefreshOptions {
                     max_runtime: bounded_duration_seconds(args.max_runtime, "--max-runtime")?,
-                    wildcard_phase_timeout: Duration::from_secs(30),
+                    wildcard_phase_timeout: Duration::ZERO,
                     batch_size: args.batch_size,
                 },
                 progress,
@@ -2358,7 +2170,7 @@ async fn main() -> Result<()> {
                             check["error"]
                                 .as_str()
                                 .or_else(|| check["warning"].as_str())
-                                .map(|error| format!(" — {}", compact_error(error, 120)))
+                                .map(|error| format!(" — {}", compact_error(error)))
                                 .unwrap_or_default(),
                             if check["working_set_truncated"].as_bool() == Some(true) {
                                 " — diagnostic set capped at 100000 names"
@@ -2467,7 +2279,7 @@ async fn main() -> Result<()> {
                         source.name, source.metadata.evidence_family, state, key, metrics
                     );
                     if let Some(error) = diagnostic.and_then(|value| value.last_error.as_deref()) {
-                        println!("  last error: {}", compact_error(error, 140));
+                        println!("  last error: {}", compact_error(error));
                     }
                 }
             }
@@ -2579,7 +2391,7 @@ async fn main() -> Result<()> {
                             result.average_ms,
                             result
                                 .error
-                                .map(|error| format!(" — {}", compact_error(&error, 100)))
+                                .map(|error| format!(" — {}", compact_error(&error)))
                                 .unwrap_or_default()
                         );
                     }
@@ -2686,6 +2498,7 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
 
     #[test]
     fn floating_point_timeouts_are_converted_without_panicking() {
@@ -2720,11 +2533,47 @@ mod tests {
     }
 
     #[test]
-    fn stream_jsonl_mode_defers_only_live_findings_until_final_classification() {
+    fn stream_jsonl_always_waits_for_final_classification() {
         assert_eq!(stream_jsonl_mode(false, false), StreamJsonlMode::Disabled);
         assert_eq!(stream_jsonl_mode(false, true), StreamJsonlMode::Disabled);
-        assert_eq!(stream_jsonl_mode(true, false), StreamJsonlMode::Realtime);
+        assert_eq!(stream_jsonl_mode(true, false), StreamJsonlMode::FinalOnly);
         assert_eq!(stream_jsonl_mode(true, true), StreamJsonlMode::FinalOnly);
+    }
+
+    #[test]
+    fn permanent_cli_errors_are_sanitized_without_truncation() {
+        let payload = "x".repeat(512);
+        let rendered = compact_error(&format!("provider failure: {payload}\x1b[31m\u{202e}spoof"));
+        assert!(rendered.contains(&payload));
+        assert!(!rendered.contains('…'));
+        assert!(!rendered.contains('\x1b'));
+        assert!(!rendered.contains('\u{202e}'));
+        assert_eq!(
+            compact_error("provider HTTP 403 <html>secret</html>"),
+            "provider HTTP 403 [HTML response omitted]"
+        );
+    }
+
+    #[test]
+    fn scan_help_describes_quiet_and_finalized_streaming_exactly() {
+        let command = Cli::command();
+        let scan = command.find_subcommand("scan").expect("scan command");
+        let help_for = |id: &str| {
+            scan.get_arguments()
+                .find(|argument| argument.get_id() == id)
+                .and_then(|argument| argument.get_help())
+                .map(ToString::to_string)
+        };
+        assert_eq!(
+            help_for("quiet").as_deref(),
+            Some("Suppress all human findings, progress, and summary output")
+        );
+        assert_eq!(
+            help_for("stream_jsonl").as_deref(),
+            Some(
+                "Write finalized finding events as JSONL after each domain completes classification"
+            )
+        );
     }
 
     #[test]
@@ -2732,7 +2581,7 @@ mod tests {
         assert!(scan_progress_enabled(false, false, false));
         assert!(scan_progress_enabled(false, true, false));
         assert!(!scan_progress_enabled(true, false, false));
-        assert!(scan_progress_enabled(true, false, true));
+        assert!(!scan_progress_enabled(true, false, true));
         assert!(raw_output_diagnostic_event(&ProgressEvent::Phase {
             name: "passive".to_owned(),
             detail: "one source".to_owned(),
@@ -2776,6 +2625,75 @@ mod tests {
             "api.example.com\nwww.example.com"
         );
         assert_eq!(raw_name_list(std::iter::empty()), "");
+    }
+
+    #[test]
+    fn every_output_defaults_to_final_live_non_wildcard_findings() {
+        let finding = |state, wildcard| Finding {
+            state,
+            wildcard,
+            ..Finding::default()
+        };
+        let live = finding(ObservationState::Live, false);
+        let historical = finding(ObservationState::Historical, false);
+        let wildcard = finding(ObservationState::Unverified, true);
+
+        assert!(finding_selected_for_output(&live, false, false));
+        assert!(!finding_selected_for_output(&historical, false, false));
+        assert!(!finding_selected_for_output(&wildcard, false, false));
+        assert!(finding_selected_for_output(&historical, true, false));
+        assert!(!finding_selected_for_output(&wildcard, true, false));
+        assert!(finding_selected_for_output(&wildcard, false, true));
+    }
+
+    #[test]
+    fn verbosity_and_explicit_non_live_output_parse_without_ambiguity() {
+        let parsed = Cli::try_parse_from([
+            "fellaga",
+            "scan",
+            "example.com",
+            "-vv",
+            "--include-non-live",
+        ])
+        .unwrap();
+        let Command::Scan(parsed) = parsed.command else {
+            panic!("scan command expected");
+        };
+        assert_eq!(parsed.verbose, 2);
+        assert!(parsed.include_non_live);
+
+        assert!(
+            Cli::try_parse_from([
+                "fellaga",
+                "scan",
+                "example.com",
+                "--include-non-live",
+                "--only-live",
+            ])
+            .is_err()
+        );
+        assert!(Cli::try_parse_from(["fellaga", "scan", "example.com", "-v", "--quiet"]).is_err());
+    }
+
+    #[test]
+    fn list_is_live_only_unless_all_states_are_requested() {
+        let parsed = Cli::try_parse_from(["fellaga", "list", "--domain", "example.com"]).unwrap();
+        let Command::List(parsed) = parsed.command else {
+            panic!("list command expected");
+        };
+        assert!(!parsed.all);
+        assert!(!parsed.only_live);
+        let default_only_live = !parsed.all || parsed.only_live;
+        assert!(default_only_live);
+
+        let parsed =
+            Cli::try_parse_from(["fellaga", "list", "--domain", "example.com", "--all-states"])
+                .unwrap();
+        let Command::List(parsed) = parsed.command else {
+            panic!("list command expected");
+        };
+        assert!(parsed.all);
+        assert!(!parsed.only_live);
     }
 
     #[test]
@@ -2988,6 +2906,12 @@ mod tests {
             "deferred_budget"
         );
         assert_eq!(
+            source_check_error_status(
+                "commoncrawl: limite cumulative configurée de 20s atteinte; pages conservées"
+            ),
+            "deferred_budget"
+        );
+        assert_eq!(
             source_check_error_status("commoncrawl: HTTP 502"),
             "upstream_error"
         );
@@ -3033,14 +2957,22 @@ mod tests {
     }
 
     #[test]
-    fn profiles_have_expected_finite_enrichment_budgets() {
-        for profile in [ScanProfile::Deep, ScanProfile::Balanced, ScanProfile::Turbo] {
+    fn profiles_disable_cumulative_runtime_limits_by_default() {
+        for profile in [
+            ScanProfile::Deep,
+            ScanProfile::Balanced,
+            ScanProfile::Passive,
+            ScanProfile::Turbo,
+        ] {
             let defaults = profile.defaults();
-            assert!(defaults.max_runtime > 0);
-            assert!(defaults.active_max_runtime > 0);
-            assert!(defaults.nsec_max_runtime > 0);
-            assert!(defaults.ct_max_runtime > 0);
-            assert!(defaults.web_max_runtime > 0);
+            assert_eq!(defaults.max_runtime, 0);
+            assert_eq!(defaults.active_max_runtime, 0);
+            assert_eq!(defaults.passive_max_runtime, 0);
+            assert_eq!(defaults.internetdb_max_runtime, 0);
+            assert_eq!(defaults.nsec_max_runtime, 0);
+            assert_eq!(defaults.ct_max_runtime, 0);
+            assert_eq!(defaults.web_max_runtime, 0);
+            assert_eq!(defaults.pipeline_budget, 0);
             assert!(
                 defaults
                     .recursive_words
@@ -3048,22 +2980,5 @@ mod tests {
                     <= 1_000_000
             );
         }
-        assert_eq!(ScanProfile::Deep.defaults().max_runtime, 600);
-        assert_eq!(ScanProfile::Balanced.defaults().max_runtime, 300);
-        assert_eq!(ScanProfile::Passive.defaults().max_runtime, 180);
-        assert_eq!(ScanProfile::Turbo.defaults().max_runtime, 300);
-        assert_eq!(ScanProfile::Passive.defaults().active_max_runtime, 0);
-        assert_eq!(ScanProfile::Deep.defaults().ct_max_runtime, 30);
-        assert_eq!(ScanProfile::Balanced.defaults().ct_max_runtime, 10);
-        assert_eq!(ScanProfile::Passive.defaults().ct_max_runtime, 30);
-        assert_eq!(ScanProfile::Turbo.defaults().ct_max_runtime, 5);
-        assert_eq!(ScanProfile::Deep.defaults().passive_max_runtime, 45);
-        assert_eq!(ScanProfile::Balanced.defaults().passive_max_runtime, 25);
-        assert_eq!(ScanProfile::Passive.defaults().passive_max_runtime, 60);
-        assert_eq!(ScanProfile::Turbo.defaults().passive_max_runtime, 15);
-        assert_eq!(ScanProfile::Deep.defaults().web_max_runtime, 90);
-        assert_eq!(ScanProfile::Balanced.defaults().web_max_runtime, 45);
-        assert_eq!(ScanProfile::Passive.defaults().web_max_runtime, 0);
-        assert_eq!(ScanProfile::Turbo.defaults().web_max_runtime, 45);
     }
 }

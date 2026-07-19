@@ -26,19 +26,24 @@ pub struct DiscoveryPipeline {
     queue: BinaryHeap<Event>,
     seen: BTreeSet<String>,
     processed: BTreeSet<String>,
-    budget: usize,
+    event_limit: Option<usize>,
     pub enqueued: usize,
     pub duplicates: usize,
     pub budget_exhausted: bool,
 }
 
 impl DiscoveryPipeline {
-    pub fn new(budget: usize) -> Self {
+    /// Create a pipeline with an optional total event ceiling.
+    ///
+    /// A zero value means unlimited. Individual producers and discovery
+    /// stages still keep their own structural limits, and `drain(0)` drains
+    /// the finite queue completely.
+    pub fn new(event_limit: usize) -> Self {
         Self {
             queue: BinaryHeap::new(),
             seen: BTreeSet::new(),
             processed: BTreeSet::new(),
-            budget: budget.max(1),
+            event_limit: (event_limit > 0).then_some(event_limit),
             enqueued: 0,
             duplicates: 0,
             budget_exhausted: false,
@@ -57,7 +62,10 @@ impl DiscoveryPipeline {
             self.duplicates += 1;
             return false;
         }
-        if self.enqueued >= self.budget {
+        if self
+            .event_limit
+            .is_some_and(|event_limit| self.enqueued >= event_limit)
+        {
             self.budget_exhausted = true;
             return false;
         }
@@ -69,6 +77,7 @@ impl DiscoveryPipeline {
 
     pub fn drain(&mut self, limit: usize) -> Vec<String> {
         let mut names = Vec::new();
+        let limit = if limit == 0 { usize::MAX } else { limit };
         while names.len() < limit {
             let Some(event) = self.queue.pop() else {
                 break;
@@ -95,5 +104,16 @@ mod tests {
         assert_eq!(pipeline.drain(1), vec!["high.example.com"]);
         assert_eq!(pipeline.duplicates, 1);
         assert!(pipeline.budget_exhausted);
+    }
+
+    #[test]
+    fn zero_limit_keeps_every_finite_event_and_drains_the_queue() {
+        let mut pipeline = DiscoveryPipeline::new(0);
+        for index in 0..10_000 {
+            assert!(pipeline.enqueue(format!("host-{index}.example.com"), 10));
+        }
+
+        assert_eq!(pipeline.drain(0).len(), 10_000);
+        assert!(!pipeline.budget_exhausted);
     }
 }

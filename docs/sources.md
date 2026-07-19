@@ -23,7 +23,7 @@ Each completed check has an explicit status:
 | `success` | The connector completed and returned one or more in-scope names. |
 | `empty` | The connector completed normally but returned no in-scope names. |
 | `degraded` | At least one completed page produced names, but a later page or operation ended with a warning. The completed names are retained. |
-| `deferred_budget` | The connector reached its bounded source or passive-phase budget before completing and produced no retained names in that check. |
+| `deferred_budget` | The connector reached an explicitly configured cumulative deadline, or the bounded deadline of `sources --check`, before completing and produced no retained names in that check. Normal scans use no cumulative passive deadline by default. |
 | `skipped_missing_key` | The connector requires a credential that is not configured, so no network request was made. |
 | `skipped_unavailable` | The registry entry is deliberately unavailable, so no network request was made. The JSON `error` field contains the registry reason, such as a retired provider. This is not a provider failure and does not affect adaptive health counters. |
 | `rate_limited` | The provider returned a quota or rate-limit response, including `Retry-After` guidance. |
@@ -33,7 +33,7 @@ Each completed check has an explicit status:
 | `transport_error` | The request failed before an application response, for example because of DNS or connection failure. |
 | `tls_error` | TLS negotiation or certificate validation failed before a usable provider response was received. |
 | `schema_error` | The provider returned a payload that did not match the connector's validated schema. |
-| `timeout` | A network operation timed out independently of the connector's explicit total-budget deadline. |
+| `timeout` | An individual network operation timed out independently of any explicitly configured cumulative deadline. |
 | `error` | The connector failed for a reason that did not match a more specific category. The bounded error text remains available for diagnosis. |
 
 The JSON form exposes the same status values together with the connector metadata, duration, retained-name count, and any bounded error or warning.
@@ -73,7 +73,7 @@ These 21 connectors require no configured credential: `anubis`, `anubisdb`, `arq
 
 Five connectors accept an optional credential and still run without it: `certspotter`, `hackertarget`, `postman`, `submd`, and `urlscan`. Every other credentialed connector is skipped locally when its required value is absent.
 
-`crtsh` gives its public HTTP interface an eight-second head start. A failed or stalled HTTP request falls back to PostgreSQL with the remaining request budget; a valid HTTP response, including an empty result, avoids a duplicate database query. PostgreSQL addresses are resolved once per request, deduplicated, and attempted with IPv4 before IPv6 so an unavailable local IPv6 route cannot prevent the fallback.
+`crtsh` gives its public HTTP interface an eight-second head start. A failed or stalled HTTP request falls back to PostgreSQL while the connector invocation remains open; a valid HTTP response, including an empty result, avoids a duplicate database query. PostgreSQL addresses are resolved once per request, deduplicated, and attempted with IPv4 before IPv6 so an unavailable local IPv6 route cannot prevent the fallback.
 
 | Connector | Requirement | Accepted environment variable(s) |
 | --- | --- | --- |
@@ -143,7 +143,7 @@ Five connectors accept an optional credential and still run without it: `certspo
 | `robtex` | Streams the forward lookup, then performs reverse lookups for at most 1,000 unique IP addresses. |
 | `viewdns` | Reads documented 1,000-record pages for at most 1,000 pages, validates the echoed domain and page counters, and rejects empty or repeated pages before the reported end. |
 
-Unless a tighter rule is listed above, connectors that expose continued pages, cursors, resume keys, or trusted next links stop after 1,000 continuations. This is a hard safety ceiling, not an expected runtime: the shorter connector and passive-phase wall deadlines normally stop a low-throughput provider first. Every completely decoded page is checkpointed before the next request.
+Unless a tighter rule is listed above, connectors that expose continued pages, cursors, resume keys, or trusted next links stop after 1,000 continuations. This is a hard safety ceiling, not an expected runtime. With the default zero cumulative passive deadline, a connector may consume every valid page until normal provider termination or that ceiling. Per-request timeouts, response-size limits, rate policies, retry ceilings, and an explicitly selected `--passive-max-runtime` still apply. Every completely decoded page is checkpointed before the next request.
 
 Censys uses the current Platform v3 global-search contract: `POST /v3/global/search/query`, Bearer PAT authentication, `cert.names` projection, and cursor pagination capped at ten pages. Set `CENSYS_API_KEY` to `PAT` or `PAT:ORGANIZATION_ID`; prefix a value with `platform:` to disable compatibility fallback. Existing v2 Basic Auth users can set `legacy:API_ID:API_SECRET`. An unprefixed two-part value is attempted as the current `PAT:ORGANIZATION_ID` format first and falls back to v2 only when the first v3 request is rejected for authentication.
 
@@ -157,7 +157,7 @@ Driftnet requires `DRIFTNET_API_KEY` and queries four authenticated summary fami
 
 `submd` reads the provider's line-oriented response as a stream instead of buffering the complete feed. A configured `SUBMD_API_KEY` is sent as a Bearer token. The stream is capped at 64 MiB, each unfinished record at 64 KiB, and normalized names use the same 1,000-name or 500-millisecond checkpoint policy. Completed checkpoints survive later stream errors, while batching avoids turning small HTTP chunks into individual SQLite transactions.
 
-`thc` requests 1,000 records per page, uses up to five paced page requests per second, checkpoints every completely decoded page, and accepts up to 1,000 pages within the remaining passive-phase budget and its 75-second connector ceiling. Empty pagination state completes the query; a repeated state, a state longer than 4,096 bytes, or a thousandth page that still advertises more work is reported as a bounded provider failure rather than allowing an endless loop.
+`thc` requests 1,000 records per page, uses up to five paced page requests per second, checkpoints every completely decoded page, and accepts up to 1,000 pages. A normal scan has no hidden 75-second connector deadline; it continues until the provider ends pagination, a structural or per-request safeguard fires, or the operator's explicit passive deadline is reached. Empty pagination state completes the query; a repeated state, a state longer than 4,096 bytes, or a thousandth page that still advertises more work is reported as a bounded provider failure rather than allowing an endless loop.
 
 `netlas` uses the current two-request API workflow with Bearer authentication: it first queries `domains_count`, then submits the same exact-domain-excluding query to `domains/download` with a domain-only projection. Fellaga conservatively requests at most 200 records by default. Set `FELLAGA_NETLAS_DOWNLOAD_LIMIT` to an integer from 1 through 1,000,000 only when the configured Netlas plan permits the larger download. Its top-level JSON array is decoded directly from the response stream with 16 MiB total, 1 MiB per-record, and 50-record checkpoint limits; a malformed or oversized tail cannot discard earlier completed checkpoints. If the provider count or response shows that the selected limit truncated the result set, Fellaga retains completed records and reports a partial/error outcome instead of complete success.
 
@@ -173,7 +173,7 @@ The `github` and `gitlab` code-search connectors continue through remaining raw 
 
 `viewdns` uses the documented subdomain-discovery endpoint with `VIEWDNS_API_KEY`. It accepts numeric pagination fields represented as JSON numbers or strings, validates the provider's echoed target and current page, filters every returned name to the requested suffix, and reports inconsistent totals or premature empty pages without discarding previously committed pages.
 
-`commoncrawl` selects up to five valid indexes from distinct years, then walks them breadth-first for at most 1,000 page rounds within the connector deadline. Each request covers 15 compressed index blocks and accepts at most 150,000 result lines in a 48 MiB decompressed response. Fellaga samples at most two trusted WARC members, each capped at 2 MiB compressed and 4 MiB decompressed.
+`commoncrawl` selects up to five valid indexes from distinct years, then walks them breadth-first for at most 1,000 page rounds. With no explicit passive deadline, it is allowed to complete those valid pages; each request still has its own timeout. Each request covers 15 compressed index blocks and accepts at most 150,000 result lines in a 48 MiB decompressed response. Fellaga samples at most two trusted WARC members, each capped at 2 MiB compressed and 4 MiB decompressed.
 
 ### Experimental and runtime-failing providers
 
@@ -234,7 +234,7 @@ Fellaga/<version> (+https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder)
 Set `FELLAGA_USER_AGENT` when an organization or provider needs a specific contact string:
 
 ```bash
-export FELLAGA_USER_AGENT='Fellaga/0.11.0 (security-team@example.org)'
+export FELLAGA_USER_AGENT='Fellaga/0.11.1 (security-team@example.org)'
 ```
 
 The override is optional. It must be non-empty ASCII, contain no control characters, and fit within 256 characters. It changes only the HTTP `User-Agent`; it does not alter source selection.
@@ -260,7 +260,7 @@ An explicitly selected source bypasses its adaptive pause. `--all-sources` selec
 
 Passive observations are merged permanently. A later empty or partial provider response cannot erase previously acquired names. The default provider refresh interval is 24 hours and can be changed with `--passive-refresh-hours`.
 
-The shared HTTP layer reuses connections, limits requests per provider, caps decompressed response bodies, validates sensitive pagination destinations, rejects redirects that change scheme, host, or port, and retries selected transient statuses with exponential backoff and jitter. Automatic request replay is restricted to safe read methods; credentialed state-changing requests are never replayed. Short `Retry-After` values are honored inline; longer waits are persisted as an adaptive pause instead of holding the scan open. Each connector receives only the time remaining in the passive phase, with a small handoff margin so a slow source cannot hold the next phase open. Common Crawl uses one field-restricted request for each 15-block page and advances its selected yearly indexes breadth-first.
+The shared HTTP layer reuses connections, limits requests per provider, caps decompressed response bodies, validates sensitive pagination destinations, rejects redirects that change scheme, host, or port, and retries selected transient statuses with exponential backoff and jitter. Automatic request replay is restricted to safe read methods; credentialed state-changing requests are never replayed. Provider-directed `Retry-After` windows up to 15 minutes are honored inside the current job; longer waits become an adaptive pause instead of making an unattended process appear hung. Normal scans pass no cumulative connector deadline, so selected providers can complete their valid pages in parallel. When `--passive-max-runtime` is positive, each connector receives the remaining phase time with a small scheduler handoff margin. `sources --check` is also deliberately bounded by its `--timeout`. Common Crawl uses one field-restricted request for each 15-block page and advances its selected yearly indexes breadth-first.
 
 Each completely decoded provider page is committed immediately to permanent SQLite observations. The connector and scan working sets keep only a bounded candidate slice, so a large archive or passive-DNS response does not need to be duplicated across every active source before `--max-passive` is applied. A later timeout therefore preserves durable page data without turning the permanent inventory into an unbounded RAM requirement.
 
@@ -270,4 +270,4 @@ Passive refreshes use a generation number stored with each evidence row, making 
 
 The scheduler records marginal unique names rather than raw response size, then combines that yield with connector reliability and latency when ordering future work. A fast connector that repeatedly contributes new names therefore moves ahead of a slow or duplicate-heavy source. New connectors receive a metadata-based bootstrap priority so they can establish real yield history.
 
-Three consecutive provider failures place an automatically selected source in a 24-hour adaptive pause. A missing credential is a local preflight skip, not a provider failure, and adding a key makes the source immediately eligible even if an older Fellaga version recorded a missing-key cooldown. A successful but zero-yield response is tracked separately from a failure. Partial results are recorded as degraded, and work deferred by a phase budget is recorded separately; neither state increases the consecutive-failure counter or starts a failure cooldown. Retained observations remain available, and a later success resets the failure streak. Use `fellaga sources` to view the current source state and retry eligibility.
+Three consecutive provider failures place an automatically selected source in a 24-hour adaptive pause. A missing credential is a local preflight skip, not a provider failure, and adding a key makes the source immediately eligible even if an older Fellaga version recorded a missing-key cooldown. A successful but zero-yield response is tracked separately from a failure. Partial results are recorded as degraded. Work deferred by an explicit phase deadline or a bounded source check keeps the historical `deferred_budget` status; it does not occur merely because a default profile timer elapsed, because profile cumulative deadlines are zero. Neither state increases the consecutive-failure counter or starts a failure cooldown. Retained observations remain available, and a later success resets the failure streak. Use `fellaga sources` to view the current source state and retry eligibility.

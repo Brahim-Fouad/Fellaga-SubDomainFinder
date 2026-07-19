@@ -6,6 +6,23 @@ Published releases and downloadable artifacts are available on [GitHub Releases]
 
 ## [Unreleased]
 
+## [0.11.1] - 2026-07-19
+
+### Changed
+
+- disable cumulative runtime deadlines by default for every scan profile and for refresh, while retaining per-operation timeouts, bounded queues, pagination ceilings, adaptive convergence, checkpoints, and explicit opt-in deadline flags;
+- replace noisy per-provider terminal output with compact phase progress, finalized live non-wildcard results across text and structured formats, aggregated diagnostics, complete wrapped values, and `-v`/`-vv` detail levels;
+- let direct CT indexing finish its finite workload before finalization when no explicit deadline is configured, and give each queued TLS endpoint its own operation timeout;
+- remove the default global event-pipeline ceiling, while preserving deduplication, finite enrichment rounds, structural stage limits, and an explicit opt-in compatibility ceiling;
+- honor ordinary provider `Retry-After` windows up to 15 minutes inside the current job instead of abandoning the source after five seconds.
+
+### Fixed
+
+- stop retained names whose latest decisive DNS validation is negative from being merged back into current scan findings, while preserving their evidence and validation journal for `list --all` and `explain`;
+- suppress raw HTML, terminal control sequences, and duplicated provider errors from human output;
+- remove hidden cumulative cutoffs from NSEC walking, DNSSEC wildcard-suspect validation, passive connectors, InternetDB enrichment, and wildcard refresh;
+- defer streaming findings until wildcard and DNS state classification is final, preventing provisional candidates from leaking into JSONL.
+
 ## [0.11.0] - 2026-07-19
 
 ### Added
@@ -299,7 +316,8 @@ Initial public release of Fellaga.
 - public MIT repository with security policy, contribution guide, third-party notices, and verifiable corpus provenance;
 - verifiable v0.8.0 release with x86-64 and ARM64 GNU/Linux archives, an amd64 Debian package, architecture SBOMs, checksums, a keyless Sigstore signature over the checksum manifest, and GitHub attestations.
 
-[Unreleased]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/compare/v0.11.0...HEAD
+[Unreleased]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/compare/v0.11.1...HEAD
+[0.11.1]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/tag/v0.11.1
 [0.11.0]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/tag/v0.11.0
 [0.10.1]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/tag/v0.10.1
 [0.10.0]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/tag/v0.10.0

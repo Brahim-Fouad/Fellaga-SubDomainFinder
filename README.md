@@ -18,14 +18,14 @@ Fellaga is a fast, adaptive subdomain enumerator written in Rust for Kali Linux 
 - Target-local grammar induction learns service, environment, region, cloud, separator, and numeric conventions from retained names, then emits a bounded ranked candidate beam.
 - Static CT tiles provide a durable fallback when a log no longer exposes the legacy entry API; tile payloads, checkpoint identity, extracted names, and cursors are committed together in SQLite.
 - Standardized metadata and semantic static analysis extract names from API catalogs, OpenID/OAuth metadata, SSH known-hosts data, Terraform discovery, HTML, JSON, JavaScript, source maps, and bounded Common Crawl WARC records without executing scripts.
-- Differential TLS compares a small prioritized set of SNI and no-SNI certificates, exposing default virtual-host names while sharing one deadline and never turning an out-of-scope SAN into active work.
-- Brave Search follows provider totals for up to ten 20-result pages. MerkleMap follows validated provider totals for up to 1,000 pages, preserving every completed page under the connector wall deadline. The retired BinaryEdge compatibility connector remains visible for legacy configuration and provenance, but it is unavailable and never selected automatically.
-- High-volume SubMD results are consumed as a bounded line stream and checkpointed after at most 1,000 names or 500 ms of received streaming progress. THC cursor pagination uses up to five paced page requests per second, can consume up to 1,000 pages of 1,000 records, rejects repeated states, and remains constrained by the passive-phase and connector wall deadlines.
-- Keyless archive and public-feed coverage includes Arquivo.pt CDX replay and ShrewdEye's domain feed. Both are streamed with strict record, line, response-size, suffix, and wall-time limits, with volume/time checkpoints that avoid one SQLite transaction per HTTP chunk.
+- Differential TLS compares a small prioritized set of SNI and no-SNI certificates, exposing default virtual-host names while giving each endpoint its own timeout and never turning an out-of-scope SAN into active work.
+- Brave Search follows provider totals for up to ten 20-result pages. MerkleMap follows validated provider totals for up to 1,000 pages and preserves every completed page. The retired BinaryEdge compatibility connector remains visible for legacy configuration and provenance, but it is unavailable and never selected automatically.
+- High-volume SubMD results are consumed as a bounded line stream and checkpointed after at most 1,000 names or 500 ms of received streaming progress. THC cursor pagination uses up to five paced page requests per second, can consume up to 1,000 pages of 1,000 records, and rejects repeated states.
+- Keyless archive and public-feed coverage includes Arquivo.pt CDX replay and ShrewdEye's domain feed. Both are streamed with strict record, line, response-size, and suffix limits, with volume/time checkpoints that avoid one SQLite transaction per HTTP chunk.
 - A single bounded Shodan InternetDB wave enriches public IP addresses already confirmed by the scan. It never sweeps an address range, retains permanent IP-to-hostname observations locally, and submits every in-scope name to the normal wildcard-aware DNS validation pipeline.
-- The default `deep` profile selects every locally accessible connector whose metadata permits automatic execution, including eligible experimental providers. `--all-sources` likewise executes each unique implementation once; compatibility names remain available for explicit selection but are not added as duplicate requests. The retired BinaryEdge entry remains unavailable, and every provider still obeys connection, rate, response-size, and wall-time safeguards.
+- The default `deep` profile selects every locally accessible connector whose metadata permits automatic execution, including eligible experimental providers. `--all-sources` likewise executes each unique implementation once; compatibility names remain available for explicit selection but are not added as duplicate requests. The retired BinaryEdge entry remains unavailable, and every provider still obeys per-request timeouts, rate controls, pagination ceilings, and response-size limits.
 - Persistent, lazy candidate scheduling: passive/authoritative seeds and active word generators are consumed in bounded SQLite-backed waves instead of being materialized in memory before DNS starts.
-- Yield-aware source scheduling learns each connector's marginal unique-name yield, reliability, and latency; complete pages remain usable when a later page reaches its deadline, and source checks distinguish `success`, `empty`, `degraded`, `deferred_budget`, `skipped_missing_key`, `rate_limited`, `auth_required`, `anti_bot`, `upstream_error`, `transport_error`, `tls_error`, `schema_error`, `timeout`, and the uncategorized `error` fallback.
+- Yield-aware source scheduling learns each connector's marginal unique-name yield, reliability, and latency; complete pages remain usable when a later request fails, and source checks distinguish `success`, `empty`, `degraded`, `skipped_missing_key`, `rate_limited`, `auth_required`, `anti_bot`, `upstream_error`, `transport_error`, `tls_error`, `schema_error`, `timeout`, and the uncategorized `error` fallback.
 - Hierarchical wildcard detection, rotating-answer recognition, exact-signature filtering, trusted-resolver consensus, authoritative validation, and locally validated DNSSEC denial proofs for purging proven synthesized owners.
 - Permanent SQLite inventory with `live`, `historical`, and `unverified` states; a complete refresh quarantines exact wildcard-signature matches only after fresh trusted-resolver consensus, while retaining their provenance and validation history.
 - Evidence-family scoring so multiple providers backed by the same underlying dataset are not counted as independent proof.
@@ -41,8 +41,8 @@ Fellaga is a fast, adaptive subdomain enumerator written in Rust for Kali Linux 
 Download the release package and install it with APT. Checksums, a Sigstore-signed manifest, and GitHub attestations are available for independent verification:
 
 ```bash
-curl -fLO https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/download/v0.11.0/fellaga_0.11.0-1_amd64.deb
-sudo apt install ./fellaga_0.11.0-1_amd64.deb
+curl -fLO https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/download/v0.11.1/fellaga_0.11.1-1_amd64.deb
+sudo apt install ./fellaga_0.11.1-1_amd64.deb
 fellaga --version
 ```
 
@@ -65,48 +65,48 @@ The source installer builds the optimized binary with Rust 1.95 or newer and pla
 Replace `your-domain.example` with an authorized target:
 
 ```bash
-# Adaptive deep scan with safe resource limits
+# Adaptive deep scan; cumulative deadlines are disabled by default
 fellaga scan your-domain.example
 
-# Fast bounded scan with broad DNS discovery and shorter enrichment budgets
+# Smaller candidate and enrichment sets, still without a cumulative deadline
 fellaga scan your-domain.example --profile turbo
 
-# Show only currently validated DNS names
-fellaga scan your-domain.example --only-live
+# Make the default live-only JSON policy explicit for automation
+fellaga scan your-domain.example --json --only-live
 
 # Print only final discovered names, one per line
 fellaga scan your-domain.example --show
 
-# Raw output restricted to currently validated non-wildcard names
-fellaga scan your-domain.example --show --only-live
+# Include retained historical and unverified observations explicitly
+fellaga scan your-domain.example --show --include-non-live
 
 # Passive discovery without the active enrichment pipeline
 fellaga scan your-domain.example --profile passive
 
 # Provider-only discovery with no DNS, HTTP, or TLS contact to the target
-fellaga scan your-domain.example --profile passive --no-target-contact --show
+fellaga scan your-domain.example --profile passive --no-target-contact --show --include-non-live
 
 # Provider-only run across every unique source implementation, including experimental sources
-fellaga scan your-domain.example --profile passive --no-target-contact --all-sources --show
+fellaga scan your-domain.example --profile passive --no-target-contact --all-sources --show --include-non-live
 
-# Stream each finding as JSONL when it is produced
+# Emit finalized finding events as JSONL after wildcard classification
 fellaga scan your-domain.example --stream-jsonl > findings.jsonl
 
 # Resume the newest checkpoint
 fellaga scan your-domain.example --resume latest
 ```
 
-`--show` keeps standard output as a sorted, deduplicated FQDN list. Progress, connector status, and warnings remain visible on standard error; add `--quiet` when a pipeline also requires silent diagnostics.
+The interactive renderer uses compact phase progress and prints only finalized `live`, non-wildcard findings by default. Provider failures are aggregated instead of flooding the terminal: use `-v` for degraded-source details or `-vv` for every technical source status. Warning details are deduplicated and delivered once in the final summary. Long FQDNs and DNS records wrap without being truncated; provider response bodies are sanitized, and external HTML pages are replaced with a short classification. `--show` keeps standard output as a sorted, deduplicated live FQDN list; add `--include-non-live` only when retained historical or unverified observations are wanted. Set `NO_COLOR=1` (or `TERM=dumb`) to disable styling and `--quiet` to disable the entire human renderer, including final findings, progress, and the summary.
 
-The default scan processes one domain at a time, caps shared DNS traffic at 250 logical queries per second, and keeps at most 128 host resolutions in flight. The rate cap remains active across validation and enrichment traffic unless `--dns-rate-limit 0` explicitly disables it. Runtime limits are profile-specific: `deep` stops after 600 seconds, `balanced` and `turbo` after 300 seconds, and `passive` after 180 seconds unless `--max-runtime` overrides the limit. The default `deep` profile also gives wildcard profiling and active candidate work a shared 120-second budget. Embedded and user wordlists, mutations, retries, and recursive candidate generation all consume that budget. At the deadline, completed outcomes are kept, unfinished names are requeued as indeterminate, and the scan can continue later with `--resume latest`. Set `--active-max-runtime 0` to disable this time bound. `--no-adaptive` disables low-yield stopping and uses the configured recursion ceilings, but it does not disable ranking, time limits, or DNS rate safeguards. Transient candidate-resolution failures receive at most three total attempts.
+The default scan processes one domain at a time, caps shared DNS traffic at 250 logical queries per second, and keeps at most 128 host resolutions in flight. Independent DNS, HTTP, TLS, AXFR, and provider requests run concurrently where useful, under shared rate and pressure controls. All profiles default to `0` for the global, active, passive, CT, NSEC, Web, and InternetDB cumulative runtime options: a phase finishes its finite queue or reaches adaptive convergence instead of being cut off by elapsed time. Per-request timeouts, retries, response-size limits, pagination ceilings, candidate limits, and bounded in-memory batches remain active. Positive `--max-runtime` or phase-specific `--*-max-runtime` values opt into a wall-clock deadline. Checkpoints and Ctrl+C provide a safe interruption path, and transient DNS failures receive at most three total attempts.
 
 `--profile passive` still performs wildcard probes, DNS validation, and direct CT-log indexing. Add `--no-target-contact` when the run must be limited to third-party passive-provider APIs. CT data can still arrive through providers such as crt.sh and Cert Spotter, while the direct CT-log indexer is disabled because some public logs can be hosted under the target's own domain. All names returned by this mode are intentionally `unverified`; no target DNS, HTTP, TLS, AXFR, or other direct target connection is attempted. Existing `live` or `historical` inventory state and DNS records are preserved when the same name is observed passively.
 
-Long-running phases emit periodic progress on standard error. Direct CT-log indexing reports the selected log, durable cursor, entry range, request timeout, and remaining phase budget. It runs opportunistically in the background and never gates the first DNS-validation wave; its `deep`/`balanced`/`passive`/`turbo` budgets are 30/10/30/5 seconds. One process-wide CT indexer runs at a time, and a completed global pass establishes a ten-minute SQLite freshness window that prevents duplicate raw-log work. Initial passive collection and AXFR remain bounded independently; passive budgets are 45/25/60/15 seconds and AXFR allows four concurrent transfers globally with a four-second default per nameserver. Passive connector concurrency accepts and honors values from 1 through 32, crt.sh uses a bounded HTTP-first PostgreSQL fallback, and a cancelled certificate-database connector aborts its pending database connection task. Wildcard certificate patterns remain patterns and are never converted into concrete host findings. Wildcard detection starts with three randomized probes and spends two additional probes only when the first stage is ambiguous. Web and JavaScript discovery also uses one cumulative profile budget across the initial crawl and later pipeline rounds. Completed connector pages are committed to permanent SQLite observations as they arrive, while the active in-memory source set remains bounded. Web fetches are likewise retained after a later operation times out, and the affected phase is reported as partial. Final JSON records include `phase_timings` for initial discovery, candidate DNS, enrichment, and finalization.
+Long-running phases emit compact progress counters on standard error. Direct CT-log indexing runs in the background while initial discovery proceeds, but an unlimited run waits for its finite log/entry workload before finalizing. One process-wide CT indexer runs at a time, and a completed global pass establishes a ten-minute SQLite freshness window that prevents duplicate raw-log work. Passive collection and AXFR run concurrently; AXFR allows four transfers globally with a four-second timeout per nameserver. Passive connector concurrency accepts values from 1 through 32. Wildcard detection starts with three randomized probes and spends two additional probes only when the first stage is ambiguous. Completed passive pages, CT cursors, and Web observations are committed to SQLite as they arrive, while active working sets remain bounded. Final JSON records include `phase_timings` for initial discovery, candidate DNS, enrichment, and finalization.
 
-The InternetDB pivot is enabled for active profiles and is disabled by `--profile passive` or `--no-internetdb`. Profile defaults query at most 16, 8, and 4 already-confirmed public IP addresses in `deep`, `balanced`, and `turbo`, with cumulative budgets of 20, 10, and 5 seconds respectively. Use `--internetdb-ips`, `--internetdb-max-runtime`, and `--internetdb-refresh-hours` to tune those bounds and successful-cache refreshes.
+The InternetDB pivot is enabled for active profiles and is disabled by `--profile passive` or `--no-internetdb`. Profile defaults query at most 16, 8, and 4 already-confirmed public IP addresses in `deep`, `balanced`, and `turbo`; no cumulative deadline is applied unless `--internetdb-max-runtime` is positive.
 
-Fellaga displays all retained states by default:
+Fellaga retains three states, while the normal CLI and `--show` display only final live, non-wildcard names by default:
 
 | State | Meaning |
 | --- | --- |
@@ -114,7 +114,7 @@ Fellaga displays all retained states by default:
 | `historical` | The name was previously validated but has not been confirmed recently. |
 | `unverified` | The name lacks DNS confirmation, or a positive answer remains ambiguous because it matches a confirmed or indeterminate wildcard profile. |
 
-Use `--only-live` when downstream tooling must receive only fresh DNS results. Use `fellaga explain <fqdn>` to inspect retained provenance, state, validation history, DNS records, and stored confidence metadata.
+Final human, text, JSON, JSONL, and streaming JSONL output is live and non-wildcard by default. Use `--include-non-live` to include retained historical and unverified scan output, `--include-wildcard` to request wildcard-marked candidates explicitly, `fellaga list --all` for retained non-quarantined inventory rows, and `fellaga explain <fqdn>` for provenance, validation history, and wildcard-quarantine evidence. `--only-live` remains available when automation should state the default policy explicitly.
 
 ## Common workflows
 

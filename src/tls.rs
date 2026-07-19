@@ -393,6 +393,13 @@ fn cached_observation(
     }
 }
 
+fn endpoint_deadlines(timeout: Duration) -> Result<(Instant, tokio::time::Instant)> {
+    let blocking = Instant::now()
+        .checked_add(timeout)
+        .context("délai TLS trop grand")?;
+    Ok((blocking, tokio::time::Instant::from_std(blocking)))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn discover(
     database: &Database,
@@ -404,12 +411,6 @@ pub async fn discover(
     concurrency: usize,
 ) -> Result<TlsDiscovery> {
     let started = Instant::now();
-    // One absolute deadline governs DNS resolution, SNI handshakes, and all
-    // optional no-SNI comparisons. A later task never receives a fresh budget.
-    let blocking_deadline = started
-        .checked_add(timeout)
-        .context("délai TLS trop grand")?;
-    let async_deadline = tokio::time::Instant::from_std(blocking_deadline);
     let now = now_epoch();
     let freshness = refresh.as_secs().min(i64::MAX as u64) as i64;
     let mut discovery = TlsDiscovery::default();
@@ -437,6 +438,11 @@ pub async fn discover(
                 let inspected_endpoint = endpoint.clone();
                 let inspected_transport = transport.clone();
                 let result = async {
+                    // The CLI timeout is per endpoint. Creating the absolute
+                    // deadline only when this work item starts prevents queued
+                    // endpoints from consuming their budget while waiting for
+                    // a concurrency slot.
+                    let (blocking_deadline, async_deadline) = endpoint_deadlines(timeout)?;
                     let addresses =
                         resolve_endpoint_before(&dns, &inspected_endpoint, port, async_deadline)
                             .await?;
@@ -513,6 +519,7 @@ pub async fn discover(
             async move {
                 let endpoint = candidate.endpoint.clone();
                 let address = candidate.address;
+                let (blocking_deadline, async_deadline) = endpoint_deadlines(timeout)?;
                 let task = tokio::task::spawn_blocking(move || {
                     inspect_certificate_with_server_name(
                         endpoint,
@@ -793,6 +800,24 @@ mod tests {
     }
 
     #[test]
+    fn queued_endpoints_receive_fresh_per_endpoint_deadlines() {
+        let timeout = Duration::from_millis(60);
+        let (first, _) = endpoint_deadlines(timeout).unwrap();
+        thread::sleep(Duration::from_millis(80));
+        let (second, _) = endpoint_deadlines(timeout).unwrap();
+        let now = Instant::now();
+
+        assert!(
+            first <= now,
+            "the first endpoint deadline should have elapsed"
+        );
+        assert!(
+            second > now,
+            "a queued endpoint inherited an already elapsed batch deadline"
+        );
+    }
+
+    #[test]
     fn starttls_slow_drip_cannot_extend_the_absolute_deadline() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -957,7 +982,7 @@ mod tests {
     }
 
     #[test]
-    fn sni_and_no_sni_share_one_absolute_deadline() {
+    fn an_absolute_deadline_is_not_reset_between_tls_operations() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
