@@ -85,11 +85,7 @@ pub fn normalize_observed_name(name: &str, domain: &str) -> Option<String> {
 }
 
 pub fn normalize_hostname(name: &str) -> Option<String> {
-    let candidate = name
-        .trim()
-        .trim_start_matches("*.")
-        .trim_end_matches('.')
-        .to_ascii_lowercase();
+    let candidate = name.trim().trim_end_matches('.').to_ascii_lowercase();
     (valid_fqdn(&candidate) && candidate.contains('.')).then_some(candidate)
 }
 
@@ -131,7 +127,6 @@ pub fn extract_observed_names(text: &str, domain: &str) -> BTreeSet<String> {
         for variant in variants {
             let candidate = variant
                 .trim_start_matches("//")
-                .trim_start_matches("*.")
                 .split('/')
                 .next()
                 .unwrap_or_default()
@@ -230,9 +225,7 @@ mod tests {
             label in "[a-zA-Z][a-zA-Z0-9]{0,20}"
         ) {
             let raw = format!("*.{label}.EXAMPLE.COM.");
-            let normalized = normalize_observed_name(&raw, "example.com").unwrap();
-            prop_assert!(normalized.ends_with(".example.com"));
-            prop_assert_ne!(normalized, "example.com");
+            prop_assert!(normalize_observed_name(&raw, "example.com").is_none());
         }
     }
 
@@ -246,11 +239,21 @@ mod tests {
 
     #[test]
     fn observed_names_stay_in_scope() {
+        assert!(normalize_observed_name("*.Api.Example.com", "example.com").is_none());
         assert_eq!(
-            normalize_observed_name("*.Api.Example.com", "example.com").as_deref(),
+            normalize_observed_name("Api.Example.com", "example.com").as_deref(),
             Some("api.example.com")
         );
         assert!(normalize_observed_name("example.net", "example.com").is_none());
+    }
+
+    #[test]
+    fn wildcard_patterns_never_become_concrete_observations() {
+        assert!(extract_observed_names("*.api.example.com", "example.com").is_empty());
+        assert_eq!(
+            extract_observed_names("*.api.example.com api.example.com", "example.com",),
+            BTreeSet::from(["api.example.com".to_owned()])
+        );
     }
 
     #[test]
@@ -280,8 +283,9 @@ mod tests {
 
     #[test]
     fn global_hostnames_are_normalized_and_reversed() {
+        assert!(normalize_hostname("*.API.Example.COM.").is_none());
         assert_eq!(
-            normalize_hostname("*.API.Example.COM.").as_deref(),
+            normalize_hostname("API.Example.COM.").as_deref(),
             Some("api.example.com")
         );
         assert_eq!(reverse_hostname("api.example.com"), "com.example.api");

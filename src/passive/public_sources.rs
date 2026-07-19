@@ -612,7 +612,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             normalize_many(values.iter().map(String::as_str), "example.com"),
-            BTreeSet::from(["api.example.com".to_owned(), "wild.example.com".to_owned()])
+            BTreeSet::from(["api.example.com".to_owned()])
         );
     }
 
@@ -644,7 +644,7 @@ mod tests {
         let text = "a.example.com\n*.b.example.com\nexample.com\nevil.test\n";
         assert_eq!(
             extract_names_from_text(text, "example.com"),
-            BTreeSet::from(["a.example.com".to_owned(), "b.example.com".to_owned()])
+            BTreeSet::from(["a.example.com".to_owned()])
         );
         assert_eq!(
             submd_line_names(b"https://deep.api.example.com/path\r", "example.com").unwrap(),

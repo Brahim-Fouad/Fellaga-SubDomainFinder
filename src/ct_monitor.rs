@@ -1653,6 +1653,19 @@ mod tests {
     }
 
     #[test]
+    fn wildcard_only_certificate_names_are_not_concrete_hosts() {
+        assert!(
+            names_from_entry(&valid_x509_entry("*.api.example.com"))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            names_from_entry(&valid_x509_entry("api.example.com")).unwrap(),
+            BTreeSet::from(["api.example.com".to_owned()])
+        );
+    }
+
+    #[test]
     fn refresh_marker_requires_every_selected_log_to_succeed() {
         assert!(!completed_selected_log_pass(0, 0));
         assert!(completed_selected_log_pass(3, 0));

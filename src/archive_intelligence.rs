@@ -1055,7 +1055,7 @@ fn scoped_names(text: &str, root: &str, limit: usize) -> BTreeSet<String> {
         while start > 0 && (hostname_byte(bytes[start - 1]) || bytes[start - 1] == b'.') {
             start -= 1;
         }
-        let candidate = lower[start..match_end].trim_start_matches("*.");
+        let candidate = &lower[start..match_end];
         if let Some(name) = normalize_observed_name(candidate, root) {
             names.insert(name);
         }

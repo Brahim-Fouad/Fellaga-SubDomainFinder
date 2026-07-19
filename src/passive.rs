@@ -17,6 +17,7 @@ use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::Write;
+use std::net::{IpAddr, SocketAddr};
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -162,6 +163,18 @@ enum SourceId {
     WhoisXmlApi,
     WindVane,
     ZoomEyeApi,
+}
+
+impl SourceId {
+    const fn implementation(self) -> Self {
+        match self {
+            Self::CertificateDetails => Self::Digitorus,
+            Self::Otx => Self::AlienVault,
+            Self::Wayback => Self::WaybackArchive,
+            Self::WhoisXml => Self::WhoisXmlApi,
+            implementation => implementation,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -925,7 +938,11 @@ fn source_metadata_from_definition(entry: SourceDefinition) -> SourceMetadata {
         "commoncrawl" | "wayback" | "waybackarchive" => 10,
         "hudsonrock" | "rapiddns" | "reconcloud" | "riddler" | "sitedossier" | "threatcrowd"
         | "threatminer" => 5,
-        "submd" | "thc" => 60,
+        "submd" => 60,
+        // The public endpoint caps responses well below the requested 1,000
+        // records. Five bounded page requests per second are needed to drain
+        // large zones inside the passive phase without increasing concurrency.
+        "thc" => 300,
         "urlscan" => 12,
         "binaryedge" | "brave" | "merklemap" => 20,
         _ if requires_key => 30,
@@ -1025,6 +1042,22 @@ pub fn automatic_sources(keys: &ApiKeyStore) -> Vec<String> {
     automatic_sources_for_profile(keys, false)
 }
 
+/// Returns every unique connector implementation, including key-gated and
+/// experimental entries. Compatibility aliases remain valid when selected
+/// explicitly but are omitted here to avoid duplicate provider requests.
+pub fn all_unique_sources() -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    SourceId::ALL
+        .iter()
+        .copied()
+        .filter_map(|source| {
+            let implementation = source.implementation();
+            (seen.insert(implementation) && source_metadata(implementation.as_str()).available)
+                .then(|| implementation.as_str().to_owned())
+        })
+        .collect()
+}
+
 pub fn automatic_sources_for_profile(
     keys: &ApiKeyStore,
     include_experimental: bool,
@@ -1108,6 +1141,14 @@ impl fmt::Display for SourceBudgetExceeded {
 }
 
 impl std::error::Error for SourceBudgetExceeded {}
+
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
 
 #[derive(Debug)]
 pub struct PassiveFetchResult {
@@ -1483,9 +1524,15 @@ pub fn source_policy(source: &str) -> SourcePolicy {
             attempts: 1,
             base_backoff: Duration::from_secs(1),
         },
-        "submd" | "thc" => SourcePolicy {
+        "submd" => SourcePolicy {
             timeout: Duration::from_secs(30),
             total_timeout: Duration::from_secs(45),
+            attempts: 2,
+            base_backoff: Duration::from_millis(750),
+        },
+        "thc" => SourcePolicy {
+            timeout: Duration::from_secs(30),
+            total_timeout: Duration::from_secs(75),
             attempts: 2,
             base_backoff: Duration::from_millis(750),
         },
@@ -3261,11 +3308,34 @@ pub async fn fetch(
     Ok(fetch_detailed(source, domain, timeout, keys).await?.names)
 }
 
+fn ordered_crtsh_postgres_addresses(
+    addresses: impl IntoIterator<Item = SocketAddr>,
+) -> Vec<IpAddr> {
+    let mut addresses = addresses.into_iter().collect::<Vec<_>>();
+    addresses.sort_by_key(|address| (address.is_ipv6(), address.ip()));
+    addresses.dedup_by_key(|address| address.ip());
+    addresses
+        .into_iter()
+        .map(|address| address.ip())
+        .take(8)
+        .collect()
+}
+
 async fn crtsh_postgres(domain: &str, timeout: Duration) -> Result<BTreeSet<String>> {
     ensure_external_host_allowed("crt.sh")?;
+    let addresses = ordered_crtsh_postgres_addresses(
+        tokio::net::lookup_host(("crt.sh", 5_432))
+            .await
+            .context("résolution du service PostgreSQL crt.sh")?,
+    );
+    if addresses.is_empty() {
+        bail!("résolution du service PostgreSQL crt.sh sans adresse");
+    }
     let mut config = tokio_postgres::Config::new();
+    for address in addresses {
+        config.host("crt.sh").hostaddr(address);
+    }
     config
-        .host("crt.sh")
         .user("guest")
         .dbname("certwatch")
         .connect_timeout(timeout.min(Duration::from_secs(10)));
@@ -3275,7 +3345,7 @@ async fn crtsh_postgres(domain: &str, timeout: Duration) -> Result<BTreeSet<Stri
         .connect(tokio_postgres::NoTls)
         .await
         .context("connexion PostgreSQL publique crt.sh")?;
-    let connection_task = tokio::spawn(connection);
+    let _connection_task = AbortOnDrop(tokio::spawn(connection));
     let query = r#"SELECT DISTINCT cai.NAME_VALUE
         FROM certificate_and_identities cai
         WHERE plainto_tsquery('certwatch', $1) @@ identities(cai.CERTIFICATE)
@@ -3302,7 +3372,6 @@ async fn crtsh_postgres(domain: &str, timeout: Duration) -> Result<BTreeSet<Stri
     }
     commit_result_page(&mut names, batch);
     drop(database);
-    connection_task.abort();
     Ok(names)
 }
 
@@ -3332,15 +3401,33 @@ async fn crtsh_http(domain: &str, timeout: Duration) -> Result<BTreeSet<String>>
         .collect())
 }
 
+fn crtsh_http_head_start(timeout: Duration) -> Duration {
+    timeout.min(Duration::from_secs(8))
+}
+
 async fn crtsh(domain: &str, timeout: Duration) -> Result<BTreeSet<String>> {
-    let postgres_error = match crtsh_postgres(domain, timeout).await {
-        Ok(names) if !names.is_empty() => return Ok(names),
-        Ok(_) => "PostgreSQL returned no in-scope names".to_owned(),
-        Err(error) => compact_external_error(&format!("{error:#}")),
+    let http_budget = crtsh_http_head_start(timeout);
+    let http_error = match tokio::time::timeout(http_budget, crtsh_http(domain, http_budget)).await
+    {
+        Ok(Ok(names)) => return Ok(names),
+        Ok(Err(error)) => compact_external_error(&format!("{error:#}")),
+        Err(_) => format!(
+            "HTTP crt.sh exceeded its {:.1}s head start",
+            http_budget.as_secs_f64()
+        ),
     };
-    crtsh_http(domain, timeout)
-        .await
-        .with_context(|| format!("fallback HTTP crt.sh après échec PostgreSQL: {postgres_error}"))
+    let postgres_budget = timeout.saturating_sub(http_budget);
+    if postgres_budget.is_zero() {
+        bail!("crt.sh HTTP failed without PostgreSQL fallback budget: {http_error}");
+    }
+    match tokio::time::timeout(postgres_budget, crtsh_postgres(domain, postgres_budget)).await {
+        Ok(result) => result
+            .with_context(|| format!("fallback PostgreSQL crt.sh après échec HTTP: {http_error}")),
+        Err(_) => bail!(
+            "fallback PostgreSQL crt.sh exceeded its remaining {:.1}s budget after HTTP failure: {http_error}",
+            postgres_budget.as_secs_f64()
+        ),
+    }
 }
 
 async fn certspotter(
@@ -4411,6 +4498,62 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
 
+    #[tokio::test]
+    async fn abort_on_drop_cancels_a_pending_background_task() {
+        struct DropProbe(Option<tokio::sync::oneshot::Sender<()>>);
+
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+
+        let (started_sender, started_receiver) = tokio::sync::oneshot::channel();
+        let (dropped_sender, dropped_receiver) = tokio::sync::oneshot::channel();
+        let task = AbortOnDrop(tokio::spawn(async move {
+            let _probe = DropProbe(Some(dropped_sender));
+            let _ = started_sender.send(());
+            std::future::pending::<()>().await;
+        }));
+        started_receiver.await.unwrap();
+
+        drop(task);
+
+        tokio::time::timeout(Duration::from_secs(1), dropped_receiver)
+            .await
+            .expect("aborted background task did not release its resources")
+            .unwrap();
+    }
+
+    #[test]
+    fn crtsh_postgres_addresses_prefer_ipv4_and_remove_duplicates() {
+        assert_eq!(
+            ordered_crtsh_postgres_addresses([
+                "[2001:db8::1]:5432".parse::<SocketAddr>().unwrap(),
+                "192.0.2.10:5432".parse::<SocketAddr>().unwrap(),
+                "192.0.2.10:5432".parse::<SocketAddr>().unwrap(),
+            ]),
+            vec![
+                "192.0.2.10".parse::<IpAddr>().unwrap(),
+                "2001:db8::1".parse::<IpAddr>().unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn crtsh_http_gets_a_bounded_head_start_before_postgres() {
+        assert_eq!(
+            crtsh_http_head_start(Duration::from_secs(30)),
+            Duration::from_secs(8)
+        );
+        assert_eq!(
+            crtsh_http_head_start(Duration::from_secs(5)),
+            Duration::from_secs(5)
+        );
+    }
+
     fn key_store(entries: &[(&str, &[&str])]) -> ApiKeyStore {
         ApiKeyStore {
             keys: entries
@@ -4851,6 +4994,21 @@ mod tests {
         assert!(!deep.contains(&"whoisxml".to_owned()));
         assert!(!deep.contains(&"certificatedetails".to_owned()));
         assert!(!deep.contains(&"bevigil".to_owned()));
+    }
+
+    #[test]
+    fn exhaustive_selection_omits_runtime_aliases_without_hiding_connectors() {
+        let sources = all_unique_sources().into_iter().collect::<BTreeSet<_>>();
+        for (canonical, alias) in [
+            ("alienvault", "otx"),
+            ("digitorus", "certificatedetails"),
+            ("waybackarchive", "wayback"),
+            ("whoisxmlapi", "whoisxml"),
+        ] {
+            assert!(sources.contains(canonical));
+            assert!(!sources.contains(alias));
+        }
+        assert_eq!(sources.len(), 62);
     }
 
     #[test]
@@ -5331,6 +5489,13 @@ mod tests {
         for source in ["commoncrawl", "waybackarchive", "brave", "submd", "thc"] {
             assert!(!source_metadata(source).recursive_children, "{source}");
         }
+    }
+
+    #[test]
+    fn thc_pagination_can_drain_large_public_result_sets() {
+        assert_eq!(source_metadata("thc").rate_limit_per_minute, 300);
+        assert_eq!(source_policy("thc").total_timeout, Duration::from_secs(75));
+        assert_eq!(host_minimum_gap("ip.thc.org"), Duration::from_millis(100));
     }
 
     #[test]

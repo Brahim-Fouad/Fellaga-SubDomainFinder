@@ -10,6 +10,7 @@ SOURCE_CSV="$ROOT/benchmarks/data/tranco-74J5X-top30.csv"
 TOOLSET="${FELLAGA_PASSIVE_TOP30_TOOLSET:-$ROOT/benchmarks/toolset.local.json}"
 
 REPETITIONS="${FELLAGA_PASSIVE_TOP30_REPETITIONS:-1}"
+DOMAIN_LIMIT="${FELLAGA_PASSIVE_TOP30_DOMAIN_LIMIT:-30}"
 DISCOVERY_TIMEOUT="${FELLAGA_PASSIVE_TOP30_TIMEOUT:-180}"
 TIMEOUT_GRACE="${FELLAGA_PASSIVE_TOP30_TIMEOUT_GRACE:-5}"
 PREFLIGHT_TIMEOUT="${FELLAGA_PASSIVE_TOP30_PREFLIGHT_TIMEOUT:-60}"
@@ -55,6 +56,7 @@ command -v python3 >/dev/null 2>&1 || {
   exit 2
 }
 integer_between "$REPETITIONS" 1 10 FELLAGA_PASSIVE_TOP30_REPETITIONS
+integer_between "$DOMAIN_LIMIT" 1 30 FELLAGA_PASSIVE_TOP30_DOMAIN_LIMIT
 integer_between "$DISCOVERY_TIMEOUT" 1 3600 FELLAGA_PASSIVE_TOP30_TIMEOUT
 positive_number "$TIMEOUT_GRACE" FELLAGA_PASSIVE_TOP30_TIMEOUT_GRACE
 integer_between "$PREFLIGHT_TIMEOUT" 1 600 FELLAGA_PASSIVE_TOP30_PREFLIGHT_TIMEOUT
@@ -258,6 +260,7 @@ done
 
 python3 "$REPORT" prepare "$OUT" --toolset "$TOOLSET" \
   --repetitions "$REPETITIONS" \
+  --domain-limit "$DOMAIN_LIMIT" \
   --discovery-timeout "$DISCOVERY_TIMEOUT" \
   --timeout-grace "$TIMEOUT_GRACE" \
   --preflight-timeout "$PREFLIGHT_TIMEOUT" \
@@ -328,6 +331,7 @@ run_one() {
   python3 "$REPORT" output-contract --toolset "$TOOLSET" "$tool" \
     --context "executable=${tool_bins[$tool]}" \
     --context "domain=$domain" \
+    --context "state_db=$state_db" \
     --context "output_file=$output_file" \
     --context "output_directory=$raw_tree_directory" > "$output_contract_file"
   local -a output_contract=()
@@ -399,12 +403,13 @@ PY
 
 tool_count="${#runnable_tools[@]}"
 completed_runs=0
-total_runs=$((REPETITIONS * tool_count * 30))
+total_runs=$((REPETITIONS * tool_count * DOMAIN_LIMIT))
 campaign_started_epoch="$(date +%s)"
 declare -A failure_streak=()
 declare -A disabled_tools=()
 for (( repetition = 1; repetition <= REPETITIONS; repetition++ )); do
   while IFS=, read -r rank domain; do
+    if (( rank > DOMAIN_LIMIT )); then break; fi
     declare -a ordered_tools=()
     if (( tool_count > 0 )); then
       offset=$(( (rank - 1 + repetition - 1) % tool_count ))

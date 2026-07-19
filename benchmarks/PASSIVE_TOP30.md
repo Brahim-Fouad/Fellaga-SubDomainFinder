@@ -89,6 +89,15 @@ FELLAGA_PASSIVE_TOP30_OUT=benchmarks/results/passive-top30-74J5X \
   bash benchmarks/run-passive-top30.sh
 ```
 
+To run the exact pinned top-five prefix while keeping the same manifest and
+integrity checks:
+
+```bash
+FELLAGA_PASSIVE_TOP30_DOMAIN_LIMIT=5 \
+FELLAGA_PASSIVE_TOP30_OUT="$HOME/fellaga-results/passive-top5-74J5X" \
+  bash benchmarks/run-passive-top30.sh
+```
+
 Private per-run configuration needs real POSIX permissions. If the repository
 is under `/mnt/c` in WSL, put the output on the Linux filesystem:
 
@@ -105,6 +114,8 @@ Optional controls:
 - `FELLAGA_PASSIVE_TOP30_TOOLSET`: local toolset path; default
   `benchmarks/toolset.local.json`.
 - `FELLAGA_PASSIVE_TOP30_REPETITIONS`: `1` to `10`; default `1`.
+- `FELLAGA_PASSIVE_TOP30_DOMAIN_LIMIT`: exact leading corpus size, `1` to `30`;
+  default `30`. The selected prefix is recorded and verified in the manifest.
 - `FELLAGA_PASSIVE_TOP30_TIMEOUT`: per-run wall deadline; default `180` seconds.
 - `FELLAGA_PASSIVE_TOP30_TIMEOUT_GRACE`: shutdown grace; default `5` seconds.
 - `FELLAGA_PASSIVE_TOP30_PREFLIGHT_TIMEOUT`: preflight deadline; default `60`.

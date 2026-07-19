@@ -701,6 +701,7 @@ def prepare_campaign(
     runnable: dict[str, str],
     missing: dict[str, str],
     skipped: dict[str, str],
+    domain_limit: int = 30,
     source_manifest: pathlib.Path = DEFAULT_SOURCE_MANIFEST,
     toolset_path: pathlib.Path = DEFAULT_TOOLSET,
     discovery_timeout_seconds: float = 900.0,
@@ -717,6 +718,8 @@ def prepare_campaign(
 ) -> dict[str, Any]:
     if not 1 <= repetitions <= 10:
         raise ValueError("repetitions must be between 1 and 10")
+    if type(domain_limit) is not int or not 1 <= domain_limit <= 30:
+        raise ValueError("domain limit must be between 1 and 30")
     for label, value in (
         ("discovery timeout", discovery_timeout_seconds),
         ("timeout grace", timeout_grace_seconds),
@@ -759,6 +762,7 @@ def prepare_campaign(
         raise ValueError("all configured passive tools must have an explicit status")
 
     source, ranked = validate_source_manifest(source_manifest)
+    ranked = ranked[:domain_limit]
     harness = _snapshot_harness(campaign)
     tool_status: dict[str, dict[str, Any]] = {}
     for tool in tools:
@@ -789,6 +793,7 @@ def prepare_campaign(
         "platform": _platform_metadata(),
         "repetitions": repetitions,
         "execution_limits": {
+            "domain_limit": domain_limit,
             "discovery_timeout_seconds": discovery_timeout_seconds,
             "timeout_grace_seconds": timeout_grace_seconds,
             "preflight_timeout_seconds": preflight_timeout_seconds,
@@ -935,6 +940,7 @@ def _validate_campaign_policy(manifest: dict[str, Any]) -> None:
         ):
             raise ValueError("campaign execution limits are invalid")
     for field, minimum, maximum in (
+        ("domain_limit", 1, 30),
         ("consecutive_failure_threshold", 1, 10),
         ("cleanup_timeout_seconds", 1, 60),
         ("redaction_timeout_seconds", 1, 60),
@@ -1361,6 +1367,13 @@ def build_report(campaign: pathlib.Path) -> dict[str, Any]:
     for field in ("source_csv_sha256", "top30_csv_sha256", "top30_domains_sha256"):
         if manifest.get("source", {}).get(field) != source["retrieval"].get(field):
             raise ValueError(f"campaign {field} does not match the pinned source")
+    domain_limit = manifest["execution_limits"]["domain_limit"]
+    ranked = ranked[:domain_limit]
+    expected_domains = [
+        {"rank": rank, "domain": domain} for rank, domain in ranked
+    ]
+    if manifest.get("domains") != expected_domains:
+        raise ValueError("campaign domains do not match the pinned source prefix")
 
     rows, issues = _load_rows(campaign / "runs.jsonl")
     issues.extend(_redaction_integrity_issues(campaign, manifest))
@@ -1439,7 +1452,7 @@ def build_report(campaign: pathlib.Path) -> dict[str, Any]:
         summaries[tool] = {
             "availability": tool_meta.get("status"),
             "availability_reason": tool_meta.get("reason"),
-            "runs_expected": 30 * repetitions if tool in runnable_tools else 0,
+            "runs_expected": len(ranked) * repetitions if tool in runnable_tools else 0,
             "runs_recorded": len(tool_rows),
             "successful_runs": counts.get("success", 0),
             "process_successful_runs": counts.get("success", 0),
@@ -1628,6 +1641,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     prepare.add_argument("campaign", type=pathlib.Path)
     prepare.add_argument("--toolset", type=pathlib.Path, required=True)
     prepare.add_argument("--repetitions", type=int, required=True)
+    prepare.add_argument("--domain-limit", type=int, default=30)
     prepare.add_argument("--discovery-timeout", type=float, required=True)
     prepare.add_argument("--timeout-grace", type=float, required=True)
     prepare.add_argument("--preflight-timeout", type=float, required=True)
@@ -1820,6 +1834,7 @@ def main(argv: list[str] | None = None) -> int:
                 _mapping(args.runnable, "--runnable", tools),
                 _mapping(args.missing, "--missing", tools),
                 _mapping(args.skipped, "--skipped", tools),
+                domain_limit=args.domain_limit,
                 toolset_path=args.toolset,
                 discovery_timeout_seconds=args.discovery_timeout,
                 timeout_grace_seconds=args.timeout_grace,

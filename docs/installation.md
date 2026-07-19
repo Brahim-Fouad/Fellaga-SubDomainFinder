@@ -7,8 +7,8 @@ Fellaga publishes GNU/Linux binaries for x86-64 and ARM64. The release workflow 
 The Debian package is the simplest installation method on an x86-64 Kali or Debian system:
 
 ```bash
-curl -fLO https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/download/v0.10.0/fellaga_0.10.0-1_amd64.deb
-sudo apt install ./fellaga_0.10.0-1_amd64.deb
+curl -fLO https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/download/v0.10.1/fellaga_0.10.1-1_amd64.deb
+sudo apt install ./fellaga_0.10.1-1_amd64.deb
 fellaga --version
 ```
 
@@ -21,13 +21,13 @@ Choose the archive that matches `uname -m`:
 
 | `uname -m` | Release archive |
 | --- | --- |
-| `x86_64` | `fellaga-v0.10.0-x86_64-unknown-linux-gnu.tar.gz` |
-| `aarch64` or `arm64` | `fellaga-v0.10.0-aarch64-unknown-linux-gnu.tar.gz` |
+| `x86_64` | `fellaga-v0.10.1-x86_64-unknown-linux-gnu.tar.gz` |
+| `aarch64` or `arm64` | `fellaga-v0.10.1-aarch64-unknown-linux-gnu.tar.gz` |
 
 Example for x86-64:
 
 ```bash
-version=0.10.0
+version=0.10.1
 target=x86_64-unknown-linux-gnu
 base="https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/download/v${version}"
 

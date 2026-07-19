@@ -2610,7 +2610,6 @@ mod tests {
                 "api.example.com".to_owned(),
                 "cdn.example.com".to_owned(),
                 "mail.dev.example.com".to_owned(),
-                "wild.example.com".to_owned(),
             ])
         );
 
@@ -2904,7 +2903,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             censys_platform_page_names(&page, "example.com"),
-            BTreeSet::from(["api.example.com".to_owned(), "wild.example.com".to_owned(),])
+            BTreeSet::from(["api.example.com".to_owned()])
         );
         let mut seen = BTreeSet::new();
         assert_eq!(
@@ -2984,7 +2983,7 @@ mod tests {
         assert_eq!(response.summary.other, 0);
         assert_eq!(
             driftnet_summary_names(&response, "example.com"),
-            BTreeSet::from(["api.example.com".to_owned(), "wild.example.com".to_owned(),])
+            BTreeSet::from(["api.example.com".to_owned()])
         );
         assert!(serde_json::from_value::<DriftnetSummaryResponse>(serde_json::json!({})).is_err());
     }
@@ -3034,10 +3033,7 @@ mod tests {
                     .map(|label| format!("{label}.example.com")),
                 "example.com"
             ),
-            BTreeSet::from([
-                "api.dev.example.com".to_owned(),
-                "www.example.com".to_owned()
-            ])
+            BTreeSet::from(["www.example.com".to_owned()])
         );
     }
 
@@ -3048,7 +3044,7 @@ mod tests {
         assert_eq!(page.count, 125);
         assert_eq!(
             merklemap_page_names(&page, "example.com"),
-            BTreeSet::from(["api.example.com".to_owned(), "dev.example.com".to_owned()])
+            BTreeSet::from(["api.example.com".to_owned()])
         );
     }
 

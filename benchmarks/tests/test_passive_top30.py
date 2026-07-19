@@ -203,10 +203,12 @@ class PassiveTop30PolicyTests(unittest.TestCase):
         script = RUNNER.read_text(encoding="utf-8")
         for fragment in (
             "FELLAGA_PASSIVE_TOP30_TOOLSET",
+            "FELLAGA_PASSIVE_TOP30_DOMAIN_LIMIT",
             "tool-list --toolset",
             "snapshot-toolset --toolset",
             "render-argv --toolset",
             "output-contract --toolset",
+            '--context "state_db=$state_db"',
             "preflight-check",
             "mapfile -d '' -t",
             "passive-observational",
@@ -299,6 +301,7 @@ class PassiveTop30PolicyTests(unittest.TestCase):
                     "HTTP_PROXY": "http://secret.invalid",
                     "FELLAGA_PASSIVE_TOP30_TOOLSET": str(toolset),
                     "FELLAGA_PASSIVE_TOP30_OUT": str(output),
+                    "FELLAGA_PASSIVE_TOP30_DOMAIN_LIMIT": "5",
                     "FELLAGA_PASSIVE_TOP30_TIMEOUT": "5",
                     "FELLAGA_PASSIVE_TOP30_PREFLIGHT_TIMEOUT": "5",
                     "FELLAGA_PASSIVE_TOP30_MAX_RUNTIME": "60",
@@ -336,6 +339,8 @@ class PassiveTop30PolicyTests(unittest.TestCase):
         self.assertEqual(report["subject"], "subject")
         self.assertIn("circuit breaker", completed.stderr)
         self.assertEqual(manifest["toolset"]["subject"], "subject")
+        self.assertEqual(manifest["execution_limits"]["domain_limit"], 5)
+        self.assertEqual(len(manifest["domains"]), 5)
         self.assertEqual(
             manifest["toolset"]["sha256"],
             snapshot_hash(manifest["toolset"]["snapshot"]),
@@ -417,6 +422,52 @@ class PassiveTop30ReportTests(unittest.TestCase):
         )
         self.assertEqual(list(manifest["tools"]), ["subject", "observer"])
         self.assertNotIn("command_policy", manifest)
+
+    def test_campaign_can_bind_the_exact_top_five_prefix(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            campaign = pathlib.Path(directory)
+            toolset = write_toolset(
+                campaign / "local-tools.json",
+                {"subject": pathlib.Path(sys.executable)},
+            )
+            manifest = prepare_campaign(
+                campaign,
+                repetitions=1,
+                runnable={"subject": sys.executable},
+                missing={},
+                skipped={},
+                domain_limit=5,
+                toolset_path=toolset,
+            )
+            write_completion_evidence(campaign)
+            report = build_report(campaign)
+
+        self.assertEqual(manifest["execution_limits"]["domain_limit"], 5)
+        self.assertEqual(
+            manifest["domains"],
+            [
+                {"rank": 1, "domain": "google.com"},
+                {"rank": 2, "domain": "gtld-servers.net"},
+                {"rank": 3, "domain": "cloudflare.com"},
+                {"rank": 4, "domain": "gstatic.com"},
+                {"rank": 5, "domain": "facebook.com"},
+            ],
+        )
+        self.assertEqual(report["tools"]["subject"]["runs_expected"], 5)
+        self.assertEqual(report["summary"]["expected_runs"], 5)
+
+    def test_campaign_rejects_invalid_domain_limits(self) -> None:
+        for value in (0, 31, True):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as directory:
+                with self.assertRaisesRegex(ValueError, "domain limit"):
+                    prepare_campaign(
+                        pathlib.Path(directory),
+                        repetitions=1,
+                        runnable={},
+                        missing={},
+                        skipped={},
+                        domain_limit=value,
+                    )
 
     def test_missing_tool_remains_descriptive_only(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
