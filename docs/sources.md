@@ -234,7 +234,7 @@ Fellaga/<version> (+https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder)
 Set `FELLAGA_USER_AGENT` when an organization or provider needs a specific contact string:
 
 ```bash
-export FELLAGA_USER_AGENT='Fellaga/0.11.1 (security-team@example.org)'
+export FELLAGA_USER_AGENT='Fellaga/0.12.0 (security-team@example.org)'
 ```
 
 The override is optional. It must be non-empty ASCII, contain no control characters, and fit within 256 characters. It changes only the HTTP `User-Agent`; it does not alter source selection.

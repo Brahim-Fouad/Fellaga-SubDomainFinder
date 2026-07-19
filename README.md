@@ -41,8 +41,8 @@ Fellaga is a fast, adaptive subdomain enumerator written in Rust for Kali Linux 
 Download the release package and install it with APT. Checksums, a Sigstore-signed manifest, and GitHub attestations are available for independent verification:
 
 ```bash
-curl -fLO https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/download/v0.11.1/fellaga_0.11.1-1_amd64.deb
-sudo apt install ./fellaga_0.11.1-1_amd64.deb
+curl -fLO https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/download/v0.12.0/fellaga_0.12.0-1_amd64.deb
+sudo apt install ./fellaga_0.12.0-1_amd64.deb
 fellaga --version
 ```
 
@@ -149,6 +149,7 @@ Required and optional provider credentials can be supplied through environment v
 - [Installation and upgrades](docs/installation.md)
 - [Scanning and command reference](docs/usage.md)
 - [Discovery, validation, wildcard handling, and stopping rules](docs/discovery-engine.md)
+- [Architecture and extension boundaries](docs/architecture.md)
 - [Passive sources and credentials](docs/sources.md)
 - [SQLite, retention, privacy, and cache behavior](docs/local-data.md)
 - [Release integrity and provenance verification](docs/release-verification.md)

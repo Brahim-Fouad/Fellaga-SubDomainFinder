@@ -5,7 +5,7 @@ use super::{
     response_json, send_external, send_external_idempotent, send_external_streaming,
     send_external_streaming_idempotent,
 };
-use crate::db::PassivePaginationPage;
+use crate::source_contract::PassivePaginationPage;
 use crate::util::{domain_hash, extract_observed_names, normalize_observed_name, valid_fqdn};
 use anyhow::{Context, Result, bail};
 use base64::Engine as _;
