@@ -1,3 +1,12 @@
+fellaga (0.11.1-1) unstable; urgency=medium
+
+  * Remove default cumulative scan and refresh deadlines.
+  * Redesign terminal output around final live non-wildcard results.
+  * Keep latest-negative historical observations out of current findings.
+  * Sanitize and aggregate provider diagnostics.
+
+ -- Brahim-Fouad GUIA <170998597+Brahim-Fouad@users.noreply.github.com>  Sun, 19 Jul 2026 00:00:00 -0400
+
 fellaga (0.11.0-1) unstable; urgency=medium
 
   * Add bounded Arquivo.pt and ShrewdEye passive connectors.

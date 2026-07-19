@@ -48,7 +48,6 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 const DNSSEC_WILDCARD_SUSPECT_CAP: usize = 4;
-const DNSSEC_WILDCARD_SUSPECT_BUDGET: Duration = Duration::from_secs(8);
 const METADATA_PHASE_BUDGET_CAP: Duration = Duration::from_secs(30);
 const METADATA_DNS_CONCURRENCY: usize = 4;
 const ENRICHMENT_VALIDATION_BATCH_SIZE: usize = 4_000;
@@ -190,10 +189,33 @@ impl Drop for PassiveRefreshLeaseGuard {
     }
 }
 
-fn metadata_phase_budget(web_budget_remaining: Option<Duration>) -> Duration {
-    web_budget_remaining
-        .map(|remaining| remaining.min(METADATA_PHASE_BUDGET_CAP))
-        .unwrap_or(METADATA_PHASE_BUDGET_CAP)
+fn metadata_phase_budget(web_budget_remaining: Option<Duration>) -> Option<Duration> {
+    web_budget_remaining.map(|remaining| remaining.min(METADATA_PHASE_BUDGET_CAP))
+}
+
+fn passive_connector_timing(
+    phase_deadline: Option<tokio::time::Instant>,
+    request_timeout: Duration,
+    policy_total_timeout: Duration,
+) -> (Duration, Duration) {
+    let connector_budget = phase_deadline
+        .as_ref()
+        .map(|deadline| {
+            deadline
+                .saturating_duration_since(tokio::time::Instant::now())
+                .saturating_sub(Duration::from_millis(250))
+                .min(policy_total_timeout)
+        })
+        // Passive connectors use zero as the explicit "no cumulative
+        // deadline" sentinel; per-request timeouts and pagination caps remain.
+        .unwrap_or(Duration::ZERO);
+    let lease_window = if phase_deadline.is_some() {
+        connector_budget
+    } else {
+        policy_total_timeout.max(request_timeout)
+    };
+    let lease_ttl = lease_window.saturating_add(PASSIVE_REFRESH_LEASE_GRACE);
+    (connector_budget, lease_ttl)
 }
 
 fn merge_resolver_metrics(
@@ -232,6 +254,16 @@ fn merge_resolver_metrics(
         .collect()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PassiveSourceOutcome {
+    Success,
+    Cached,
+    Partial,
+    Deferred,
+    Skipped,
+    Stale,
+}
+
 #[derive(Debug, Clone)]
 pub enum ProgressEvent {
     Started {
@@ -244,6 +276,7 @@ pub enum ProgressEvent {
     },
     PassiveSource {
         source: String,
+        outcome: PassiveSourceOutcome,
         status: String,
         names: usize,
     },
@@ -1308,6 +1341,22 @@ async fn finish_pending_ct_task_after_grace(
     finish_pending_ct_task_after_grace_with_hook(tasks, grace, std::future::ready(())).await
 }
 
+async fn finish_pending_ct_task(
+    tasks: &mut tokio::task::JoinSet<Result<(CtMonitorResult, Vec<String>)>>,
+    final_grace: Option<Duration>,
+) -> (Option<CtTaskJoinResult>, bool) {
+    if let Some(grace) = final_grace {
+        return finish_pending_ct_task_after_grace(tasks, grace).await;
+    }
+
+    // A zero CT phase timeout means that only the log/entry/backfill caps stop
+    // the task. Waiting here preserves the parallel overlap with DNS without
+    // discarding a structurally bounded CT result at the end of the scan.
+    let joined = tasks.join_next().await;
+    let completed_without_result = joined.is_none();
+    (joined, completed_without_result)
+}
+
 fn phase_deadline(remaining: Option<Duration>) -> Option<tokio::time::Instant> {
     remaining.map(|remaining| {
         let now = tokio::time::Instant::now();
@@ -1619,7 +1668,7 @@ fn dnssec_assessment_proves_nonexistence(assessment: &DnssecProofAssessment) -> 
         })
 }
 
-/// Assess a deliberately tiny set under one absolute deadline.
+/// Assess a deliberately tiny set, optionally under a caller-owned deadline.
 ///
 /// The supplied assessment must already come from local DNSSEC validation.
 /// This function intentionally has no AD-bit input and additionally requires a
@@ -1627,14 +1676,14 @@ fn dnssec_assessment_proves_nonexistence(assessment: &DnssecProofAssessment) -> 
 async fn assess_dnssec_suspects_bounded<F, Fut>(
     domain: &str,
     suspects: impl IntoIterator<Item = String>,
-    deadline: tokio::time::Instant,
+    deadline: Option<tokio::time::Instant>,
     assess: F,
 ) -> BTreeSet<String>
 where
     F: Fn(String) -> Fut,
     Fut: Future<Output = DnssecProofAssessment>,
 {
-    if deadline <= tokio::time::Instant::now() {
+    if deadline.is_some_and(|deadline| deadline <= tokio::time::Instant::now()) {
         return BTreeSet::new();
     }
     let suspects = suspects
@@ -1652,14 +1701,20 @@ where
         .buffer_unordered(DNSSEC_WILDCARD_SUSPECT_CAP);
     let mut nonexistent = BTreeSet::new();
     loop {
-        match tokio::time::timeout_at(deadline, pending.next()).await {
-            Ok(Some((fqdn, assessment))) => {
+        let next = match deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline, pending.next())
+                .await
+                .ok()
+                .flatten(),
+            None => pending.next().await,
+        };
+        match next {
+            Some((fqdn, assessment)) => {
                 if dnssec_assessment_proves_nonexistence(&assessment) {
                     nonexistent.insert(fqdn);
                 }
             }
-            Ok(None) => break,
-            Err(_) => break,
+            None => break,
         }
     }
     // Dropping the buffered stream cancels all unfinished resolver futures;
@@ -1692,6 +1747,14 @@ impl BatchResolution {
         self.not_started_hosts.append(&mut other.not_started_hosts);
         self.attempted_hosts.append(&mut other.attempted_hosts);
     }
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct LateCtValidationDrain {
+    cache_hits: usize,
+    resolved_from_network: usize,
+    pending: usize,
+    deadline_exhausted: bool,
 }
 
 impl Scanner {
@@ -1917,13 +1980,9 @@ impl Scanner {
         if suspects.is_empty() {
             return Ok(BTreeSet::new());
         }
-        let local_deadline = tokio::time::Instant::now() + DNSSEC_WILDCARD_SUSPECT_BUDGET;
-        let deadline = phase_deadline
-            .map(|deadline| deadline.min(local_deadline))
-            .unwrap_or(local_deadline);
         let dns = self.trusted_dns.as_ref().unwrap_or(&self.dns);
         let nonexistent =
-            assess_dnssec_suspects_bounded(domain, suspects, deadline, |fqdn| async move {
+            assess_dnssec_suspects_bounded(domain, suspects, phase_deadline, |fqdn| async move {
                 // TXT is intentionally orthogonal to the A/AAAA response that
                 // triggered wildcard suspicion. A real owner yields secure
                 // exact-owner NODATA, while a synthesized owner can expose the
@@ -2532,6 +2591,7 @@ impl Scanner {
                 let names = cached.map(|entry| entry.names).unwrap_or_default();
                 self.emit(ProgressEvent::PassiveSource {
                     source: source.clone(),
+                    outcome: PassiveSourceOutcome::Skipped,
                     status: format!(
                         "source indisponible, aucune requête: {}",
                         metadata
@@ -2554,6 +2614,7 @@ impl Scanner {
                 let names = cached.map(|entry| entry.names).unwrap_or_default();
                 self.emit(ProgressEvent::PassiveSource {
                     source: source.clone(),
+                    outcome: PassiveSourceOutcome::Skipped,
                     status: "clé API absente, source ignorée, mémoire permanente".to_owned(),
                     names: names.len(),
                 });
@@ -2571,6 +2632,7 @@ impl Scanner {
                 let names = cached.map(|entry| entry.names).unwrap_or_default();
                 self.emit(ProgressEvent::PassiveSource {
                     source: source.clone(),
+                    outcome: PassiveSourceOutcome::Deferred,
                     status: external_pauses
                         .get(source)
                         .map(|retry_until| external_pause_status(retry_until.saturating_sub(now)))
@@ -2592,6 +2654,7 @@ impl Scanner {
             {
                 self.emit(ProgressEvent::PassiveSource {
                     source: source.clone(),
+                    outcome: PassiveSourceOutcome::Cached,
                     status: "cache frais".to_owned(),
                     names: entry.names.len(),
                 });
@@ -2652,19 +2715,15 @@ impl Scanner {
                         .await
                         .expect("le sémaphore passif reste ouvert pendant le scan");
                     let policy = source_policy(&source);
-                    let remaining = passive_deadline
-                        .map(|deadline| {
-                            deadline
-                                .saturating_duration_since(tokio::time::Instant::now())
-                                .saturating_sub(Duration::from_millis(250))
-                        })
-                        .unwrap_or(policy.total_timeout)
-                        .min(policy.total_timeout);
-                    if remaining.is_zero() {
+                    let (remaining, lease_ttl) = passive_connector_timing(
+                        passive_deadline,
+                        policy.timeout,
+                        policy.total_timeout,
+                    );
+                    if passive_deadline.is_some() && remaining.is_zero() {
                         return (source, 0, None, 0);
                     }
                     let started = Instant::now();
-                    let lease_ttl = remaining.saturating_add(PASSIVE_REFRESH_LEASE_GRACE);
                     let lease = match PassiveRefreshLeaseGuard::try_acquire(
                         database.clone(),
                         domain,
@@ -2912,12 +2971,12 @@ impl Scanner {
                         .map(|sources| sources.len())
                         .unwrap_or_default();
                     let remaining = passive_deadline
-                        .map(|deadline| format!("{}s", deadline.saturating_duration_since(tokio::time::Instant::now()).as_secs()))
-                        .unwrap_or_else(|| "illimité".to_owned());
+                        .map(|deadline| format!("limite cumulative dans {}s", deadline.saturating_duration_since(tokio::time::Instant::now()).as_secs()))
+                        .unwrap_or_else(|| "sans limite cumulative".to_owned());
                     self.emit(ProgressEvent::Phase {
                         name: "passif".to_owned(),
                         detail: format!(
-                            "{refresh_finished}/{refresh_total} source(s), {active} active(s), budget restant {remaining}"
+                            "{refresh_finished}/{refresh_total} source(s), {active} active(s), {remaining}"
                         ),
                     });
                     continue;
@@ -2927,7 +2986,7 @@ impl Scanner {
             let Some(next) = poll else {
                 let unfinished = refresh_total.saturating_sub(refresh_finished);
                 let warning = format!(
-                    "budget passif de {:.1}s atteint; {unfinished} source(s) lente(s) annulée(s), mémoire permanente conservée",
+                    "limite cumulative passive de {:.1}s atteinte; {unfinished} source(s) lente(s) annulée(s), mémoire permanente conservée",
                     self.options.passive_phase_timeout.as_secs_f64()
                 );
                 self.emit(ProgressEvent::Warning(warning.clone()));
@@ -2952,7 +3011,8 @@ impl Scanner {
                 let names = stale.map(|entry| entry.names).unwrap_or_default();
                 self.emit(ProgressEvent::PassiveSource {
                     source: source.clone(),
-                    status: "cache périmé, source différée par le budget".to_owned(),
+                    outcome: PassiveSourceOutcome::Deferred,
+                    status: "cache périmé, source différée par la limite cumulative".to_owned(),
                     names: names.len(),
                 });
                 passive_union_omitted =
@@ -3050,6 +3110,11 @@ impl Scanner {
                     }
                     self.emit(ProgressEvent::PassiveSource {
                         source: source.clone(),
+                        outcome: if partial_warning.is_some() {
+                            PassiveSourceOutcome::Partial
+                        } else {
+                            PassiveSourceOutcome::Success
+                        },
                         status: if partial_warning.is_some() {
                             "réseau partiel + mémoire permanente".to_owned()
                         } else {
@@ -3109,6 +3174,7 @@ impl Scanner {
                         let names = stale.names;
                         self.emit(ProgressEvent::PassiveSource {
                             source: source.clone(),
+                            outcome: PassiveSourceOutcome::Stale,
                             status: "cache périmé".to_owned(),
                             names: names.len(),
                         });
@@ -3143,15 +3209,17 @@ impl Scanner {
                     self.database.record_source_deferred(
                         &source,
                         started_at.elapsed().as_millis(),
-                        "source cancelled when the shared passive budget ended",
+                        "source cancelled when the configured passive deadline was reached",
                     )?;
                 }
                 self.emit(ProgressEvent::PassiveSource {
                     source: source.clone(),
+                    outcome: PassiveSourceOutcome::Deferred,
                     status: if started {
                         "cache périmé, requête lente annulée".to_owned()
                     } else {
-                        "cache périmé, source différée par le budget".to_owned()
+                        "cache périmé, source différée par la limite cumulative configurée"
+                            .to_owned()
                     },
                     names: names.len(),
                 });
@@ -3187,7 +3255,7 @@ impl Scanner {
         passive_union_omitted = passive_union_omitted.saturating_sub(refilled);
         if passive_union_omitted > 0 {
             let warning = format!(
-                "budget passif en mémoire atteint: {passive_union_omitted} nom(s) supplémentaires conservé(s) uniquement dans SQLite"
+                "limite --max-passive atteinte: {passive_union_omitted} nom(s) supplémentaires conservé(s) uniquement dans SQLite"
             );
             self.emit(ProgressEvent::Warning(warning.clone()));
             warnings.push(warning);
@@ -3299,7 +3367,7 @@ impl Scanner {
             .collect::<BTreeSet<_>>();
         sources.retain(|name, _| keep.contains(name));
         let warning = format!(
-            "budget global de découverte appliqué: {} noms conservés sur {before}",
+            "limite globale de candidats appliquée: {} noms conservés sur {before}",
             sources.len()
         );
         self.emit(ProgressEvent::Warning(warning.clone()));
@@ -3432,7 +3500,7 @@ impl Scanner {
                     Err(_) => {
                         let unfinished = zone_total.saturating_sub(zone_completed);
                         let warning = format!(
-                            "budget passif récursif de {:.1}s atteint; {unfinished} zone(s) restante(s) annulée(s)",
+                            "limite cumulative passive de {:.1}s atteinte; {unfinished} zone(s) restante(s) annulée(s)",
                             self.options.passive_phase_timeout.as_secs_f64()
                         );
                         self.emit(ProgressEvent::Warning(warning.clone()));
@@ -3477,7 +3545,7 @@ impl Scanner {
             }
             if truncated > 0 {
                 let warning = format!(
-                    "{zone}: {truncated} nom(s) récursif(s) ignoré(s), budget global atteint"
+                    "{zone}: {truncated} nom(s) récursif(s) ignoré(s), limite globale atteinte"
                 );
                 self.emit(ProgressEvent::Warning(warning.clone()));
                 warnings.push(warning);
@@ -3642,6 +3710,34 @@ impl Scanner {
         }
     }
 
+    fn unverified_seed_audit_finding(
+        fqdn: String,
+        sources: BTreeSet<String>,
+        generation_path: &str,
+    ) -> Finding {
+        let evidence_families = evidence_families(&sources);
+        let state = crate::model::ObservationState::Unverified;
+        let confidence = assess_confidence(&sources, false, state, false);
+        Finding {
+            fqdn,
+            records: Vec::new(),
+            from_cache: sources
+                .iter()
+                .all(|source| source.contains(":cache") || source.contains(":stale")),
+            sources,
+            wildcard: false,
+            discovery_score: Some(f64::from(confidence.score) / 100.0),
+            confidence,
+            state,
+            last_verified_at: None,
+            evidence_families,
+            authoritative_validation: false,
+            wildcard_verdict: WildcardVerdict::NotProfiled,
+            owner_proofs: BTreeSet::new(),
+            generation_path: vec![generation_path.to_owned()],
+        }
+    }
+
     fn append_persistent_inventory(
         &self,
         domain: &str,
@@ -3658,7 +3754,7 @@ impl Scanner {
         loop {
             let inventory =
                 self.database
-                    .inventory_page(domain, false, cursor.as_deref(), 4_096)?;
+                    .current_inventory_page(domain, false, cursor.as_deref(), 4_096)?;
             if inventory.is_empty() {
                 break;
             }
@@ -3760,27 +3856,11 @@ impl Scanner {
         let mut findings = sources
             .iter()
             .map(|(fqdn, origins)| {
-                let evidence_families = evidence_families(origins);
-                let state = crate::model::ObservationState::Unverified;
-                let confidence = assess_confidence(origins, false, state, false);
-                Finding {
-                    fqdn: fqdn.clone(),
-                    records: Vec::new(),
-                    sources: origins.clone(),
-                    wildcard: false,
-                    from_cache: origins
-                        .iter()
-                        .all(|source| source.contains(":cache") || source.contains(":stale")),
-                    discovery_score: Some(f64::from(confidence.score) / 100.0),
-                    confidence,
-                    state,
-                    last_verified_at: None,
-                    evidence_families,
-                    authoritative_validation: false,
-                    wildcard_verdict: WildcardVerdict::NotProfiled,
-                    owner_proofs: BTreeSet::new(),
-                    generation_path: vec!["passive_provider_only".to_owned()],
-                }
+                Self::unverified_seed_audit_finding(
+                    fqdn.clone(),
+                    origins.clone(),
+                    "passive_provider_only",
+                )
             })
             .collect::<Vec<_>>();
         findings.sort_by(|left, right| left.fqdn.cmp(&right.fqdn));
@@ -3793,6 +3873,14 @@ impl Scanner {
         self.database.store_scan_observations(domain, &sources)?;
         self.database
             .persist_unverified_findings_preserving_state(scan_id, domain, &findings)?;
+        let current_names = self.database.current_seed_output_names(
+            domain,
+            &findings
+                .iter()
+                .map(|finding| finding.fqdn.clone())
+                .collect::<Vec<_>>(),
+        )?;
+        findings.retain(|finding| current_names.contains(&finding.fqdn));
         if self.options.only_live {
             findings.clear();
         }
@@ -3951,9 +4039,50 @@ impl Scanner {
             return Ok(BatchResolution::default());
         }
 
+        self.validate_claimed_seed_batch_bounded(
+            scan_id,
+            domain,
+            &claimed,
+            phase,
+            scan_started,
+            sources,
+            root_wildcard,
+            parent_by_host,
+            wildcard_by_parent,
+            reliable_wildcard_zones,
+            wildcard_parent_limit,
+            remaining,
+        )
+        .await
+    }
+
+    /// Validate one page that has already been atomically claimed from the
+    /// durable seed queue. Keeping claim and validation separate lets late CT
+    /// drain every accepted page in the current run when no active deadline is
+    /// configured, without repeatedly materializing the complete CT payload.
+    #[allow(clippy::too_many_arguments)]
+    async fn validate_claimed_seed_batch_bounded(
+        &self,
+        scan_id: i64,
+        domain: &str,
+        claimed: &[String],
+        phase: &str,
+        scan_started: &Instant,
+        sources: &BTreeMap<String, BTreeSet<String>>,
+        root_wildcard: &BTreeSet<String>,
+        parent_by_host: &mut HashMap<String, String>,
+        wildcard_by_parent: &mut BTreeMap<String, BTreeSet<String>>,
+        reliable_wildcard_zones: &mut BTreeSet<String>,
+        wildcard_parent_limit: usize,
+        remaining: &mut Option<Duration>,
+    ) -> Result<BatchResolution> {
+        if claimed.is_empty() {
+            return Ok(BatchResolution::default());
+        }
+
         let registration = self
             .register_wildcard_parents_with_budget(
-                &claimed,
+                claimed,
                 domain,
                 parent_by_host,
                 wildcard_by_parent,
@@ -4030,6 +4159,84 @@ impl Scanner {
         resolution.not_started_hosts.sort();
         resolution.not_started_hosts.dedup();
         Ok(resolution)
+    }
+
+    /// Drain the durable seed tail created when CT joins after the ordinary
+    /// candidate loop. With `remaining == None`, structural queue and retry
+    /// bounds are the only stopping conditions. A configured active deadline
+    /// is shared across every page and leaves unstarted work resumable.
+    #[allow(clippy::too_many_arguments)]
+    async fn drain_late_ct_seed_validation(
+        &self,
+        scan_id: i64,
+        domain: &str,
+        scan_started: &Instant,
+        sources: &BTreeMap<String, BTreeSet<String>>,
+        root_wildcard: &BTreeSet<String>,
+        parent_by_host: &mut HashMap<String, String>,
+        wildcard_by_parent: &mut BTreeMap<String, BTreeSet<String>>,
+        reliable_wildcard_zones: &mut BTreeSet<String>,
+        answers: &mut BTreeMap<String, ResolvedHost>,
+        remaining: &mut Option<Duration>,
+        batch_size: usize,
+    ) -> Result<LateCtValidationDrain> {
+        let mut drain = LateCtValidationDrain::default();
+        let batch_size = batch_size.clamp(1, ENRICHMENT_VALIDATION_BATCH_SIZE);
+        loop {
+            if active_candidate_budget_exhausted(*remaining) {
+                drain.deadline_exhausted = true;
+                break;
+            }
+            let claimed = self
+                .database
+                .pending_scan_seed_candidates(scan_id, batch_size)?;
+            if claimed.is_empty() {
+                break;
+            }
+            let (already_answered, validation_hosts): (Vec<_>, Vec<_>) = claimed
+                .into_iter()
+                .map(|(fqdn, _, _)| fqdn)
+                .partition(|fqdn| answers.contains_key(fqdn));
+            self.database
+                .mark_scan_seed_candidates_done(scan_id, &already_answered)?;
+            if validation_hosts.is_empty() {
+                continue;
+            }
+
+            let resolution = self
+                .validate_claimed_seed_batch_bounded(
+                    scan_id,
+                    domain,
+                    &validation_hosts,
+                    "DNS CT tardif",
+                    scan_started,
+                    sources,
+                    root_wildcard,
+                    parent_by_host,
+                    wildcard_by_parent,
+                    reliable_wildcard_zones,
+                    20,
+                    remaining,
+                )
+                .await?;
+            drain.cache_hits = drain.cache_hits.saturating_add(resolution.cache_hits);
+            drain.resolved_from_network = drain
+                .resolved_from_network
+                .saturating_add(resolution.resolved_from_network);
+            drain.deadline_exhausted |= resolution.deadline_exhausted;
+            for answer in resolution.answers {
+                answers.insert(answer.fqdn.clone(), answer);
+            }
+            if drain.deadline_exhausted || active_candidate_budget_exhausted(*remaining) {
+                drain.deadline_exhausted = true;
+                break;
+            }
+        }
+        drain.pending = self
+            .database
+            .pending_scan_seed_candidate_count(scan_id)?
+            .max(0) as usize;
+        Ok(drain)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4648,15 +4855,18 @@ impl Scanner {
         }
 
         let phase_started = Instant::now();
-        let phase_budget = if self.options.ct_phase_timeout.is_zero() {
-            "unlimited".to_owned()
+        let phase_limit = if self.options.ct_phase_timeout.is_zero() {
+            "sans limite cumulative".to_owned()
         } else {
-            format!("{} s", self.options.ct_phase_timeout.as_secs())
+            format!(
+                "limite cumulative {} s",
+                self.options.ct_phase_timeout.as_secs()
+            )
         };
         self.emit(ProgressEvent::Phase {
             name: "CT incrémental".to_owned(),
             detail: format!(
-                "indexation opportuniste en arrière-plan: {} journal(aux), {} entrées maximum par journal, budget {phase_budget}",
+                "indexation en arrière-plan: {} journal(aux), {} entrées maximum par journal, {phase_limit}",
                 self.options.ct_max_logs, self.options.ct_entries_per_log,
             ),
         });
@@ -4696,8 +4906,8 @@ impl Scanner {
         if !self.options.ct_phase_timeout.is_zero()
             && phase_started.elapsed() >= self.options.ct_phase_timeout
         {
-            let warning =
-                "CT incrémental: budget cumulé atteint; résultats partiels conservés".to_owned();
+            let warning = "CT incrémental: limite cumulative configurée atteinte; résultats partiels conservés"
+                .to_owned();
             self.emit(ProgressEvent::Warning(warning.clone()));
             ct_warnings.push(warning);
         }
@@ -5445,7 +5655,7 @@ impl Scanner {
             generated_candidates_enabled = false;
             if !active_budget_warning_emitted {
                 let detail = format!(
-                    "budget DNS actif de {}s atteint après {} candidat(s); expansion générée arrêtée, résultats terminés conservés et requêtes inachevées remises en file",
+                    "limite cumulative DNS active de {}s atteinte après {} candidat(s); expansion générée arrêtée, résultats terminés conservés et requêtes inachevées remises en file",
                     self.options.active_phase_timeout.as_secs(),
                     generator_attempts.values().sum::<usize>()
                 );
@@ -5592,7 +5802,7 @@ impl Scanner {
                 generated_candidates_enabled = false;
                 if !active_budget_warning_emitted {
                     let detail = format!(
-                        "budget DNS actif de {}s atteint après {} candidat(s); expansion générée arrêtée, résultats terminés conservés et requêtes inachevées remises en file",
+                        "limite cumulative DNS active de {}s atteinte après {} candidat(s); expansion générée arrêtée, résultats terminés conservés et requêtes inachevées remises en file",
                         self.options.active_phase_timeout.as_secs(),
                         generator_attempts.values().sum::<usize>()
                     );
@@ -5979,7 +6189,7 @@ impl Scanner {
                 generated_candidates_enabled = false;
                 if !active_budget_warning_emitted {
                     let detail = format!(
-                        "budget DNS actif de {}s atteint après {} candidat(s); expansion générée arrêtée, résultats terminés conservés et requêtes inachevées remises en file",
+                        "limite cumulative DNS active de {}s atteinte après {} candidat(s); expansion générée arrêtée, résultats terminés conservés et requêtes inachevées remises en file",
                         self.options.active_phase_timeout.as_secs(),
                         generator_attempts.values().sum::<usize>()
                     );
@@ -6073,23 +6283,29 @@ impl Scanner {
         }
 
         if ct_task_pending {
-            let minimum_runtime = if self.options.ct_phase_timeout.is_zero() {
-                Duration::from_secs(3)
-            } else {
-                self.options.ct_phase_timeout.min(Duration::from_secs(3))
-            };
-            let grace = minimum_runtime.saturating_sub(ct_task_started.elapsed());
-            if !grace.is_zero() {
+            let final_grace = if self.options.ct_phase_timeout.is_zero() {
                 self.emit(ProgressEvent::Phase {
                     name: "CT incrémental".to_owned(),
-                    detail: format!(
-                        "courte fenêtre finale bornée à {:.1}s; DNS déjà terminé",
-                        grace.as_secs_f64()
-                    ),
+                    detail: "validation DNS terminée; attente de la collecte CT bornée par les journaux et les entrées"
+                        .to_owned(),
                 });
-            }
+                None
+            } else {
+                let minimum_runtime = self.options.ct_phase_timeout.min(Duration::from_secs(3));
+                let grace = minimum_runtime.saturating_sub(ct_task_started.elapsed());
+                if !grace.is_zero() {
+                    self.emit(ProgressEvent::Phase {
+                        name: "CT incrémental".to_owned(),
+                        detail: format!(
+                            "courte fenêtre finale bornée à {:.1}s; DNS déjà terminé",
+                            grace.as_secs_f64()
+                        ),
+                    });
+                }
+                Some(grace)
+            };
             let (joined_ct, ct_aborted_without_join) =
-                finish_pending_ct_task_after_grace(&mut ct_tasks, grace).await;
+                finish_pending_ct_task(&mut ct_tasks, final_grace).await;
             let mut late_ct = match joined_ct {
                 Some(Ok(Ok((result, late_warnings)))) => {
                     warnings.extend(late_warnings);
@@ -6202,96 +6418,35 @@ impl Scanner {
                 self.options.max_passive,
             )?;
 
-            let accepted_seeds = self
-                .database
-                .scan_seed_candidates_for_output(scan_id)?
-                .into_iter()
-                .map(|(name, _)| name)
-                .collect::<BTreeSet<_>>();
-            let validation_hosts = late_payload
-                .iter()
-                .map(|(name, _, _)| name.clone())
-                .filter(|name| accepted_seeds.contains(name))
-                .filter(|name| !answers.contains_key(name))
-                .take(2_000)
-                .collect::<Vec<_>>();
-            let mut validation_hosts = self
-                .database
-                .claim_scan_seed_candidates_by_name(scan_id, &validation_hosts)?;
-            if !validation_hosts.is_empty() {
-                let claimed_validation_hosts = validation_hosts.clone();
-                let late_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-                let parent_registration = self
-                    .register_wildcard_parents_bounded(
-                        &validation_hosts,
-                        domain,
-                        &mut parent_by_host,
-                        &mut wildcard_by_parent,
-                        &mut reliable_wildcard_zones,
-                        20,
-                        Some(late_deadline),
-                    )
-                    .await;
-                let deferred_hosts = Self::deferred_wildcard_hosts(
-                    validation_hosts.iter().cloned(),
-                    &root_wildcard,
-                    &wildcard_by_parent,
-                );
-                self.database.requeue_unstarted_scan_seed_candidates(
+            // CT finished after the ordinary candidate loop. Drain every
+            // accepted durable seed page now instead of applying a hidden 5 s
+            // tail deadline or requiring one resume per 2 000 names. A
+            // user-configured active deadline remains cumulative because the
+            // shared `active_budget_remaining` value is charged page by page.
+            let late_drain = self
+                .drain_late_ct_seed_validation(
                     scan_id,
-                    &deferred_hosts.iter().cloned().collect::<Vec<_>>(),
-                )?;
-                validation_hosts.retain(|host| !deferred_hosts.contains(host));
-                let mut late_resolution = if validation_hosts.is_empty() {
-                    BatchResolution::default()
-                } else {
-                    self.resolve_batch_with_deadline(
-                        scan_id,
-                        domain,
-                        &validation_hosts,
-                        "DNS CT tardif",
-                        &started,
-                        &sources,
-                        &root_wildcard,
-                        &parent_by_host,
-                        &wildcard_by_parent,
-                        &reliable_wildcard_zones,
-                        Some(late_deadline),
-                        BatchDnsMode::Conservative,
-                    )
-                    .await?
-                };
-                late_resolution
-                    .not_started_hosts
-                    .extend(deferred_hosts.iter().cloned());
-                let not_started = late_resolution
-                    .not_started_hosts
-                    .iter()
-                    .cloned()
-                    .collect::<BTreeSet<_>>();
-                let terminal = claimed_validation_hosts
-                    .iter()
-                    .filter(|name| !not_started.contains(*name))
-                    .cloned()
-                    .collect::<Vec<_>>();
-                self.database
-                    .mark_scan_seed_candidates_done(scan_id, &terminal)?;
-                cache_hits += late_resolution.cache_hits;
-                network_resolved += late_resolution.resolved_from_network;
-                for answer in late_resolution.answers {
-                    answers.insert(answer.fqdn.clone(), answer);
-                }
-                if parent_registration.deadline_exhausted
-                    || parent_registration.deferred_parents > 0
-                    || late_resolution.deadline_exhausted
-                {
-                    let warning = format!(
-                        "CT incrémental: validation tardive bornée à 5s; {} nom(s) non démarré(s) restent non vérifiés",
-                        late_resolution.not_started_hosts.len()
-                    );
-                    self.emit(ProgressEvent::Warning(warning.clone()));
-                    warnings.push(warning);
-                }
+                    domain,
+                    &started,
+                    &sources,
+                    &root_wildcard,
+                    &mut parent_by_host,
+                    &mut wildcard_by_parent,
+                    &mut reliable_wildcard_zones,
+                    &mut answers,
+                    &mut active_budget_remaining,
+                    ENRICHMENT_VALIDATION_BATCH_SIZE,
+                )
+                .await?;
+            cache_hits += late_drain.cache_hits;
+            network_resolved += late_drain.resolved_from_network;
+            if late_drain.pending > 0 && late_drain.deadline_exhausted {
+                let warning = format!(
+                    "CT incrémental: limite cumulative DNS active configurée atteinte; {} nom(s) restent conservés pour --resume latest",
+                    late_drain.pending
+                );
+                self.emit(ProgressEvent::Warning(warning.clone()));
+                warnings.push(warning);
             }
         }
         phase_timings.push(PhaseTiming {
@@ -6444,7 +6599,7 @@ impl Scanner {
                         active_budget_remaining = Some(Duration::ZERO);
                     }
                     let warning =
-                        "PTR: budget DNS actif atteint; résultats inverses terminés conservés"
+                        "PTR: limite cumulative DNS active atteinte; résultats inverses terminés conservés"
                             .to_owned();
                     self.emit(ProgressEvent::Warning(warning.clone()));
                     warnings.push(warning);
@@ -6520,7 +6675,7 @@ impl Scanner {
         } else if self.options.ptr_pivot {
             self.emit(ProgressEvent::Phase {
                 name: "pivot PTR".to_owned(),
-                detail: "ignoré: budget DNS actif déjà épuisé".to_owned(),
+                detail: "ignoré: limite cumulative DNS active déjà atteinte".to_owned(),
             });
         }
 
@@ -6533,29 +6688,40 @@ impl Scanner {
                 self.options.internetdb_max_ips,
             );
             if !addresses.is_empty() {
+                let phase_limit = (!self.options.internetdb_phase_timeout.is_zero())
+                    .then_some(self.options.internetdb_phase_timeout);
+                let phase_limit_label = phase_limit
+                    .map(|limit| format!("limite cumulative {}s", limit.as_secs()))
+                    .unwrap_or_else(|| "sans limite cumulative".to_owned());
                 self.emit(ProgressEvent::Phase {
                     name: "pivot InternetDB".to_owned(),
                     detail: format!(
-                        "{} IP publique(s), une seule vague, budget {}s",
+                        "{} IP publique(s), une seule vague, {phase_limit_label}",
                         addresses.len(),
-                        self.options.internetdb_phase_timeout.as_secs()
                     ),
                 });
-                let deadline = tokio::time::Instant::now() + self.options.internetdb_phase_timeout;
+                let deadline = phase_deadline(phase_limit);
                 let refresh_seconds =
                     i64::try_from(self.options.internetdb_refresh.as_secs()).unwrap_or(i64::MAX);
                 let retry_seconds =
                     i64::try_from(INTERNETDB_ERROR_RETRY_AFTER.as_secs()).unwrap_or(i64::MAX);
                 let mut pivot_names = BTreeSet::new();
                 let mut pivot_edges = BTreeSet::new();
-                let mut phase_budget_exhausted = false;
+                let mut phase_deadline_reached = false;
+                let mut provider_rate_limited = false;
 
                 for address in addresses {
-                    if phase_budget_exhausted
-                        || tokio::time::Instant::now() >= deadline
-                        || pivot_names.len() >= INTERNETDB_MAX_AGGREGATE_NAMES
+                    if phase_deadline_reached || provider_rate_limited {
+                        break;
+                    }
+                    if deadline
+                        .as_ref()
+                        .is_some_and(|deadline| tokio::time::Instant::now() >= *deadline)
                     {
-                        phase_budget_exhausted = true;
+                        phase_deadline_reached = true;
+                        break;
+                    }
+                    if pivot_names.len() >= INTERNETDB_MAX_AGGREGATE_NAMES {
                         break;
                     }
                     let now = now_epoch();
@@ -6579,15 +6745,20 @@ impl Scanner {
                     {
                         (hostnames, qualifier)
                     } else {
-                        let remaining =
-                            deadline.saturating_duration_since(tokio::time::Instant::now());
-                        if remaining.is_zero() {
-                            phase_budget_exhausted = true;
+                        let request_timeout = deadline
+                            .as_ref()
+                            .map(|deadline| {
+                                deadline
+                                    .saturating_duration_since(tokio::time::Instant::now())
+                                    .min(INTERNETDB_REQUEST_TIMEOUT)
+                            })
+                            .unwrap_or(INTERNETDB_REQUEST_TIMEOUT);
+                        if request_timeout.is_zero() {
+                            phase_deadline_reached = true;
                             break;
                         }
-                        let request_timeout = remaining.min(INTERNETDB_REQUEST_TIMEOUT);
-                        match tokio::time::timeout_at(
-                            deadline,
+                        match tokio::time::timeout(
+                            request_timeout,
                             crate::passive::lookup_internetdb(address, request_timeout),
                         )
                         .await
@@ -6627,7 +6798,7 @@ impl Scanner {
                                         || error.contains("quota")
                                 };
                                 if rate_limited {
-                                    phase_budget_exhausted = true;
+                                    provider_rate_limited = true;
                                 }
                                 let stale = cached
                                     .as_ref()
@@ -6639,8 +6810,16 @@ impl Scanner {
                                 (stale, ":stale")
                             }
                             Err(_) => {
-                                phase_budget_exhausted = true;
-                                let error = "phase deadline reached";
+                                let cumulative_deadline_reached =
+                                    deadline.as_ref().is_some_and(|deadline| {
+                                        tokio::time::Instant::now() >= *deadline
+                                    });
+                                phase_deadline_reached |= cumulative_deadline_reached;
+                                let error = if cumulative_deadline_reached {
+                                    "phase deadline reached"
+                                } else {
+                                    "request timeout"
+                                };
                                 self.database.store_ip_hostname_failure(
                                     INTERNETDB_PROVIDER,
                                     address,
@@ -6657,7 +6836,6 @@ impl Scanner {
 
                     for hostname in hostnames {
                         if pivot_names.len() >= INTERNETDB_MAX_AGGREGATE_NAMES {
-                            phase_budget_exhausted = true;
                             break;
                         }
                         let Some(name) = normalize_observed_name(&hostname, domain) else {
@@ -6676,10 +6854,9 @@ impl Scanner {
                     }
                 }
 
-                if phase_budget_exhausted {
-                    let warning =
-                        "InternetDB: phase bornée arrêtée; résultats et cache déjà reçus conservés"
-                            .to_owned();
+                if phase_deadline_reached {
+                    let warning = "InternetDB: limite cumulative atteinte; résultats et cache déjà reçus conservés"
+                        .to_owned();
                     self.emit(ProgressEvent::Warning(warning.clone()));
                     warnings.push(warning);
                 }
@@ -6781,13 +6958,13 @@ impl Scanner {
                 .collect::<BTreeSet<_>>();
             let phase_started = Instant::now();
             let deadline = phase_deadline(nsec_budget_remaining);
-            let phase_budget = nsec_budget_remaining
-                .map(|remaining| format!("{} s restantes", remaining.as_secs()))
-                .unwrap_or_else(|| "illimité".to_owned());
+            let phase_limit = nsec_budget_remaining
+                .map(|remaining| format!("limite cumulative: {} s restantes", remaining.as_secs()))
+                .unwrap_or_else(|| "sans limite cumulative".to_owned());
             self.emit(ProgressEvent::Phase {
                 name: "DNSSEC NSEC".to_owned(),
                 detail: format!(
-                    "{} zone(s), parcours borné, cache permanent, budget {phase_budget}",
+                    "{} zone(s), parcours borné par le nombre de noms, cache permanent, {phase_limit}",
                     zones.len()
                 ),
             });
@@ -6809,8 +6986,8 @@ impl Scanner {
                 .await;
             consume_phase_budget(&mut nsec_budget_remaining, phase_started.elapsed());
             if nsec_budget_remaining.is_some_and(|remaining| remaining.is_zero()) {
-                let warning =
-                    "DNSSEC NSEC: budget cumulé atteint; résultats partiels conservés".to_owned();
+                let warning = "DNSSEC NSEC: limite cumulative configurée atteinte; résultats partiels conservés"
+                    .to_owned();
                 self.emit(ProgressEvent::Warning(warning.clone()));
                 warnings.push(warning);
                 nsec_budget_warning_emitted = true;
@@ -6888,7 +7065,7 @@ impl Scanner {
         if self.options.metadata_discovery {
             let metadata_phase_started = Instant::now();
             let metadata_budget = metadata_phase_budget(web_budget_remaining);
-            let metadata_deadline = tokio::time::Instant::now() + metadata_budget;
+            let metadata_deadline = phase_deadline(metadata_budget);
             let mut metadata_hosts = vec![domain.to_owned()];
             metadata_hosts.extend(
                 answers
@@ -6921,13 +7098,15 @@ impl Scanner {
             metadata_hosts.sort();
             metadata_hosts.dedup();
             metadata_hosts.truncate(self.options.metadata_max_requests.div_ceil(6).max(1));
+            let metadata_limit_label = metadata_budget
+                .map(|limit| format!("limite cumulative partagée {}s", limit.as_secs()))
+                .unwrap_or_else(|| "sans limite cumulative".to_owned());
             self.emit(ProgressEvent::Phase {
                 name: "métadonnées standardisées".to_owned(),
                 detail: format!(
-                    "{} hôte(s), {} requêtes HTTPS maximum, budget partagé {}s",
+                    "{} hôte(s), {} requêtes HTTPS maximum, {metadata_limit_label}",
                     metadata_hosts.len(),
-                    self.options.metadata_max_requests,
-                    metadata_budget.as_secs()
+                    self.options.metadata_max_requests
                 ),
             });
             let metadata_config = MetadataDiscoveryConfig {
@@ -6935,7 +7114,7 @@ impl Scanner {
                 max_redirects: 2,
                 max_requests: self.options.metadata_max_requests,
                 request_timeout: self.options.web_timeout.min(Duration::from_secs(8)),
-                phase_deadline: Some(metadata_deadline),
+                phase_deadline: metadata_deadline,
                 dns_concurrency: METADATA_DNS_CONCURRENCY,
             };
             let metadata_dns = self.trusted_dns.as_ref().unwrap_or(&self.dns);
@@ -7005,7 +7184,7 @@ impl Scanner {
                     }
                     if metadata.budget_exhausted {
                         warnings.push(
-                            "métadonnées standardisées: budget atteint, résultats partiels conservés"
+                            "métadonnées standardisées: limite cumulative configurée atteinte, résultats partiels conservés"
                                 .to_owned(),
                         );
                     }
@@ -7061,13 +7240,13 @@ impl Scanner {
             web_processed.extend(web_hosts.iter().cloned());
             let web_phase_started = Instant::now();
             let web_deadline = phase_deadline(web_budget_remaining);
-            let web_budget = web_budget_remaining
-                .map(|remaining| format!("{} s restantes", remaining.as_secs()))
-                .unwrap_or_else(|| "illimité".to_owned());
+            let web_limit = web_budget_remaining
+                .map(|remaining| format!("limite cumulative: {} s restantes", remaining.as_secs()))
+                .unwrap_or_else(|| "sans limite cumulative".to_owned());
             self.emit(ProgressEvent::Phase {
                 name: "web/JavaScript".to_owned(),
                 detail: format!(
-                    "{} hôte(s), {} asset(s) maximum par hôte, budget {web_budget}",
+                    "{} hôte(s), {} asset(s) maximum par hôte, {web_limit}",
                     web_hosts.len(),
                     self.options.web_assets_per_host
                 ),
@@ -7097,7 +7276,7 @@ impl Scanner {
             web_budget_exhausted = web.budget_exhausted
                 || web_budget_remaining.is_some_and(|remaining| remaining.is_zero());
             if web_budget_exhausted {
-                let warning = "Web/JavaScript: budget cumulé atteint; résultats partiels conservés et travaux restants ignorés"
+                let warning = "Web/JavaScript: limite cumulative configurée atteinte; résultats partiels conservés et travaux restants ignorés"
                     .to_owned();
                 self.emit(ProgressEvent::Warning(warning.clone()));
                 warnings.push(warning);
@@ -7317,7 +7496,7 @@ impl Scanner {
                 self.emit(ProgressEvent::Phase {
                     name: format!("pipeline événementiel {round}"),
                     detail: format!(
-                        "{} hôte(s) graphe, {} hôte(s) web, budget TLS {}",
+                        "{} hôte(s) graphe, {} hôte(s) web, capacité TLS restante {}",
                         graph_hosts.len(),
                         web_hosts.len(),
                         tls_remaining
@@ -7404,7 +7583,7 @@ impl Scanner {
                         || web_budget_remaining.is_some_and(|remaining| remaining.is_zero())
                     {
                         web_budget_exhausted = true;
-                        let warning = "Web/JavaScript: budget cumulé atteint pendant le pipeline; résultats partiels conservés et travaux restants ignorés"
+                        let warning = "Web/JavaScript: limite cumulative configurée atteinte pendant le pipeline; résultats partiels conservés et travaux restants ignorés"
                             .to_owned();
                         self.emit(ProgressEvent::Warning(warning.clone()));
                         warnings.push(warning);
@@ -7568,9 +7747,8 @@ impl Scanner {
                 if !nsec_budget_warning_emitted
                     && nsec_budget_remaining.is_some_and(|remaining| remaining.is_zero())
                 {
-                    let warning =
-                        "DNSSEC NSEC: budget cumulé atteint; résultats partiels conservés"
-                            .to_owned();
+                    let warning = "DNSSEC NSEC: limite cumulative configurée atteinte; résultats partiels conservés"
+                        .to_owned();
                     self.emit(ProgressEvent::Warning(warning.clone()));
                     warnings.push(warning);
                 }
@@ -7843,8 +8021,20 @@ impl Scanner {
             }
         }
 
+        let answer_hosts = answers.keys().cloned().collect::<Vec<_>>();
+        let current_answer_names = self
+            .database
+            .current_seed_output_names(domain, &answer_hosts)?;
+        let mut suppressed_sources = BTreeMap::<String, BTreeSet<String>>::new();
         let mut findings = Vec::new();
         for answer in answers.into_values() {
+            if !current_answer_names.contains(&answer.fqdn) {
+                suppressed_sources
+                    .entry(answer.fqdn.clone())
+                    .or_default()
+                    .extend(sources.get(&answer.fqdn).cloned().unwrap_or_default());
+                continue;
+            }
             if let Some(finding) = self.finding_for_answer(
                 &answer,
                 &sources,
@@ -7860,6 +8050,13 @@ impl Scanner {
             .map(|finding| finding.fqdn.clone())
             .collect::<BTreeSet<_>>();
         let seed_candidates = self.database.scan_seed_candidates_for_output(scan_id)?;
+        let current_seed_names = self.database.current_seed_output_names(
+            domain,
+            &seed_candidates
+                .iter()
+                .map(|(fqdn, _)| fqdn.clone())
+                .collect::<Vec<_>>(),
+        )?;
         let seed_cache = self.database.fresh_cache(
             &seed_candidates
                 .iter()
@@ -7867,6 +8064,13 @@ impl Scanner {
                 .collect::<Vec<_>>(),
         )?;
         for (fqdn, seed_sources) in seed_candidates {
+            if !current_seed_names.contains(&fqdn) {
+                suppressed_sources
+                    .entry(fqdn)
+                    .or_default()
+                    .extend(seed_sources);
+                continue;
+            }
             if !known_findings.insert(fqdn.clone()) {
                 continue;
             }
@@ -7895,13 +8099,10 @@ impl Scanner {
                     }
                 }
                 Some(CachedAnswer::Negative) => {
-                    findings.push(self.finding_for_unresolved_seed(
-                        fqdn,
-                        seed_sources,
-                        crate::model::ObservationState::Historical,
-                        &root_wildcard,
-                        &wildcard_by_parent,
-                    ));
+                    suppressed_sources
+                        .entry(fqdn)
+                        .or_default()
+                        .extend(seed_sources);
                 }
                 None => {
                     findings.push(self.finding_for_unresolved_seed(
@@ -7914,6 +8115,12 @@ impl Scanner {
                 }
             }
         }
+        let suppressed_findings = suppressed_sources
+            .into_iter()
+            .map(|(fqdn, sources)| {
+                Self::unverified_seed_audit_finding(fqdn, sources, "suppressed_current_result")
+            })
+            .collect::<Vec<_>>();
         findings.sort_by(|left, right| left.fqdn.cmp(&right.fqdn));
 
         let durable_learning = self.database.scan_candidate_learning(scan_id)?;
@@ -7956,12 +8163,28 @@ impl Scanner {
         pipeline_metrics.duplicates_suppressed = pipeline.duplicates;
         pipeline_metrics.names_validated = pipeline_names_validated;
         pipeline_metrics.budget_exhausted = pipeline.budget_exhausted;
-        let confirmed_sources = findings
-            .iter()
-            .map(|finding| (finding.fqdn.clone(), finding.sources.clone()))
-            .collect::<BTreeMap<_, _>>();
+        if pipeline.budget_exhausted {
+            let warning = format!(
+                "pipeline événementiel: limite explicite de {} événement(s) atteinte; utilisez --pipeline-limit 0 pour drainer toute la file finie",
+                self.options.pipeline_budget
+            );
+            self.emit(ProgressEvent::Warning(warning.clone()));
+            warnings.push(warning);
+        }
+        let mut confirmed_sources = BTreeMap::<String, BTreeSet<String>>::new();
+        for finding in findings.iter().chain(&suppressed_findings) {
+            confirmed_sources
+                .entry(finding.fqdn.clone())
+                .or_default()
+                .extend(finding.sources.iter().cloned());
+        }
         self.database
             .store_scan_observations(domain, &confirmed_sources)?;
+        self.database.persist_unverified_findings_preserving_state(
+            scan_id,
+            domain,
+            &suppressed_findings,
+        )?;
         self.database
             .persist_findings(scan_id, domain, &findings, self.options.ttl_cap)?;
         let restored_inventory = self.append_persistent_inventory(
@@ -7974,7 +8197,7 @@ impl Scanner {
             self.emit(ProgressEvent::Phase {
                 name: "inventaire permanent".to_owned(),
                 detail: format!(
-                    "{restored_inventory} résultat(s) historique(s) ou non revérifié(s) ajouté(s) à la sortie"
+                    "{restored_inventory} observation(s) permanente(s) encore pertinente(s) ajoutée(s) au résultat structuré"
                 ),
             });
         }
@@ -8127,8 +8350,8 @@ pub struct RefreshOptions {
 impl Default for RefreshOptions {
     fn default() -> Self {
         Self {
-            max_runtime: Duration::from_secs(300),
-            wildcard_phase_timeout: Duration::from_secs(30),
+            max_runtime: Duration::ZERO,
+            wildcard_phase_timeout: Duration::ZERO,
             batch_size: 256,
         }
     }
@@ -8226,10 +8449,14 @@ fn refresh_deadline(max_runtime: Duration) -> Option<tokio::time::Instant> {
 fn capped_phase_deadline(
     global: Option<tokio::time::Instant>,
     phase_timeout: Duration,
-) -> tokio::time::Instant {
-    let now = tokio::time::Instant::now();
-    let phase = now.checked_add(phase_timeout).unwrap_or(now);
-    global.map(|deadline| deadline.min(phase)).unwrap_or(phase)
+) -> Option<tokio::time::Instant> {
+    let phase = refresh_deadline(phase_timeout);
+    match (global, phase) {
+        (Some(global), Some(phase)) => Some(global.min(phase)),
+        (Some(global), None) => Some(global),
+        (None, Some(phase)) => Some(phase),
+        (None, None) => None,
+    }
 }
 
 fn refresh_allows_wildcard_purge(status: &str, classification_reliable: bool) -> bool {
@@ -8448,7 +8675,7 @@ pub async fn refresh_inventory_bounded(
     let require_wildcard_consensus = trusted_dns.is_some();
 
     let root_result = before_refresh_deadline(
-        Some(wildcard_deadline),
+        wildcard_deadline,
         wildcard_profile_observed(
             database,
             wildcard_dns,
@@ -8459,6 +8686,7 @@ pub async fn refresh_inventory_bounded(
         ),
     )
     .await;
+    let mut wildcard_deadline_reached = root_result.is_none() && wildcard_deadline.is_some();
     let mut wildcard_phase_complete =
         refresh_wildcard_observation_is_reliable(root_result.as_ref());
     let root_wildcard = root_result
@@ -8472,8 +8700,12 @@ pub async fn refresh_inventory_bounded(
     let mut setup_timed_out = false;
     let mut inventory_cursor = None::<String>;
     loop {
-        if wildcard_deadline <= tokio::time::Instant::now() {
+        if wildcard_deadline
+            .as_ref()
+            .is_some_and(|deadline| *deadline <= tokio::time::Instant::now())
+        {
             setup_timed_out = true;
+            wildcard_deadline_reached = true;
             break;
         }
         let page = database.known_subdomains_page(
@@ -8498,8 +8730,12 @@ pub async fn refresh_inventory_bounded(
     }
     let mut cache_cursor = None::<String>;
     while !setup_timed_out {
-        if wildcard_deadline <= tokio::time::Instant::now() {
+        if wildcard_deadline
+            .as_ref()
+            .is_some_and(|deadline| *deadline <= tokio::time::Instant::now())
+        {
             setup_timed_out = true;
+            wildcard_deadline_reached = true;
             break;
         }
         let page = database.positive_cache_only_names_page(
@@ -8523,10 +8759,6 @@ pub async fn refresh_inventory_bounded(
     }
     if setup_timed_out {
         wildcard_phase_complete = false;
-        warnings.push(
-            "budget partagé des profils wildcard atteint pendant la préparation paginée des zones parentes"
-                .to_owned(),
-        );
     }
     let mut parents = parent_counts.into_iter().collect::<Vec<_>>();
     parents.sort_by_key(|(parent, count)| {
@@ -8563,9 +8795,9 @@ pub async fn refresh_inventory_bounded(
         })
         .buffer_unordered(16);
     let mut profiles = BTreeMap::new();
-    loop {
-        match tokio::time::timeout_at(wildcard_deadline, pending_profiles.next()).await {
-            Ok(Some((parent, observation))) => {
+    while profiles.len() < selected_parent_set.len() {
+        match before_refresh_deadline(wildcard_deadline, pending_profiles.next()).await {
+            Some(Some((parent, observation))) => {
                 if !refresh_wildcard_observation_is_reliable(Some(&observation)) {
                     wildcard_phase_complete = false;
                 }
@@ -8574,26 +8806,35 @@ pub async fn refresh_inventory_bounded(
                     .unwrap_or_else(indeterminate_wildcard_signature);
                 profiles.insert(parent, signature);
             }
-            Ok(None) => break,
-            Err(_) => {
+            Some(None) => {
                 wildcard_phase_complete = false;
+                break;
+            }
+            None => {
+                wildcard_phase_complete = false;
+                wildcard_deadline_reached = true;
                 break;
             }
         }
     }
-    // timeout_at cancels only the current `next()` future. Drop the buffered
-    // stream as well so unfinished wildcard probes release DNS/rate-limit
-    // resources before inventory validation starts.
+    // The optional deadline wrapper cancels only the current `next()` future.
+    // Drop the buffered stream as well so unfinished wildcard probes release
+    // DNS/rate-limit resources before inventory validation starts.
     drop(pending_profiles);
     let completed_parents = profiles.keys().cloned().collect::<BTreeSet<_>>();
     for parent in selected_parent_set.difference(&completed_parents) {
         profiles.insert(parent.clone(), indeterminate_wildcard_signature());
     }
-    if !wildcard_phase_complete {
-        warnings.push(format!(
-            "classification wildcard incomplète ou budget partagé de {} s atteint; profils manquants traités comme indéterminés",
-            options.wildcard_phase_timeout.as_secs()
-        ));
+    if wildcard_deadline_reached {
+        warnings.push(
+            "limite cumulative atteinte pendant la classification wildcard; profils manquants traités comme indéterminés"
+                .to_owned(),
+        );
+    } else if !wildcard_phase_complete {
+        warnings.push(
+            "classification wildcard incomplète; profils indéterminés conservés et purge désactivée"
+                .to_owned(),
+        );
     }
     wildcard_by_parent.extend(profiles);
     let wildcard_classification_reliable = trusted_dns.is_some()
@@ -8896,9 +9137,9 @@ pub async fn refresh_inventory_bounded(
     } else {
         "completed".to_owned()
     };
-    if timed_out || checked < total {
+    if timed_out && global_deadline.is_some() {
         warnings.push(format!(
-            "budget global atteint après {checked}/{total} nom(s); état des noms non traités préservé"
+            "limite cumulative globale atteinte après {checked}/{total} nom(s); état des noms non traités préservé"
         ));
     }
     if indeterminate_count > 0 {
@@ -8924,7 +9165,7 @@ pub async fn refresh_inventory_bounded(
             None => {
                 status = "partial".to_owned();
                 warnings.push(
-                    "budget global atteint pendant la purge wildcard atomique; aucune suppression appliquée"
+                    "limite cumulative globale atteinte pendant la purge wildcard atomique; aucune suppression appliquée"
                         .to_owned(),
                 );
                 (0, 0)
@@ -8984,15 +9225,15 @@ mod tests {
         collect_dns_outcomes_until, consume_phase_budget, deferred_wildcard_signature,
         dnssec_assessment_proves_nonexistence, effective_passive_concurrency,
         external_deferral_seconds, external_pause_status, external_retry_after_seconds,
-        finish_pending_ct_task_after_grace_with_hook, high_value_window_needs_materialization,
-        high_value_window_persist_limit, indeterminate_wildcard_signature,
-        internetdb_cache_decision, is_missing_api_key_error, is_preflight_auth_error,
-        late_ct_seed_reserve, materialize_ct_fallback_bounded, merge_ct_fallback_names,
-        merge_passive_names_bounded, merge_resolver_metrics, metadata_phase_budget,
-        passive_connector_working_set_limit, persist_routed_dns_outcomes, phase_deadline,
-        prioritized_answer_addresses, record_bounded_parent_candidate,
-        refill_passive_union_from_cache, refresh_allows_wildcard_purge,
-        refresh_can_demote_wildcard_ambiguity, refresh_deadline,
+        finish_pending_ct_task, finish_pending_ct_task_after_grace_with_hook,
+        high_value_window_needs_materialization, high_value_window_persist_limit,
+        indeterminate_wildcard_signature, internetdb_cache_decision, is_missing_api_key_error,
+        is_preflight_auth_error, late_ct_seed_reserve, materialize_ct_fallback_bounded,
+        merge_ct_fallback_names, merge_passive_names_bounded, merge_resolver_metrics,
+        metadata_phase_budget, passive_connector_timing, passive_connector_working_set_limit,
+        persist_routed_dns_outcomes, phase_deadline, prioritized_answer_addresses,
+        record_bounded_parent_candidate, refill_passive_union_from_cache,
+        refresh_allows_wildcard_purge, refresh_can_demote_wildcard_ambiguity, refresh_deadline,
         refresh_parent_selection_is_complete, refresh_wildcard_observation_is_reliable,
         refresh_wildcard_profile_is_reliable, route_dns_outcomes,
         select_bounded_mutation_observations, should_expand_adaptive_wave,
@@ -9006,7 +9247,8 @@ mod tests {
     use crate::dns::{DnsEngine, DnsResolutionOutcome, WildcardProbeOutcome};
     use crate::dnssec_proof::{DnssecOwnerState, DnssecProofAssessment, DnssecProofKind};
     use crate::model::{
-        CtMonitorResult, DnsRecord, Finding, ObservationState, ResolvedHost, ResolverMetric,
+        CtMonitorResult, DnsRecord, Finding, ObservationState, PipelineMetrics, ResolvedHost,
+        ResolverMetric,
     };
     use hickory_net::proto::op::{Message, MessageType, ResponseCode};
     use hickory_net::proto::rr::rdata::A;
@@ -9372,8 +9614,14 @@ mod tests {
         );
         assert!(events.lock().unwrap().iter().any(|event| matches!(
             event,
-            super::ProgressEvent::PassiveSource { source, status, names }
+            super::ProgressEvent::PassiveSource {
+                source,
+                outcome,
+                status,
+                names,
+            }
                 if source == "binaryedge"
+                    && *outcome == super::PassiveSourceOutcome::Skipped
                     && status.contains("indisponible")
                     && !status.contains("clé API")
                     && *names == 1
@@ -9875,17 +10123,41 @@ mod tests {
     }
 
     #[test]
-    fn metadata_uses_the_remaining_web_budget_with_a_hard_cap() {
-        assert_eq!(metadata_phase_budget(None), Duration::from_secs(30));
+    fn metadata_is_unlimited_with_the_web_phase_and_caps_explicit_budgets() {
+        assert_eq!(metadata_phase_budget(None), None);
         assert_eq!(
             metadata_phase_budget(Some(Duration::from_secs(90))),
-            Duration::from_secs(30)
+            Some(Duration::from_secs(30))
         );
         assert_eq!(
             metadata_phase_budget(Some(Duration::from_secs(7))),
-            Duration::from_secs(7)
+            Some(Duration::from_secs(7))
         );
-        assert!(metadata_phase_budget(Some(Duration::ZERO)).is_zero());
+        assert_eq!(
+            metadata_phase_budget(Some(Duration::ZERO)),
+            Some(Duration::ZERO)
+        );
+    }
+
+    #[test]
+    fn unlimited_passive_phase_disables_only_the_connector_cumulative_deadline() {
+        let request_timeout = Duration::from_secs(10);
+        let policy_total_timeout = Duration::from_secs(45);
+        let (connector_budget, lease_ttl) =
+            passive_connector_timing(None, request_timeout, policy_total_timeout);
+
+        assert_eq!(connector_budget, Duration::ZERO);
+        assert_eq!(
+            lease_ttl,
+            policy_total_timeout + super::PASSIVE_REFRESH_LEASE_GRACE
+        );
+
+        let (expired_budget, _) = passive_connector_timing(
+            Some(tokio::time::Instant::now() - Duration::from_secs(1)),
+            request_timeout,
+            policy_total_timeout,
+        );
+        assert_eq!(expired_budget, Duration::ZERO);
     }
 
     #[test]
@@ -9933,7 +10205,7 @@ mod tests {
         let nonexistent = assess_dnssec_suspects_bounded(
             "example.com",
             suspects,
-            tokio::time::Instant::now() + Duration::from_secs(1),
+            Some(tokio::time::Instant::now() + Duration::from_secs(1)),
             {
                 let calls = Arc::clone(&calls);
                 let in_flight = Arc::clone(&in_flight);
@@ -9986,7 +10258,7 @@ mod tests {
         let nonexistent = assess_dnssec_suspects_bounded(
             "example.com",
             (0..8).map(|index| format!("slow-{index}.example.com")),
-            tokio::time::Instant::now() + Duration::from_millis(35),
+            Some(tokio::time::Instant::now() + Duration::from_millis(35)),
             {
                 let calls = Arc::clone(&calls);
                 move |_fqdn| {
@@ -10007,6 +10279,22 @@ mod tests {
             started.elapsed() < Duration::from_millis(150),
             "les évaluations ont reçu des deadlines individuelles"
         );
+    }
+
+    #[tokio::test]
+    async fn dnssec_suspect_assessment_has_no_hidden_cumulative_deadline() {
+        let nonexistent = assess_dnssec_suspects_bounded(
+            "example.com",
+            ["wild.example.com".to_owned()],
+            None,
+            |_fqdn| async {
+                tokio::time::sleep(Duration::from_millis(15)).await;
+                proven_dnssec_denial(DnssecProofKind::NxnameNsec)
+            },
+        )
+        .await;
+
+        assert_eq!(nonexistent, BTreeSet::from(["wild.example.com".to_owned()]));
     }
 
     #[test]
@@ -10171,6 +10459,102 @@ mod tests {
         assert_eq!(result.entries_processed, 7);
         assert!(result.names.contains("late.example.com"));
         assert_eq!(warnings, vec!["late warning"]);
+    }
+
+    #[tokio::test]
+    async fn unlimited_ct_drain_waits_for_structurally_bounded_completion() {
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            Ok((
+                CtMonitorResult {
+                    entries_processed: 11,
+                    names: BTreeSet::from(["complete.example.com".to_owned()]),
+                    ..CtMonitorResult::default()
+                },
+                Vec::new(),
+            ))
+        });
+
+        let (joined, aborted_without_result) = finish_pending_ct_task(&mut tasks, None).await;
+
+        assert!(!aborted_without_result);
+        let (result, warnings) = joined.unwrap().unwrap().unwrap();
+        assert_eq!(result.entries_processed, 11);
+        assert!(result.names.contains("complete.example.com"));
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn final_seed_materialization_hides_negative_and_quarantined_names_from_scan_json() {
+        let database = Database::in_memory().unwrap();
+        let domain = "example.com";
+        let allowed = "allowed.example.com".to_owned();
+        let negative = "negative.example.com".to_owned();
+        let quarantined = "quarantined.example.com".to_owned();
+        let scan_id = database.create_scan(domain, &json!({})).unwrap();
+        database
+            .record_discovery_negatives(scan_id, std::slice::from_ref(&negative))
+            .unwrap();
+        database
+            .quarantine_dnssec_nonexistent(scan_id, domain, std::slice::from_ref(&quarantined))
+            .unwrap();
+        let sources = BTreeMap::from([
+            (allowed.clone(), BTreeSet::from(["passive:test".to_owned()])),
+            (
+                negative.clone(),
+                BTreeSet::from(["passive:test".to_owned()]),
+            ),
+            (
+                quarantined.clone(),
+                BTreeSet::from(["passive:test".to_owned()]),
+            ),
+        ]);
+        let dns = DnsEngine::new_with_rate(
+            4,
+            Duration::from_millis(50),
+            &["127.0.0.1".parse().unwrap()],
+            10,
+        )
+        .unwrap();
+        let scanner = Scanner::new(database.clone(), dns, scanner_test_options(false));
+
+        let result = scanner
+            .finalize_no_target_contact_scan(
+                scan_id,
+                domain,
+                Instant::now(),
+                sources,
+                CtMonitorResult::default(),
+                PipelineMetrics::default(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            result
+                .findings
+                .iter()
+                .map(|finding| finding.fqdn.as_str())
+                .collect::<Vec<_>>(),
+            vec![allowed.as_str()]
+        );
+        let audit = database.inventory(Some(domain), false).unwrap();
+        assert_eq!(audit.len(), 2);
+        assert!(audit.iter().any(|entry| entry.fqdn == negative));
+        assert!(audit.iter().all(|entry| entry.fqdn != quarantined));
+        assert_eq!(
+            database.explain(&negative).unwrap()["dns_verifications"][0]["outcome"],
+            "negative"
+        );
+        assert_eq!(
+            database.explain(&quarantined).unwrap()["quarantine"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -10590,6 +10974,122 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unlimited_late_ct_validation_drains_every_seed_page_in_one_run() {
+        let (address, requests, server) = wildcard_test_resolver().await;
+        let database = Database::in_memory().unwrap();
+        let scan_id = database
+            .create_scan("example.test", &json!({"late_ct": true}))
+            .unwrap();
+        let hosts = ["one.example.test", "two.example.test"]
+            .into_iter()
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        let origins = BTreeSet::from(["passive:ct-direct".to_owned()]);
+        let seeds = hosts
+            .iter()
+            .map(|fqdn| (fqdn.clone(), origins.clone(), 100))
+            .collect::<Vec<_>>();
+        database
+            .persist_scan_seed_candidates(scan_id, &seeds, seeds.len())
+            .unwrap();
+        let dns =
+            DnsEngine::new_with_socket_addresses(8, Duration::from_secs(1), &[address], 0).unwrap();
+        let mut options = scanner_test_options(false);
+        options.max_passive = seeds.len();
+        let scanner = Scanner::new(database.clone(), dns, options);
+        let sources = hosts
+            .iter()
+            .map(|fqdn| (fqdn.clone(), origins.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let root_wildcard = BTreeSet::new();
+        let mut parent_by_host = HashMap::new();
+        let mut wildcard_by_parent =
+            BTreeMap::from([("example.test".to_owned(), root_wildcard.clone())]);
+        let mut reliable_wildcard_zones = BTreeSet::new();
+        let mut answers = BTreeMap::new();
+        let mut remaining = None;
+
+        let drain = scanner
+            .drain_late_ct_seed_validation(
+                scan_id,
+                "example.test",
+                &Instant::now(),
+                &sources,
+                &root_wildcard,
+                &mut parent_by_host,
+                &mut wildcard_by_parent,
+                &mut reliable_wildcard_zones,
+                &mut answers,
+                &mut remaining,
+                1,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(drain.pending, 0);
+        assert!(!drain.deadline_exhausted);
+        assert_eq!(answers.keys().cloned().collect::<Vec<_>>(), hosts);
+        assert!(requests.load(Ordering::SeqCst) >= 2);
+        assert_eq!(
+            database.pending_scan_seed_candidate_count(scan_id).unwrap(),
+            0
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn explicit_active_deadline_stops_late_ct_before_claiming_work() {
+        let (address, requests, server) = wildcard_test_resolver().await;
+        let database = Database::in_memory().unwrap();
+        let scan_id = database
+            .create_scan("example.test", &json!({"late_ct": true}))
+            .unwrap();
+        let fqdn = "queued.example.test".to_owned();
+        let origins = BTreeSet::from(["passive:ct-direct".to_owned()]);
+        database
+            .persist_scan_seed_candidates(scan_id, &[(fqdn.clone(), origins.clone(), 100)], 1)
+            .unwrap();
+        let dns =
+            DnsEngine::new_with_socket_addresses(8, Duration::from_secs(1), &[address], 0).unwrap();
+        let scanner = Scanner::new(database.clone(), dns, scanner_test_options(false));
+        let sources = BTreeMap::from([(fqdn.clone(), origins)]);
+        let root_wildcard = BTreeSet::new();
+        let mut parent_by_host = HashMap::new();
+        let mut wildcard_by_parent =
+            BTreeMap::from([("example.test".to_owned(), root_wildcard.clone())]);
+        let mut reliable_wildcard_zones = BTreeSet::new();
+        let mut answers = BTreeMap::new();
+        let mut remaining = Some(Duration::ZERO);
+
+        let drain = scanner
+            .drain_late_ct_seed_validation(
+                scan_id,
+                "example.test",
+                &Instant::now(),
+                &sources,
+                &root_wildcard,
+                &mut parent_by_host,
+                &mut wildcard_by_parent,
+                &mut reliable_wildcard_zones,
+                &mut answers,
+                &mut remaining,
+                1,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(drain.pending, 1);
+        assert!(drain.deadline_exhausted);
+        assert!(answers.is_empty());
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            database.pending_scan_seed_candidate_count(scan_id).unwrap(),
+            1
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn recursive_passive_zones_are_marked_only_when_a_task_is_scheduled() {
         let database = Database::in_memory().unwrap();
         let dns = DnsEngine::new_with_rate(
@@ -10813,6 +11313,7 @@ mod tests {
         let mut unlimited = None;
         consume_phase_budget(&mut unlimited, Duration::from_secs(99));
         assert_eq!(unlimited, None);
+        assert!(phase_deadline(unlimited).is_none());
     }
 
     #[test]
@@ -11200,11 +11701,21 @@ mod tests {
     }
 
     #[test]
-    fn refresh_defaults_are_bounded_and_batch_persistence_is_small() {
+    fn refresh_defaults_disable_cumulative_limits_and_keep_batches_bounded() {
         let options = RefreshOptions::default();
-        assert_eq!(options.max_runtime, Duration::from_secs(300));
-        assert_eq!(options.wildcard_phase_timeout, Duration::from_secs(30));
+        assert_eq!(options.max_runtime, Duration::ZERO);
+        assert_eq!(options.wildcard_phase_timeout, Duration::ZERO);
         assert_eq!(options.batch_size, 256);
+    }
+
+    #[tokio::test]
+    async fn absent_refresh_deadline_waits_for_completion() {
+        let result = before_refresh_deadline(None, async {
+            tokio::task::yield_now().await;
+            7_u8
+        })
+        .await;
+        assert_eq!(result, Some(7));
     }
 
     #[tokio::test]
@@ -11221,7 +11732,13 @@ mod tests {
     fn global_refresh_deadline_caps_the_shared_wildcard_phase() {
         let global = tokio::time::Instant::now() + Duration::from_secs(1);
         let capped = capped_phase_deadline(Some(global), Duration::from_secs(30));
-        assert_eq!(capped, global);
+        assert_eq!(capped, Some(global));
+        assert_eq!(
+            capped_phase_deadline(Some(global), Duration::ZERO),
+            Some(global)
+        );
+        assert!(capped_phase_deadline(None, Duration::ZERO).is_none());
+        assert!(refresh_deadline(Duration::ZERO).is_none());
     }
 
     #[test]
@@ -11229,7 +11746,7 @@ mod tests {
         let before = tokio::time::Instant::now();
         let phase = phase_deadline(Some(Duration::MAX)).unwrap();
         let refresh = refresh_deadline(Duration::MAX).unwrap();
-        let capped = capped_phase_deadline(None, Duration::MAX);
+        let capped = capped_phase_deadline(None, Duration::MAX).unwrap();
         let after = tokio::time::Instant::now();
         for deadline in [phase, refresh, capped] {
             assert!(deadline >= before && deadline <= after);

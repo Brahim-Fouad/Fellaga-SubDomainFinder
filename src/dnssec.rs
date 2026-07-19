@@ -18,7 +18,6 @@ use std::time::Duration;
 use tokio::time::{Instant, timeout};
 
 const NSEC_QUERIES_PER_SECOND: u64 = 20;
-const NSEC_ZONE_MAX_RUNTIME: Duration = Duration::from_secs(120);
 
 struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
 
@@ -34,10 +33,15 @@ struct NsecRateLimiter {
 }
 
 impl NsecRateLimiter {
-    async fn wait_before(&self, deadline: Instant) -> bool {
-        if deadline <= Instant::now() {
+    async fn wait_before(
+        &self,
+        phase_deadline: Option<Instant>,
+        operation_timeout: Duration,
+    ) -> bool {
+        let Some(wait_budget) = operation_budget(phase_deadline, operation_timeout) else {
             return false;
-        }
+        };
+        let deadline = Instant::now() + wait_budget;
         let spacing = Duration::from_secs_f64(1.0 / NSEC_QUERIES_PER_SECOND as f64);
         let Ok(mut next) = tokio::time::timeout_at(deadline, self.next.lock()).await else {
             return false;
@@ -59,18 +63,33 @@ impl NsecRateLimiter {
 async fn wait_for_nsec_query_slot(
     dns: &DnsEngine,
     limiter: &NsecRateLimiter,
-    deadline: Instant,
+    phase_deadline: Option<Instant>,
+    operation_timeout: Duration,
 ) -> bool {
-    limiter.wait_before(deadline).await && dns.wait_for_rate_slot_before(deadline).await
+    if !limiter.wait_before(phase_deadline, operation_timeout).await {
+        return false;
+    }
+    let Some(wait_budget) = operation_budget(phase_deadline, operation_timeout) else {
+        return false;
+    };
+    dns.wait_for_rate_slot_before(Instant::now() + wait_budget)
+        .await
 }
 
-fn earliest_deadline(zone_deadline: Instant, phase_deadline: Option<Instant>) -> Instant {
-    phase_deadline
-        .map(|deadline| deadline.min(zone_deadline))
-        .unwrap_or(zone_deadline)
+fn phase_deadline_reached(phase_deadline: Option<Instant>) -> bool {
+    phase_deadline.is_some_and(|deadline| deadline <= Instant::now())
 }
 
-fn operation_budget(deadline: Instant, operation_timeout: Duration) -> Option<Duration> {
+fn operation_budget(
+    phase_deadline: Option<Instant>,
+    operation_timeout: Duration,
+) -> Option<Duration> {
+    if operation_timeout.is_zero() {
+        return None;
+    }
+    let Some(deadline) = phase_deadline else {
+        return Some(operation_timeout);
+    };
     let remaining = deadline.saturating_duration_since(Instant::now());
     (!remaining.is_zero()).then(|| remaining.min(operation_timeout))
 }
@@ -79,7 +98,7 @@ fn mark_deadline(result: &mut DnssecWalkResult) {
     if !result.names.is_empty() {
         result.status = "partial".to_owned();
     }
-    result.error = Some("budget de temps NSEC atteint".to_owned());
+    result.error = Some("limite cumulative NSEC atteinte".to_owned());
 }
 
 fn reusable_walk_status(status: &str) -> bool {
@@ -137,7 +156,7 @@ async fn walk_one(
     operation_timeout: Duration,
     max_names: usize,
     limiter: &NsecRateLimiter,
-    deadline: Instant,
+    phase_deadline: Option<Instant>,
 ) -> DnssecWalkResult {
     let mut result = DnssecWalkResult {
         zone: zone.to_owned(),
@@ -155,8 +174,12 @@ async fn walk_one(
             return result;
         }
     };
-    let Some(connect_timeout) = operation_budget(deadline, operation_timeout) else {
-        mark_deadline(&mut result);
+    let Some(connect_timeout) = operation_budget(phase_deadline, operation_timeout) else {
+        if phase_deadline_reached(phase_deadline) {
+            mark_deadline(&mut result);
+        } else {
+            result.error = Some("délai unitaire NSEC invalide".to_owned());
+        }
         return result;
     };
     let socket = SocketAddr::new(address, 53);
@@ -168,7 +191,7 @@ async fn walk_one(
             return result;
         }
         Err(_) => {
-            if Instant::now() >= deadline {
+            if phase_deadline_reached(phase_deadline) {
                 mark_deadline(&mut result);
             } else {
                 result.error = Some("timeout de connexion DNSSEC".to_owned());
@@ -189,8 +212,12 @@ async fn walk_one(
             return result;
         }
     };
-    if !wait_for_nsec_query_slot(dns, limiter, deadline).await {
-        mark_deadline(&mut result);
+    if !wait_for_nsec_query_slot(dns, limiter, phase_deadline, operation_timeout).await {
+        if phase_deadline_reached(phase_deadline) {
+            mark_deadline(&mut result);
+        } else {
+            result.error = Some("timeout du limiteur de débit NSEC".to_owned());
+        }
         return result;
     }
     result.queries += 1;
@@ -201,8 +228,12 @@ async fn walk_one(
     options.edns_set_dnssec_ok = true;
     options.recursion_desired = false;
     let mut probe_responses = client.lookup(probe_query, options);
-    let Some(probe_timeout) = operation_budget(deadline, operation_timeout) else {
-        mark_deadline(&mut result);
+    let Some(probe_timeout) = operation_budget(phase_deadline, operation_timeout) else {
+        if phase_deadline_reached(phase_deadline) {
+            mark_deadline(&mut result);
+        } else {
+            result.error = Some("délai unitaire NSEC invalide".to_owned());
+        }
         return result;
     };
     let probe = match timeout(probe_timeout, probe_responses.next()).await {
@@ -216,7 +247,7 @@ async fn walk_one(
             return result;
         }
         Err(_) => {
-            if Instant::now() >= deadline {
+            if phase_deadline_reached(phase_deadline) {
                 mark_deadline(&mut result);
             } else {
                 result.error = Some("timeout de détection NSEC".to_owned());
@@ -280,16 +311,24 @@ async fn walk_one(
             result.status = "walked".to_owned();
             break;
         }
-        if !wait_for_nsec_query_slot(dns, limiter, deadline).await {
-            mark_deadline(&mut result);
+        if !wait_for_nsec_query_slot(dns, limiter, phase_deadline, operation_timeout).await {
+            if phase_deadline_reached(phase_deadline) {
+                mark_deadline(&mut result);
+            } else {
+                result.error = Some("timeout du limiteur de débit NSEC".to_owned());
+            }
             break;
         }
         result.queries += 1;
         let mut nsec_query = Query::query(current.clone(), RecordType::NSEC);
         nsec_query.set_query_class(DNSClass::IN);
         let mut nsec_responses = client.lookup(nsec_query, options);
-        let Some(query_timeout) = operation_budget(deadline, operation_timeout) else {
-            mark_deadline(&mut result);
+        let Some(query_timeout) = operation_budget(phase_deadline, operation_timeout) else {
+            if phase_deadline_reached(phase_deadline) {
+                mark_deadline(&mut result);
+            } else {
+                result.error = Some("délai unitaire NSEC invalide".to_owned());
+            }
             break;
         };
         let response = match timeout(query_timeout, nsec_responses.next()).await {
@@ -303,7 +342,7 @@ async fn walk_one(
                 break;
             }
             Err(_) => {
-                if Instant::now() >= deadline {
+                if phase_deadline_reached(phase_deadline) {
                     mark_deadline(&mut result);
                 } else {
                     result.error = Some("timeout pendant NSEC walking".to_owned());
@@ -455,19 +494,26 @@ async fn discover_nsec_until(
                     from_cache: false,
                     error: Some("aucun serveur DNS autoritaire joignable".to_owned()),
                 };
-                let zone_deadline = Instant::now() + NSEC_ZONE_MAX_RUNTIME;
-                let deadline = earliest_deadline(zone_deadline, phase_deadline);
                 let mut observed_names = BTreeSet::new();
                 let mut total_queries = 0_usize;
-                if deadline <= Instant::now() {
+                if phase_deadline_reached(phase_deadline) {
                     mark_deadline(&mut best);
                 } else {
-                    match tokio::time::timeout_at(deadline, dns.authoritative_servers(&zone)).await
-                    {
+                    let Some(authority_timeout) =
+                        operation_budget(phase_deadline, operation_timeout)
+                    else {
+                        if phase_deadline_reached(phase_deadline) {
+                            mark_deadline(&mut best);
+                        } else {
+                            best.error = Some("délai unitaire NSEC invalide".to_owned());
+                        }
+                        return best;
+                    };
+                    match timeout(authority_timeout, dns.authoritative_servers(&zone)).await {
                         Ok(Ok(servers)) => {
                             'servers: for (nameserver, addresses) in servers {
                                 for address in addresses {
-                                    if deadline <= Instant::now() {
+                                    if phase_deadline_reached(phase_deadline) {
                                         mark_deadline(&mut best);
                                         break 'servers;
                                     }
@@ -480,7 +526,7 @@ async fn discover_nsec_until(
                                         operation_timeout,
                                         max_names,
                                         &limiter,
-                                        deadline,
+                                        phase_deadline,
                                     )
                                     .await;
                                     let terminal = stops_nameserver_fallback(&attempt, max_names);
@@ -501,7 +547,16 @@ async fn discover_nsec_until(
                             }
                         }
                         Ok(Err(error)) => best.error = Some(error.to_string()),
-                        Err(_) => mark_deadline(&mut best),
+                        Err(_) => {
+                            if phase_deadline_reached(phase_deadline) {
+                                mark_deadline(&mut best);
+                            } else {
+                                best.error = Some(
+                                    "timeout de découverte des serveurs DNS autoritaires"
+                                        .to_owned(),
+                                );
+                            }
+                        }
                     }
                 }
                 best.queries = total_queries;
@@ -566,18 +621,25 @@ mod tests {
     }
 
     #[test]
-    fn cumulative_deadline_always_caps_the_per_zone_deadline() {
-        let now = Instant::now();
-        let zone = now + Duration::from_secs(120);
-        let phase = now + Duration::from_secs(3);
-        assert_eq!(earliest_deadline(zone, Some(phase)), phase);
-        assert_eq!(earliest_deadline(zone, None), zone);
+    fn no_phase_deadline_uses_the_full_per_operation_timeout() {
+        assert_eq!(
+            operation_budget(None, Duration::from_secs(3)),
+            Some(Duration::from_secs(3))
+        );
     }
 
     #[test]
-    fn expired_deadline_has_no_operation_budget() {
+    fn explicit_phase_deadline_caps_each_operation_and_is_respected_when_expired() {
+        let soon = Instant::now() + Duration::from_millis(100);
+        let budget = operation_budget(Some(soon), Duration::from_secs(3)).unwrap();
+        assert!(budget <= Duration::from_millis(100));
+        assert!(budget > Duration::ZERO);
+
         let expired = Instant::now() - Duration::from_millis(1);
-        assert_eq!(operation_budget(expired, Duration::from_secs(3)), None);
+        assert_eq!(
+            operation_budget(Some(expired), Duration::from_secs(3)),
+            None
+        );
     }
 
     #[tokio::test]
@@ -607,7 +669,17 @@ mod tests {
     async fn rate_limiter_never_waits_past_an_expired_deadline() {
         let limiter = NsecRateLimiter::default();
         let expired = Instant::now() - Duration::from_millis(1);
-        assert!(!limiter.wait_before(expired).await);
+        assert!(
+            !limiter
+                .wait_before(Some(expired), Duration::from_secs(1))
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn rate_limiter_without_phase_deadline_uses_a_unit_timeout() {
+        let limiter = NsecRateLimiter::default();
+        assert!(limiter.wait_before(None, Duration::from_secs(1)).await);
     }
 
     #[tokio::test]
@@ -632,7 +704,10 @@ mod tests {
 
         let limiter = NsecRateLimiter::default();
         let started = Instant::now();
-        assert!(wait_for_nsec_query_slot(&primary, &limiter, deadline).await);
+        assert!(
+            wait_for_nsec_query_slot(&primary, &limiter, Some(deadline), Duration::from_secs(2))
+                .await
+        );
         assert!(
             started.elapsed() >= Duration::from_millis(400),
             "NSEC bypassed the shared two-queries-per-second cadence"
@@ -653,7 +728,10 @@ mod tests {
 
         let limiter = NsecRateLimiter::default();
         let short_deadline = Instant::now() + Duration::from_millis(75);
-        assert!(!wait_for_nsec_query_slot(&dns, &limiter, short_deadline).await);
+        assert!(
+            !wait_for_nsec_query_slot(&dns, &limiter, Some(short_deadline), Duration::from_secs(1))
+                .await
+        );
     }
 
     #[test]
@@ -684,7 +762,7 @@ mod tests {
             "partial",
             ["api.example.test"],
             3,
-            Some("budget de temps NSEC atteint"),
+            Some("limite cumulative NSEC atteinte"),
         );
         assert!(!stops_nameserver_fallback(&transient, 10));
         assert!(!stops_nameserver_fallback(&deadline, 10));

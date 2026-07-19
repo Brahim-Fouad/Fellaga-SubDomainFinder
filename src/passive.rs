@@ -1118,7 +1118,10 @@ const COMMONCRAWL_MAX_BODY_BYTES: usize = 3 * MAX_EXTERNAL_BODY_BYTES;
 const COMMONCRAWL_WARC_SAMPLE_LIMIT: usize = 2;
 const COMMONCRAWL_MAX_WARC_MEMBER_BYTES: usize = 2 * 1024 * 1024;
 const COMMONCRAWL_MAX_WARC_DECOMPRESSED_BYTES: usize = 4 * 1024 * 1024;
-const MAX_INLINE_RETRY_AFTER: Duration = Duration::from_secs(5);
+// A provider-directed pause is finite work, not a scan-wide runtime limit.
+// Honour ordinary quota windows in the current job while still refusing an
+// absurd multi-hour Retry-After that would make an unattended scan look hung.
+const MAX_INLINE_RETRY_AFTER: Duration = Duration::from_secs(15 * 60);
 
 fn defer_retry_after(delay: Duration) -> bool {
     delay > MAX_INLINE_RETRY_AFTER
@@ -1136,23 +1139,23 @@ pub struct SourcePolicy {
 }
 
 #[derive(Debug)]
-struct SourceBudgetExceeded {
+struct SourceDeadlineExceeded {
     source: String,
-    budget: Duration,
+    deadline: Duration,
 }
 
-impl fmt::Display for SourceBudgetExceeded {
+impl fmt::Display for SourceDeadlineExceeded {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "{}: budget total de {}s dépassé; pages terminées conservées dans le résultat courant",
+            "{}: limite cumulative configurée de {}s atteinte; pages terminées conservées dans le résultat courant",
             self.source,
-            self.budget.as_secs_f64()
+            self.deadline.as_secs_f64()
         )
     }
 }
 
-impl std::error::Error for SourceBudgetExceeded {}
+impl std::error::Error for SourceDeadlineExceeded {}
 
 struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
 
@@ -2460,12 +2463,69 @@ fn unsafe_log_character(character: char) -> bool {
 pub(super) fn compact_external_error(body: &str) -> String {
     const MAX_CHARACTERS: usize = 500;
 
+    let prefix = body
+        .trim_start()
+        .chars()
+        .take(4_096)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    let html = prefix.starts_with("<!doctype html")
+        || prefix.starts_with("<html")
+        || prefix.contains("<html ")
+        || prefix.contains("<head>")
+        || prefix.contains("<body>");
+    if html {
+        let anti_bot = [
+            "cloudflare",
+            "cf-chl-",
+            "just a moment",
+            "captcha",
+            "challenge-platform",
+            "checking your browser",
+        ]
+        .iter()
+        .any(|marker| prefix.contains(marker));
+        return if anti_bot {
+            "HTML anti-bot challenge".to_owned()
+        } else {
+            "HTML error page".to_owned()
+        };
+    }
+
     let mut compact = String::with_capacity(body.len().min(MAX_CHARACTERS));
     let mut characters = 0_usize;
     let mut pending_space = false;
     let mut truncated = false;
 
-    for character in body.chars() {
+    let mut input = body.chars().peekable();
+    while let Some(character) = input.next() {
+        if character == '\u{1b}' {
+            match input.peek().copied() {
+                Some('[') => {
+                    input.next();
+                    for sequence_character in input.by_ref() {
+                        if ('@'..='~').contains(&sequence_character) {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    input.next();
+                    let mut escape = false;
+                    for sequence_character in input.by_ref() {
+                        if sequence_character == '\u{7}' || (escape && sequence_character == '\\') {
+                            break;
+                        }
+                        escape = sequence_character == '\u{1b}';
+                    }
+                }
+                Some(_) => {
+                    input.next();
+                }
+                None => {}
+            }
+            continue;
+        }
         if character.is_whitespace() {
             pending_space |= !compact.is_empty();
             continue;
@@ -3009,10 +3069,13 @@ async fn enforce_source_budget<T, F>(source: &str, budget: Duration, request: F)
 where
     F: std::future::Future<Output = Result<T>>,
 {
+    if budget.is_zero() {
+        return request.await;
+    }
     tokio::time::timeout(budget, request).await.map_err(|_| {
-        anyhow::Error::new(SourceBudgetExceeded {
+        anyhow::Error::new(SourceDeadlineExceeded {
             source: source.to_owned(),
-            budget,
+            deadline: budget,
         })
     })?
 }
@@ -3061,7 +3124,8 @@ where
     match result {
         Err(error) => {
             let partial = checkpoint.snapshot();
-            if error.downcast_ref::<SourceBudgetExceeded>().is_some() || !partial.names.is_empty() {
+            if error.downcast_ref::<SourceDeadlineExceeded>().is_some() || !partial.names.is_empty()
+            {
                 let mut warning = format!("{error:#}");
                 if let Some(persistence_error) = partial.persistence_error {
                     warning.push_str(&format!("; {persistence_error}"));
@@ -3233,8 +3297,9 @@ pub async fn fetch_detailed(
 }
 
 /// Runs the complete connector under a caller-supplied wall deadline while
-/// retaining pages committed before the deadline. Source-specific safety
-/// limits remain an upper bound when the caller supplies a larger value.
+/// retaining pages committed before the deadline. A zero duration deliberately
+/// disables the cumulative wall deadline; per-request timeouts and structural
+/// pagination/response limits remain active.
 pub async fn fetch_detailed_bounded(
     source: &str,
     domain: &str,
@@ -3247,7 +3312,11 @@ pub async fn fetch_detailed_bounded(
         domain,
         timeout,
         keys,
-        total_budget.min(source_policy(source).total_timeout),
+        if total_budget.is_zero() {
+            Duration::ZERO
+        } else {
+            total_budget.min(source_policy(source).total_timeout)
+        },
         usize::MAX,
         None,
         None,
@@ -3271,7 +3340,11 @@ pub async fn fetch_detailed_bounded_with_limit(
         domain,
         timeout,
         keys,
-        total_budget.min(source_policy(source).total_timeout),
+        if total_budget.is_zero() {
+            Duration::ZERO
+        } else {
+            total_budget.min(source_policy(source).total_timeout)
+        },
         working_set_limit.max(1),
         None,
         None,
@@ -3296,7 +3369,11 @@ pub async fn fetch_detailed_bounded_with_sink(
         domain,
         timeout,
         keys,
-        total_budget.min(source_policy(source).total_timeout),
+        if total_budget.is_zero() {
+            Duration::ZERO
+        } else {
+            total_budget.min(source_policy(source).total_timeout)
+        },
         working_set_limit,
         Some(page_sink),
         None,
@@ -3323,7 +3400,11 @@ pub async fn fetch_detailed_bounded_with_pagination(
         domain,
         timeout,
         keys,
-        total_budget.min(source_policy(source).total_timeout),
+        if total_budget.is_zero() {
+            Duration::ZERO
+        } else {
+            total_budget.min(source_policy(source).total_timeout)
+        },
         working_set_limit,
         Some(page_sink),
         Some(pagination_context),
@@ -5589,11 +5670,11 @@ mod tests {
     }
 
     #[test]
-    fn long_retry_after_is_deferred_instead_of_blocking_the_scan() {
+    fn ordinary_retry_after_is_honored_and_absurd_delays_are_deferred() {
         assert!(!defer_retry_after(Duration::ZERO));
         assert!(!defer_retry_after(MAX_INLINE_RETRY_AFTER));
-        assert!(defer_retry_after(Duration::from_secs(6)));
-        assert!(defer_retry_after(Duration::from_secs(30)));
+        assert!(!defer_retry_after(Duration::from_secs(30)));
+        assert!(defer_retry_after(Duration::from_secs(15 * 60 + 1)));
     }
 
     #[test]
@@ -5685,7 +5766,40 @@ mod tests {
         assert!(compact.ends_with('…'));
         assert!(compact.chars().count() <= 501);
         assert!(!compact.contains('\u{1b}'));
+        assert!(!compact.contains("[31m"));
         assert!(!compact.contains('\u{202e}'));
+    }
+
+    #[test]
+    fn external_html_errors_never_leak_markup_or_page_bodies() {
+        let cloudflare = r#"<!DOCTYPE html><html><head><title>Just a moment...</title></head><body><script src="/cdn-cgi/challenge-platform/test.js"></script>secret page body</body></html>"#;
+        let generic =
+            r#"<html><head><title>Server error</title></head><body>private trace</body></html>"#;
+
+        assert_eq!(
+            compact_external_error(cloudflare),
+            "HTML anti-bot challenge"
+        );
+        assert_eq!(compact_external_error(generic), "HTML error page");
+        for compact in [
+            compact_external_error(cloudflare),
+            compact_external_error(generic),
+        ] {
+            assert!(!compact.contains('<'));
+            assert!(!compact.contains("secret"));
+            assert!(!compact.contains("private trace"));
+        }
+    }
+
+    #[tokio::test]
+    async fn zero_source_budget_disables_only_the_cumulative_deadline() {
+        let result = enforce_source_budget("unlimited-test", Duration::ZERO, async {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            Ok::<_, anyhow::Error>("complete")
+        })
+        .await
+        .unwrap();
+        assert_eq!(result, "complete");
     }
 
     #[test]
@@ -5845,7 +5959,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_budget_timeout_without_a_committed_page_is_deferred_not_failed() {
+    async fn a_deadline_without_a_committed_page_is_deferred_not_failed() {
         let result = enforce_source_budget_preserving_partial(
             "empty-test",
             Duration::from_millis(10),
@@ -5859,7 +5973,7 @@ mod tests {
             result
                 .partial_warning
                 .as_deref()
-                .is_some_and(|warning| warning.contains("empty-test") && warning.contains("budget"))
+                .is_some_and(|warning| warning.contains("empty-test") && warning.contains("limite"))
         );
     }
 
