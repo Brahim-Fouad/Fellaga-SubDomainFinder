@@ -113,7 +113,9 @@ then
   exit 6
 fi
 
-# shellcheck disable=SC2329
+# Invoked indirectly by the EXIT trap below. Newer ShellCheck versions report
+# both the declaration and its body as unreachable without this scoped guard.
+# shellcheck disable=SC2317,SC2329
 finalize_campaign() {
   local original_exit=$?
   local cleanup_exit=0
