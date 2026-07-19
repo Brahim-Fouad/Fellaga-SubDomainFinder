@@ -1,4 +1,7 @@
 use crate::model::{ConfidenceAssessment, EvidenceFamily, ObservationState};
+#[cfg(test)]
+use crate::passive::catalog::all_source_metadata;
+use crate::passive::catalog::passive_source_evidence_family;
 use std::collections::BTreeSet;
 
 pub fn evidence_family(source: &str) -> Option<EvidenceFamily> {
@@ -33,7 +36,7 @@ pub fn evidence_family(source: &str) -> Option<EvidenceFamily> {
         if matches!(connector, "ct-direct" | "google-ct") {
             return Some(EvidenceFamily::CertificateTransparency);
         }
-        return crate::passive::passive_source_evidence_family(connector);
+        return passive_source_evidence_family(connector);
     }
     None
 }
@@ -241,20 +244,20 @@ mod tests {
 
     #[test]
     fn every_registered_connector_uses_its_typed_registry_family() {
-        for status in crate::passive::source_statuses(&crate::passive::ApiKeyStore::default()) {
-            let source = format!("passive:{}", status.name);
+        for metadata in all_source_metadata() {
+            let source = format!("passive:{}", metadata.name);
             let qualified = format!("{source}:cache");
             assert_eq!(
                 evidence_family(&source),
-                Some(status.metadata.evidence_family),
+                Some(metadata.evidence_family),
                 "{}",
-                status.name
+                metadata.name
             );
             assert_eq!(
                 evidence_family(&qualified),
-                Some(status.metadata.evidence_family),
+                Some(metadata.evidence_family),
                 "{} qualified provenance",
-                status.name
+                metadata.name
             );
         }
     }

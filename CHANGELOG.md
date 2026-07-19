@@ -6,6 +6,21 @@ Published releases and downloadable artifacts are available on [GitHub Releases]
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-07-19
+
+### Added
+
+- add an architecture guide covering component ownership, dependency direction, concurrency, finding truth, and extension rules;
+- add architecture fitness tests that keep the entry point and compatibility façades focused, prohibit passive-to-SQLite coupling, and enforce one output-selection policy.
+
+### Changed
+
+- split the CLI, scan application, passive connectors, DNS engine, and SQLite adapter into cohesive modules behind their existing public paths;
+- replace the monolithic scan coordinator with typed discovery, active-validation, enrichment, and finalization states while preserving phase order, checkpoints, cancellation, and CT overlap;
+- move passive pagination values into an infrastructure-neutral contract with backward-compatible database re-exports;
+- centralize live, historical, unverified, and wildcard output selection for human, JSON, JSONL, CSV, and raw-list consumers;
+- preserve all commands, source identifiers, public library APIs, SQLite schema and migrations, and external behavior during the refactor.
+
 ## [0.11.1] - 2026-07-19
 
 ### Changed
@@ -316,7 +331,8 @@ Initial public release of Fellaga.
 - public MIT repository with security policy, contribution guide, third-party notices, and verifiable corpus provenance;
 - verifiable v0.8.0 release with x86-64 and ARM64 GNU/Linux archives, an amd64 Debian package, architecture SBOMs, checksums, a keyless Sigstore signature over the checksum manifest, and GitHub attestations.
 
-[Unreleased]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/compare/v0.11.1...HEAD
+[Unreleased]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/compare/v0.12.0...HEAD
+[0.12.0]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/tag/v0.12.0
 [0.11.1]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/tag/v0.11.1
 [0.11.0]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/tag/v0.11.0
 [0.10.1]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/tag/v0.10.1
