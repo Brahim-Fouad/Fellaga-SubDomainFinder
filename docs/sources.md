@@ -1,6 +1,6 @@
 # Passive sources and credentials
 
-The current Fellaga registry contains 67 connector names: 57 canonical provider integrations, five Fellaga-native connectors, and five compatibility entries. Registry coverage means an entry is present and addressable; it does not mean that every provider is currently reachable, keyless, stable, or productive.
+The current Fellaga registry contains 69 connector names: 59 canonical provider integrations, five Fellaga-native connectors, and five compatibility entries. Runtime availability, authentication, health, and yield are reported separately for every entry.
 
 Fellaga also has separate opportunistic direct CT-log monitoring, authoritative AXFR, DNS graph, DNSSEC, Web, TLS, and active DNS candidate generation. Those mechanisms are not counted as passive connectors.
 
@@ -42,13 +42,13 @@ The JSON form exposes the same status values together with the connector metadat
 
 ### Canonical connectors
 
-The 57 canonical connector names are:
+The 59 canonical connector names are:
 
-- `alienvault`, `anubis`, `bevigil`, `bufferover`, `builtwith`, `c99`, `censys`, `certspotter`, `chaos`, `chinaz`, `commoncrawl`
+- `alienvault`, `anubis`, `arquivopt`, `bevigil`, `bufferover`, `builtwith`, `c99`, `censys`, `certspotter`, `chaos`, `chinaz`, `commoncrawl`
 - `crtsh`, `digitalyama`, `digitorus`, `dnsdb`, `dnsdumpster`, `dnsrepo`, `domainsproject`, `driftnet`, `fofa`, `fullhunt`
 - `github`, `gitlab`, `hackertarget`, `hudsonrock`, `intelx`, `leakix`, `merklemap`, `netlas`, `onyphe`, `postman`, `profundis`
 - `pugrecon`, `quake`, `rapiddns`, `reconcloud`, `reconeer`, `redhuntlabs`, `riddler`, `robtex`, `rsecloud`, `securitytrails`, `shodan`
-- `shodanct`, `sitedossier`, `submd`, `thc`, `threatbook`, `threatcrowd`, `threatminer`, `urlscan`, `virustotal`, `viewdns`, `waybackarchive`, `whoisxmlapi`, `windvane`, `zoomeyeapi`
+- `shodanct`, `shrewdeye`, `sitedossier`, `submd`, `thc`, `threatbook`, `threatcrowd`, `threatminer`, `urlscan`, `virustotal`, `viewdns`, `waybackarchive`, `whoisxmlapi`, `windvane`, `zoomeyeapi`
 
 Fellaga retains ten additional names:
 
@@ -69,7 +69,7 @@ Compatibility names preserve existing configurations and cached provenance. Sele
 
 ### Authentication
 
-These 19 connectors require no configured credential: `anubis`, `anubisdb`, `certificatedetails`, `commoncrawl`, `crtsh`, `digitorus`, `hudsonrock`, `rapiddns`, `reconcloud`, `riddler`, `shodanct`, `sitedossier`, `subdomainapp`, `subdomaincenter`, `thc`, `threatcrowd`, `threatminer`, `wayback`, and `waybackarchive`.
+These 21 connectors require no configured credential: `anubis`, `anubisdb`, `arquivopt`, `certificatedetails`, `commoncrawl`, `crtsh`, `digitorus`, `hudsonrock`, `rapiddns`, `reconcloud`, `riddler`, `shodanct`, `shrewdeye`, `sitedossier`, `subdomainapp`, `subdomaincenter`, `thc`, `threatcrowd`, `threatminer`, `wayback`, and `waybackarchive`.
 
 Five connectors accept an optional credential and still run without it: `certspotter`, `hackertarget`, `postman`, `submd`, and `urlscan`. Every other credentialed connector is skipped locally when its required value is absent.
 
@@ -130,6 +130,7 @@ Five connectors accept an optional credential and still run without it: `certspo
 
 | Connector | Current behavior |
 | --- | --- |
+| `arquivopt` | Streams Arquivo.pt CDX newline-delimited JSON, extracts only URL hostnames inside the requested suffix, and retains at most 50,000 records within a 32 MiB body ceiling. |
 | `binaryedge` | Retained compatibility entry only; the retired provider is unavailable and no request is started. |
 | `brave` | Reads at most ten 20-result Web-search pages and stops when the provider reports no further results. |
 | `merklemap` | Starts at page 0 and follows validated result totals for up to 1,000 pages. |
@@ -137,6 +138,7 @@ Five connectors accept an optional credential and still run without it: `certspo
 | `netlas` | Performs one count request and one streamed download; the default limit is 200 records and `FELLAGA_NETLAS_DOWNLOAD_LIMIT` can explicitly raise it to any integer from 1 through 1,000,000 when the configured plan permits. |
 | `postman` | Searches public request metadata in pages of 25, follows at most 100 distinct cursors, and rejects cursors longer than 8 KiB or repeated pages. `POSTMAN_API_KEY` is optional and never changes the public-visibility filter. |
 | `securitytrails` | Follows at most 1,000 distinct scroll identifiers of at most 4,096 bytes; an exact HTTP 403 selects the legacy non-scroll endpoint. |
+| `shrewdeye` | Streams the public domain feed with a 64 MiB body ceiling, 1 KiB line ceiling, and one-million-record ceiling; an exact 404 is a valid empty result. |
 | `thc` | Reads at most 1,000 pages of 1,000 records; pagination state is limited to 4,096 bytes and must not repeat. |
 | `robtex` | Streams the forward lookup, then performs reverse lookups for at most 1,000 unique IP addresses. |
 | `viewdns` | Reads documented 1,000-record pages for at most 1,000 pages, validates the echoed domain and page counters, and rejects empty or repeated pages before the reported end. |
@@ -149,7 +151,11 @@ Driftnet requires `DRIFTNET_API_KEY` and queries four authenticated summary fami
 
 ### Bounded high-volume connectors
 
-`submd` reads the provider's line-oriented response as a stream instead of buffering the complete feed. A configured `SUBMD_API_KEY` is sent as a Bearer token. The stream is capped at 64 MiB, each unfinished record at 64 KiB, and normalized names are checkpointed after at most 1,000 distinct names and before every subsequent network read. Completed records therefore survive a later stream error or deadline even when a transport chunk contains fewer than 1,000 names.
+`arquivopt` queries Arquivo.pt's CDX domain-match endpoint and decodes its newline-delimited JSON incrementally. It accepts only a structured `url` field whose parsed hostname belongs to the requested suffix. The response is capped at 32 MiB and 50,000 non-empty records; requesting one extra provider record allows saturation to be reported instead of treating a truncated result as complete. Normalized names are checkpointed after at most 1,000 names or 500 ms of received streaming progress, and again when the stream completes or fails.
+
+`shrewdeye` consumes the provider's public per-domain text feed without buffering it as one response. It rejects wildcard patterns, malformed lines, apex-only values, and names outside the requested suffix. The stream is bounded to 64 MiB, 1 KiB per unfinished line, and one million non-empty records, with the same incremental volume/time checkpointing behavior.
+
+`submd` reads the provider's line-oriented response as a stream instead of buffering the complete feed. A configured `SUBMD_API_KEY` is sent as a Bearer token. The stream is capped at 64 MiB, each unfinished record at 64 KiB, and normalized names use the same 1,000-name or 500-millisecond checkpoint policy. Completed checkpoints survive later stream errors, while batching avoids turning small HTTP chunks into individual SQLite transactions.
 
 `thc` requests 1,000 records per page, uses up to five paced page requests per second, checkpoints every completely decoded page, and accepts up to 1,000 pages within the remaining passive-phase budget and its 75-second connector ceiling. Empty pagination state completes the query; a repeated state, a state longer than 4,096 bytes, or a thousandth page that still advertises more work is reported as a bounded provider failure rather than allowing an endless loop.
 
@@ -171,7 +177,7 @@ The `github` and `gitlab` code-search connectors continue through remaining raw 
 
 ### Experimental and runtime-failing providers
 
-The registry marks `anubis`, `anubisdb`, `certificatedetails`, `digitorus`, `driftnet`, `hudsonrock`, `rapiddns`, `reconcloud`, `reconeer`, `riddler`, `sitedossier`, `subdomainapp`, `subdomaincenter`, `threatcrowd`, and `threatminer` as experimental. The default `deep` profile enables every locally accessible connector whose metadata permits automatic execution, including eligible experimental entries. Four duplicate compatibility names (`certificatedetails`, `otx`, `wayback`, and `whoisxml`) remain opt-in to prevent duplicate provider traffic. `--all-sources` selects the corresponding unique implementations once; compatibility aliases remain explicitly selectable.
+The registry marks `anubis`, `anubisdb`, `certificatedetails`, `digitorus`, `driftnet`, `hudsonrock`, `rapiddns`, `reconcloud`, `reconeer`, `riddler`, `shrewdeye`, `sitedossier`, `subdomainapp`, `subdomaincenter`, `threatcrowd`, and `threatminer` as experimental. The default `deep` profile enables every locally accessible connector whose metadata permits automatic execution, including eligible experimental entries. Four duplicate compatibility names (`certificatedetails`, `otx`, `wayback`, and `whoisxml`) remain opt-in to prevent duplicate provider traffic. `--all-sources` selects the corresponding unique implementations once; compatibility aliases remain explicitly selectable.
 
 BinaryEdge retired its service and is represented separately as an unavailable compatibility entry. Fellaga keeps the name so existing configuration and cached provenance remain understandable, but neither automatic selection, explicit selection, nor `--all-sources` sends a request to the retired endpoint.
 
@@ -228,7 +234,7 @@ Fellaga/<version> (+https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder)
 Set `FELLAGA_USER_AGENT` when an organization or provider needs a specific contact string:
 
 ```bash
-export FELLAGA_USER_AGENT='Fellaga/0.10.1 (security-team@example.org)'
+export FELLAGA_USER_AGENT='Fellaga/0.11.0 (security-team@example.org)'
 ```
 
 The override is optional. It must be non-empty ASCII, contain no control characters, and fit within 256 characters. It changes only the HTTP `User-Agent`; it does not alter source selection.

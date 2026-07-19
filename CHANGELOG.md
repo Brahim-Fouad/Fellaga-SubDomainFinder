@@ -6,6 +6,19 @@ Published releases and downloadable artifacts are available on [GitHub Releases]
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-07-19
+
+### Added
+
+- add bounded, keyless streaming connectors for Arquivo.pt CDX replay and the experimental ShrewdEye domain feed, expanding the registry to 69 names with 59 canonical integrations, five Fellaga-native connectors, and five compatibility entries;
+- add a single bounded Shodan InternetDB wave for public IP addresses already confirmed by the scan, with strict public-address filtering, suffix validation, ordinary wildcard-aware DNS validation, permanent local IP-to-hostname observations, and profile-specific request and time ceilings;
+- add `--no-internetdb`, `--internetdb-ips`, `--internetdb-max-runtime`, and `--internetdb-refresh-hours` controls.
+- bind PTR enrichment to the remaining active-DNS deadline, retain only completed reverse lookups at that boundary, and batch streamed passive-source checkpoints by volume or time instead of arbitrary HTTP chunk boundaries.
+
+### Fixed
+
+- run PTR enrichment independently from the DNS graph so `--no-dns-graph` no longer disables an explicitly enabled PTR pivot.
+
 ## [0.10.1] - 2026-07-18
 
 ### Changed
@@ -286,7 +299,8 @@ Initial public release of Fellaga.
 - public MIT repository with security policy, contribution guide, third-party notices, and verifiable corpus provenance;
 - verifiable v0.8.0 release with x86-64 and ARM64 GNU/Linux archives, an amd64 Debian package, architecture SBOMs, checksums, a keyless Sigstore signature over the checksum manifest, and GitHub attestations.
 
-[Unreleased]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/compare/v0.10.1...HEAD
+[Unreleased]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/tag/v0.11.0
 [0.10.1]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/tag/v0.10.1
 [0.10.0]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/tag/v0.10.0
 [0.9.2]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/tag/v0.9.2

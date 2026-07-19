@@ -24,6 +24,9 @@ pub fn evidence_family(source: &str) -> Option<EvidenceFamily> {
     if source.starts_with("web:") {
         return Some(EvidenceFamily::WebCrawl);
     }
+    if source.starts_with("ip-pivot:shodan-internetdb:") {
+        return Some(EvidenceFamily::PassiveDns);
+    }
 
     if let Some(passive_source) = source.strip_prefix("passive:") {
         let connector = passive_source.split(':').next().unwrap_or_default();
@@ -212,6 +215,10 @@ mod tests {
         );
         assert_eq!(
             evidence_family("passive:dnsdb"),
+            Some(EvidenceFamily::PassiveDns)
+        );
+        assert_eq!(
+            evidence_family("ip-pivot:shodan-internetdb:1.1.1.1:cache"),
             Some(EvidenceFamily::PassiveDns)
         );
         assert_eq!(

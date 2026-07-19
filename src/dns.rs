@@ -2328,9 +2328,20 @@ impl DnsEngine {
         &self,
         addresses: Vec<IpAddr>,
     ) -> BTreeMap<IpAddr, BTreeSet<String>> {
+        self.reverse_names_until(addresses, None).await.0
+    }
+
+    /// Resolves PTR records while retaining every address completed before a
+    /// shared phase deadline. Dropping the remaining stream cancels queued
+    /// rate reservations and in-flight resolver futures.
+    pub async fn reverse_names_until(
+        &self,
+        addresses: Vec<IpAddr>,
+        deadline: Option<tokio::time::Instant>,
+    ) -> (BTreeMap<IpAddr, BTreeSet<String>>, bool) {
         let resolver = self.resolvers[self.resolver_order()[0]].resolver.clone();
         let engine = self.clone();
-        stream::iter(addresses.into_iter().collect::<BTreeSet<_>>())
+        let mut pending = stream::iter(addresses.into_iter().collect::<BTreeSet<_>>())
             .map(move |address| {
                 let resolver = resolver.clone();
                 let engine = engine.clone();
@@ -2355,9 +2366,27 @@ impl DnsEngine {
                     (address, names)
                 }
             })
-            .buffer_unordered(self.concurrency())
-            .collect()
-            .await
+            .buffer_unordered(self.concurrency());
+        let deadline_sleep = async move {
+            if let Some(deadline) = deadline {
+                tokio::time::sleep_until(deadline).await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        };
+        tokio::pin!(deadline_sleep);
+        let mut results = BTreeMap::new();
+        loop {
+            let next = tokio::select! {
+                biased;
+                _ = &mut deadline_sleep => return (results, true),
+                next = pending.next() => next,
+            };
+            let Some((address, names)) = next else {
+                return (results, false);
+            };
+            results.insert(address, names);
+        }
     }
 
     async fn resolve_host_classified_with_policy(
@@ -4471,6 +4500,28 @@ mod tests {
         let metrics = engine.take_metrics();
         assert_eq!(metrics.iter().map(|metric| metric.requests).sum::<u64>(), 2);
         assert_eq!(metrics.iter().map(|metric| metric.failures).sum::<u64>(), 2);
+    }
+
+    #[tokio::test]
+    async fn expired_ptr_deadline_starts_no_reverse_lookup() {
+        let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let engine = discovery_test_engine(&[silent.local_addr().unwrap()], Duration::from_secs(1));
+        let (names, deadline_exhausted) = engine
+            .reverse_names_until(
+                vec!["1.1.1.1".parse().unwrap()],
+                Some(tokio::time::Instant::now()),
+            )
+            .await;
+        assert!(deadline_exhausted);
+        assert!(names.is_empty());
+        assert_eq!(
+            engine
+                .take_metrics()
+                .iter()
+                .map(|metric| metric.requests)
+                .sum::<u64>(),
+            0
+        );
     }
 
     #[tokio::test]

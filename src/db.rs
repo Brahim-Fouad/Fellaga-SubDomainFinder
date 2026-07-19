@@ -4,8 +4,9 @@ use crate::model::{
     ResolvedHost, ResolverMetric, ServiceEndpoint, Stats, WildcardVerdict,
 };
 use crate::util::{
-    domain_hash, learnable_label, learnable_relative_name, normalize_observed_name, now_epoch,
-    public_suffix, registrable_domain, reverse_hostname, valid_relative_name,
+    domain_hash, learnable_label, learnable_relative_name, normalize_hostname,
+    normalize_observed_name, now_epoch, public_suffix, registrable_domain, reverse_hostname,
+    valid_relative_name,
 };
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -14,6 +15,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::OpenOptions;
 use std::io::{BufRead, Read, Seek, SeekFrom};
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex,
@@ -35,6 +37,7 @@ const MAX_DISCOVERY_ACTIONS: usize = 4_096;
 const MAX_DISCOVERY_ACTION_CLAIM: usize = 512;
 const MAX_DISCOVERY_OUTCOME_JSON: usize = 64 * 1024;
 const MAX_NAMED_SEED_CLAIM: usize = 4_096;
+const MAX_IP_HOSTNAME_CACHE_NAMES: usize = 4_096;
 const MAX_PASSIVE_PAGINATION_IDENTIFIER: usize = 128;
 const PASSIVE_PAGINATION_HASH_LENGTH: usize = 64;
 // Refresh generations are operational restart state, not observations. After
@@ -68,6 +71,18 @@ fn validate_passive_pagination_identifier(value: &str, field: &str) -> Result<()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"-_".contains(&byte))
     {
         bail!("identifiant {field} invalide pour la pagination passive");
+    }
+    Ok(())
+}
+
+fn validate_ip_hostname_provider(provider: &str) -> Result<()> {
+    if provider.is_empty()
+        || provider.len() > 64
+        || !provider
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        bail!("identifiant de fournisseur IP invalide");
     }
     Ok(())
 }
@@ -601,6 +616,14 @@ pub struct DnssecCacheEntry {
     pub status: String,
     pub names: Vec<String>,
     pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IpHostnameCacheEntry {
+    pub hostnames: BTreeSet<String>,
+    pub last_success_at: i64,
+    pub last_attempt_at: i64,
+    pub status: String,
 }
 
 #[derive(Debug, Clone)]
@@ -1829,6 +1852,28 @@ impl Database {
             );
             CREATE INDEX IF NOT EXISTS idx_discovery_edges_target
                 ON discovery_edges(root_domain, target);
+
+            CREATE TABLE IF NOT EXISTS ip_hostname_observations (
+                provider TEXT NOT NULL,
+                address TEXT NOT NULL,
+                hostname TEXT NOT NULL,
+                first_seen INTEGER NOT NULL,
+                last_seen INTEGER NOT NULL,
+                times_seen INTEGER NOT NULL DEFAULT 1,
+                PRIMARY KEY(provider, address, hostname)
+            ) WITHOUT ROWID;
+
+            CREATE TABLE IF NOT EXISTS ip_hostname_refresh (
+                provider TEXT NOT NULL,
+                address TEXT NOT NULL,
+                last_success_at INTEGER NOT NULL DEFAULT 0,
+                last_attempt_at INTEGER NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('success', 'empty', 'error')),
+                last_error TEXT,
+                PRIMARY KEY(provider, address)
+            ) WITHOUT ROWID;
+            CREATE INDEX IF NOT EXISTS idx_ip_hostname_refresh_age
+                ON ip_hostname_refresh(provider, last_success_at);
 
             CREATE TABLE IF NOT EXISTS service_endpoints (
                 root_domain TEXT NOT NULL,
@@ -8947,6 +8992,128 @@ impl Database {
                 metrics.names_validated as i64,
                 i64::from(metrics.budget_exhausted)
             ],
+        )?;
+        Ok(())
+    }
+
+    pub fn ip_hostname_cache(
+        &self,
+        provider: &str,
+        address: IpAddr,
+        limit: usize,
+    ) -> Result<Option<IpHostnameCacheEntry>> {
+        validate_ip_hostname_provider(provider)?;
+        let address = address.to_string();
+        let connection = self.lock()?;
+        let refresh = connection
+            .query_row(
+                r#"SELECT last_success_at, last_attempt_at, status
+                   FROM ip_hostname_refresh
+                   WHERE provider=?1 AND address=?2"#,
+                params![provider, address],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((last_success_at, last_attempt_at, status)) = refresh else {
+            return Ok(None);
+        };
+        let mut statement = connection.prepare(
+            r#"SELECT hostname FROM ip_hostname_observations
+               WHERE provider=?1 AND address=?2
+               ORDER BY last_seen DESC, hostname ASC LIMIT ?3"#,
+        )?;
+        let hostnames = statement
+            .query_map(
+                params![
+                    provider,
+                    address,
+                    limit.min(MAX_IP_HOSTNAME_CACHE_NAMES) as i64
+                ],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<rusqlite::Result<BTreeSet<_>>>()?;
+        Ok(Some(IpHostnameCacheEntry {
+            hostnames,
+            last_success_at,
+            last_attempt_at,
+            status,
+        }))
+    }
+
+    pub fn store_ip_hostname_success(
+        &self,
+        provider: &str,
+        address: IpAddr,
+        hostnames: &BTreeSet<String>,
+    ) -> Result<()> {
+        validate_ip_hostname_provider(provider)?;
+        let address = address.to_string();
+        let hostnames = hostnames
+            .iter()
+            .filter_map(|hostname| normalize_hostname(hostname))
+            .take(MAX_IP_HOSTNAME_CACHE_NAMES)
+            .collect::<BTreeSet<_>>();
+        let status = if hostnames.is_empty() {
+            "empty"
+        } else {
+            "success"
+        };
+        let now = now_epoch();
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        {
+            let mut statement = transaction.prepare(
+                r#"INSERT INTO ip_hostname_observations(
+                       provider, address, hostname, first_seen, last_seen, times_seen
+                   ) VALUES (?1, ?2, ?3, ?4, ?4, 1)
+                   ON CONFLICT(provider, address, hostname) DO UPDATE SET
+                       last_seen=excluded.last_seen,
+                       times_seen=ip_hostname_observations.times_seen+1"#,
+            )?;
+            for hostname in &hostnames {
+                statement.execute(params![provider, address, hostname, now])?;
+            }
+        }
+        transaction.execute(
+            r#"INSERT INTO ip_hostname_refresh(
+                   provider, address, last_success_at, last_attempt_at, status, last_error
+               ) VALUES (?1, ?2, ?3, ?3, ?4, NULL)
+               ON CONFLICT(provider, address) DO UPDATE SET
+                   last_success_at=excluded.last_success_at,
+                   last_attempt_at=excluded.last_attempt_at,
+                   status=excluded.status,
+                   last_error=NULL"#,
+            params![provider, address, now, status],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn store_ip_hostname_failure(
+        &self,
+        provider: &str,
+        address: IpAddr,
+        error: &str,
+    ) -> Result<()> {
+        validate_ip_hostname_provider(provider)?;
+        let address = address.to_string();
+        let now = now_epoch();
+        let error = error.chars().take(1_024).collect::<String>();
+        self.lock()?.execute(
+            r#"INSERT INTO ip_hostname_refresh(
+                   provider, address, last_success_at, last_attempt_at, status, last_error
+               ) VALUES (?1, ?2, 0, ?3, 'error', ?4)
+               ON CONFLICT(provider, address) DO UPDATE SET
+                   last_attempt_at=excluded.last_attempt_at,
+                   status='error',
+                   last_error=excluded.last_error"#,
+            params![provider, address, now, error],
         )?;
         Ok(())
     }
@@ -16594,5 +16761,60 @@ mod tests {
             )
             .unwrap();
         assert_eq!(rows, (1, 1));
+    }
+
+    #[test]
+    fn ip_hostname_cache_is_permanent_and_failures_never_delete_names() {
+        let db = Database::in_memory().unwrap();
+        let address: IpAddr = "1.1.1.1".parse().unwrap();
+        assert!(
+            db.ip_hostname_cache("shodan-internetdb", address, 256)
+                .unwrap()
+                .is_none()
+        );
+
+        db.store_ip_hostname_success(
+            "shodan-internetdb",
+            address,
+            &BTreeSet::from([
+                "a.example.com".to_owned(),
+                "b.example.com".to_owned(),
+                "invalid host".to_owned(),
+            ]),
+        )
+        .unwrap();
+        db.store_ip_hostname_success(
+            "shodan-internetdb",
+            address,
+            &BTreeSet::from(["b.example.com".to_owned(), "c.example.com".to_owned()]),
+        )
+        .unwrap();
+        let before_failure = db
+            .ip_hostname_cache("shodan-internetdb", address, 256)
+            .unwrap()
+            .unwrap();
+        assert_eq!(before_failure.status, "success");
+        assert_eq!(
+            before_failure.hostnames,
+            BTreeSet::from([
+                "a.example.com".to_owned(),
+                "b.example.com".to_owned(),
+                "c.example.com".to_owned(),
+            ])
+        );
+
+        db.store_ip_hostname_failure("shodan-internetdb", address, "temporary failure")
+            .unwrap();
+        let after_failure = db
+            .ip_hostname_cache("shodan-internetdb", address, 256)
+            .unwrap()
+            .unwrap();
+        assert_eq!(after_failure.status, "error");
+        assert_eq!(after_failure.hostnames, before_failure.hostnames);
+        assert_eq!(
+            after_failure.last_success_at,
+            before_failure.last_success_at
+        );
+        assert!(db.ip_hostname_cache("INVALID", address, 1).is_err());
     }
 }

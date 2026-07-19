@@ -4,7 +4,7 @@ use crate::confidence::{assess_with_context as assess_confidence, evidence_famil
 use crate::ct_monitor::{
     CtProgressCallback, CtProgressEvent, monitor_ct_logs_bounded_with_progress_and_limit,
 };
-use crate::db::{CachedAnswer, Database};
+use crate::db::{CachedAnswer, Database, IpHostnameCacheEntry};
 use crate::discovery::discover_dns_graph;
 use crate::dns::{DnsEngine, DnsResolutionOutcome, WildcardProbeOutcome};
 use crate::dnssec::discover_nsec_bounded;
@@ -38,6 +38,7 @@ use serde_json::json;
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::future::Future;
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::{
     Arc, Mutex,
@@ -52,7 +53,86 @@ const METADATA_PHASE_BUDGET_CAP: Duration = Duration::from_secs(30);
 const METADATA_DNS_CONCURRENCY: usize = 4;
 const ENRICHMENT_VALIDATION_BATCH_SIZE: usize = 4_000;
 const PASSIVE_REFRESH_LEASE_GRACE: Duration = Duration::from_secs(60);
+const INTERNETDB_PROVIDER: &str = "shodan-internetdb";
+const INTERNETDB_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const INTERNETDB_MAX_AGGREGATE_NAMES: usize = 2_000;
+const INTERNETDB_MAX_HOSTNAMES_PER_IP: usize = 256;
+const INTERNETDB_ERROR_RETRY_AFTER: Duration = Duration::from_secs(15 * 60);
 static PASSIVE_REFRESH_LEASE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+fn prioritized_answer_addresses<'a>(
+    answers: impl IntoIterator<Item = &'a ResolvedHost>,
+    public_only: bool,
+    limit: usize,
+) -> Vec<IpAddr> {
+    let mut usage = BTreeMap::<IpAddr, usize>::new();
+    for answer in answers {
+        let addresses = answer
+            .records
+            .iter()
+            .filter(|record| matches!(record.record_type.as_str(), "A" | "AAAA"))
+            .filter_map(|record| record.value.parse::<IpAddr>().ok())
+            .filter(|address| !public_only || crate::passive::is_public_internet_address(*address))
+            .collect::<BTreeSet<_>>();
+        for address in addresses {
+            *usage.entry(address).or_default() += 1;
+        }
+    }
+    let mut prioritized = usage.into_iter().collect::<Vec<_>>();
+    prioritized.sort_by_key(|(address, count)| (address.is_ipv6(), *count, *address));
+    prioritized
+        .into_iter()
+        .take(limit)
+        .map(|(address, _)| address)
+        .collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum InternetDbCacheDecision {
+    Use {
+        hostnames: BTreeSet<String>,
+        qualifier: &'static str,
+    },
+    Refresh,
+}
+
+fn internetdb_cache_decision(
+    cached: Option<&IpHostnameCacheEntry>,
+    now: i64,
+    refresh_seconds: i64,
+    retry_seconds: i64,
+    refresh_requested: bool,
+) -> InternetDbCacheDecision {
+    if refresh_requested {
+        return InternetDbCacheDecision::Refresh;
+    }
+    let Some(cache) = cached else {
+        return InternetDbCacheDecision::Refresh;
+    };
+    if cache.status == "error" && now.saturating_sub(cache.last_attempt_at) <= retry_seconds {
+        return InternetDbCacheDecision::Use {
+            hostnames: cache.hostnames.clone(),
+            qualifier: ":stale",
+        };
+    }
+    if cache.last_success_at <= 0 || now.saturating_sub(cache.last_success_at) > refresh_seconds {
+        return InternetDbCacheDecision::Refresh;
+    }
+    if cache.status == "empty" {
+        return InternetDbCacheDecision::Use {
+            hostnames: BTreeSet::new(),
+            qualifier: ":cache",
+        };
+    }
+    InternetDbCacheDecision::Use {
+        hostnames: cache.hostnames.clone(),
+        qualifier: if cache.status == "error" {
+            ":stale"
+        } else {
+            ":cache"
+        },
+    }
+}
 
 struct PassiveRefreshLeaseGuard {
     database: Database,
@@ -270,6 +350,10 @@ pub struct ScanOptions {
     pub service_discovery: bool,
     pub ptr_pivot: bool,
     pub ptr_max_ips: usize,
+    pub internetdb_pivot: bool,
+    pub internetdb_max_ips: usize,
+    pub internetdb_phase_timeout: Duration,
+    pub internetdb_refresh: Duration,
     pub dnssec_nsec: bool,
     pub nsec_timeout: Duration,
     pub nsec_refresh: Duration,
@@ -4442,6 +4526,10 @@ impl Scanner {
             "service_discovery": self.options.service_discovery,
             "ptr_pivot": self.options.ptr_pivot,
             "ptr_max_ips": self.options.ptr_max_ips,
+            "internetdb_pivot": self.options.internetdb_pivot,
+            "internetdb_max_ips": self.options.internetdb_max_ips,
+            "internetdb_phase_timeout_seconds": self.options.internetdb_phase_timeout.as_secs(),
+            "internetdb_refresh_seconds": self.options.internetdb_refresh.as_secs(),
             "dnssec_nsec": self.options.dnssec_nsec,
             "nsec_timeout_ms": self.options.nsec_timeout.as_millis(),
             "nsec_refresh_seconds": self.options.nsec_refresh.as_secs(),
@@ -6260,41 +6348,6 @@ impl Scanner {
                     });
                 }
             }
-            if self.options.ptr_pivot {
-                let addresses = answers
-                    .values()
-                    .filter(|answer| {
-                        Self::is_strict_enrichment_seed(answer, &root_wildcard, &wildcard_by_parent)
-                    })
-                    .flat_map(|answer| answer.records.iter())
-                    .filter(|record| matches!(record.record_type.as_str(), "A" | "AAAA"))
-                    .filter_map(|record| record.value.parse().ok())
-                    .collect::<BTreeSet<_>>()
-                    .into_iter()
-                    .take(self.options.ptr_max_ips)
-                    .collect::<Vec<_>>();
-                graph.queried += addresses.len();
-                let reverse_names = self
-                    .await_with_phase_heartbeat(
-                        "graphe DNS",
-                        "résolution inverse PTR",
-                        self.dns.reverse_names(addresses),
-                    )
-                    .await;
-                for (address, names) in reverse_names {
-                    for name in names {
-                        if let Some(name) = normalize_observed_name(&name, domain) {
-                            graph.names.insert(name.clone());
-                            graph.edges.insert(DiscoveryEdge {
-                                owner: address.to_string(),
-                                record_type: "PTR".to_owned(),
-                                value: name.clone(),
-                                target: Some(name),
-                            });
-                        }
-                    }
-                }
-            }
             self.database.store_discovery_graph(
                 domain,
                 &graph.edges,
@@ -6359,6 +6412,322 @@ impl Scanner {
             dns_edges = graph.edges.into_iter().collect();
             child_zones = graph.child_zones;
             service_endpoints = graph.service_endpoints.into_iter().collect();
+        }
+
+        // PTR is an independent enrichment capability. Keeping it outside the
+        // DNS-graph gate means --no-dns-graph no longer disables --ptr.
+        if self.options.ptr_pivot && active_candidate_work_allowed(active_budget_remaining) {
+            let addresses = prioritized_answer_addresses(
+                answers.values().filter(|answer| {
+                    Self::is_strict_enrichment_seed(answer, &root_wildcard, &wildcard_by_parent)
+                }),
+                false,
+                self.options.ptr_max_ips,
+            );
+            if !addresses.is_empty() {
+                self.emit(ProgressEvent::Phase {
+                    name: "pivot PTR".to_owned(),
+                    detail: format!("{} adresse(s) confirmée(s), vague bornée", addresses.len()),
+                });
+                let ptr_started = Instant::now();
+                let ptr_deadline = phase_deadline(active_budget_remaining);
+                let (reverse_names, ptr_deadline_exhausted) = self
+                    .await_with_phase_heartbeat(
+                        "pivot PTR",
+                        "résolution inverse des adresses confirmées",
+                        self.dns.reverse_names_until(addresses, ptr_deadline),
+                    )
+                    .await;
+                consume_phase_budget(&mut active_budget_remaining, ptr_started.elapsed());
+                if ptr_deadline_exhausted {
+                    if active_budget_remaining.is_some() {
+                        active_budget_remaining = Some(Duration::ZERO);
+                    }
+                    let warning =
+                        "PTR: budget DNS actif atteint; résultats inverses terminés conservés"
+                            .to_owned();
+                    self.emit(ProgressEvent::Warning(warning.clone()));
+                    warnings.push(warning);
+                }
+                let mut ptr_names = BTreeSet::new();
+                let mut ptr_edges = BTreeSet::new();
+                for (address, names) in reverse_names {
+                    for name in names {
+                        if let Some(name) = normalize_observed_name(&name, domain) {
+                            ptr_names.insert(name.clone());
+                            ptr_edges.insert(DiscoveryEdge {
+                                owner: address.to_string(),
+                                record_type: "PTR".to_owned(),
+                                value: name.clone(),
+                                target: Some(name),
+                            });
+                        }
+                    }
+                }
+                self.database.store_discovery_graph(
+                    domain,
+                    &ptr_edges,
+                    &BTreeSet::new(),
+                    &BTreeSet::new(),
+                )?;
+                for edge in &ptr_edges {
+                    if let Some(target) = &edge.target {
+                        sources
+                            .entry(target.clone())
+                            .or_default()
+                            .insert(format!("dns-graph:ptr:{}", edge.owner));
+                    }
+                }
+                for name in &ptr_names {
+                    pipeline.enqueue(name.clone(), 90);
+                }
+                let ptr_hosts = if self.options.pipeline {
+                    pipeline.drain(self.options.pipeline_budget)
+                } else {
+                    ptr_names
+                        .iter()
+                        .filter(|name| !answers.contains_key(*name))
+                        .cloned()
+                        .collect::<Vec<_>>()
+                };
+                if !ptr_hosts.is_empty() {
+                    validation_rounds += 1;
+                    pipeline_names_validated += ptr_hosts.len();
+                }
+                let ptr_resolution = self
+                    .validate_enrichment_batch_bounded(
+                        scan_id,
+                        domain,
+                        &ptr_hosts,
+                        "DNS PTR",
+                        &started,
+                        &sources,
+                        &root_wildcard,
+                        &mut parent_by_host,
+                        &mut wildcard_by_parent,
+                        &mut reliable_wildcard_zones,
+                        20,
+                        &mut active_budget_remaining,
+                    )
+                    .await?;
+                cache_hits += ptr_resolution.cache_hits;
+                network_resolved += ptr_resolution.resolved_from_network;
+                for answer in ptr_resolution.answers {
+                    answers.insert(answer.fqdn.clone(), answer);
+                }
+                dns_edges.extend(ptr_edges);
+            }
+        } else if self.options.ptr_pivot {
+            self.emit(ProgressEvent::Phase {
+                name: "pivot PTR".to_owned(),
+                detail: "ignoré: budget DNS actif déjà épuisé".to_owned(),
+            });
+        }
+
+        if self.options.internetdb_pivot {
+            let addresses = prioritized_answer_addresses(
+                answers.values().filter(|answer| {
+                    Self::is_strict_enrichment_seed(answer, &root_wildcard, &wildcard_by_parent)
+                }),
+                true,
+                self.options.internetdb_max_ips,
+            );
+            if !addresses.is_empty() {
+                self.emit(ProgressEvent::Phase {
+                    name: "pivot InternetDB".to_owned(),
+                    detail: format!(
+                        "{} IP publique(s), une seule vague, budget {}s",
+                        addresses.len(),
+                        self.options.internetdb_phase_timeout.as_secs()
+                    ),
+                });
+                let deadline = tokio::time::Instant::now() + self.options.internetdb_phase_timeout;
+                let refresh_seconds =
+                    i64::try_from(self.options.internetdb_refresh.as_secs()).unwrap_or(i64::MAX);
+                let retry_seconds =
+                    i64::try_from(INTERNETDB_ERROR_RETRY_AFTER.as_secs()).unwrap_or(i64::MAX);
+                let mut pivot_names = BTreeSet::new();
+                let mut pivot_edges = BTreeSet::new();
+                let mut phase_budget_exhausted = false;
+
+                for address in addresses {
+                    if phase_budget_exhausted
+                        || tokio::time::Instant::now() >= deadline
+                        || pivot_names.len() >= INTERNETDB_MAX_AGGREGATE_NAMES
+                    {
+                        phase_budget_exhausted = true;
+                        break;
+                    }
+                    let now = now_epoch();
+                    let cached = self.database.ip_hostname_cache(
+                        INTERNETDB_PROVIDER,
+                        address,
+                        INTERNETDB_MAX_HOSTNAMES_PER_IP,
+                    )?;
+                    let cache_decision = internetdb_cache_decision(
+                        cached.as_ref(),
+                        now,
+                        refresh_seconds,
+                        retry_seconds,
+                        self.options.refresh_cache,
+                    );
+
+                    let (hostnames, qualifier) = if let InternetDbCacheDecision::Use {
+                        hostnames,
+                        qualifier,
+                    } = cache_decision
+                    {
+                        (hostnames, qualifier)
+                    } else {
+                        let remaining =
+                            deadline.saturating_duration_since(tokio::time::Instant::now());
+                        if remaining.is_zero() {
+                            phase_budget_exhausted = true;
+                            break;
+                        }
+                        let request_timeout = remaining.min(INTERNETDB_REQUEST_TIMEOUT);
+                        match tokio::time::timeout_at(
+                            deadline,
+                            crate::passive::lookup_internetdb(address, request_timeout),
+                        )
+                        .await
+                        {
+                            Ok(Ok(lookup)) => {
+                                self.database.store_ip_hostname_success(
+                                    INTERNETDB_PROVIDER,
+                                    address,
+                                    &lookup.hostnames,
+                                )?;
+                                if lookup.truncated {
+                                    let warning = format!(
+                                        "InternetDB {address}: plus de {INTERNETDB_MAX_HOSTNAMES_PER_IP} hostnames; résultat borné"
+                                    );
+                                    self.emit(ProgressEvent::Warning(warning.clone()));
+                                    warnings.push(warning);
+                                }
+                                (lookup.hostnames, "")
+                            }
+                            Ok(Err(error)) => {
+                                let error = sanitize_external_error(
+                                    &format!("{error:#}"),
+                                    &self.options.api_keys,
+                                );
+                                self.database.store_ip_hostname_failure(
+                                    INTERNETDB_PROVIDER,
+                                    address,
+                                    &error,
+                                )?;
+                                let warning = format!("InternetDB {address}: {error}");
+                                self.emit(ProgressEvent::Warning(warning.clone()));
+                                warnings.push(warning);
+                                let rate_limited = {
+                                    let error = error.to_ascii_lowercase();
+                                    error.contains("http 429")
+                                        || error.contains("retry-after")
+                                        || error.contains("quota")
+                                };
+                                if rate_limited {
+                                    phase_budget_exhausted = true;
+                                }
+                                let stale = cached
+                                    .as_ref()
+                                    .map(|cache| cache.hostnames.clone())
+                                    .unwrap_or_default();
+                                if rate_limited && stale.is_empty() {
+                                    break;
+                                }
+                                (stale, ":stale")
+                            }
+                            Err(_) => {
+                                phase_budget_exhausted = true;
+                                let error = "phase deadline reached";
+                                self.database.store_ip_hostname_failure(
+                                    INTERNETDB_PROVIDER,
+                                    address,
+                                    error,
+                                )?;
+                                let stale = cached
+                                    .as_ref()
+                                    .map(|cache| cache.hostnames.clone())
+                                    .unwrap_or_default();
+                                (stale, ":stale")
+                            }
+                        }
+                    };
+
+                    for hostname in hostnames {
+                        if pivot_names.len() >= INTERNETDB_MAX_AGGREGATE_NAMES {
+                            phase_budget_exhausted = true;
+                            break;
+                        }
+                        let Some(name) = normalize_observed_name(&hostname, domain) else {
+                            continue;
+                        };
+                        let provenance =
+                            format!("ip-pivot:{INTERNETDB_PROVIDER}:{address}{qualifier}");
+                        sources.entry(name.clone()).or_default().insert(provenance);
+                        pivot_names.insert(name.clone());
+                        pivot_edges.insert(DiscoveryEdge {
+                            owner: address.to_string(),
+                            record_type: "INTERNETDB".to_owned(),
+                            value: name.clone(),
+                            target: Some(name),
+                        });
+                    }
+                }
+
+                if phase_budget_exhausted {
+                    let warning =
+                        "InternetDB: phase bornée arrêtée; résultats et cache déjà reçus conservés"
+                            .to_owned();
+                    self.emit(ProgressEvent::Warning(warning.clone()));
+                    warnings.push(warning);
+                }
+                self.database.store_discovery_graph(
+                    domain,
+                    &pivot_edges,
+                    &BTreeSet::new(),
+                    &BTreeSet::new(),
+                )?;
+                for name in &pivot_names {
+                    pipeline.enqueue(name.clone(), 85);
+                }
+                let pivot_hosts = if self.options.pipeline {
+                    pipeline.drain(self.options.pipeline_budget)
+                } else {
+                    pivot_names
+                        .iter()
+                        .filter(|name| !answers.contains_key(*name))
+                        .cloned()
+                        .collect::<Vec<_>>()
+                };
+                if !pivot_hosts.is_empty() {
+                    validation_rounds += 1;
+                    pipeline_names_validated += pivot_hosts.len();
+                }
+                let pivot_resolution = self
+                    .validate_enrichment_batch_bounded(
+                        scan_id,
+                        domain,
+                        &pivot_hosts,
+                        "DNS InternetDB",
+                        &started,
+                        &sources,
+                        &root_wildcard,
+                        &mut parent_by_host,
+                        &mut wildcard_by_parent,
+                        &mut reliable_wildcard_zones,
+                        20,
+                        &mut active_budget_remaining,
+                    )
+                    .await?;
+                cache_hits += pivot_resolution.cache_hits;
+                network_resolved += pivot_resolution.resolved_from_network;
+                for answer in pivot_resolution.answers {
+                    answers.insert(answer.fqdn.clone(), answer);
+                }
+                dns_edges.extend(pivot_edges);
+            }
         }
 
         if self.options.passive && !child_zones.is_empty() {
@@ -8617,10 +8986,11 @@ mod tests {
         external_deferral_seconds, external_pause_status, external_retry_after_seconds,
         finish_pending_ct_task_after_grace_with_hook, high_value_window_needs_materialization,
         high_value_window_persist_limit, indeterminate_wildcard_signature,
-        is_missing_api_key_error, is_preflight_auth_error, late_ct_seed_reserve,
-        materialize_ct_fallback_bounded, merge_ct_fallback_names, merge_passive_names_bounded,
-        merge_resolver_metrics, metadata_phase_budget, passive_connector_working_set_limit,
-        persist_routed_dns_outcomes, phase_deadline, record_bounded_parent_candidate,
+        internetdb_cache_decision, is_missing_api_key_error, is_preflight_auth_error,
+        late_ct_seed_reserve, materialize_ct_fallback_bounded, merge_ct_fallback_names,
+        merge_passive_names_bounded, merge_resolver_metrics, metadata_phase_budget,
+        passive_connector_working_set_limit, persist_routed_dns_outcomes, phase_deadline,
+        prioritized_answer_addresses, record_bounded_parent_candidate,
         refill_passive_union_from_cache, refresh_allows_wildcard_purge,
         refresh_can_demote_wildcard_ambiguity, refresh_deadline,
         refresh_parent_selection_is_complete, refresh_wildcard_observation_is_reliable,
@@ -8632,7 +9002,7 @@ mod tests {
         wildcard_profile_observed, wildcard_signature_is_deferred, wilson_upper_bound,
     };
     use crate::candidate::CandidateProposal;
-    use crate::db::{CachedAnswer, Database};
+    use crate::db::{CachedAnswer, Database, IpHostnameCacheEntry};
     use crate::dns::{DnsEngine, DnsResolutionOutcome, WildcardProbeOutcome};
     use crate::dnssec_proof::{DnssecOwnerState, DnssecProofAssessment, DnssecProofKind};
     use crate::model::{
@@ -8643,6 +9013,7 @@ mod tests {
     use hickory_net::proto::rr::{RData, Record, RecordType};
     use serde_json::json;
     use std::collections::{BTreeMap, BTreeSet, HashMap};
+    use std::net::IpAddr;
     use std::sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -8698,6 +9069,10 @@ mod tests {
             service_discovery: false,
             ptr_pivot: false,
             ptr_max_ips: 0,
+            internetdb_pivot: false,
+            internetdb_max_ips: 0,
+            internetdb_phase_timeout: Duration::from_millis(100),
+            internetdb_refresh: Duration::from_secs(86_400),
             dnssec_nsec: false,
             nsec_timeout: Duration::from_millis(100),
             nsec_refresh: Duration::from_secs(300),
@@ -11238,6 +11613,82 @@ mod tests {
             &normal_root,
             &by_parent
         ));
+    }
+
+    #[test]
+    fn internetdb_address_selection_is_public_deduplicated_and_yield_ranked() {
+        let answer = |fqdn: &str, addresses: &[&str]| ResolvedHost {
+            fqdn: fqdn.to_owned(),
+            records: addresses
+                .iter()
+                .map(|address| crate::model::DnsRecord {
+                    record_type: if address.contains(':') { "AAAA" } else { "A" }.to_owned(),
+                    value: (*address).to_owned(),
+                    ttl: 60,
+                })
+                .collect(),
+            from_cache: false,
+            last_verified_at: None,
+            authoritative_validation: false,
+            resolver_count: 2,
+        };
+        let first = answer(
+            "a.example.com",
+            &["1.1.1.1", "8.8.8.8", "10.0.0.1", "2606:4700:4700::1111"],
+        );
+        let second = answer("b.example.com", &["1.1.1.1", "1.1.1.1"]);
+        assert_eq!(
+            prioritized_answer_addresses([&first, &second], true, 3),
+            vec![
+                "8.8.8.8".parse::<IpAddr>().unwrap(),
+                "1.1.1.1".parse::<IpAddr>().unwrap(),
+                "2606:4700:4700::1111".parse::<IpAddr>().unwrap(),
+            ]
+        );
+        assert_eq!(
+            prioritized_answer_addresses([&first, &second], true, 1),
+            vec!["8.8.8.8".parse::<IpAddr>().unwrap()]
+        );
+    }
+
+    #[test]
+    fn internetdb_cache_keeps_history_without_relabeling_empty_or_failed_snapshots() {
+        let historical = BTreeSet::from(["old.example.com".to_owned()]);
+        let empty = IpHostnameCacheEntry {
+            hostnames: historical.clone(),
+            last_success_at: 1_000,
+            last_attempt_at: 1_000,
+            status: "empty".to_owned(),
+        };
+        assert_eq!(
+            internetdb_cache_decision(Some(&empty), 1_100, 3_600, 900, false),
+            super::InternetDbCacheDecision::Use {
+                hostnames: BTreeSet::new(),
+                qualifier: ":cache",
+            }
+        );
+
+        let failed = IpHostnameCacheEntry {
+            hostnames: historical.clone(),
+            last_success_at: 1,
+            last_attempt_at: 1_000,
+            status: "error".to_owned(),
+        };
+        assert_eq!(
+            internetdb_cache_decision(Some(&failed), 1_100, 10, 900, false),
+            super::InternetDbCacheDecision::Use {
+                hostnames: historical,
+                qualifier: ":stale",
+            }
+        );
+        assert_eq!(
+            internetdb_cache_decision(Some(&failed), 2_000, 10, 900, false),
+            super::InternetDbCacheDecision::Refresh
+        );
+        assert_eq!(
+            internetdb_cache_decision(Some(&failed), 1_100, 3_600, 900, true),
+            super::InternetDbCacheDecision::Refresh
+        );
     }
 
     #[test]

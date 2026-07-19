@@ -13,14 +13,16 @@ Fellaga is a fast, adaptive subdomain enumerator written in Rust for Kali Linux 
 ## Highlights
 
 - Native asynchronous DNS engine with correlated UDP queries, EDNS0, TCP fallback, resolver balancing, retries, and one shared adaptive network governor for discovery, consensus, DNSSEC, Web, and TLS preparation.
-- Adaptive `deep` scan by default: 67 registered passive connector names across canonical, Fellaga-native, and compatibility integrations, Certificate Transparency, a one-million-candidate corpus, recursive DNS, AXFR, DNSSEC/NSEC, Web and JavaScript discovery, TLS/STARTTLS, and bounded PTR pivots.
+- Adaptive `deep` scan by default: 69 registered passive connector names across canonical, Fellaga-native, and compatibility integrations, Certificate Transparency, a one-million-candidate corpus, recursive DNS, AXFR, DNSSEC/NSEC, Web and JavaScript discovery, TLS/STARTTLS, and bounded PTR and IP-to-hostname pivots.
 - Protocol-aware DNS discovery follows bounded DNS-SD, NAPTR, URI, SPF, DMARC, MTA-STS, TLS reporting, and BIMI relationships without querying names outside the authorized root.
 - Target-local grammar induction learns service, environment, region, cloud, separator, and numeric conventions from retained names, then emits a bounded ranked candidate beam.
 - Static CT tiles provide a durable fallback when a log no longer exposes the legacy entry API; tile payloads, checkpoint identity, extracted names, and cursors are committed together in SQLite.
 - Standardized metadata and semantic static analysis extract names from API catalogs, OpenID/OAuth metadata, SSH known-hosts data, Terraform discovery, HTML, JSON, JavaScript, source maps, and bounded Common Crawl WARC records without executing scripts.
 - Differential TLS compares a small prioritized set of SNI and no-SNI certificates, exposing default virtual-host names while sharing one deadline and never turning an out-of-scope SAN into active work.
 - Brave Search follows provider totals for up to ten 20-result pages. MerkleMap follows validated provider totals for up to 1,000 pages, preserving every completed page under the connector wall deadline. The retired BinaryEdge compatibility connector remains visible for legacy configuration and provenance, but it is unavailable and never selected automatically.
-- High-volume SubMD results are consumed as a bounded line stream and checkpointed in batches of at most 1,000 names and before the next network read. THC cursor pagination uses up to five paced page requests per second, can consume up to 1,000 pages of 1,000 records, rejects repeated states, and remains constrained by the passive-phase and connector wall deadlines.
+- High-volume SubMD results are consumed as a bounded line stream and checkpointed after at most 1,000 names or 500 ms of received streaming progress. THC cursor pagination uses up to five paced page requests per second, can consume up to 1,000 pages of 1,000 records, rejects repeated states, and remains constrained by the passive-phase and connector wall deadlines.
+- Keyless archive and public-feed coverage includes Arquivo.pt CDX replay and ShrewdEye's domain feed. Both are streamed with strict record, line, response-size, suffix, and wall-time limits, with volume/time checkpoints that avoid one SQLite transaction per HTTP chunk.
+- A single bounded Shodan InternetDB wave enriches public IP addresses already confirmed by the scan. It never sweeps an address range, retains permanent IP-to-hostname observations locally, and submits every in-scope name to the normal wildcard-aware DNS validation pipeline.
 - The default `deep` profile selects every locally accessible connector whose metadata permits automatic execution, including eligible experimental providers. `--all-sources` likewise executes each unique implementation once; compatibility names remain available for explicit selection but are not added as duplicate requests. The retired BinaryEdge entry remains unavailable, and every provider still obeys connection, rate, response-size, and wall-time safeguards.
 - Persistent, lazy candidate scheduling: passive/authoritative seeds and active word generators are consumed in bounded SQLite-backed waves instead of being materialized in memory before DNS starts.
 - Yield-aware source scheduling learns each connector's marginal unique-name yield, reliability, and latency; complete pages remain usable when a later page reaches its deadline, and source checks distinguish `success`, `empty`, `degraded`, `deferred_budget`, `skipped_missing_key`, `rate_limited`, `auth_required`, `anti_bot`, `upstream_error`, `transport_error`, `tls_error`, `schema_error`, `timeout`, and the uncategorized `error` fallback.
@@ -39,8 +41,8 @@ Fellaga is a fast, adaptive subdomain enumerator written in Rust for Kali Linux 
 Download the release package and install it with APT. Checksums, a Sigstore-signed manifest, and GitHub attestations are available for independent verification:
 
 ```bash
-curl -fLO https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/download/v0.10.1/fellaga_0.10.1-1_amd64.deb
-sudo apt install ./fellaga_0.10.1-1_amd64.deb
+curl -fLO https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/download/v0.11.0/fellaga_0.11.0-1_amd64.deb
+sudo apt install ./fellaga_0.11.0-1_amd64.deb
 fellaga --version
 ```
 
@@ -102,6 +104,8 @@ The default scan processes one domain at a time, caps shared DNS traffic at 250 
 
 Long-running phases emit periodic progress on standard error. Direct CT-log indexing reports the selected log, durable cursor, entry range, request timeout, and remaining phase budget. It runs opportunistically in the background and never gates the first DNS-validation wave; its `deep`/`balanced`/`passive`/`turbo` budgets are 30/10/30/5 seconds. One process-wide CT indexer runs at a time, and a completed global pass establishes a ten-minute SQLite freshness window that prevents duplicate raw-log work. Initial passive collection and AXFR remain bounded independently; passive budgets are 45/25/60/15 seconds and AXFR allows four concurrent transfers globally with a four-second default per nameserver. Passive connector concurrency accepts and honors values from 1 through 32, crt.sh uses a bounded HTTP-first PostgreSQL fallback, and a cancelled certificate-database connector aborts its pending database connection task. Wildcard certificate patterns remain patterns and are never converted into concrete host findings. Wildcard detection starts with three randomized probes and spends two additional probes only when the first stage is ambiguous. Web and JavaScript discovery also uses one cumulative profile budget across the initial crawl and later pipeline rounds. Completed connector pages are committed to permanent SQLite observations as they arrive, while the active in-memory source set remains bounded. Web fetches are likewise retained after a later operation times out, and the affected phase is reported as partial. Final JSON records include `phase_timings` for initial discovery, candidate DNS, enrichment, and finalization.
 
+The InternetDB pivot is enabled for active profiles and is disabled by `--profile passive` or `--no-internetdb`. Profile defaults query at most 16, 8, and 4 already-confirmed public IP addresses in `deep`, `balanced`, and `turbo`, with cumulative budgets of 20, 10, and 5 seconds respectively. Use `--internetdb-ips`, `--internetdb-max-runtime`, and `--internetdb-refresh-hours` to tune those bounds and successful-cache refreshes.
+
 Fellaga displays all retained states by default:
 
 | State | Meaning |
@@ -137,7 +141,7 @@ fellaga refresh your-domain.example
 
 Run `fellaga <command> --help` for the complete option list.
 
-Required and optional provider credentials can be supplied through environment variables or `~/.config/fellaga/config.json`; missing required keys are skipped locally. Fellaga sends a transparent `Fellaga/<version>` HTTP user agent with the project URL by default, and `FELLAGA_USER_AGENT` provides an optional organization-specific override. See [passive sources and credentials](docs/sources.md) for all 67 registry names, accepted variables, experimental provider behavior, bounded connector semantics, and health statuses.
+Required and optional provider credentials can be supplied through environment variables or `~/.config/fellaga/config.json`; missing required keys are skipped locally. Fellaga sends a transparent `Fellaga/<version>` HTTP user agent with the project URL by default, and `FELLAGA_USER_AGENT` provides an optional organization-specific override. See [passive sources and credentials](docs/sources.md) for all 69 registry names, accepted variables, experimental provider behavior, bounded connector semantics, and health statuses.
 
 ## Documentation
 
