@@ -207,15 +207,7 @@ SUBJECT="$(jq -r '.roles.subject' "$TOOLSET_RUNTIME")"
 VALIDATOR="$(jq -r '.roles.validator' "$TOOLSET_RUNTIME")"
 CAPACITY_GUARD="$(jq -r '.roles.capacity_guard' "$TOOLSET_RUNTIME")"
 SUBJECT_BIN="$(jq -r --arg tool "$SUBJECT" '.resolved_executables[$tool]' "$TOOLSET_RUNTIME")"
-mapfile -t DISCOVERERS < <(jq -r '.roles.discoverers[]' "$TOOLSET_RUNTIME")
 mapfile -t REQUIRED_TOOLS < <(jq -r '.roles.required_tools[]' "$TOOLSET_RUNTIME")
-mapfile -t PROVENANCE_TOOLS < <(
-  jq -r '.roles.required_tools[], .roles.validator, .roles.provenance_only[]' \
-    "$TOOLSET_RUNTIME" | awk '!seen[$0]++'
-)
-mapfile -t CREDENTIAL_PARTICIPANTS < <(
-  jq -r '.roles.credential_participants[]' "$TOOLSET_RUNTIME"
-)
 if (( ${#BENCH_PROFILE_BASELINES[@]} > 0 )) && ! jq -e --arg tool "$SUBJECT" '
   ((.snapshot.tools[$tool].commands.active.required_context // []) +
    (.snapshot.tools[$tool].parameters // {} | keys))
