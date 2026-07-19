@@ -6,6 +6,34 @@ Published releases and downloadable artifacts are available on [GitHub Releases]
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-07-18
+
+### Added
+
+- add `scan --profile passive --no-target-contact` for provider-only collection that retains unverified provenance while preventing target DNS, HTTP, TLS, AXFR, wildcard, and enrichment traffic;
+- add a pinned Tranco top-30 observational campaign with isolated no-key comparative runs, executable provenance, live progress, and descriptive-only reporting;
+- expand the passive registry to 67 connector names with 57 canonical integrations, five Fellaga-native connectors, five compatibility entries, capability metadata, bounded pagination, and incremental page persistence;
+- add current provider contracts for Censys Platform v3, Netlas streamed downloads, SecurityTrails scrolling, four-family Driftnet summaries, ViewDNS discovery, Postman public request search, and full code-search content extraction.
+
+### Changed
+
+- select every locally accessible connector eligible for automatic execution in the default deep profile while keeping duplicate and unavailable compatibility entries outside automatic selection;
+- walk five yearly Common Crawl indexes breadth-first, follow Wayback resume keys, rotate code-search credentials on quota responses, and retain completed pages before later failures;
+- follow up to ten Brave Search result pages while retaining every completed page, and keep the retired BinaryEdge connector unavailable and outside automatic selection while preserving legacy configuration and provenance;
+- use one typed passive-source registry for identifiers, credentials, environment aliases, and exhaustive dispatch; retry the documented read-only Postman search POST without making generic POST requests replayable;
+- make interrupted passive refreshes generation-idempotent without per-name cleanup cascades, serialize each domain/source refresh with an expiring SQLite lease, and publish multi-lane freshness only after every lane completes;
+- reduce recursive and authoritative UDP socket reservations, cap cached authoritative transports, release the global cadence lock before sleeping, and reuse the A-only discovery quorum before conservative fallback;
+- use generic `json`, `jsonl`, `text`, and `dns-text` import format names without coupling the runtime interface to another enumeration product.
+
+### Fixed
+
+- fail closed when an external benchmark tool's no-DNS dry run exits successfully but still reports a semantic DNS-resolution requirement;
+- disable direct CT-log indexing in `--no-target-contact` mode when a public log endpoint could belong to the target, while retaining CT provider connectors;
+- preserve existing live or historical inventory state, verification time, and DNS records when provider-only observations are merged;
+- treat empty no-result provider payloads as empty results, keep mixed Driftnet evidence in the aggregator family, and reject repeated cursors, unsafe pagination destinations, oversized streams, or truncated records without discarding completed checkpoints.
+- keep partial passive connectors eligible during `--resume`, distinguish wildcard-parent batch truncation from deadline exhaustion, and keep deferred indeterminate parents eligible for later profiling;
+- reject Postman and ViewDNS total-count drift before committing an invalid page, detect reordered repeated Postman pages, and keep deadline cancellation neutral to resolver-health backoff after accounting for a sent packet.
+
 ## [0.9.2] - 2026-07-17
 
 ### Added
@@ -129,7 +157,7 @@ Published releases and downloadable artifacts are available on [GitHub Releases]
 - coalesce each Common Crawl 15-block index window into one URL-only request and defer long `Retry-After` waits into the persistent source scheduler;
 - qualify generated-candidate NXDOMAIN fast paths with resolver health probes, keep their negatives journal-only, and use full consensus for retained names, wordlists, retries, refresh, wildcard, Web, and TLS work;
 - force per-name verification indexes in candidate finalization, align lazy wordlist pages with scheduler batches, and group negative inventory updates;
-- make full-coverage benchmarks pass an explicit active runtime and verify the exact active-corpus count against PureDNS capacity evidence.
+- make full-coverage benchmarks pass an explicit active runtime and verify the exact active-corpus count against independently measured bulk-DNS capacity evidence.
 
 ### Fixed
 
@@ -155,7 +183,7 @@ Published releases and downloadable artifacts are available on [GitHub Releases]
 - route Web, TLS, PTR, authoritative, trusted-consensus, and direct NSEC traffic through the configured shared DNS cadence;
 - cap cross-target, Web, TLS, passive, CT, NSEC, and enrichment concurrency while preserving partial results from completed work;
 - page refresh inventory and cache reads with stable SQLite cursors, rank parent wildcard zones in bounded memory, and stage wildcard matches in SQLite;
-- harden the competitor benchmark with isolated homes, equal-key validation, fresh output directories, process-group timeouts, recursive redaction, resolver fairness metadata, executable and input hashes, strict repetition accounting, and fail-closed qualification reports;
+- harden the comparative benchmark with isolated homes, equal-key validation, fresh output directories, process-group timeouts, recursive redaction, resolver fairness metadata, executable and input hashes, strict repetition accounting, and fail-closed qualification reports;
 - separate the 100,000-query transport test from the ten-million-candidate pipeline test and give each an independent wall timeout.
 
 ### Fixed
@@ -164,6 +192,7 @@ Published releases and downloadable artifacts are available on [GitHub Releases]
 - apply completed wildcard cleanup in one cancellable transaction, roll it back on timeout or interruption, quarantine exact current-consensus wildcard matches even when passive history exists, and retain all provenance for `explain`;
 - recalculate historical scan result counts after wildcard cleanup and disable all cleanup when parent-zone coverage or current wildcard classification is incomplete;
 - keep low-rate DNS queues from turning valid hosts into indeterminate results before their requests are sent;
+- reject numeric source completion when advertised record or page totals are incomplete, and restart abandoned numeric generations from page one without deleting permanent observations;
 - enforce `--dns-rate-limit` for direct NSEC traffic in addition to its local traversal cap;
 - preserve completed refresh batches and close the refresh checkpoint safely on timeout, Ctrl+C, or future cancellation.
 
@@ -224,7 +253,7 @@ Initial public release of Fellaga.
 - hierarchical wildcard detection, evidence families, and explained confidence scores;
 - pinned and compressed one-million-candidate corpus derived from SecLists;
 - text, JSON, JSONL, streaming JSONL, import, export, explanation, source-health, and resolver-test interfaces;
-- reproducible competitor benchmark, controlled DNS laboratory, property tests, fuzz target, and CI/release workflows.
+- reproducible comparative benchmark, controlled DNS laboratory, property tests, fuzz target, and CI/release workflows.
 
 ### Security and reliability
 
@@ -241,7 +270,8 @@ Initial public release of Fellaga.
 - public MIT repository with security policy, contribution guide, third-party notices, and verifiable corpus provenance;
 - verifiable v0.8.0 release with x86-64 and ARM64 GNU/Linux archives, an amd64 Debian package, architecture SBOMs, checksums, a keyless Sigstore signature over the checksum manifest, and GitHub attestations.
 
-[Unreleased]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/compare/v0.9.2...HEAD
+[Unreleased]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/tag/v0.10.0
 [0.9.2]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/tag/v0.9.2
 [0.9.1]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/tag/v0.9.1
 [0.9.0]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/tag/v0.9.0

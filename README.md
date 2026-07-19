@@ -13,14 +13,15 @@ Fellaga is a fast, adaptive subdomain enumerator written in Rust for Kali Linux 
 ## Highlights
 
 - Native asynchronous DNS engine with correlated UDP queries, EDNS0, TCP fallback, resolver balancing, retries, and one shared adaptive network governor for discovery, consensus, DNSSEC, Web, and TLS preparation.
-- Adaptive `deep` scan by default: 30 passive connectors, Certificate Transparency, a one-million-candidate corpus, recursive DNS, AXFR, DNSSEC/NSEC, Web and JavaScript discovery, TLS/STARTTLS, and bounded PTR pivots.
+- Adaptive `deep` scan by default: 67 registered passive connector names across canonical, Fellaga-native, and compatibility integrations, Certificate Transparency, a one-million-candidate corpus, recursive DNS, AXFR, DNSSEC/NSEC, Web and JavaScript discovery, TLS/STARTTLS, and bounded PTR pivots.
 - Protocol-aware DNS discovery follows bounded DNS-SD, NAPTR, URI, SPF, DMARC, MTA-STS, TLS reporting, and BIMI relationships without querying names outside the authorized root.
 - Target-local grammar induction learns service, environment, region, cloud, separator, and numeric conventions from retained names, then emits a bounded ranked candidate beam.
 - Static CT tiles provide a durable fallback when a log no longer exposes the legacy entry API; tile payloads, checkpoint identity, extracted names, and cursors are committed together in SQLite.
 - Standardized metadata and semantic static analysis extract names from API catalogs, OpenID/OAuth metadata, SSH known-hosts data, Terraform discovery, HTML, JSON, JavaScript, source maps, and bounded Common Crawl WARC records without executing scripts.
 - Differential TLS compares a small prioritized set of SNI and no-SNI certificates, exposing default virtual-host names while sharing one deadline and never turning an out-of-scope SAN into active work.
-- Targeted BinaryEdge, MerkleMap, and Brave Search connectors use one-page fast paths and request at most one additional page when the provider reports more raw results.
-- OTX passive DNS is enabled automatically when its API key is configured, while the official authenticated Driftnet Certificate Transparency connector becomes eligible for automatic `deep` scans with its key; browser-facing anti-bot connectors remain manual in every profile.
+- Brave Search follows provider totals for up to ten 20-result pages. MerkleMap follows validated provider totals for up to 1,000 pages, preserving every completed page under the connector wall deadline. The retired BinaryEdge compatibility connector remains visible for legacy configuration and provenance, but it is unavailable and never selected automatically.
+- High-volume SubMD results are consumed as a bounded line stream and checkpointed in batches of at most 1,000 names and before the next network read. THC cursor pagination can consume up to 1,000 pages of 1,000 records, rejects repeated states, and remains constrained by the connector wall deadline.
+- The default `deep` profile selects every locally accessible connector whose metadata permits automatic execution, including eligible experimental providers. Four duplicate compatibility names remain opt-in, the retired BinaryEdge entry remains unavailable, and every provider still obeys connection, rate, response-size, and wall-time safeguards.
 - Persistent, lazy candidate scheduling: passive/authoritative seeds and active word generators are consumed in bounded SQLite-backed waves instead of being materialized in memory before DNS starts.
 - Yield-aware source scheduling learns each connector's marginal unique-name yield, reliability, and latency; complete pages remain usable when a later page reaches its deadline, and source checks distinguish `success`, `empty`, `degraded`, `deferred_budget`, `skipped_missing_key`, `rate_limited`, `auth_required`, `anti_bot`, `upstream_error`, `transport_error`, `tls_error`, `schema_error`, `timeout`, and the uncategorized `error` fallback.
 - Hierarchical wildcard detection, rotating-answer recognition, exact-signature filtering, trusted-resolver consensus, authoritative validation, and locally validated DNSSEC denial proofs for purging proven synthesized owners.
@@ -38,8 +39,8 @@ Fellaga is a fast, adaptive subdomain enumerator written in Rust for Kali Linux 
 Download the release package and install it with APT. Checksums, a Sigstore-signed manifest, and GitHub attestations are available for independent verification:
 
 ```bash
-curl -fLO https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/download/v0.9.2/fellaga_0.9.2-1_amd64.deb
-sudo apt install ./fellaga_0.9.2-1_amd64.deb
+curl -fLO https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/download/v0.10.0/fellaga_0.10.0-1_amd64.deb
+sudo apt install ./fellaga_0.10.0-1_amd64.deb
 fellaga --version
 ```
 
@@ -80,6 +81,12 @@ fellaga scan your-domain.example --show --only-live
 # Passive discovery without the active enrichment pipeline
 fellaga scan your-domain.example --profile passive
 
+# Provider-only discovery with no DNS, HTTP, or TLS contact to the target
+fellaga scan your-domain.example --profile passive --no-target-contact --show
+
+# Provider-only registry diagnostic, including compatibility and experimental sources
+fellaga scan your-domain.example --profile passive --no-target-contact --all-sources --show
+
 # Stream each finding as JSONL when it is produced
 fellaga scan your-domain.example --stream-jsonl > findings.jsonl
 
@@ -88,6 +95,8 @@ fellaga scan your-domain.example --resume latest
 ```
 
 The default scan processes one domain at a time, caps shared DNS traffic at 250 logical queries per second, and keeps at most 128 host resolutions in flight. The rate cap remains active across validation and enrichment traffic unless `--dns-rate-limit 0` explicitly disables it. Runtime limits are profile-specific: `deep` stops after 600 seconds, `balanced` and `turbo` after 300 seconds, and `passive` after 180 seconds unless `--max-runtime` overrides the limit. The default `deep` profile also gives wildcard profiling and active candidate work a shared 120-second budget. Embedded and user wordlists, mutations, retries, and recursive candidate generation all consume that budget. At the deadline, completed outcomes are kept, unfinished names are requeued as indeterminate, and the scan can continue later with `--resume latest`. Set `--active-max-runtime 0` to disable this time bound. `--no-adaptive` disables low-yield stopping and uses the configured recursion ceilings, but it does not disable ranking, time limits, or DNS rate safeguards. Transient candidate-resolution failures receive at most three total attempts.
+
+`--profile passive` still performs wildcard probes, DNS validation, and direct CT-log indexing. Add `--no-target-contact` when the run must be limited to third-party passive-provider APIs. CT data can still arrive through providers such as crt.sh and Cert Spotter, while the direct CT-log indexer is disabled because some public logs can be hosted under the target's own domain. All names returned by this mode are intentionally `unverified`; no target DNS, HTTP, TLS, AXFR, or other direct target connection is attempted. Existing `live` or `historical` inventory state and DNS records are preserved when the same name is observed passively.
 
 Long-running phases emit periodic progress on standard error. Direct CT-log indexing reports the selected log, durable cursor, entry range, request timeout, and remaining phase budget. It runs opportunistically in the background and never gates the first DNS-validation wave; its `deep`/`balanced`/`passive`/`turbo` budgets are 30/10/30/5 seconds. One process-wide CT indexer runs at a time, and a completed global pass establishes a ten-minute SQLite freshness window that prevents duplicate raw-log work. Initial passive collection and AXFR remain bounded independently; passive budgets are 45/25/60/15 seconds and AXFR allows four concurrent transfers globally with a four-second default per nameserver. Wildcard detection starts with three randomized probes and spends two additional probes only when the first stage is ambiguous. Web and JavaScript discovery also uses one cumulative profile budget across the initial crawl and later pipeline rounds. Completed connector pages are committed to permanent SQLite observations as they arrive, while the active in-memory source set remains bounded. Web fetches are likewise retained after a later operation times out, and the affected phase is reported as partial. Final JSON records include `phase_timings` for initial discovery, candidate DNS, enrichment, and finalization.
 
@@ -126,7 +135,7 @@ fellaga refresh your-domain.example
 
 Run `fellaga <command> --help` for the complete option list.
 
-Driftnet requires `DRIFTNET_API_KEY`, and OTX requires `OTX_API_KEY` (or `X_OTX_API_KEY`). Credentials can be supplied through environment variables or `~/.config/fellaga/config.json`. Fellaga sends a transparent `Fellaga/<version>` HTTP user agent with the project URL by default; `FELLAGA_USER_AGENT` provides an optional organization-specific override. See [passive sources and credentials](docs/sources.md) for the connector catalog, health statuses, and configuration format.
+Required and optional provider credentials can be supplied through environment variables or `~/.config/fellaga/config.json`; missing required keys are skipped locally. Fellaga sends a transparent `Fellaga/<version>` HTTP user agent with the project URL by default, and `FELLAGA_USER_AGENT` provides an optional organization-specific override. See [passive sources and credentials](docs/sources.md) for all 67 registry names, accepted variables, experimental provider behavior, bounded connector semantics, and health statuses.
 
 ## Documentation
 

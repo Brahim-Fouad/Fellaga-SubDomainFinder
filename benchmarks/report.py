@@ -11,36 +11,157 @@ import re
 import statistics
 import sys
 from collections import defaultdict
+from dataclasses import dataclass
 from typing import Any
 
 try:
     from .names import NameError, normalize_domain, read_name_file
+    from .toolset import ToolsetError, snapshot_hash
 except ImportError:  # Direct script execution.
     from names import NameError, normalize_domain, read_name_file
+    from toolset import ToolsetError, snapshot_hash
 
 
-REQUIRED_TOOLS = ("fellaga", "subfinder", "amass", "bbot", "puredns")
-PROVENANCE_TOOLS = REQUIRED_TOOLS + ("massdns", "dnsx")
-CREDENTIAL_TOOLS = {"fellaga", "subfinder", "amass", "bbot"}
 MINIMUM_DOMAINS = 30
 MINIMUM_REPETITIONS = 3
-SAFE_TOOL = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
+SAFE_TOOL = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 SAFE_CAMPAIGN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{7,127}$")
 HEX_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 GIT_COMMIT = re.compile(r"^[0-9a-f]{40,64}$")
-DNS_CONTROL_REQUIREMENTS = {
-    "fellaga": {"resolver_list", "trusted_resolver_list", "rate_limit", "concurrency"},
-    "subfinder": {"resolver_list"},
-    "amass": {"resolver_list", "concurrency"},
-    "bbot": {"concurrency", "bruteforce_resolver_list", "no_strict_qps_cli"},
-    "puredns": {
-        "resolver_list",
-        "trusted_resolver_list",
-        "rate_limit",
-        "trusted_rate_limit",
-    },
-    "dnsx": {"resolver_list", "rate_limit", "concurrency"},
-}
+
+
+@dataclass(frozen=True)
+class ActiveCampaign:
+    """Role bindings embedded in a normalized active toolset snapshot."""
+
+    subject: str
+    discoverers: tuple[str, ...]
+    validator: str
+    capacity_guard: str
+    provenance_only: tuple[str, ...]
+    credential_participants: frozenset[str]
+    tools: dict[str, dict[str, Any]]
+
+    @property
+    def required_tools(self) -> tuple[str, ...]:
+        return tuple(dict.fromkeys((self.subject, *self.discoverers)))
+
+    @property
+    def provenance_tools(self) -> tuple[str, ...]:
+        return tuple(
+            dict.fromkeys(
+                (*self.required_tools, self.validator, *self.provenance_only)
+            )
+        )
+
+    @property
+    def dns_control_requirements(self) -> dict[str, set[str]]:
+        return {
+            tool: set(self.tools[tool].get("dns_controls", []))
+            for tool in self.provenance_tools
+            if self.tools[tool].get("dns_controls")
+        }
+
+
+def _canonical_sha256(value: Any) -> str:
+    if not isinstance(value, dict):
+        raise TypeError("toolset snapshot must be an object")
+    return snapshot_hash(value)
+
+
+def _tool_ids(value: Any) -> tuple[str, ...] | None:
+    if not isinstance(value, list):
+        return None
+    tools = tuple(value)
+    if (
+        any(not isinstance(tool, str) or not SAFE_TOOL.fullmatch(tool) for tool in tools)
+        or len(tools) != len(set(tools))
+    ):
+        return None
+    return tools
+
+
+def _active_campaign(manifest: dict[str, Any]) -> tuple[ActiveCampaign | None, list[str]]:
+    issues: list[str] = []
+    binding = manifest.get("toolset")
+    if not isinstance(binding, dict):
+        return None, ["missing_toolset_binding"]
+    if binding.get("campaign") != "active":
+        issues.append("invalid_toolset_campaign")
+    snapshot = binding.get("snapshot")
+    digest = binding.get("sha256")
+    if not isinstance(snapshot, dict):
+        return None, [*issues, "invalid_toolset_snapshot"]
+    try:
+        computed_digest = snapshot_hash(snapshot)
+    except ToolsetError:
+        return None, [*issues, "invalid_toolset_snapshot"]
+    if not isinstance(digest, str) or not HEX_SHA256.fullmatch(digest):
+        issues.append("invalid_toolset_hash")
+    elif digest != computed_digest:
+        issues.append("toolset_hash_mismatch")
+    campaigns = snapshot.get("campaigns")
+    tools = snapshot.get("tools")
+    subject = snapshot.get("subject")
+    active = campaigns.get("active") if isinstance(campaigns, dict) else None
+    if (
+        snapshot.get("schema_version") != 1
+        or not isinstance(tools, dict)
+        or not isinstance(active, dict)
+        or not isinstance(subject, str)
+        or not SAFE_TOOL.fullmatch(subject)
+    ):
+        return None, [*issues, "invalid_active_toolset_snapshot"]
+    discoverers = _tool_ids(active.get("discoverers"))
+    provenance_only = _tool_ids(active.get("provenance_only"))
+    credential_participants = _tool_ids(active.get("credential_participants"))
+    validator = active.get("validator")
+    capacity_guard = active.get("capacity_guard")
+    if (
+        discoverers is None
+        or not discoverers
+        or provenance_only is None
+        or credential_participants is None
+        or not isinstance(validator, str)
+        or not SAFE_TOOL.fullmatch(validator)
+        or not isinstance(capacity_guard, str)
+        or not SAFE_TOOL.fullmatch(capacity_guard)
+    ):
+        return None, [*issues, "invalid_active_toolset_roles"]
+    required = tuple(dict.fromkeys((subject, *discoverers)))
+    provenance = tuple(dict.fromkeys((*required, validator, *provenance_only)))
+    if (
+        subject not in discoverers
+        or capacity_guard not in discoverers
+        or not set(credential_participants).issubset(discoverers)
+    ):
+        issues.append("invalid_active_toolset_role_membership")
+    for tool in provenance:
+        definition = tools.get(tool)
+        if not isinstance(definition, dict):
+            issues.append(f"missing_toolset_tool:{tool}")
+            continue
+        controls = definition.get("dns_controls", [])
+        if (
+            not isinstance(controls, list)
+            or any(not isinstance(control, str) or not control for control in controls)
+            or len(controls) != len(set(controls))
+        ):
+            issues.append(f"invalid_toolset_dns_controls:{tool}")
+    if any(issue.startswith(("missing_toolset_tool:", "invalid_toolset_dns_controls:")) for issue in issues):
+        return None, issues
+    return (
+        ActiveCampaign(
+            subject=subject,
+            discoverers=discoverers,
+            validator=validator,
+            capacity_guard=capacity_guard,
+            provenance_only=provenance_only,
+            credential_participants=frozenset(credential_participants),
+            tools={tool: tools[tool] for tool in provenance},
+        ),
+        issues,
+    )
 
 
 def _finite_number(document: dict[str, Any], key: str, default: float) -> float:
@@ -98,9 +219,11 @@ def _timing_evidence(row: dict[str, Any]) -> tuple[float, float, float] | None:
     return discovery, validation, end_to_end
 
 
-def _manifest_evidence_issues(manifest: dict[str, Any]) -> list[str]:
+def _manifest_evidence_issues(
+    manifest: dict[str, Any], campaign: ActiveCampaign | None
+) -> list[str]:
     issues: list[str] = []
-    if manifest.get("schema_version") not in {1, 2}:
+    if manifest.get("schema_version") != 3:
         issues.append("invalid_manifest_schema")
     campaign_id = manifest.get("campaign_id")
     if not isinstance(campaign_id, str) or not SAFE_CAMPAIGN.fullmatch(campaign_id):
@@ -109,11 +232,19 @@ def _manifest_evidence_issues(manifest: dict[str, Any]) -> list[str]:
     if mode not in {"no-key", "equal-keys"}:
         issues.append("invalid_mode")
 
+    provenance_tools = campaign.provenance_tools if campaign is not None else ()
+    credential_tools = (
+        campaign.credential_participants if campaign is not None else frozenset()
+    )
+    dns_requirements = (
+        campaign.dns_control_requirements if campaign is not None else {}
+    )
+
     versions = manifest.get("versions")
     if not isinstance(versions, dict):
         issues.append("missing_versions")
         versions = {}
-    for tool in PROVENANCE_TOOLS:
+    for tool in provenance_tools:
         if not isinstance(versions.get(tool), str) or not versions[tool].strip():
             issues.append(f"missing_version:{tool}")
 
@@ -135,7 +266,7 @@ def _manifest_evidence_issues(manifest: dict[str, Any]) -> list[str]:
     if not isinstance(executables, dict):
         issues.append("missing_executable_provenance")
         executables = {}
-    for tool in PROVENANCE_TOOLS:
+    for tool in provenance_tools:
         evidence = executables.get(tool)
         if not isinstance(evidence, dict):
             issues.append(f"missing_executable:{tool}")
@@ -154,6 +285,7 @@ def _manifest_evidence_issues(manifest: dict[str, Any]) -> list[str]:
         "active_corpus_sha256",
         "pipeline_corpus_sha256",
         "resolvers_sha256",
+        "toolset_sha256",
     )
     if not isinstance(inputs, dict):
         issues.append("missing_input_provenance")
@@ -162,6 +294,10 @@ def _manifest_evidence_issues(manifest: dict[str, Any]) -> list[str]:
         digest = inputs.get(name)
         if not isinstance(digest, str) or not HEX_SHA256.fullmatch(digest):
             issues.append(f"invalid_input_hash:{name}")
+    binding = manifest.get("toolset")
+    binding_hash = binding.get("sha256") if isinstance(binding, dict) else None
+    if inputs.get("toolset_sha256") != binding_hash:
+        issues.append("toolset_input_hash_mismatch")
     keys_digest = inputs.get("keys_manifest_sha256")
     if mode == "equal-keys":
         if not isinstance(keys_digest, str) or not HEX_SHA256.fullmatch(keys_digest):
@@ -193,20 +329,19 @@ def _manifest_evidence_issues(manifest: dict[str, Any]) -> list[str]:
                     issues.append("invalid_equal_keys_provider")
                     continue
                 name = provider.get("name")
-                variable = provider.get("fellaga_env")
+                variable = provider.get("subject_env")
                 tools = provider.get("configured_tools")
                 if (
                     not isinstance(name, str)
                     or not name
                     or name in seen_names
                     or not isinstance(variable, str)
-                    or not variable
+                    or not re.fullmatch(r"[A-Z][A-Z0-9_]{2,127}", variable)
                     or variable in seen_env
                     or not isinstance(tools, list)
                     or any(not isinstance(tool, str) for tool in tools)
-                    or not CREDENTIAL_TOOLS.issubset(
-                        {tool for tool in tools if isinstance(tool, str)}
-                    )
+                    or len(tools) != len(set(tools))
+                    or set(tools) != credential_tools
                 ):
                     issues.append("invalid_equal_keys_provider")
                 if isinstance(name, str):
@@ -235,12 +370,15 @@ def _manifest_evidence_issues(manifest: dict[str, Any]) -> list[str]:
         if not isinstance(controls, dict):
             issues.append("missing_dns_tool_controls")
         else:
-            for tool, required in DNS_CONTROL_REQUIREMENTS.items():
+            if set(controls) != set(dns_requirements):
+                issues.append("unexpected_dns_tool_controls")
+            for tool, required in dns_requirements.items():
                 documented = controls.get(tool)
                 if (
                     not isinstance(documented, list)
                     or any(not isinstance(value, str) for value in documented)
-                    or not required.issubset(set(documented))
+                    or len(documented) != len(set(documented))
+                    or set(documented) != required
                 ):
                     issues.append(f"missing_dns_tool_controls:{tool}")
     return issues
@@ -254,9 +392,11 @@ def _integer(document: dict[str, Any], key: str) -> int | None:
 
 
 def _capacity_preflight_issues(
-    manifest: dict[str, Any], configuration: dict[str, Any]
+    manifest: dict[str, Any],
+    configuration: dict[str, Any],
+    campaign: ActiveCampaign | None,
 ) -> list[str]:
-    """Validate schema-v2 capacity evidence and its internal calculations."""
+    """Validate capacity evidence and its internal calculations."""
 
     issues: list[str] = []
     provenance = manifest.get("provenance")
@@ -316,17 +456,17 @@ def _capacity_preflight_issues(
         ):
             issues.append("invalid_disk_preflight")
 
-    puredns = preflight.get("puredns_capacity")
-    if not isinstance(puredns, dict):
-        issues.append("missing_puredns_preflight")
+    capacity_guard = preflight.get("capacity_guard")
+    if not isinstance(capacity_guard, dict):
+        issues.append("missing_capacity_guard_preflight")
     else:
-        corpus = _integer(puredns, "corpus_candidates")
-        rate = _integer(puredns, "rate_limit_qps")
-        timeout = _integer(puredns, "timeout_seconds")
-        headroom = _integer(puredns, "headroom_percent")
-        estimated_seconds = _integer(puredns, "estimated_minimum_seconds")
-        minimum_rate = _integer(puredns, "minimum_coherent_rate_qps")
-        capacity = _integer(puredns, "capacity_candidates")
+        corpus = _integer(capacity_guard, "corpus_candidates")
+        rate = _integer(capacity_guard, "rate_limit_qps")
+        timeout = _integer(capacity_guard, "timeout_seconds")
+        headroom = _integer(capacity_guard, "headroom_percent")
+        estimated_seconds = _integer(capacity_guard, "estimated_minimum_seconds")
+        minimum_rate = _integer(capacity_guard, "minimum_coherent_rate_qps")
+        capacity = _integer(capacity_guard, "capacity_candidates")
         valid_inputs = (
             corpus is not None
             and corpus > 0
@@ -351,13 +491,15 @@ def _capacity_preflight_issues(
             rate * timeout * 100 // headroom if valid_inputs else None
         )
         if (
-            puredns.get("schema_version") != 1
-            or puredns.get("check") != "puredns_capacity"
-            or puredns.get("status") != "coherent"
+            capacity_guard.get("schema_version") != 1
+            or capacity_guard.get("check") != "active_resolver_capacity"
+            or capacity_guard.get("status") != "coherent"
+            or campaign is None
+            or capacity_guard.get("tool") != campaign.capacity_guard
             or corpus != active_corpus_candidates
             or rate != _integer(configuration, "dns_rate_limit")
             or timeout != _integer(configuration, "discovery_timeout_seconds")
-            or headroom != _integer(configuration, "puredns_headroom_percent")
+            or headroom != _integer(configuration, "capacity_guard_headroom_percent")
             or estimated_seconds != expected_seconds
             or minimum_rate != expected_rate
             or capacity != expected_capacity
@@ -365,9 +507,9 @@ def _capacity_preflight_issues(
             or timeout is None
             or estimated_seconds > timeout
         ):
-            issues.append("invalid_puredns_preflight")
+            issues.append("invalid_capacity_guard_preflight")
 
-    profiles = configuration.get("fellaga_profile_baselines")
+    profiles = configuration.get("subject_profile_baselines")
     allowed_profiles = {"deep", "balanced", "passive", "turbo"}
     if (
         not isinstance(profiles, list)
@@ -375,7 +517,7 @@ def _capacity_preflight_issues(
         or len(profiles) != len(set(profiles))
         or not set(profiles).issubset(allowed_profiles)
     ):
-        issues.append("invalid_fellaga_profile_baselines")
+        issues.append("invalid_subject_profile_baselines")
     return issues
 
 
@@ -459,18 +601,24 @@ def build_report(
     manifest = manifest or {}
     rows = _load_rows(root)
     manifest_issues: list[str] = []
+    campaign, toolset_issues = _active_campaign(manifest)
     if manifest_load_error == "missing":
         manifest_issues.append("missing_manifest")
     elif manifest_load_error is not None:
         manifest_issues.append("invalid_manifest_json")
     else:
-        manifest_issues.extend(_manifest_evidence_issues(manifest))
+        manifest_issues.extend(toolset_issues)
+        manifest_issues.extend(_manifest_evidence_issues(manifest, campaign))
+    required_tools = campaign.required_tools if campaign is not None else ()
+    subject = campaign.subject if campaign is not None else ""
     configuration = manifest.get("configuration", {})
     if not isinstance(configuration, dict):
         manifest_issues.append("invalid_configuration")
         configuration = {}
-    if manifest.get("schema_version") == 2:
-        manifest_issues.extend(_capacity_preflight_issues(manifest, configuration))
+    if manifest.get("schema_version") == 3:
+        manifest_issues.extend(
+            _capacity_preflight_issues(manifest, configuration, campaign)
+        )
     requested_repetitions = configuration.get(
         "required_repetitions", manifest.get("repetitions", MINIMUM_REPETITIONS)
     )
@@ -497,14 +645,19 @@ def build_report(
         manifest_issues.append("invalid_configuration:candidate_pipeline_candidates")
     if _finite_number(configuration, "dns_transport_queries", 0) < 100_000:
         manifest_issues.append("invalid_configuration:dns_transport_queries")
-    if manifest.get("schema_version") == 2:
+    if manifest.get("schema_version") == 3:
         active_max_runtime = _integer(
-            configuration, "fellaga_active_max_runtime_seconds"
+            configuration, "subject_active_max_runtime_seconds"
         )
         if active_max_runtime is None or active_max_runtime < 0:
             manifest_issues.append(
-                "invalid_configuration:fellaga_active_max_runtime_seconds"
+                "invalid_configuration:subject_active_max_runtime_seconds"
             )
+        if campaign is not None:
+            if configuration.get("subject") != campaign.subject:
+                manifest_issues.append("invalid_configuration:subject")
+            if configuration.get("required_tools") != list(campaign.required_tools):
+                manifest_issues.append("invalid_configuration:required_tools")
 
     manifest_domains = manifest.get("authorized_domains", [])
     domain_errors: list[str] = []
@@ -577,7 +730,7 @@ def build_report(
         label = f"{domain}/{tool}/r{repetition}"
         expected_run = (
             domain in domains
-            and tool in REQUIRED_TOOLS
+            and tool in required_tools
             and repetition <= required_repetitions
         )
         if not expected_run:
@@ -655,7 +808,7 @@ def build_report(
     failed_validation_runs: list[str] = []
     invalid_output_runs: list[str] = []
     for domain in ordered_domains:
-        for tool in REQUIRED_TOOLS:
+        for tool in required_tools:
             for repetition in range(1, required_repetitions + 1):
                 key = (domain, tool, repetition)
                 candidates = rows_by_key.get(key, [])
@@ -676,7 +829,7 @@ def build_report(
 
     aggregates: dict[tuple[str, str], dict[str, float]] = {}
     for domain in ordered_domains:
-        for tool in REQUIRED_TOOLS:
+        for tool in required_tools:
             tool_rows: list[dict[str, Any]] = []
             for repetition in range(1, required_repetitions + 1):
                 candidates = rows_by_key.get((domain, tool, repetition), [])
@@ -694,34 +847,34 @@ def build_report(
             }
 
     wins = 0
-    fellaga_total = 0.0
-    best_competitor_total = 0.0
+    subject_total = 0.0
+    best_alternative_total = 0.0
     coverage_duration_ok = True
     ranked_domains = 0
     for domain in ordered_domains:
-        fellaga = aggregates.get((domain, "fellaga"))
-        competitors = [
+        subject_result = aggregates.get((domain, subject))
+        alternatives = [
             aggregates[(domain, tool)]
-            for tool in REQUIRED_TOOLS
-            if tool != "fellaga" and (domain, tool) in aggregates
+            for tool in required_tools
+            if tool != subject and (domain, tool) in aggregates
         ]
-        if fellaga is None or len(competitors) != len(REQUIRED_TOOLS) - 1:
+        if subject_result is None or len(alternatives) != len(required_tools) - 1:
             continue
         ranked_domains += 1
         best = max(
-            competitors,
+            alternatives,
             key=lambda value: (
                 value["median_true_positives"],
                 -value["median_end_to_end_seconds"],
             ),
         )
-        fellaga_total += fellaga["median_true_positives"]
-        best_competitor_total += best["median_true_positives"]
-        if fellaga["median_true_positives"] > best["median_true_positives"]:
+        subject_total += subject_result["median_true_positives"]
+        best_alternative_total += best["median_true_positives"]
+        if subject_result["median_true_positives"] > best["median_true_positives"]:
             wins += 1
         coverage_duration_ok = bool(
             coverage_duration_ok
-            and fellaga["median_end_to_end_seconds"]
+            and subject_result["median_end_to_end_seconds"]
             <= 2 * max(best["median_end_to_end_seconds"], 0.001)
         )
 
@@ -732,38 +885,38 @@ def build_report(
         if truth is None:
             continue
         aggregate_truth.update((domain, name) for name in truth)
-        fellaga_rows = [
-            rows_by_key[(domain, "fellaga", repetition)][0]
+        subject_rows = [
+            rows_by_key[(domain, subject, repetition)][0]
             for repetition in range(1, required_repetitions + 1)
-            if len(rows_by_key.get((domain, "fellaga", repetition), [])) == 1
-            and rows_by_key[(domain, "fellaga", repetition)][0][
+            if len(rows_by_key.get((domain, subject, repetition), [])) == 1
+            and rows_by_key[(domain, subject, repetition)][0][
                 "eligible_for_ranking"
             ]
         ]
-        for row in fellaga_rows:
+        for row in subject_rows:
             aggregate_found.update((domain, name) for name in found_by_row[id(row)])
     aggregate_metrics = _metric_counts(
         {f"{domain}\0{name}" for domain, name in aggregate_found},
         {f"{domain}\0{name}" for domain, name in aggregate_truth},
     )
-    incomplete_fellaga_ground_truth_runs: list[str] = []
+    incomplete_subject_ground_truth_runs: list[str] = []
     for domain in ordered_domains:
         if domain not in truth_by_domain:
             continue
         for repetition in range(1, required_repetitions + 1):
-            candidates = rows_by_key.get((domain, "fellaga", repetition), [])
+            candidates = rows_by_key.get((domain, subject, repetition), [])
             if len(candidates) != 1 or not candidates[0].get("eligible_for_ranking"):
                 continue
             row = candidates[0]
             if row.get("recall") != 1.0 or row.get("false_negatives") != 0:
-                incomplete_fellaga_ground_truth_runs.append(
-                    f"{domain}/fellaga/r{repetition}"
+                incomplete_subject_ground_truth_runs.append(
+                    f"{domain}/{subject}/r{repetition}"
                 )
 
     win_rate = wins / ranked_domains if ranked_domains else 0.0
     validated_gain = (
-        (fellaga_total - best_competitor_total) / best_competitor_total
-        if best_competitor_total > 0
+        (subject_total - best_alternative_total) / best_alternative_total
+        if best_alternative_total > 0
         else None
     )
     dns_transport_path = root / "dns-transport.json"
@@ -780,11 +933,11 @@ def build_report(
     provenance = manifest.get("provenance", {})
     executables = provenance.get("executables", {}) if isinstance(provenance, dict) else {}
     inputs = provenance.get("inputs", {}) if isinstance(provenance, dict) else {}
-    fellaga_evidence = (
-        executables.get("fellaga", {}) if isinstance(executables, dict) else {}
+    subject_evidence = (
+        executables.get(subject, {}) if isinstance(executables, dict) else {}
     )
-    expected_fellaga_hash = (
-        fellaga_evidence.get("sha256") if isinstance(fellaga_evidence, dict) else None
+    expected_subject_hash = (
+        subject_evidence.get("sha256") if isinstance(subject_evidence, dict) else None
     )
     expected_pipeline_hash = (
         inputs.get("pipeline_corpus_sha256") if isinstance(inputs, dict) else None
@@ -827,8 +980,8 @@ def build_report(
     aggregate_recall = aggregate_metrics["recall"]
     if aggregate_recall != 1.0 or aggregate_metrics["false_negatives"] != 0:
         reasons.append("aggregate_ground_truth_recall_below_100_percent")
-    if incomplete_fellaga_ground_truth_runs:
-        reasons.append("fellaga_run_ground_truth_recall_below_100_percent")
+    if incomplete_subject_ground_truth_runs:
+        reasons.append("subject_run_ground_truth_recall_below_100_percent")
     if not coverage_duration_ok:
         reasons.append("deep_profile_exceeds_2x_best_coverage_duration")
     if dns_transport_error == "missing":
@@ -843,7 +996,7 @@ def build_report(
             reasons.append("dns_transport_benchmark_failed")
         if (
             dns_transport.get("campaign_id") != campaign_id
-            or dns_transport.get("fellaga_sha256") != expected_fellaga_hash
+            or dns_transport.get("subject_sha256") != expected_subject_hash
         ):
             reasons.append("dns_transport_provenance_mismatch")
         transport_queries = _finite_number(dns_transport, "queries", 0)
@@ -872,13 +1025,12 @@ def build_report(
         if (
             candidate_pipeline.get("schema_version") != 1
             or candidate_pipeline.get("benchmark") != "candidate_pipeline"
-            or candidate_pipeline.get("engine") != "fellaga_core"
         ):
             reasons.append("invalid_candidate_pipeline_schema")
         if (
             candidate_pipeline.get("campaign_id") != campaign_id
-            or candidate_pipeline.get("fellaga_sha256") != expected_fellaga_hash
-            or candidate_pipeline.get("binary_sha256") != expected_fellaga_hash
+            or candidate_pipeline.get("subject_sha256") != expected_subject_hash
+            or candidate_pipeline.get("binary_sha256") != expected_subject_hash
             or candidate_pipeline.get("corpus_sha256") != expected_pipeline_hash
             or candidate_pipeline.get("wordlist_sha256") != expected_pipeline_hash
         ):
@@ -943,12 +1095,17 @@ def build_report(
         "authorized_domains": len(ordered_domains),
         "required_repetitions": required_repetitions,
         "ranked_domains": ranked_domains,
-        "fellaga_wins": wins,
-        "fellaga_win_rate": win_rate,
-        "fellaga_live_total": fellaga_total,
-        "best_competitor_live_total": best_competitor_total,
-        "fellaga_true_positive_total": fellaga_total,
-        "best_competitor_true_positive_total": best_competitor_total,
+        "subject": subject,
+        "required_tools": list(required_tools),
+        "subject_wins": wins,
+        "subject_win_rate": win_rate,
+        "subject_live_total": subject_total,
+        "best_alternative_live_total": best_alternative_total,
+        # Compatibility aliases retained for existing report consumers.
+        "best_competitor_live_total": best_alternative_total,
+        "subject_true_positive_total": subject_total,
+        "best_alternative_true_positive_total": best_alternative_total,
+        "best_competitor_true_positive_total": best_alternative_total,
         "validated_gain": validated_gain,
         "true_positives": aggregate_metrics["true_positives"],
         "false_positives": aggregate_metrics["false_positives"],
@@ -969,7 +1126,7 @@ def build_report(
         "invalid_output_runs": invalid_output_runs,
         "invalid_timing_runs": invalid_timing_runs,
         "campaign_mismatch_runs": campaign_mismatch_runs,
-        "incomplete_fellaga_ground_truth_runs": incomplete_fellaga_ground_truth_runs,
+        "incomplete_subject_ground_truth_runs": incomplete_subject_ground_truth_runs,
         "unexpected_runs": unexpected_runs,
         "missing_ground_truth": missing_truth,
         "empty_ground_truth": empty_truth,

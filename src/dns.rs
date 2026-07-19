@@ -29,12 +29,22 @@ use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::{OnceCell, oneshot};
 
 static PROBE_COUNTER: AtomicU64 = AtomicU64::new(0);
-const UDP_SOCKET_BUFFER_BYTES: usize = 16 * 1024 * 1024;
+// The scanner is intentionally capped well below the point where a 16 MiB
+// send *and* receive reservation per socket is useful.  A smaller buffer still
+// absorbs several seconds of the default DNS rate while preventing recursive
+// plus authoritative transports from asking the OS for gigabytes of memory.
+const UDP_SOCKET_BUFFER_BYTES: usize = 2 * 1024 * 1024;
 const MAX_AUTHORITATIVE_SERVER_CACHE_ENTRIES: usize = 4_096;
-const MAX_AUTHORITATIVE_TRANSPORTS: usize = 64;
+const MAX_AUTHORITATIVE_TRANSPORTS: usize = 16;
 const MAX_AUTHORITATIVE_ZONE_CANDIDATES: usize = 5;
 const MAX_NAMESERVERS_PER_ZONE: usize = 8;
 const MAX_ADDRESSES_PER_NAMESERVER: usize = 8;
+// Only a handful of tasks may reserve future cadence slots at once. Keeping
+// the permit until the reserved instant prevents a burst of concurrent tasks
+// from building a long queue based on a rate that may already have changed.
+// If a task is cancelled after reserving, the abandoned horizon is therefore
+// bounded to this many slots.
+const MAX_CADENCE_RESERVATIONS: usize = 4;
 type AuthoritativeServers = Vec<(String, Vec<IpAddr>)>;
 type AuthoritativeServerCell = Arc<OnceCell<AuthoritativeServers>>;
 
@@ -250,7 +260,8 @@ fn merge_record_lookup_outcomes(
 /// Poll both address families together. A validated positive establishes that
 /// the owner is live, so the other family can be cancelled immediately. A
 /// negative remains deliberately strict and is returned only after both
-/// families independently report NXDOMAIN.
+/// families independently report NXDOMAIN. Fresh generated candidates use a
+/// separate A-only quorum before reaching this conservative path.
 async fn first_positive_or_both<A, Aaaa>(a: A, aaaa: Aaaa) -> RecordLookupOutcome
 where
     A: std::future::Future<Output = RecordLookupOutcome>,
@@ -679,9 +690,49 @@ pub struct DnsEngine {
     rate_limit: u64,
     governor: Arc<NetworkGovernor>,
     next_query_at: Arc<tokio::sync::Mutex<Instant>>,
+    cadence_reservations: Arc<tokio::sync::Semaphore>,
     selection_counter: Arc<AtomicU64>,
     authoritative_resolvers: Arc<Mutex<HashMap<SocketAddr, Arc<FastResolver>>>>,
     authoritative_server_cache: Arc<tokio::sync::Mutex<HashMap<String, AuthoritativeServerCell>>>,
+}
+
+/// Keeps a cadence permit alive until its reserved instant even if the caller
+/// is cancelled while sleeping. Without this handoff, repeated cancellations
+/// could release permits early while leaving `next_query_at` advanced, letting
+/// queued tasks build an unbounded chain of abandoned future slots.
+struct CadenceReservation {
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    slot: tokio::time::Instant,
+}
+
+impl CadenceReservation {
+    fn new(permit: tokio::sync::OwnedSemaphorePermit, slot: tokio::time::Instant) -> Self {
+        Self {
+            permit: Some(permit),
+            slot,
+        }
+    }
+}
+
+impl Drop for CadenceReservation {
+    fn drop(&mut self) {
+        if self.slot <= tokio::time::Instant::now() {
+            return;
+        }
+        let Some(permit) = self.permit.take() else {
+            return;
+        };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let slot = self.slot;
+        // Dropping a JoinHandle detaches the task. The task itself owns the
+        // permit and releases it at the original reservation instant.
+        drop(runtime.spawn(async move {
+            tokio::time::sleep_until(slot).await;
+            drop(permit);
+        }));
+    }
 }
 
 struct FastResolver {
@@ -707,10 +758,14 @@ struct PendingDnsQuery {
 struct PendingQueryGuard {
     id: u16,
     pending: Arc<tokio::sync::Mutex<HashMap<u16, PendingDnsQuery>>>,
+    armed: bool,
 }
 
 impl Drop for PendingQueryGuard {
     fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
         if let Ok(mut pending) = self.pending.try_lock() {
             pending.remove(&self.id);
             return;
@@ -843,9 +898,10 @@ impl FastUdpTransport {
         );
         // Cette garde retire l'identifiant même si Ctrl+C ou la deadline
         // globale annule le future pendant l'attente de la réponse.
-        let _pending_guard = PendingQueryGuard {
+        let mut pending_guard = PendingQueryGuard {
             id,
             pending: self.pending.clone(),
+            armed: true,
         };
         let remaining = timeout_duration.saturating_sub(started.elapsed());
         if remaining.is_zero() {
@@ -863,6 +919,10 @@ impl FastUdpTransport {
         })
         .await
         .context("délai DNS UDP dépassé")??;
+        // The receiver removes a correlated entry before completing the
+        // channel. Avoid taking the pending-map mutex a second time on every
+        // successful response; cancellation and errors keep the guard armed.
+        pending_guard.armed = false;
         let response = Message::from_vec(&response)?;
         if response.id() != id
             || response.message_type() != MessageType::Response
@@ -1104,9 +1164,10 @@ impl DnsSendSignal {
     }
 }
 
-/// Finalizes resolver health even when an outer phase deadline drops the
-/// query future after its packet was sent.  Pre-send cancellation leaves the
-/// signal unset and therefore cannot fabricate a request or a failure.
+/// Finalizes resolver accounting even when an outer phase deadline drops the
+/// query future after its packet was sent. Pre-send cancellation leaves the
+/// signal unset; post-send cancellation records traffic but remains neutral
+/// to resolver health and to the adaptive governor.
 struct ResolverAttemptGuard<'a> {
     state: Option<&'a Mutex<ResolverState>>,
     governor: &'a NetworkGovernor,
@@ -1144,11 +1205,30 @@ impl<'a> ResolverAttemptGuard<'a> {
         self.governor
             .observe_delta(1, u64::from(!operational), duration_ms);
     }
+
+    fn finish_cancelled(&mut self) {
+        if self.finalized {
+            return;
+        }
+        self.finalized = true;
+        let Some(duration_ms) = self.signal.elapsed_ms() else {
+            return;
+        };
+        if let Some(state) = self.state
+            && let Ok(mut state) = state.lock()
+        {
+            // The packet was accepted by the kernel, so retain request and
+            // timing accounting. An outer phase cancellation is not evidence
+            // that the resolver failed and must not trigger network backoff.
+            state.requests = state.requests.saturating_add(1);
+            state.total_ms = state.total_ms.saturating_add(duration_ms);
+        }
+    }
 }
 
 impl Drop for ResolverAttemptGuard<'_> {
     fn drop(&mut self) {
-        self.finish(false);
+        self.finish_cancelled();
     }
 }
 
@@ -1349,6 +1429,7 @@ impl DnsEngine {
                 effective_concurrency,
             )),
             next_query_at: Arc::new(tokio::sync::Mutex::new(Instant::now())),
+            cadence_reservations: Arc::new(tokio::sync::Semaphore::new(MAX_CADENCE_RESERVATIONS)),
             selection_counter: Arc::new(AtomicU64::new(0)),
             authoritative_resolvers: Arc::new(Mutex::new(HashMap::new())),
             authoritative_server_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -1412,6 +1493,7 @@ impl DnsEngine {
                 concurrency.max(1),
             )),
             next_query_at: Arc::new(tokio::sync::Mutex::new(Instant::now())),
+            cadence_reservations: Arc::new(tokio::sync::Semaphore::new(MAX_CADENCE_RESERVATIONS)),
             selection_counter: Arc::new(AtomicU64::new(0)),
             authoritative_resolvers: Arc::new(Mutex::new(HashMap::new())),
             authoritative_server_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -1424,6 +1506,7 @@ impl DnsEngine {
         self.rate_limit = other.rate_limit;
         self.governor = other.governor.clone();
         self.next_query_at = other.next_query_at.clone();
+        self.cadence_reservations = other.cadence_reservations.clone();
         self
     }
 
@@ -1502,17 +1585,28 @@ impl DnsEngine {
     }
 
     async fn wait_for_rate_slot(&self) {
+        if self.governor.current_rate() == 0 {
+            return;
+        }
+        let Ok(permit) = self.cadence_reservations.clone().acquire_owned().await else {
+            return;
+        };
+        // Adaptive control may have changed while this task waited for a
+        // reservation permit, so calculate spacing only at admission time.
         let current_rate = self.governor.current_rate();
         if current_rate == 0 {
             return;
         }
         let spacing = Duration::from_secs_f64(1.0 / current_rate as f64);
-        let mut next = self.next_query_at.lock().await;
-        let now = Instant::now();
-        if *next > now {
-            tokio::time::sleep(*next - now).await;
-        }
-        *next = Instant::now() + spacing;
+        let slot = {
+            let mut next = self.next_query_at.lock().await;
+            let slot = (*next).max(Instant::now());
+            *next = slot + spacing;
+            slot
+        };
+        let slot = tokio::time::Instant::from_std(slot);
+        let _reservation = CadenceReservation::new(permit, slot);
+        tokio::time::sleep_until(slot).await;
     }
 
     /// Acquire the shared global DNS cadence slot without waiting beyond a
@@ -1523,6 +1617,20 @@ impl DnsEngine {
         if deadline <= tokio::time::Instant::now() {
             return false;
         }
+        if self.governor.current_rate() == 0 {
+            return true;
+        }
+        let Ok(Ok(permit)) =
+            tokio::time::timeout_at(deadline, self.cadence_reservations.clone().acquire_owned())
+                .await
+        else {
+            return false;
+        };
+        if deadline <= tokio::time::Instant::now() {
+            return false;
+        }
+        // Re-read the adaptive rate after admission rather than reserving
+        // several slots ahead using a stale value.
         let current_rate = self.governor.current_rate();
         if current_rate == 0 {
             return true;
@@ -1532,16 +1640,17 @@ impl DnsEngine {
         else {
             return false;
         };
-        let now = Instant::now();
-        if *next > now
-            && tokio::time::timeout_at(deadline, tokio::time::sleep(*next - now))
-                .await
-                .is_err()
-        {
+        let slot = (*next).max(Instant::now());
+        let slot = tokio::time::Instant::from_std(slot);
+        if slot >= deadline {
             return false;
         }
-        *next = Instant::now() + spacing;
-        true
+        *next = slot.into_std() + spacing;
+        drop(next);
+        let _reservation = CadenceReservation::new(permit, slot);
+        tokio::time::timeout_at(deadline, tokio::time::sleep_until(slot))
+            .await
+            .is_ok()
     }
 
     pub fn seed_metrics(&self, history: &HashMap<String, ResolverMetric>) {
@@ -1917,36 +2026,11 @@ impl DnsEngine {
             .collect()
     }
 
-    async fn resolver_reports_strict_nxdomain(
-        &self,
-        index: usize,
-        fqdn: &str,
-        host_attempted: Option<Arc<std::sync::atomic::AtomicBool>>,
-    ) -> bool {
-        let (Some(resolver), Some(node)) =
-            (self.fast_resolvers.get(index), self.resolvers.get(index))
-        else {
-            return false;
-        };
-        let response = self
-            .observed_fast_query_until(
-                resolver,
-                Some(node),
-                fqdn,
-                RecordType::A,
-                true,
-                None,
-                host_attempted,
-            )
-            .await;
-        response.as_ref().is_ok_and(is_definitive_nxdomain)
-    }
-
-    async fn discovery_nxdomain_quorum(
+    async fn discovery_a_quorum_outcome(
         &self,
         fqdn: &str,
         host_attempted: Option<Arc<std::sync::atomic::AtomicBool>>,
-    ) -> bool {
+    ) -> RecordLookupOutcome {
         let order = self
             .resolver_order()
             .into_iter()
@@ -1954,13 +2038,33 @@ impl DnsEngine {
             .take(2)
             .collect::<Vec<_>>();
         let [first, second] = order.as_slice() else {
-            return false;
+            return RecordLookupOutcome::Indeterminate;
         };
-        let (first_negative, second_negative) = tokio::join!(
-            self.resolver_reports_strict_nxdomain(*first, fqdn, host_attempted.clone()),
-            self.resolver_reports_strict_nxdomain(*second, fqdn, host_attempted),
+        let query = |index: usize, signal: Option<Arc<std::sync::atomic::AtomicBool>>| async move {
+            let (Some(resolver), Some(node)) =
+                (self.fast_resolvers.get(index), self.resolvers.get(index))
+            else {
+                return RecordLookupOutcome::Indeterminate;
+            };
+            classify_address_response(
+                self.observed_fast_query_until(
+                    resolver,
+                    Some(node),
+                    fqdn,
+                    RecordType::A,
+                    true,
+                    None,
+                    signal,
+                )
+                .await,
+                RecordType::A,
+            )
+        };
+        let (first_outcome, second_outcome) = tokio::join!(
+            query(*first, host_attempted.clone()),
+            query(*second, host_attempted),
         );
-        first_negative && second_negative
+        merge_record_lookup_outcomes(first_outcome, second_outcome)
     }
 
     async fn lookup_records_classified(
@@ -2262,18 +2366,21 @@ impl DnsEngine {
         allow_discovery_fast_negative: bool,
         host_attempted: Option<Arc<std::sync::atomic::AtomicBool>>,
     ) -> DnsResolutionOutcome {
-        // A strict NXDOMAIN from two independent resolvers proves that the
-        // owner does not exist and lets the discovery path skip AAAA. Any
-        // disagreement, NODATA, CNAME, timeout, or malformed response falls
-        // back to the full conservative A+AAAA path.
-        if allow_discovery_fast_negative
-            && self
-                .discovery_nxdomain_quorum(fqdn, host_attempted.clone())
+        // Fresh discovery candidates start with one parallel A query to two
+        // independent resolvers. A positive A/CNAME answer establishes a live
+        // owner immediately, while two strict NXDOMAIN replies establish a
+        // discovery-only negative. Only disagreement, NODATA, timeout, or a
+        // malformed response pays for the conservative A+AAAA fallback.
+        if allow_discovery_fast_negative {
+            match self
+                .discovery_a_quorum_outcome(fqdn, host_attempted.clone())
                 .await
-        {
-            return DnsResolutionOutcome::Negative {
-                fqdn: fqdn.to_owned(),
-            };
+            {
+                outcome @ (RecordLookupOutcome::Positive(_) | RecordLookupOutcome::Negative) => {
+                    return classify_host_lookup(fqdn, outcome);
+                }
+                RecordLookupOutcome::Indeterminate => {}
+            }
         }
         // The individual resolver operations are bounded by `self.timeout`.
         // The queue imposed by `--dns-rate-limit` is intentionally excluded:
@@ -2605,6 +2712,25 @@ mod tests {
         assert_eq!(inflight.load(Ordering::Relaxed), 0);
     }
 
+    #[test]
+    fn post_send_cancellation_is_accounted_without_poisoning_resolver_health() {
+        let state = Mutex::new(ResolverState::default());
+        let governor = NetworkGovernor::new(NetworkControl::Adaptive, 250, 128);
+        let signal = DnsSendSignal::default();
+        signal.mark_sent();
+        {
+            let _guard = ResolverAttemptGuard::new(Some(&state), &governor, signal);
+        }
+        let state = state.lock().unwrap();
+        assert_eq!(state.requests, 1);
+        assert_eq!(state.successes, 0);
+        assert_eq!(state.failures, 0);
+        assert_eq!(state.consecutive_failures, 0);
+        drop(state);
+        governor.evaluate_pending_for_test();
+        assert_eq!(governor.snapshot().backoffs, 0);
+    }
+
     fn positive_records(value: &str) -> Vec<DnsRecord> {
         vec![DnsRecord {
             record_type: "A".to_owned(),
@@ -2781,6 +2907,7 @@ mod tests {
             rate_limit: 0,
             governor: Arc::new(NetworkGovernor::new(NetworkControl::Fixed, 0, 8)),
             next_query_at: Arc::new(tokio::sync::Mutex::new(Instant::now())),
+            cadence_reservations: Arc::new(tokio::sync::Semaphore::new(MAX_CADENCE_RESERVATIONS)),
             selection_counter: Arc::new(AtomicU64::new(0)),
             authoritative_resolvers: Arc::new(Mutex::new(HashMap::new())),
             authoritative_server_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -2832,6 +2959,7 @@ mod tests {
             rate_limit: 0,
             governor: Arc::new(NetworkGovernor::new(NetworkControl::Fixed, 0, 8)),
             next_query_at: Arc::new(tokio::sync::Mutex::new(Instant::now())),
+            cadence_reservations: Arc::new(tokio::sync::Semaphore::new(MAX_CADENCE_RESERVATIONS)),
             selection_counter: Arc::new(AtomicU64::new(0)),
             authoritative_resolvers: Arc::new(Mutex::new(HashMap::new())),
             authoritative_server_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -2847,6 +2975,7 @@ mod tests {
             rate_limit: 0,
             governor: Arc::new(NetworkGovernor::new(NetworkControl::Fixed, 0, 8)),
             next_query_at: Arc::new(tokio::sync::Mutex::new(Instant::now())),
+            cadence_reservations: Arc::new(tokio::sync::Semaphore::new(MAX_CADENCE_RESERVATIONS)),
             selection_counter: Arc::new(AtomicU64::new(0)),
             authoritative_resolvers: Arc::new(Mutex::new(HashMap::new())),
             authoritative_server_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -3207,6 +3336,7 @@ mod tests {
             rate_limit: 0,
             governor: Arc::new(NetworkGovernor::new(NetworkControl::Fixed, 0, 8)),
             next_query_at: Arc::new(tokio::sync::Mutex::new(Instant::now())),
+            cadence_reservations: Arc::new(tokio::sync::Semaphore::new(MAX_CADENCE_RESERVATIONS)),
             selection_counter: Arc::new(AtomicU64::new(0)),
             authoritative_resolvers: Arc::new(Mutex::new(HashMap::new())),
             authoritative_server_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -3455,8 +3585,8 @@ mod tests {
             panic!("an empty NOERROR response incorrectly stopped resolver consensus");
         };
         assert_eq!(answer.records, positive_records("192.0.2.45"));
-        assert!(primary_requests.load(Ordering::SeqCst) >= 2);
-        assert!(secondary_requests.load(Ordering::SeqCst) >= 2);
+        assert_eq!(primary_requests.load(Ordering::SeqCst), 1);
+        assert_eq!(secondary_requests.load(Ordering::SeqCst), 1);
 
         primary_task.abort();
         secondary_task.abort();
@@ -3991,6 +4121,93 @@ mod tests {
         .share_rate_limit_with(&primary);
         assert_eq!(trusted.rate_limit, 100);
         assert!(Arc::ptr_eq(&primary.next_query_at, &trusted.next_query_at));
+        assert!(Arc::ptr_eq(
+            &primary.cadence_reservations,
+            &trusted.cadence_reservations
+        ));
+    }
+
+    #[tokio::test]
+    async fn cadence_reservation_horizon_is_bounded_under_cancellation() {
+        let engine = DnsEngine::new_with_rate(
+            32,
+            Duration::from_secs(1),
+            &["1.1.1.1".parse().unwrap()],
+            10,
+        )
+        .unwrap();
+        let base = Instant::now() + Duration::from_secs(5);
+        *engine.next_query_at.lock().await = base;
+
+        let mut waiters = Vec::new();
+        for _ in 0..(MAX_CADENCE_RESERVATIONS * 4) {
+            let engine = engine.clone();
+            waiters.push(tokio::spawn(async move {
+                engine.wait_for_rate_slot().await;
+            }));
+        }
+
+        let spacing = Duration::from_secs_f64(1.0 / 10.0);
+        let expected_horizon = base + spacing * MAX_CADENCE_RESERVATIONS as u32;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let horizon = *engine.next_query_at.lock().await;
+                assert!(
+                    horizon <= expected_horizon,
+                    "cadence reservations escaped their bounded horizon"
+                );
+                if horizon == expected_horizon {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cadence waiters did not reserve the bounded slots");
+
+        for waiter in &waiters {
+            waiter.abort();
+        }
+        for waiter in waiters {
+            let _ = waiter.await;
+        }
+
+        assert_eq!(*engine.next_query_at.lock().await, expected_horizon);
+        assert_eq!(
+            engine.cadence_reservations.available_permits(),
+            0,
+            "cancelled reservations released their permits before their slots"
+        );
+    }
+
+    #[tokio::test]
+    async fn cadence_reservation_queue_respects_the_caller_deadline() {
+        let engine = DnsEngine::new_with_rate(
+            8,
+            Duration::from_secs(1),
+            &["1.1.1.1".parse().unwrap()],
+            100,
+        )
+        .unwrap();
+        let initial_horizon = *engine.next_query_at.lock().await;
+        let held = engine
+            .cadence_reservations
+            .clone()
+            .acquire_many_owned(MAX_CADENCE_RESERVATIONS as u32)
+            .await
+            .unwrap();
+
+        let acquired = tokio::time::timeout(
+            Duration::from_millis(250),
+            engine
+                .wait_for_rate_slot_before(tokio::time::Instant::now() + Duration::from_millis(25)),
+        )
+        .await
+        .expect("cadence admission ignored its caller deadline");
+
+        assert!(!acquired);
+        assert_eq!(*engine.next_query_at.lock().await, initial_horizon);
+        drop(held);
     }
 
     #[tokio::test]
@@ -4286,7 +4503,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancellation_after_udp_send_records_a_failure_and_governor_pressure() {
+    async fn cancellation_after_udp_send_records_traffic_without_governor_pressure() {
         let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let address = silent.local_addr().unwrap();
         let mut engine = discovery_test_engine(&[address], Duration::from_secs(5));
@@ -4326,9 +4543,9 @@ mod tests {
             metrics.iter().map(|metric| metric.successes).sum::<u64>(),
             0
         );
-        assert_eq!(metrics.iter().map(|metric| metric.failures).sum::<u64>(), 1);
+        assert_eq!(metrics.iter().map(|metric| metric.failures).sum::<u64>(), 0);
         engine.governor.evaluate_pending_for_test();
-        assert_eq!(engine.network_governor_snapshot().backoffs, 1);
+        assert_eq!(engine.network_governor_snapshot().backoffs, 0);
     }
 
     #[tokio::test]

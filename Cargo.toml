@@ -1,6 +1,6 @@
 [package]
 name = "fellaga-subdomainfinder"
-version = "0.9.2"
+version = "0.10.0"
 edition = "2024"
 rust-version = "1.95"
 description = "Fast, learning subdomain enumerator for Kali Linux"
@@ -52,6 +52,7 @@ serde_json = "1.0"
 sha2 = "0.10"
 socket2 = "0.6"
 tokio = { version = "1.52", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-postgres = "0.7"
 url = "2.5"
 zstd = "0.13"
 

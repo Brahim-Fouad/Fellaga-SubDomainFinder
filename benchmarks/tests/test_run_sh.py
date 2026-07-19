@@ -20,25 +20,222 @@ RUN_SH = BENCHMARKS / "run.sh"
     "benchmark campaign smoke test requires bash, jq, and timeout",
 )
 class RunScriptTests(unittest.TestCase):
+    def _write_toolset(
+        self, root: pathlib.Path, executables: dict[str, pathlib.Path]
+    ) -> pathlib.Path:
+        identity = {
+            "version_argv": ["{executable}", "--version"],
+            "extra_kind": "none",
+        }
+
+        def tool(
+            name: str,
+            commands: dict[str, object],
+            controls: list[str] | None = None,
+        ) -> dict[str, object]:
+            return {
+                "executable": str(executables[name]),
+                "identity": identity,
+                "dns_controls": controls or [],
+                "commands": commands,
+            }
+
+        active_context = [
+            "domain",
+            "output_path",
+            "database_path",
+            "config_path",
+            "profile",
+            "resolvers_csv",
+            "max_runtime",
+            "active_max_runtime",
+            "dns_rate",
+            "dns_concurrency",
+        ]
+        document = {
+            "schema_version": 1,
+            "subject": "subject_engine",
+            "campaigns": {
+                "active": {
+                    "discoverers": [
+                        "subject_engine",
+                        "finder_stdout",
+                        "finder_tree",
+                        "capacity_probe",
+                    ],
+                    "validator": "validator",
+                    "capacity_guard": "capacity_probe",
+                    "provenance_only": ["transport_helper"],
+                    "credential_participants": [
+                        "subject_engine",
+                        "finder_stdout",
+                        "finder_tree",
+                    ],
+                },
+                "passive-observational": {"discoverers": ["subject_engine"]},
+            },
+            "tools": {
+                "subject_engine": tool(
+                    "subject_engine",
+                    {
+                        "active": {
+                            "argv": [
+                                "{executable}",
+                                "active",
+                                "--domain",
+                                "{domain}",
+                                "--database",
+                                "{database_path}",
+                                "--config-file",
+                                "{config_path}",
+                                "--profile",
+                                "{profile}",
+                                "--max-runtime",
+                                "{max_runtime}",
+                                "--active-max-runtime",
+                                "{active_max_runtime}",
+                                "--dns-rate",
+                                "{dns_rate}",
+                                "--dns-concurrency",
+                                "{dns_concurrency}",
+                                "--resolvers-csv",
+                                "{resolvers_csv}",
+                                "--output",
+                                "{output_path}",
+                            ],
+                            "required_context": active_context,
+                            "output": {
+                                "kind": "finding_json",
+                                "path": "{output_path}",
+                            },
+                        },
+                        "passive-observational": {
+                            "argv": [
+                                "{executable}",
+                                "passive-observational",
+                                "--domain",
+                                "{domain}",
+                            ],
+                            "required_context": ["domain"],
+                            "output": {"kind": "line_stdout"},
+                        },
+                    },
+                    ["resolver_list", "trusted_resolver_list", "rate_limit", "concurrency"],
+                ),
+                "finder_stdout": tool(
+                    "finder_stdout",
+                    {
+                        "active": {
+                            "argv": ["{executable}", "active", "--domain", "{domain}"],
+                            "required_context": ["domain"],
+                            "output": {"kind": "line_stdout"},
+                        }
+                    },
+                    ["resolver_list"],
+                ),
+                "finder_tree": tool(
+                    "finder_tree",
+                    {
+                        "active": {
+                            "argv": [
+                                "{executable}",
+                                "active",
+                                "--domain",
+                                "{domain}",
+                                "--output-dir",
+                                "{output_dir}",
+                            ],
+                            "required_context": ["domain", "output_dir"],
+                            "output": {
+                                "kind": "dns_event_tree",
+                                "path": "{output_dir}",
+                            },
+                        }
+                    },
+                    ["resolver_list", "concurrency"],
+                ),
+                "capacity_probe": tool(
+                    "capacity_probe",
+                    {
+                        "active": {
+                            "argv": [
+                                "{executable}",
+                                "active",
+                                "--domain",
+                                "{domain}",
+                                "--output",
+                                "{output_path}",
+                                "--corpus",
+                                "{corpus}",
+                            ],
+                            "required_context": ["domain", "output_path", "corpus"],
+                            "output": {
+                                "kind": "line_file",
+                                "path": "{output_path}",
+                            },
+                        }
+                    },
+                    [
+                        "resolver_list",
+                        "trusted_resolver_list",
+                        "rate_limit",
+                        "trusted_rate_limit",
+                    ],
+                ),
+                "validator": tool(
+                    "validator",
+                    {
+                        "validate": {
+                            "argv": [
+                                "{executable}",
+                                "validate",
+                                "--input",
+                                "{input_path}",
+                                "--output",
+                                "{output_path}",
+                            ],
+                            "required_context": ["input_path", "output_path"],
+                            "output": {
+                                "kind": "line_file",
+                                "path": "{output_path}",
+                            },
+                        }
+                    },
+                    ["resolver_list", "rate_limit", "concurrency"],
+                ),
+                "transport_helper": tool("transport_helper", {}),
+            },
+        }
+        document["tools"]["subject_engine"]["passive_policy"] = {
+            "target_contact": "prohibited",
+            "direct_dns": False,
+            "direct_http_or_tls": False,
+        }
+        path = root / "toolset.json"
+        path.write_text(json.dumps(document), encoding="utf-8")
+        return path
+
     def _early_policy_environment(
         self, root: pathlib.Path, campaign: pathlib.Path
     ) -> tuple[dict[str, str], pathlib.Path, pathlib.Path]:
         fake_bin = root / "policy-bin"
         fake_bin.mkdir()
         true_binary = pathlib.Path(shutil.which("true") or "/bin/true")
-        for command in (
-            "fellaga",
-            "subfinder",
-            "amass",
-            "bbot",
-            "puredns",
-            "massdns",
-            "dnsx",
-            "zstd",
-        ):
+        tool_names = (
+            "subject_engine",
+            "finder_stdout",
+            "finder_tree",
+            "capacity_probe",
+            "validator",
+            "transport_helper",
+        )
+        executables: dict[str, pathlib.Path] = {}
+        for command in (*tool_names, "zstd"):
             target = fake_bin / command
             shutil.copyfile(true_binary, target)
             target.chmod(0o755)
+            if command in tool_names:
+                executables[command] = target
         zstd = fake_bin / "zstd"
         zstd.write_text("#!/bin/sh\nprintf 'one\\ntwo\\n'\n", encoding="utf-8")
         zstd.chmod(0o755)
@@ -46,6 +243,7 @@ class RunScriptTests(unittest.TestCase):
         domains.write_text("example.test\n", encoding="utf-8")
         resolvers = root / "resolvers.txt"
         resolvers.write_text("1.1.1.1\n", encoding="utf-8")
+        toolset = self._write_toolset(root, executables)
         environment = os.environ.copy()
         environment.update(
             {
@@ -53,6 +251,7 @@ class RunScriptTests(unittest.TestCase):
                 "BENCH_OUT": str(campaign),
                 "FELLAGA_BENCH_AUTHORIZED": "YES",
                 "FELLAGA_BENCH_RESOLVERS_FILE": str(resolvers),
+                "FELLAGA_BENCH_TOOLSET": str(toolset),
                 "FELLAGA_BENCH_PIPELINE_BYTES_PER_CANDIDATE": "1",
                 "FELLAGA_BENCH_PIPELINE_FIXED_BYTES": "0",
                 "FELLAGA_BENCH_PIPELINE_DISK_MARGIN_PERCENT": "100",
@@ -187,7 +386,7 @@ class RunScriptTests(unittest.TestCase):
             self.assertEqual(completed.returncode, 2)
             self.assertIn("non-negative integers", completed.stderr)
 
-    def test_puredns_preflight_rejects_impossible_qps_timeout_pair(self) -> None:
+    def test_capacity_guard_preflight_rejects_impossible_qps_timeout_pair(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
             campaign = root / "campaign"
@@ -197,7 +396,7 @@ class RunScriptTests(unittest.TestCase):
                     "FELLAGA_BENCH_MAX_RUNTIME": "1",
                     "FELLAGA_BENCH_DISCOVERY_TIMEOUT": "1",
                     "FELLAGA_BENCH_DNS_RATE": "1",
-                    "FELLAGA_BENCH_PUREDNS_HEADROOM_PERCENT": "100",
+                    "FELLAGA_BENCH_CAPACITY_GUARD_HEADROOM_PERCENT": "100",
                 }
             )
             completed = subprocess.run(
@@ -209,9 +408,9 @@ class RunScriptTests(unittest.TestCase):
                 env=environment,
             )
             self.assertEqual(completed.returncode, 8, completed.stderr)
-            self.assertIn("PureDNS capacity preflight failed", completed.stderr)
+            self.assertIn("capacity-guard preflight failed", completed.stderr)
             evidence = json.loads(
-                (campaign / "puredns-preflight.json").read_text(encoding="utf-8")
+                (campaign / "capacity-guard-preflight.json").read_text(encoding="utf-8")
             )
             self.assertEqual(evidence["status"], "incoherent")
             self.assertEqual(evidence["minimum_coherent_rate_qps"], 2)
@@ -244,7 +443,7 @@ class RunScriptTests(unittest.TestCase):
 
                     if tool == "zstd":
                         print("api")
-                    elif tool == "fellaga" and "benchmark" in args and "candidate-pipeline" in args:
+                    elif tool == "subject_engine" and "benchmark" in args and "candidate-pipeline" in args:
                         wordlist = pathlib.Path(value("--wordlist"))
                         wordlist.write_text("bench-fixture\\n", encoding="utf-8")
                         wordlist_sha256 = hashlib.sha256(wordlist.read_bytes()).hexdigest()
@@ -254,7 +453,7 @@ class RunScriptTests(unittest.TestCase):
                             json.dumps({
                                 "schema_version": 1,
                                 "benchmark": "candidate_pipeline",
-                                "engine": "fellaga_core",
+                                "engine": "subject_core",
                                 "campaign_id": value("--campaign-id"),
                                 "wordlist_sha256": wordlist_sha256,
                                 "binary_sha256": binary_sha256,
@@ -270,7 +469,7 @@ class RunScriptTests(unittest.TestCase):
                             }),
                             encoding="utf-8",
                         )
-                    elif tool == "fellaga" and args[:2] == ["resolvers", "benchmark"]:
+                    elif tool == "subject_engine" and args[:2] == ["resolvers", "benchmark"]:
                         pathlib.Path(value("--output")).write_text(
                             json.dumps({
                                 "queries": int(value("--queries")),
@@ -279,49 +478,45 @@ class RunScriptTests(unittest.TestCase):
                             }),
                             encoding="utf-8",
                         )
-                    elif tool == "fellaga":
-                        database = pathlib.Path(value("--db"))
-                        config = pathlib.Path(value("--config"))
+                    elif tool == "subject_engine" and args[:1] == ["active"]:
+                        database = pathlib.Path(value("--database"))
+                        config = pathlib.Path(value("--config-file"))
                         if not database.parent.is_dir() or not config.parent.is_dir():
                             raise SystemExit(20)
                         database.write_text("fresh", encoding="utf-8")
                         config.write_text("{}", encoding="utf-8")
-                        with pathlib.Path(os.environ["MOCK_FELLAGA_PATHS"]).open("a", encoding="utf-8") as log:
-                            log.write(
-                                f"{database} {config} {value('--profile')} "
-                                f"{value('--max-runtime')} {value('--active-max-runtime')}\\n"
-                            )
-                        domain = args[args.index("scan") + 1]
-                        print(json.dumps({
+                        with pathlib.Path(os.environ["MOCK_SUBJECT_PATHS"]).open("a", encoding="utf-8") as log:
+                            log.write(json.dumps([
+                                str(database), str(config), value("--profile"),
+                                value("--max-runtime"), value("--active-max-runtime")
+                            ]) + "\\n")
+                        domain = value("--domain")
+                        pathlib.Path(value("--output")).write_text(json.dumps({
                             "findings": [{"fqdn": f"api.{domain}", "state": "live"}],
                             "resolver_metrics": [],
-                        }))
-                    elif tool == "subfinder":
-                        pathlib.Path(value("-o")).write_text(
-                            f"api.{value('-d')}\\n", encoding="utf-8"
-                        )
-                    elif tool == "amass":
+                        }), encoding="utf-8")
+                    elif tool == "finder_stdout" and args[:1] == ["active"]:
                         print(f"provider rejected {os.environ.get('MOCK_SECRET', 'credential-cleared')}", file=sys.stderr)
                         raise SystemExit(7)
-                    elif tool == "bbot":
-                        output = pathlib.Path(value("-o"))
+                    elif tool == "finder_tree" and args[:1] == ["active"]:
+                        output = pathlib.Path(value("--output-dir"))
                         output.mkdir(parents=True, exist_ok=True)
-                        domain = value("-t")
+                        domain = value("--domain")
                         (output / "output.json").write_text(
                             json.dumps({"type": "DNS_NAME", "data": domain}) + "\\n" +
                             json.dumps({"type": "DNS_NAME", "data": f"api.{domain}"}) + "\\n",
                             encoding="utf-8",
                         )
-                    elif tool == "puredns":
-                        domain = args[args.index("bruteforce") + 2]
-                        pathlib.Path(value("--write")).write_text(
+                    elif tool == "capacity_probe" and args[:1] == ["active"]:
+                        domain = value("--domain")
+                        pathlib.Path(value("--output")).write_text(
                             f"api.{domain}\\n", encoding="utf-8"
                         )
-                    elif tool == "dnsx":
-                        source = pathlib.Path(value("-l"))
-                        output = pathlib.Path(value("-o"))
+                    elif tool == "validator" and args[:1] == ["validate"]:
+                        source = pathlib.Path(value("--input"))
+                        output = pathlib.Path(value("--output"))
                         shutil.copyfile(source, output)
-                        with pathlib.Path(os.environ["MOCK_DNSX_CALLS"]).open("a", encoding="utf-8") as log:
+                        with pathlib.Path(os.environ["MOCK_VALIDATOR_CALLS"]).open("a", encoding="utf-8") as log:
                             log.write(f"{source}\\n")
                     else:
                         raise SystemExit(f"unexpected mock invocation: {tool} {args}")
@@ -330,27 +525,30 @@ class RunScriptTests(unittest.TestCase):
                 encoding="utf-8",
             )
             dispatcher.chmod(0o755)
-            for tool in (
-                "fellaga",
-                "subfinder",
-                "amass",
-                "bbot",
-                "puredns",
-                "massdns",
-                "dnsx",
-                "zstd",
-            ):
+            tool_names = (
+                "subject_engine",
+                "finder_stdout",
+                "finder_tree",
+                "capacity_probe",
+                "validator",
+                "transport_helper",
+            )
+            executables: dict[str, pathlib.Path] = {}
+            for tool in (*tool_names, "zstd"):
                 target = fake_bin / tool
                 shutil.copyfile(dispatcher, target)
                 target.chmod(0o755)
+                if tool in tool_names:
+                    executables[tool] = target
+            toolset = self._write_toolset(root, executables)
 
             domains = root / "domains.txt"
             domains.write_text("example.test\n", encoding="utf-8")
             resolvers = root / "resolvers.txt"
             resolvers.write_text("1.1.1.1\n8.8.8.8\n", encoding="utf-8")
-            campaign = root / "campaign"
-            paths_log = root / "fellaga-paths.txt"
-            dnsx_log = root / "dnsx-calls.txt"
+            campaign = root / "campaign with spaces;literal"
+            paths_log = root / "subject-paths.txt"
+            validator_log = root / "validator-calls.txt"
             secret = "benchmark-secret-must-not-enter-summary"
             environment = os.environ.copy()
             environment.update(
@@ -366,13 +564,14 @@ class RunScriptTests(unittest.TestCase):
                     "FELLAGA_BENCH_RESOLVER_QUERIES": "100000",
                     "FELLAGA_BENCH_REPETITIONS": "3",
                     "FELLAGA_BENCH_RESOLVERS_FILE": str(resolvers),
+                    "FELLAGA_BENCH_TOOLSET": str(toolset),
                     "FELLAGA_BENCH_REQUIRE_PASS": "0",
                     "FELLAGA_BENCH_PIPELINE_BYTES_PER_CANDIDATE": "1",
                     "FELLAGA_BENCH_PIPELINE_FIXED_BYTES": "0",
                     "FELLAGA_BENCH_PIPELINE_DISK_MARGIN_PERCENT": "100",
                     "FELLAGA_BENCH_PROFILE_BASELINES": "all",
-                    "MOCK_FELLAGA_PATHS": str(paths_log),
-                    "MOCK_DNSX_CALLS": str(dnsx_log),
+                    "MOCK_SUBJECT_PATHS": str(paths_log),
+                    "MOCK_VALIDATOR_CALLS": str(validator_log),
                     "MOCK_SECRET": secret,
                 }
             )
@@ -386,13 +585,16 @@ class RunScriptTests(unittest.TestCase):
             )
             self.assertEqual(completed.returncode, 0, completed.stderr)
 
-            fellaga_paths = paths_log.read_text(encoding="utf-8").splitlines()
-            self.assertEqual(len(fellaga_paths), 12)
-            databases = {line.split()[0] for line in fellaga_paths}
-            configs = {line.split()[1] for line in fellaga_paths}
-            profiles = [line.split()[2] for line in fellaga_paths]
-            hard_runtimes = [line.split()[3] for line in fellaga_paths]
-            active_runtimes = [line.split()[4] for line in fellaga_paths]
+            subject_paths = [
+                json.loads(line)
+                for line in paths_log.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(len(subject_paths), 12)
+            databases = {line[0] for line in subject_paths}
+            configs = {line[1] for line in subject_paths}
+            profiles = [line[2] for line in subject_paths]
+            hard_runtimes = [line[3] for line in subject_paths]
+            active_runtimes = [line[4] for line in subject_paths]
             self.assertEqual(len(databases), 12)
             self.assertEqual(len(configs), 12)
             self.assertEqual(
@@ -404,25 +606,25 @@ class RunScriptTests(unittest.TestCase):
             self.assertTrue(all(pathlib.Path(path).is_file() for path in databases))
             self.assertTrue(all(pathlib.Path(path).is_file() for path in configs))
 
-            dnsx_inputs = dnsx_log.read_text(encoding="utf-8").splitlines()
-            self.assertEqual(len(dnsx_inputs), 21)
-            self.assertFalse(any(".amass." in path for path in dnsx_inputs))
+            validator_inputs = validator_log.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(validator_inputs), 18)
+            self.assertFalse(any(".finder_stdout." in path for path in validator_inputs))
 
             summary_text = (campaign / "summary.jsonl").read_text(encoding="utf-8")
             self.assertNotIn(secret, summary_text)
-            amass_log = campaign / "logs" / "example.test.amass.r1.discovery.stderr"
-            self.assertNotIn(secret, amass_log.read_text(encoding="utf-8"))
-            self.assertIn("credential-cleared", amass_log.read_text(encoding="utf-8"))
+            finder_log = campaign / "logs" / "example.test.finder_stdout.r1.discovery.stderr"
+            self.assertNotIn(secret, finder_log.read_text(encoding="utf-8"))
+            self.assertIn("credential-cleared", finder_log.read_text(encoding="utf-8"))
             rows = [json.loads(line) for line in summary_text.splitlines()]
-            self.assertEqual(len(rows), 15)
-            fellaga_rows = [row for row in rows if row["tool"] == "fellaga"]
-            self.assertTrue(all(row["profile"] == "deep" for row in fellaga_rows))
+            self.assertEqual(len(rows), 12)
+            subject_rows = [row for row in rows if row["tool"] == "subject_engine"]
+            self.assertTrue(all(row["profile"] == "deep" for row in subject_rows))
             self.assertTrue(
                 all(row["benchmark_kind"] == "qualification" for row in rows)
             )
             baseline_rows = [
                 json.loads(line)
-                for line in (campaign / "fellaga-profile-baselines.jsonl")
+                for line in (campaign / "subject-profile-baselines.jsonl")
                 .read_text(encoding="utf-8")
                 .splitlines()
             ]
@@ -433,8 +635,8 @@ class RunScriptTests(unittest.TestCase):
             )
             self.assertTrue(
                 all(
-                    row["benchmark_kind"] == "fellaga_profile_baseline"
-                    and row["tool"] == "fellaga"
+                    row["benchmark_kind"] == "subject_profile_baseline"
+                    and row["tool"] == "subject_engine"
                     for row in baseline_rows
                 )
             )
@@ -451,7 +653,7 @@ class RunScriptTests(unittest.TestCase):
                 10_000_000,
             )
             self.assertEqual(
-                manifest["configuration"]["fellaga_active_max_runtime_seconds"],
+                manifest["configuration"]["subject_active_max_runtime_seconds"],
                 1,
             )
             self.assertEqual(
@@ -459,7 +661,7 @@ class RunScriptTests(unittest.TestCase):
                 1,
             )
             self.assertEqual(
-                manifest["configuration"]["fellaga_profile_baselines"],
+                manifest["configuration"]["subject_profile_baselines"],
                 ["deep", "balanced", "passive", "turbo"],
             )
             self.assertEqual(
@@ -467,16 +669,16 @@ class RunScriptTests(unittest.TestCase):
                 "sufficient",
             )
             self.assertEqual(
-                manifest["preflight"]["puredns_capacity"]["status"],
+                manifest["preflight"]["capacity_guard"]["status"],
                 "coherent",
             )
             self.assertEqual(
-                manifest["preflight"]["puredns_capacity"]["corpus_candidates"],
+                manifest["preflight"]["capacity_guard"]["corpus_candidates"],
                 manifest["provenance"]["inputs"]["active_corpus_candidates"],
             )
-            amass_rows = [row for row in rows if row["tool"] == "amass"]
+            failed_rows = [row for row in rows if row["tool"] == "finder_stdout"]
             self.assertTrue(
-                all(row["validation_status"] == "skipped" for row in amass_rows)
+                all(row["validation_status"] == "skipped" for row in failed_rows)
             )
             self.assertTrue(
                 all("validation_error_log" in row for row in rows)

@@ -7,6 +7,27 @@ upstream design attribution. Rust dependency versions are pinned in
 license files in the resolved crate sources. The architecture SBOMs contain
 the same resolved dependency graph and bind it to the packaged binary digest.
 
+## Tranco top-30 benchmark excerpt
+
+The passive observational benchmark includes a factual 30-row excerpt of the
+Tranco standard daily list with permanent ID `74J5X`, generated on
+2026-07-17. Its permanent source and methodology record are available at
+<https://tranco-list.eu/list/74J5X/1000000>.
+
+Requested citation:
+
+Victor Le Pochat, Tom Van Goethem, Samaneh Tajalizadehkhoob, Maciej
+Korczynski, and Wouter Joosen. 2019. "Tranco: A Research-Oriented Top Sites
+Ranking Hardened Against Manipulation," Proceedings of NDSS 2019.
+<https://doi.org/10.14722/ndss.2019.23386>
+
+No single license is asserted here for the Tranco aggregate or the factual
+excerpt, and the excerpt is not represented as covered by Fellaga's MIT
+license. Tranco documents mixed upstream terms, including CC BY 3.0 for
+Majestic, CC BY-SA 4.0 for CrUX, and CC BY-NC 4.0 for Cloudflare Radar. See
+<https://tranco-list.eu/> and `benchmarks/data/tranco-74J5X-top30.json` for
+the pinned attribution, retrieval URLs, and hashes.
+
 ## SecLists
 
 Fellaga redistributes a generated candidate corpus derived from these files in

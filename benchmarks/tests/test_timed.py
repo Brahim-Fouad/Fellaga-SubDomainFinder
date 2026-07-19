@@ -15,7 +15,7 @@ BENCHMARKS = pathlib.Path(__file__).resolve().parents[1]
 TIMED = BENCHMARKS / "timed.py"
 sys.path.insert(0, str(BENCHMARKS))
 
-from timed import run_bounded
+from timed import LINGERING_PROCESS_EXIT_CODE, run_bounded
 
 
 def process_is_alive(pid: int) -> bool:
@@ -40,6 +40,34 @@ class TimedRunnerTests(unittest.TestCase):
         self.assertEqual(success["exit_code"], 0)
         self.assertEqual(error["status"], "error")
         self.assertEqual(error["exit_code"], 7)
+
+    @unittest.skipUnless(os.name == "posix", "process-group assertion requires POSIX")
+    def test_successful_leader_with_lingering_child_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            helper = root / "helper.py"
+            child_pid_file = root / "child-pid.txt"
+            helper.write_text(
+                "import pathlib, signal, subprocess, sys\n"
+                "child_code = 'import signal,time; signal.signal(signal.SIGINT, signal.SIG_IGN); time.sleep(60)'\n"
+                "child = subprocess.Popen([sys.executable, '-c', child_code])\n"
+                "pathlib.Path(sys.argv[1]).write_text(str(child.pid), encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+
+            result = run_bounded(
+                [sys.executable, str(helper), str(child_pid_file)], 5, 0.2
+            )
+
+            self.assertEqual(result["status"], "error")
+            self.assertEqual(result["exit_code"], LINGERING_PROCESS_EXIT_CODE)
+            self.assertTrue(result["interrupted"])
+            self.assertIn("descendants", result["error"])
+            child_pid = int(child_pid_file.read_text(encoding="utf-8"))
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline and process_is_alive(child_pid):
+                time.sleep(0.05)
+            self.assertFalse(process_is_alive(child_pid))
 
     @unittest.skipUnless(os.name == "posix", "process-group assertion requires POSIX")
     def test_timeout_forces_complete_process_group_cleanup(self) -> None:

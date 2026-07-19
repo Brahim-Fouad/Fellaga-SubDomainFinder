@@ -1,0 +1,11 @@
+{
+  "summary": {
+    "other": 0,
+    "values": {
+      "API.EXAMPLE.COM.": 8,
+      "*.wild.example.com": 3,
+      "example.com": 2,
+      "outside.test": 1
+    }
+  }
+}

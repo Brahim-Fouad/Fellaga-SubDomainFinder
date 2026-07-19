@@ -1,6 +1,4 @@
-{
-  "items": [
-    {"data": {"domain": "edge.example.com"}},
-    {"data": {"domain": "outside.example.net"}}
-  ]
-}
+[
+  {"data": {"domain": "edge.example.com", "txt": ["brace } inside a string"]}},
+  {"data": {"domain": "outside.example.net"}}
+]

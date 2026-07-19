@@ -22,9 +22,10 @@ BENCH_REQUIRE_PASS="${FELLAGA_BENCH_REQUIRE_PASS:-1}"
 BENCH_PIPELINE_BYTES_PER_CANDIDATE="${FELLAGA_BENCH_PIPELINE_BYTES_PER_CANDIDATE:-2048}"
 BENCH_PIPELINE_FIXED_BYTES="${FELLAGA_BENCH_PIPELINE_FIXED_BYTES:-2147483648}"
 BENCH_PIPELINE_DISK_MARGIN_PERCENT="${FELLAGA_BENCH_PIPELINE_DISK_MARGIN_PERCENT:-125}"
-BENCH_PUREDNS_HEADROOM_PERCENT="${FELLAGA_BENCH_PUREDNS_HEADROOM_PERCENT:-125}"
+BENCH_CAPACITY_GUARD_HEADROOM_PERCENT="${FELLAGA_BENCH_CAPACITY_GUARD_HEADROOM_PERCENT:-125}"
 BENCH_PROFILE_BASELINES_SPEC="${FELLAGA_BENCH_PROFILE_BASELINES:-none}"
 RESOLVERS_SOURCE="${FELLAGA_BENCH_RESOLVERS_FILE:-}"
+TOOLSET_SOURCE="${FELLAGA_BENCH_TOOLSET:-$ROOT/benchmarks/toolset.local.json}"
 
 if [[ "$MODE" != "no-key" && "$MODE" != "equal-keys" ]]; then
   echo "usage: $0 no-key|equal-keys DOMAINS_FILE" >&2
@@ -43,7 +44,7 @@ for value in "$BENCH_MAX_RUNTIME" "$BENCH_ACTIVE_MAX_RUNTIME" \
   "$BENCH_PIPELINE_CONCURRENCY" "$BENCH_REPETITIONS" "$BENCH_TIMEOUT_GRACE" \
   "$BENCH_REQUIRE_PASS" "$BENCH_PIPELINE_BYTES_PER_CANDIDATE" \
   "$BENCH_PIPELINE_FIXED_BYTES" "$BENCH_PIPELINE_DISK_MARGIN_PERCENT" \
-  "$BENCH_PUREDNS_HEADROOM_PERCENT"; do
+  "$BENCH_CAPACITY_GUARD_HEADROOM_PERCENT"; do
   [[ "$value" =~ ^[0-9]+$ ]] || {
     echo "benchmark numeric settings must be non-negative integers" >&2
     exit 2
@@ -69,8 +70,8 @@ done
 }
 (( BENCH_PIPELINE_BYTES_PER_CANDIDATE > 0 \
   && BENCH_PIPELINE_DISK_MARGIN_PERCENT >= 100 \
-  && BENCH_PUREDNS_HEADROOM_PERCENT >= 100 )) || {
-  echo "pipeline bytes per candidate must be positive; disk and PureDNS margins must be at least 100 percent" >&2
+  && BENCH_CAPACITY_GUARD_HEADROOM_PERCENT >= 100 )) || {
+  echo "pipeline bytes per candidate must be positive; disk and capacity-guard margins must be at least 100 percent" >&2
   exit 2
 }
 
@@ -111,13 +112,17 @@ for value in "$BENCH_DISCOVERY_TIMEOUT" "$BENCH_VALIDATION_TIMEOUT" \
   }
 done
 
-for command in fellaga subfinder amass bbot puredns massdns dnsx jq zstd python3 \
-  timeout git sha256sum readlink awk; do
+for command in jq zstd python3 timeout git sha256sum awk; do
   command -v "$command" >/dev/null || {
     echo "missing prerequisite: $command" >&2
     exit 4
   }
 done
+
+[[ -f "$TOOLSET_SOURCE" ]] || {
+  echo "FELLAGA_BENCH_TOOLSET must name a benchmark toolset JSON file" >&2
+  exit 4
+}
 
 [[ -f "$RESOLVERS_SOURCE" ]] || {
   echo "FELLAGA_BENCH_RESOLVERS_FILE must name a curated resolver list" >&2
@@ -129,6 +134,145 @@ done
   exit 6
 }
 mkdir -p "$OUT/raw" "$OUT/live" "$OUT/logs" "$OUT/state" "$OUT/config"
+
+TOOLSET_RUNTIME="$OUT/config/toolset.runtime.json"
+if ! python3 - "$ROOT/benchmarks" "$TOOLSET_SOURCE" "$TOOLSET_RUNTIME" <<'PY'
+import json
+import pathlib
+import sys
+
+sys.path.insert(0, sys.argv[1])
+from toolset import (  # noqa: E402
+    capture_identity,
+    load_toolset,
+    normalized_snapshot,
+    resolve_executable,
+    snapshot_hash,
+)
+
+config = load_toolset(pathlib.Path(sys.argv[2]))
+snapshot = normalized_snapshot(config)
+active = snapshot["campaigns"]["active"]
+subject = snapshot["subject"]
+required_tools = list(dict.fromkeys([subject, *active["discoverers"]]))
+provenance_tools = list(
+    dict.fromkeys([*required_tools, active["validator"], *active["provenance_only"]])
+)
+identity_environment = {
+    "PATH": __import__("os").environ.get("PATH", ""),
+    "LANG": "C.UTF-8",
+    "LC_ALL": "C.UTF-8",
+    "TZ": "UTC",
+    "NO_COLOR": "1",
+}
+identities = {
+    tool: capture_identity(config, tool, env=identity_environment)
+    for tool in provenance_tools
+}
+failed = [
+    tool
+    for tool, identity in identities.items()
+    if identity.get("version_probe_status") != "success" or not identity.get("version")
+]
+if failed:
+    raise SystemExit("unsuccessful identity probe: " + ", ".join(failed))
+resolved_executables = {
+    tool: str(resolve_executable(config, tool)) for tool in provenance_tools
+}
+document = {
+    "snapshot": snapshot,
+    "sha256": snapshot_hash(snapshot),
+    "roles": {
+        "subject": subject,
+        "discoverers": active["discoverers"],
+        "required_tools": required_tools,
+        "validator": active["validator"],
+        "capacity_guard": active["capacity_guard"],
+        "provenance_only": active["provenance_only"],
+        "credential_participants": active["credential_participants"],
+    },
+    "identities": identities,
+    "resolved_executables": resolved_executables,
+}
+pathlib.Path(sys.argv[3]).write_text(
+    json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+)
+PY
+then
+  echo "active benchmark toolset validation or identity capture failed" >&2
+  exit 4
+fi
+
+SUBJECT="$(jq -r '.roles.subject' "$TOOLSET_RUNTIME")"
+VALIDATOR="$(jq -r '.roles.validator' "$TOOLSET_RUNTIME")"
+CAPACITY_GUARD="$(jq -r '.roles.capacity_guard' "$TOOLSET_RUNTIME")"
+SUBJECT_BIN="$(jq -r --arg tool "$SUBJECT" '.resolved_executables[$tool]' "$TOOLSET_RUNTIME")"
+mapfile -t REQUIRED_TOOLS < <(jq -r '.roles.required_tools[]' "$TOOLSET_RUNTIME")
+if (( ${#BENCH_PROFILE_BASELINES[@]} > 0 )) && ! jq -e --arg tool "$SUBJECT" '
+  ((.snapshot.tools[$tool].commands.active.required_context // []) +
+   (.snapshot.tools[$tool].parameters // {} | keys))
+  | index("profile") != null
+' "$TOOLSET_RUNTIME" >/dev/null; then
+  echo "profile baselines require a configurable profile field on the subject adapter" >&2
+  exit 4
+fi
+
+render_tool_command() {
+  local tool="$1" phase="$2" values_file="$3" result_name="$4"
+  local -n result="$result_name"
+  result=()
+  mapfile -d '' -t result < <(
+    python3 - "$ROOT/benchmarks" "$TOOLSET_SOURCE" "$tool" "$phase" \
+      "$values_file" <<'PY'
+import json
+import pathlib
+import sys
+
+sys.path.insert(0, sys.argv[1])
+from toolset import load_toolset, render_argv  # noqa: E402
+
+config = load_toolset(pathlib.Path(sys.argv[2]))
+tool, phase = sys.argv[3:5]
+values = json.loads(pathlib.Path(sys.argv[5]).read_text(encoding="utf-8"))
+definition = config["tools"][tool]
+command = definition["commands"][phase]
+allowed = set(command.get("required_context", [])) | set(
+    definition.get("parameters", {})
+)
+context = {key: value for key, value in values.items() if key in allowed}
+argv = render_argv(config, tool, phase, context)
+sys.stdout.buffer.write(b"".join(value.encode() + b"\0" for value in argv))
+PY
+  )
+  (( ${#result[@]} > 0 )) || {
+    echo "toolset rendered an empty command for $tool/$phase" >&2
+    return 4
+  }
+}
+
+render_tool_output() {
+  local tool="$1" phase="$2" values_file="$3"
+  python3 - "$ROOT/benchmarks" "$TOOLSET_SOURCE" "$tool" "$phase" \
+    "$values_file" <<'PY'
+import json
+import pathlib
+import sys
+
+sys.path.insert(0, sys.argv[1])
+from toolset import load_toolset, render_output  # noqa: E402
+
+config = load_toolset(pathlib.Path(sys.argv[2]))
+tool, phase = sys.argv[3:5]
+values = json.loads(pathlib.Path(sys.argv[5]).read_text(encoding="utf-8"))
+definition = config["tools"][tool]
+command = definition["commands"][phase]
+allowed = set(command.get("required_context", [])) | set(
+    definition.get("parameters", {})
+)
+context = {key: value for key, value in values.items() if key in allowed}
+print(json.dumps(render_output(config, tool, phase, context), sort_keys=True))
+PY
+}
 
 DISK_PREFLIGHT="$OUT/disk-preflight.json"
 if ! python3 "$ROOT/benchmarks/preflight.py" disk \
@@ -221,20 +365,21 @@ if [[ "$MODE" == "equal-keys" ]]; then
     echo "KEYS_MANIFEST is required in equal-keys mode" >&2
     exit 5
   }
-  jq -e '
+  credential_participants_json="$(jq -c '.roles.credential_participants | sort' "$TOOLSET_RUNTIME")"
+  jq -e --argjson participants "$credential_participants_json" '
     .policy == "same-provider-keys" and
     (.providers | type == "array" and length > 0) and
     ([.providers[].name] | length == (unique | length)) and
-    ([.providers[].fellaga_env] | length == (unique | length)) and
+    ([.providers[].subject_env] | length == (unique | length)) and
     all(.providers[];
       (.name | type == "string" and test("^[a-z0-9][a-z0-9_-]{0,63}$")) and
-      (.fellaga_env | type == "string" and test("^[A-Z][A-Z0-9_]{2,127}$")) and
-      .competitors_configured == true and
+      (.subject_env | type == "string" and test("^[A-Z][A-Z0-9_]{2,127}$")) and
+      .participants_configured == true and
       (.configured_tools | type == "array") and
-      ((["fellaga", "subfinder", "amass", "bbot"] - .configured_tools) | length == 0)
+      ((.configured_tools | sort) == $participants)
     )
   ' "$manifest" >/dev/null || {
-    echo "invalid equal-keys manifest: non-empty unique providers and all configured_tools are required" >&2
+    echo "invalid equal-keys manifest: providers must cover the toolset credential participants exactly" >&2
     exit 5
   }
   while IFS= read -r variable; do
@@ -243,11 +388,11 @@ if [[ "$MODE" == "equal-keys" ]]; then
       exit 5
     }
   done < <(
-    jq -r '.providers[].fellaga_env' "$manifest"
+    jq -r '.providers[].subject_env' "$manifest"
   )
   keys_home="${FELLAGA_BENCH_KEYS_HOME:-}"
   [[ -d "$keys_home" ]] || {
-    echo "FELLAGA_BENCH_KEYS_HOME must name a prepared competitor configuration home" >&2
+    echo "FELLAGA_BENCH_KEYS_HOME must name a prepared participant configuration home" >&2
     exit 5
   }
   BENCH_ISOLATED_HOME="$(mktemp -d "${TMPDIR:-/tmp}/fellaga-benchmark-keys.XXXXXX")"
@@ -261,7 +406,7 @@ if [[ "$MODE" == "equal-keys" ]]; then
       policy,
       providers: [.providers[] | {
         name,
-        fellaga_env,
+        subject_env,
         configured_tools: (.configured_tools | sort)
       }]
     }' "$manifest"
@@ -315,49 +460,31 @@ ACTIVE_CORPUS_CANDIDATES="$(awk 'NF { candidates++ } END { print candidates + 0 
   exit 6
 }
 
-PUREDNS_PREFLIGHT="$OUT/puredns-preflight.json"
-if ! python3 "$ROOT/benchmarks/preflight.py" puredns \
+CAPACITY_GUARD_PREFLIGHT="$OUT/capacity-guard-preflight.json"
+if ! python3 "$ROOT/benchmarks/preflight.py" active-resolver \
   --corpus "$corpus" \
   --rate-qps "$BENCH_DNS_RATE" \
   --timeout-seconds "$BENCH_DISCOVERY_TIMEOUT" \
-  --headroom-percent "$BENCH_PUREDNS_HEADROOM_PERCENT" \
-  --output "$PUREDNS_PREFLIGHT" > "$OUT/logs/puredns-preflight.stdout"; then
-  puredns_status="$(jq -r '.status // "error"' "$PUREDNS_PREFLIGHT" 2>/dev/null || echo error)"
-  puredns_minimum_rate="$(jq -r '.minimum_coherent_rate_qps // "unknown"' "$PUREDNS_PREFLIGHT" 2>/dev/null || echo unknown)"
-  puredns_estimated_seconds="$(jq -r '.estimated_minimum_seconds // "unknown"' "$PUREDNS_PREFLIGHT" 2>/dev/null || echo unknown)"
-  echo "PureDNS capacity preflight failed: status=$puredns_status estimated_seconds=$puredns_estimated_seconds timeout_seconds=$BENCH_DISCOVERY_TIMEOUT minimum_rate_qps=$puredns_minimum_rate" >&2
+  --headroom-percent "$BENCH_CAPACITY_GUARD_HEADROOM_PERCENT" \
+  --output "$CAPACITY_GUARD_PREFLIGHT" > "$OUT/logs/capacity-guard-preflight.stdout"; then
+  capacity_status="$(jq -r '.status // "error"' "$CAPACITY_GUARD_PREFLIGHT" 2>/dev/null || echo error)"
+  capacity_minimum_rate="$(jq -r '.minimum_coherent_rate_qps // "unknown"' "$CAPACITY_GUARD_PREFLIGHT" 2>/dev/null || echo unknown)"
+  capacity_estimated_seconds="$(jq -r '.estimated_minimum_seconds // "unknown"' "$CAPACITY_GUARD_PREFLIGHT" 2>/dev/null || echo unknown)"
+  echo "capacity-guard preflight failed: status=$capacity_status estimated_seconds=$capacity_estimated_seconds timeout_seconds=$BENCH_DISCOVERY_TIMEOUT minimum_rate_qps=$capacity_minimum_rate" >&2
   exit 8
 fi
 if ! jq -e --argjson candidates "$ACTIVE_CORPUS_CANDIDATES" \
-  '.corpus_candidates == $candidates' "$PUREDNS_PREFLIGHT" >/dev/null; then
-  echo "PureDNS preflight corpus count does not match the active corpus" >&2
+  '.corpus_candidates == $candidates' "$CAPACITY_GUARD_PREFLIGHT" >/dev/null; then
+  echo "capacity-guard preflight corpus count does not match the active corpus" >&2
   exit 8
 fi
+capacity_guard_preflight_tmp="$OUT/config/capacity-guard-preflight.tmp.json"
+jq --arg tool "$CAPACITY_GUARD" '. + {tool: $tool}' \
+  "$CAPACITY_GUARD_PREFLIGHT" > "$capacity_guard_preflight_tmp"
+mv -- "$capacity_guard_preflight_tmp" "$CAPACITY_GUARD_PREFLIGHT"
 
-versions='{}'
-executables='{}'
-for tool in fellaga subfinder amass bbot puredns massdns dnsx; do
-  if ! version_output="$(timeout 10s "$tool" --version 2>&1)"; then
-    echo "unable to obtain a successful version from $tool" >&2
-    exit 4
-  fi
-  version="${version_output%%$'\n'*}"
-  [[ -n "$version" ]] || {
-    echo "empty version returned by $tool" >&2
-    exit 4
-  }
-  executable_path="$(readlink -f "$(command -v "$tool")")"
-  executable_sha256="$(sha256sum "$executable_path" | awk '{print $1}')"
-  versions="$(
-    jq -c --arg tool "$tool" --arg version "$version" \
-      '. + {($tool): $version}' <<< "$versions"
-  )"
-  executables="$(
-    jq -c --arg tool "$tool" --arg version "$version" \
-      --arg sha256 "$executable_sha256" \
-      '. + {($tool): {version: $version, sha256: $sha256}}' <<< "$executables"
-  )"
-done
+versions="$(jq -c '.identities | with_entries(.value = .value.version)' "$TOOLSET_RUNTIME")"
+executables="$(jq -c '.identities' "$TOOLSET_RUNTIME")"
 
 pipeline_corpus="$OUT/raw/candidates-10m.txt"
 CAMPAIGN_ID="$STAMP-$(python3 -c 'import secrets; print(secrets.token_hex(8))')"
@@ -367,7 +494,7 @@ candidate_database="$OUT/state/candidate-pipeline.sqlite"
 python3 "$ROOT/benchmarks/timed.py" \
   --timeout "$BENCH_PIPELINE_TIMEOUT" --grace "$BENCH_TIMEOUT_GRACE" \
   "$candidate_timing" -- \
-  fellaga --db "$candidate_database" benchmark candidate-pipeline \
+  "$SUBJECT_BIN" --db "$candidate_database" benchmark candidate-pipeline \
     --wordlist "$pipeline_corpus" --candidates "$BENCH_PIPELINE_CANDIDATES" \
     --batch-size "$BENCH_PIPELINE_BATCH" --concurrency "$BENCH_PIPELINE_CONCURRENCY" \
     --timeout 2 --campaign-id "$CAMPAIGN_ID" --output "$candidate_raw" \
@@ -379,17 +506,17 @@ if [[ "$(jq -r '.status' "$candidate_timing")" != "success" || ! -s "$candidate_
   exit 7
 fi
 
-repository_commit="$(git -C "$ROOT" rev-parse --verify HEAD)"
+repository_commit="$(git -c safe.directory="$ROOT" -C "$ROOT" rev-parse --verify HEAD)"
 repository_dirty=false
-[[ -z "$(git -C "$ROOT" status --porcelain)" ]] || repository_dirty=true
+[[ -z "$(git -c safe.directory="$ROOT" -C "$ROOT" status --porcelain)" ]] || repository_dirty=true
 domains_sha256="$(sha256sum "$OUT/authorized-domains.txt" | awk '{print $1}')"
 corpus_archive_sha256="$(sha256sum "$ROOT/data/candidates-1m.txt.zst" | awk '{print $1}')"
 corpus_sha256="$(sha256sum "$corpus" | awk '{print $1}')"
 pipeline_corpus_sha256="$(sha256sum "$pipeline_corpus" | awk '{print $1}')"
-expected_fellaga_sha256="$(jq -r '.fellaga.sha256' <<< "$executables")"
+expected_subject_sha256="$(jq -r --arg tool "$SUBJECT" '.[$tool].sha256' <<< "$executables")"
 if ! jq -e --arg campaign_id "$CAMPAIGN_ID" \
   --arg wordlist_sha256 "$pipeline_corpus_sha256" \
-  --arg binary_sha256 "$expected_fellaga_sha256" \
+  --arg binary_sha256 "$expected_subject_sha256" \
   '.campaign_id == $campaign_id and
    .wordlist_sha256 == $wordlist_sha256 and
    .binary_sha256 == $binary_sha256' "$candidate_raw" >/dev/null; then
@@ -403,13 +530,25 @@ fi
 domains_json="$(jq -Rsc 'split("\n") | map(select(length > 0))' "$OUT/authorized-domains.txt")"
 baseline_profiles_json="$(printf '%s\n' "${BENCH_PROFILE_BASELINES[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))')"
 disk_preflight_json="$(jq -c . "$DISK_PREFLIGHT")"
-puredns_preflight_json="$(jq -c . "$PUREDNS_PREFLIGHT")"
+capacity_guard_preflight_json="$(jq -c . "$CAPACITY_GUARD_PREFLIGHT")"
+toolset_snapshot_json="$(jq -c '.snapshot' "$TOOLSET_RUNTIME")"
+toolset_sha256="$(jq -r '.sha256' "$TOOLSET_RUNTIME")"
+required_tools_json="$(jq -c '.roles.required_tools' "$TOOLSET_RUNTIME")"
+dns_controls_json="$(jq -c '
+  $root as $document
+  | [$document.roles.required_tools[], $document.roles.validator, $document.roles.provenance_only[]]
+  | unique
+  | map({key: ., value: ($document.snapshot.tools[.].dns_controls // [])})
+  | map(select(.value | length > 0))
+  | from_entries
+' --argjson root "$(jq -c . "$TOOLSET_RUNTIME")" <<< '{}')"
 jq -n \
   --arg campaign_id "$CAMPAIGN_ID" \
   --arg mode "$MODE" \
   --argjson started_at "$(date -u +%s)" \
   --argjson versions "$versions" \
   --argjson executables "$executables" \
+  --arg subject "$SUBJECT" \
   --arg repository_commit "$repository_commit" \
   --argjson repository_dirty "$repository_dirty" \
   --argjson authorized_domains "$domains_json" \
@@ -430,10 +569,14 @@ jq -n \
   --argjson pipeline_bytes_per_candidate "$BENCH_PIPELINE_BYTES_PER_CANDIDATE" \
   --argjson pipeline_fixed_bytes "$BENCH_PIPELINE_FIXED_BYTES" \
   --argjson pipeline_disk_margin "$BENCH_PIPELINE_DISK_MARGIN_PERCENT" \
-  --argjson puredns_headroom "$BENCH_PUREDNS_HEADROOM_PERCENT" \
+  --argjson capacity_guard_headroom "$BENCH_CAPACITY_GUARD_HEADROOM_PERCENT" \
   --argjson baseline_profiles "$baseline_profiles_json" \
   --argjson disk_preflight "$disk_preflight_json" \
-  --argjson puredns_preflight "$puredns_preflight_json" \
+  --argjson capacity_guard_preflight "$capacity_guard_preflight_json" \
+  --argjson required_tools "$required_tools_json" \
+  --argjson dns_controls "$dns_controls_json" \
+  --argjson toolset_snapshot "$toolset_snapshot_json" \
+  --arg toolset_sha256 "$toolset_sha256" \
   --argjson resolver_count "$RESOLVER_COUNT" \
   --arg resolvers_sha256 "$RESOLVERS_SHA256" \
   --arg domains_sha256 "$domains_sha256" \
@@ -444,17 +587,23 @@ jq -n \
   --argjson keys_manifest_sha256 "$keys_manifest_sha256" \
   --argjson credential_evidence "$credential_evidence" \
   '{
-    schema_version: 2,
+    schema_version: 3,
     campaign_id: $campaign_id,
     mode: $mode,
     started_at: $started_at,
     versions: $versions,
     authorized_domains: $authorized_domains,
     repetitions: $repetitions,
+    toolset: {
+      campaign: "active",
+      sha256: $toolset_sha256,
+      snapshot: $toolset_snapshot
+    },
     configuration: {
       required_repetitions: $repetitions,
-      required_tools: ["fellaga", "subfinder", "amass", "bbot", "puredns"],
-      fellaga_active_max_runtime_seconds: $active_max_runtime,
+      required_tools: $required_tools,
+      subject: $subject,
+      subject_active_max_runtime_seconds: $active_max_runtime,
       discovery_timeout_seconds: $discovery_timeout,
       validation_timeout_seconds: $validation_timeout,
       dns_transport_timeout_seconds: $transport_timeout,
@@ -470,10 +619,10 @@ jq -n \
       candidate_pipeline_bytes_per_candidate: $pipeline_bytes_per_candidate,
       candidate_pipeline_fixed_bytes: $pipeline_fixed_bytes,
       candidate_pipeline_disk_margin_percent: $pipeline_disk_margin,
-      puredns_headroom_percent: $puredns_headroom,
-      fellaga_profile_baselines: $baseline_profiles,
-      fellaga_cache_mode: "fresh_database_per_run",
-      fellaga_config_mode: "fresh_file_per_run"
+      capacity_guard_headroom_percent: $capacity_guard_headroom,
+      subject_profile_baselines: $baseline_profiles,
+      subject_cache_mode: "fresh_database_per_run",
+      subject_config_mode: "fresh_file_per_run"
     },
     provenance: {
       repository: {commit: $repository_commit, dirty: $repository_dirty},
@@ -485,27 +634,21 @@ jq -n \
         active_corpus_candidates: $active_corpus_candidates,
         pipeline_corpus_sha256: $pipeline_corpus_sha256,
         resolvers_sha256: $resolvers_sha256,
+        toolset_sha256: $toolset_sha256,
         keys_manifest_sha256: $keys_manifest_sha256
       }
     },
     credentials: $credential_evidence,
     preflight: {
       candidate_pipeline_disk: $disk_preflight,
-      puredns_capacity: $puredns_preflight
+      capacity_guard: $capacity_guard_preflight
     },
     dns_fairness: {
       rate_limit_qps: $dns_rate,
       concurrency: $dns_concurrency,
       resolver_count: $resolver_count,
       resolvers_sha256: $resolvers_sha256,
-      controls: {
-        fellaga: ["resolver_list", "trusted_resolver_list", "rate_limit", "concurrency"],
-        subfinder: ["resolver_list"],
-        amass: ["resolver_list", "concurrency"],
-        bbot: ["concurrency", "bruteforce_resolver_list", "no_strict_qps_cli"],
-        puredns: ["resolver_list", "trusted_resolver_list", "rate_limit", "trusted_rate_limit"],
-        dnsx: ["resolver_list", "rate_limit", "concurrency"]
-      }
+      controls: $dns_controls
     }
   }' > "$OUT/manifest.json"
 
@@ -514,7 +657,7 @@ jq --arg status "$(jq -r '.status' "$candidate_timing")" \
   --argjson wall_seconds "$(jq -r '.duration_seconds' "$candidate_timing")" \
   --argjson rss "$(jq -r '.max_rss_kib' "$candidate_timing")" \
   --arg campaign_id "$CAMPAIGN_ID" \
-  --arg fellaga_sha256 "$(jq -r '.provenance.executables.fellaga.sha256' "$OUT/manifest.json")" \
+  --arg subject_sha256 "$(jq -r --arg tool "$SUBJECT" '.provenance.executables[$tool].sha256' "$OUT/manifest.json")" \
   --arg corpus_sha256 "$pipeline_corpus_sha256" \
   '. + {
     engine_status: (.status // "unknown"),
@@ -523,7 +666,7 @@ jq --arg status "$(jq -r '.status' "$candidate_timing")" \
     wall_seconds: $wall_seconds,
     max_rss_kib: $rss,
     campaign_id: (.campaign_id // $campaign_id),
-    fellaga_sha256: $fellaga_sha256,
+    subject_sha256: $subject_sha256,
     corpus_sha256: $corpus_sha256,
     candidates: (.requested_candidates // .candidates // 0)
   }' "$candidate_raw" > "$OUT/candidate-pipeline.json"
@@ -534,22 +677,38 @@ if [[ "$(jq -r '.status' "$candidate_timing")" != "success" ]]; then
   exit 7
 fi
 
+safe_output_path() {
+  local candidate="$1" allowed_root="$2"
+  python3 - "$candidate" "$allowed_root" <<'PY'
+import pathlib
+import sys
+
+candidate = pathlib.Path(sys.argv[1]).resolve()
+allowed = pathlib.Path(sys.argv[2]).resolve()
+try:
+    candidate.relative_to(allowed)
+except ValueError as exc:
+    raise SystemExit(f"toolset output escapes campaign directory: {candidate}") from exc
+print(candidate)
+PY
+}
+
 run_tool() {
   local domain="$1" tool="$2" repetition="$3"
-  local fellaga_profile="${4:-deep}"
+  local subject_profile="${4:-deep}"
   local result_file="${5:-$OUT/summary.jsonl}"
   local benchmark_kind="${6:-qualification}"
   local base="$domain.$tool.r$repetition"
-  if [[ "$benchmark_kind" == "fellaga_profile_baseline" ]]; then
-    [[ "$tool" == "fellaga" ]] || {
-      echo "profile baselines support only Fellaga" >&2
+  if [[ "$benchmark_kind" == "subject_profile_baseline" ]]; then
+    [[ "$tool" == "$SUBJECT" ]] || {
+      echo "profile baselines support only the configured subject" >&2
       return 2
     }
-    base="$domain.fellaga-profile-$fellaga_profile.r$repetition"
+    base="$domain.subject-profile-$subject_profile.r$repetition"
   fi
   local raw="$OUT/raw/$base.txt"
   local normalized="$OUT/raw/$base.normalized.txt"
-  local live_raw="$OUT/live/$base.dnsx.txt"
+  local live_raw="$OUT/live/$base.validator.txt"
   local live="$OUT/live/$base.txt"
   local discovery_timing="$OUT/logs/$base.discovery.time.json"
   local validation_timing="$OUT/logs/$base.validation.time.json"
@@ -560,6 +719,41 @@ run_tool() {
   local parse_error="$OUT/logs/$base.parse.stderr"
   local historical=null dns_queries=null capture_pid="" capture=""
   local discovery_override="" validation_override=""
+  local discovery_values="$OUT/config/$base.active-context.json"
+  local validation_values="$OUT/config/$base.validate-context.json"
+  local tool_database="$OUT/state/$base.sqlite"
+  local tool_config="$OUT/config/$base.json"
+  local requested_output="$OUT/raw/$base.tool-output"
+  local requested_output_dir="$OUT/raw/$base.tool-output-tree"
+
+  jq -n \
+    --arg domain "$domain" --arg target "$domain" \
+    --arg output "$requested_output" --arg output_path "$requested_output" \
+    --arg output_file "$requested_output" --arg output_dir "$requested_output_dir" \
+    --arg database "$tool_database" --arg database_path "$tool_database" \
+    --arg config "$tool_config" --arg config_path "$tool_config" \
+    --arg profile "$subject_profile" --arg corpus "$corpus" \
+    --arg wordlist "$corpus" --arg candidate_corpus "$corpus" \
+    --arg resolver_file "$RESOLVERS_FILE" --arg resolvers_file "$RESOLVERS_FILE" \
+    --arg trusted_resolver_file "$RESOLVERS_FILE" \
+    --arg trusted_resolvers_file "$RESOLVERS_FILE" \
+    --arg resolver_csv "$RESOLVERS_CSV" --arg resolvers_csv "$RESOLVERS_CSV" \
+    --argjson max_runtime "$BENCH_MAX_RUNTIME" \
+    --argjson active_max_runtime "$BENCH_ACTIVE_MAX_RUNTIME" \
+    --argjson dns_rate "$BENCH_DNS_RATE" \
+    --argjson dns_concurrency "$BENCH_DNS_CONCURRENCY" \
+    '{domain:$domain,target:$target,output:$output,output_path:$output_path,
+      output_file:$output_file,output_dir:$output_dir,database:$database,
+      database_path:$database_path,config:$config,config_path:$config_path,
+      profile:$profile,corpus:$corpus,resolver_file:$resolver_file,
+      wordlist:$wordlist,candidate_corpus:$candidate_corpus,
+      resolvers_file:$resolvers_file,resolver_csv:$resolver_csv,
+      trusted_resolver_file:$trusted_resolver_file,
+      trusted_resolvers_file:$trusted_resolvers_file,
+      resolvers_csv:$resolvers_csv,max_runtime:$max_runtime,
+      active_max_runtime:$active_max_runtime,dns_rate:$dns_rate,
+      dns_concurrency:$dns_concurrency,rate_limit:$dns_rate,
+      concurrency:$dns_concurrency}' > "$discovery_values"
 
   if command -v tshark >/dev/null 2>&1 && [[ "$(id -u)" -eq 0 ]]; then
     capture="$OUT/logs/$base.pcapng"
@@ -570,80 +764,68 @@ run_tool() {
     sleep 0.2
   fi
 
-  case "$tool" in
-    fellaga)
-      local fellaga_json="$OUT/raw/$base.json"
-      local fellaga_metadata="$OUT/logs/$base.fellaga-metadata.json"
-      local fellaga_db="$OUT/state/$base.sqlite"
-      local fellaga_config="$OUT/config/$base.json"
-      python3 "$ROOT/benchmarks/timed.py" \
-        --timeout "$BENCH_DISCOVERY_TIMEOUT" --grace "$BENCH_TIMEOUT_GRACE" \
-        "$discovery_timing" -- \
-        fellaga --db "$fellaga_db" --config "$fellaga_config" \
-          scan "$domain" --profile "$fellaga_profile" --max-runtime "$BENCH_MAX_RUNTIME" \
-          --active-max-runtime "$BENCH_ACTIVE_MAX_RUNTIME" \
-          --dns-rate-limit "$BENCH_DNS_RATE" \
-          --concurrency "$BENCH_DNS_CONCURRENCY" \
-          --resolvers "$RESOLVERS_CSV" --trusted-resolvers "$RESOLVERS_CSV" --json \
-        > "$fellaga_json" 2> "$discovery_error" || true
-      if python3 "$ROOT/benchmarks/names.py" fellaga "$domain" "$fellaga_json" \
-        --metadata "$fellaga_metadata" > "$raw" 2> "$parse_error"; then
-        historical="$(jq -r '.historical_names' "$fellaga_metadata")"
+  local discovery_output_json discovery_kind discovery_source
+  discovery_output_json="$(render_tool_output "$tool" active "$discovery_values")"
+  discovery_kind="$(jq -r '.kind' <<< "$discovery_output_json")"
+  case "$discovery_kind" in
+    line_stdout)
+      discovery_source="$requested_output"
+      ;;
+    line_file|finding_json|dns_event_tree)
+      discovery_source="$(jq -r '.path' <<< "$discovery_output_json")"
+      discovery_source="$(safe_output_path "$discovery_source" "$OUT/raw")"
+      ;;
+    *)
+      echo "unsupported active output kind for $tool: $discovery_kind" >&2
+      return 4
+      ;;
+  esac
+  if [[ "$discovery_kind" == "dns_event_tree" ]]; then
+    mkdir -p "$discovery_source"
+  else
+    mkdir -p "$(dirname -- "$discovery_source")"
+  fi
+  local active_argv=()
+  render_tool_command "$tool" active "$discovery_values" active_argv
+  if [[ "$discovery_kind" == "line_stdout" ]]; then
+    python3 "$ROOT/benchmarks/timed.py" \
+      --timeout "$BENCH_DISCOVERY_TIMEOUT" --grace "$BENCH_TIMEOUT_GRACE" \
+      "$discovery_timing" -- "${active_argv[@]}" \
+      > "$discovery_source" 2> "$discovery_error" || true
+    : > "$discovery_stdout"
+  else
+    python3 "$ROOT/benchmarks/timed.py" \
+      --timeout "$BENCH_DISCOVERY_TIMEOUT" --grace "$BENCH_TIMEOUT_GRACE" \
+      "$discovery_timing" -- "${active_argv[@]}" \
+      > "$discovery_stdout" 2> "$discovery_error" || true
+  fi
+
+  touch "$parse_error"
+  local extracted="$raw"
+  case "$discovery_kind" in
+    line_stdout|line_file)
+      touch "$discovery_source"
+      extracted="$discovery_source"
+      ;;
+    finding_json)
+      local finding_metadata="$OUT/logs/$base.finding-metadata.json"
+      if python3 "$ROOT/benchmarks/names.py" fellaga "$domain" "$discovery_source" \
+        --metadata "$finding_metadata" > "$raw" 2> "$parse_error"; then
+        historical="$(jq -r '.historical_names' "$finding_metadata")"
       elif [[ "$(jq -r '.status' "$discovery_timing")" == "success" ]]; then
         discovery_override="error"
       fi
       ;;
-    subfinder)
-      python3 "$ROOT/benchmarks/timed.py" \
-        --timeout "$BENCH_DISCOVERY_TIMEOUT" --grace "$BENCH_TIMEOUT_GRACE" \
-        "$discovery_timing" -- \
-        subfinder -silent -all -d "$domain" -rL "$RESOLVERS_FILE" \
-          -t "$BENCH_DNS_CONCURRENCY" -o "$raw" \
-        > "$discovery_stdout" 2> "$discovery_error" || true
-      ;;
-    amass)
-      python3 "$ROOT/benchmarks/timed.py" \
-        --timeout "$BENCH_DISCOVERY_TIMEOUT" --grace "$BENCH_TIMEOUT_GRACE" \
-        "$discovery_timing" -- \
-        amass enum -active -d "$domain" -rf "$RESOLVERS_FILE" \
-          -max-dns-queries "$BENCH_DNS_CONCURRENCY" -o "$raw" \
-        > "$discovery_stdout" 2> "$discovery_error" || true
-      ;;
-    bbot)
-      local directory="$OUT/raw/$base.bbot"
-      mkdir -p "$directory"
-      python3 "$ROOT/benchmarks/timed.py" \
-        --timeout "$BENCH_DISCOVERY_TIMEOUT" --grace "$BENCH_TIMEOUT_GRACE" \
-        "$discovery_timing" -- \
-        bbot -y -t "$domain" -p subdomain-enum -om json -o "$directory" \
-          --config dns.threads="$BENCH_DNS_CONCURRENCY" \
-          dns.brute_threads="$BENCH_DNS_CONCURRENCY" \
-          dns.brute_nameservers="$RESOLVERS_FILE" \
-        > "$discovery_stdout" 2> "$discovery_error" || true
-      if ! python3 "$ROOT/benchmarks/names.py" bbot "$domain" "$directory" \
-        > "$raw" 2> "$parse_error"; then
+    dns_event_tree)
+      if ! python3 "$ROOT/benchmarks/names.py" dns-events "$domain" \
+        "$discovery_source" > "$raw" 2> "$parse_error"; then
         [[ "$(jq -r '.status' "$discovery_timing")" != "success" ]] || \
           discovery_override="error"
       fi
       ;;
-    puredns)
-      python3 "$ROOT/benchmarks/timed.py" \
-        --timeout "$BENCH_DISCOVERY_TIMEOUT" --grace "$BENCH_TIMEOUT_GRACE" \
-        "$discovery_timing" -- \
-        puredns bruteforce "$corpus" "$domain" --write "$raw" \
-          --bin "$(command -v massdns)" --resolvers "$RESOLVERS_FILE" \
-          --resolvers-trusted "$RESOLVERS_FILE" \
-          --rate-limit "$BENCH_DNS_RATE" --rate-limit-trusted "$BENCH_DNS_RATE" \
-        > "$discovery_stdout" 2> "$discovery_error" || true
-      ;;
-    *)
-      echo "unsupported benchmark tool: $tool" >&2
-      return 2
-      ;;
   esac
-
-  touch "$raw" "$parse_error"
-  if ! python3 "$ROOT/benchmarks/names.py" normalize "$domain" "$raw" \
+  touch "$extracted"
+  if ! python3 "$ROOT/benchmarks/names.py" normalize "$domain" "$extracted" \
     > "$normalized" 2>> "$parse_error"; then
     [[ "$(jq -r '.status' "$discovery_timing")" != "success" ]] || \
       discovery_override="error"
@@ -652,15 +834,91 @@ run_tool() {
   local pre_validation_discovery_status
   pre_validation_discovery_status="${discovery_override:-$(jq -r '.status' "$discovery_timing")}"
   if [[ "$pre_validation_discovery_status" == "success" ]]; then
-    python3 "$ROOT/benchmarks/timed.py" \
-      --timeout "$BENCH_VALIDATION_TIMEOUT" --grace "$BENCH_TIMEOUT_GRACE" \
-      "$validation_timing" -- \
-      dnsx -silent -a -aaaa -cname -l "$normalized" -o "$live_raw" \
-        -r "$RESOLVERS_FILE" -rl "$BENCH_DNS_RATE" \
-        -t "$BENCH_DNS_CONCURRENCY" \
-      > "$validation_stdout" 2> "$validation_error" || true
-    touch "$live_raw"
-    if ! python3 "$ROOT/benchmarks/names.py" normalize "$domain" "$live_raw" \
+    local requested_live_output="$OUT/live/$base.validator-output"
+    local requested_live_dir="$OUT/live/$base.validator-output-tree"
+    jq -n \
+      --arg domain "$domain" --arg target "$domain" \
+      --arg input "$normalized" --arg input_path "$normalized" \
+      --arg input_file "$normalized" \
+      --arg output "$requested_live_output" \
+      --arg output_path "$requested_live_output" \
+      --arg output_file "$requested_live_output" \
+      --arg output_dir "$requested_live_dir" \
+      --arg resolver_file "$RESOLVERS_FILE" \
+      --arg resolvers_file "$RESOLVERS_FILE" \
+      --arg trusted_resolver_file "$RESOLVERS_FILE" \
+      --arg trusted_resolvers_file "$RESOLVERS_FILE" \
+      --arg resolver_csv "$RESOLVERS_CSV" --arg resolvers_csv "$RESOLVERS_CSV" \
+      --argjson dns_rate "$BENCH_DNS_RATE" \
+      --argjson dns_concurrency "$BENCH_DNS_CONCURRENCY" \
+      '{domain:$domain,target:$target,input:$input,input_path:$input_path,
+        input_file:$input_file,output:$output,output_path:$output_path,
+        output_file:$output_file,output_dir:$output_dir,
+        resolver_file:$resolver_file,resolvers_file:$resolvers_file,
+        trusted_resolver_file:$trusted_resolver_file,
+        trusted_resolvers_file:$trusted_resolvers_file,
+        resolver_csv:$resolver_csv,resolvers_csv:$resolvers_csv,
+        dns_rate:$dns_rate,dns_concurrency:$dns_concurrency,
+        rate_limit:$dns_rate,concurrency:$dns_concurrency}' \
+      > "$validation_values"
+    local validation_output_json validation_kind validation_source
+    validation_output_json="$(render_tool_output "$VALIDATOR" validate "$validation_values")"
+    validation_kind="$(jq -r '.kind' <<< "$validation_output_json")"
+    case "$validation_kind" in
+      line_stdout)
+        validation_source="$requested_live_output"
+        ;;
+      line_file|finding_json|dns_event_tree)
+        validation_source="$(jq -r '.path' <<< "$validation_output_json")"
+        validation_source="$(safe_output_path "$validation_source" "$OUT/live")"
+        ;;
+      *)
+        echo "unsupported validation output kind: $validation_kind" >&2
+        return 4
+        ;;
+    esac
+    if [[ "$validation_kind" == "dns_event_tree" ]]; then
+      mkdir -p "$validation_source"
+    else
+      mkdir -p "$(dirname -- "$validation_source")"
+    fi
+    local validate_argv=()
+    render_tool_command "$VALIDATOR" validate "$validation_values" validate_argv
+    if [[ "$validation_kind" == "line_stdout" ]]; then
+      python3 "$ROOT/benchmarks/timed.py" \
+        --timeout "$BENCH_VALIDATION_TIMEOUT" --grace "$BENCH_TIMEOUT_GRACE" \
+        "$validation_timing" -- "${validate_argv[@]}" \
+        > "$validation_source" 2> "$validation_error" || true
+      : > "$validation_stdout"
+    else
+      python3 "$ROOT/benchmarks/timed.py" \
+        --timeout "$BENCH_VALIDATION_TIMEOUT" --grace "$BENCH_TIMEOUT_GRACE" \
+        "$validation_timing" -- "${validate_argv[@]}" \
+        > "$validation_stdout" 2> "$validation_error" || true
+    fi
+    local validation_extracted="$live_raw"
+    case "$validation_kind" in
+      line_stdout|line_file)
+        touch "$validation_source"
+        validation_extracted="$validation_source"
+        ;;
+      finding_json)
+        if ! python3 "$ROOT/benchmarks/names.py" fellaga "$domain" \
+          "$validation_source" > "$live_raw" 2>> "$parse_error"; then
+          [[ "$(jq -r '.status' "$validation_timing")" != "success" ]] || \
+            validation_override="error"
+        fi
+        ;;
+      dns_event_tree)
+        if ! python3 "$ROOT/benchmarks/names.py" dns-events "$domain" \
+          "$validation_source" > "$live_raw" 2>> "$parse_error"; then
+          [[ "$(jq -r '.status' "$validation_timing")" != "success" ]] || \
+            validation_override="error"
+        fi
+        ;;
+    esac
+    touch "$validation_extracted"
+    if ! python3 "$ROOT/benchmarks/names.py" normalize "$domain" "$validation_extracted" \
       > "$live" 2>> "$parse_error"; then
       [[ "$(jq -r '.status' "$validation_timing")" != "success" ]] || \
         validation_override="error"
@@ -691,10 +949,9 @@ run_tool() {
     if [[ "$(jq -r '.status' "$tshark_timing")" == "success" ]]; then
       dns_queries="$(wc -l < "$query_frames")"
     fi
-  elif [[ "$tool" == "fellaga" ]]; then
-    local fellaga_json="$OUT/raw/$base.json"
+  elif [[ "$tool" == "$SUBJECT" && "$discovery_kind" == "finding_json" ]]; then
     dns_queries="$(
-      jq '[.resolver_metrics[]?.requests] | add // 0' "$fellaga_json" 2>/dev/null || \
+      jq '[.resolver_metrics[]?.requests] | add // 0' "$discovery_source" 2>/dev/null || \
         echo null
     )"
   fi
@@ -723,7 +980,8 @@ run_tool() {
   jq -nc \
     --arg campaign_id "$CAMPAIGN_ID" \
     --arg domain "$domain" --arg tool "$tool" \
-    --arg profile "$fellaga_profile" \
+    --arg subject "$SUBJECT" \
+    --arg profile "$subject_profile" \
     --arg benchmark_kind "$benchmark_kind" \
     --argjson repetition "$repetition" \
     --arg discovery_status "$discovery_status" \
@@ -750,7 +1008,7 @@ run_tool() {
       campaign_id: $campaign_id,
       domain: $domain,
       tool: $tool,
-      profile: (if $tool == "fellaga" then $profile else null end),
+      profile: (if $tool == $subject then $profile else null end),
       benchmark_kind: $benchmark_kind,
       repetition: $repetition,
       status: $status,
@@ -777,7 +1035,7 @@ run_tool() {
     }' >> "$result_file"
 }
 
-tools=(fellaga subfinder amass bbot puredns)
+tools=("${REQUIRED_TOOLS[@]}")
 for (( repetition = 1; repetition <= BENCH_REPETITIONS; repetition++ )); do
   for domain in "${authorized_domains[@]}"; do
     # Rotate the first tool between repetitions to reduce fixed-order bias.
@@ -790,19 +1048,20 @@ for (( repetition = 1; repetition <= BENCH_REPETITIONS; repetition++ )); do
 done
 
 if (( ${#BENCH_PROFILE_BASELINES[@]} > 0 )); then
-  baseline_results="$OUT/fellaga-profile-baselines.jsonl"
+  baseline_results="$OUT/subject-profile-baselines.jsonl"
   : > "$baseline_results"
   for profile in "${BENCH_PROFILE_BASELINES[@]}"; do
     if [[ "$profile" == "deep" ]]; then
       jq -c \
-        'select(.tool == "fellaga") | .benchmark_kind = "fellaga_profile_baseline"' \
+        --arg subject "$SUBJECT" \
+        'select(.tool == $subject) | .benchmark_kind = "subject_profile_baseline"' \
         "$OUT/summary.jsonl" >> "$baseline_results"
       continue
     fi
     for (( repetition = 1; repetition <= BENCH_REPETITIONS; repetition++ )); do
       for domain in "${authorized_domains[@]}"; do
-        run_tool "$domain" fellaga "$repetition" "$profile" \
-          "$baseline_results" fellaga_profile_baseline
+        run_tool "$domain" "$SUBJECT" "$repetition" "$profile" \
+          "$baseline_results" subject_profile_baseline
       done
     done
   done
@@ -813,7 +1072,7 @@ dns_raw="$OUT/dns-transport.raw.json"
 python3 "$ROOT/benchmarks/timed.py" \
   --timeout "$BENCH_DNS_ENGINE_TIMEOUT" --grace "$BENCH_TIMEOUT_GRACE" \
   "$dns_timing" -- \
-  fellaga resolvers benchmark --queries "$BENCH_RESOLVER_QUERIES" \
+  "$SUBJECT_BIN" resolvers benchmark --queries "$BENCH_RESOLVER_QUERIES" \
     --concurrency "$BENCH_RESOLVER_CONCURRENCY" --output "$dns_raw" \
   > "$OUT/logs/dns-transport.stdout" 2> "$OUT/logs/dns-transport.stderr" || true
 [[ -s "$dns_raw" ]] || printf '{}\n' > "$dns_raw"
@@ -824,14 +1083,14 @@ jq --arg status "$(jq -r '.status' "$dns_timing")" \
   --argjson elapsed "$(jq -r '.duration_seconds' "$dns_timing")" \
   --argjson rss "$(jq -r '.max_rss_kib' "$dns_timing")" \
   --arg campaign_id "$CAMPAIGN_ID" \
-  --arg fellaga_sha256 "$(jq -r '.provenance.executables.fellaga.sha256' "$OUT/manifest.json")" \
+  --arg subject_sha256 "$(jq -r --arg tool "$SUBJECT" '.provenance.executables[$tool].sha256' "$OUT/manifest.json")" \
   '. + {
     status: $status,
     exit_code: $exit_code,
     wall_seconds: $elapsed,
     max_rss_kib: $rss,
     campaign_id: $campaign_id,
-    fellaga_sha256: $fellaga_sha256
+    subject_sha256: $subject_sha256
   }' "$dns_raw" > "$OUT/dns-transport.json"
 
 report_args=("$OUT")

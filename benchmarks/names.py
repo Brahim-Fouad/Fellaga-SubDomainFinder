@@ -13,10 +13,29 @@ from typing import Any
 
 
 ASCII_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+MAX_OBSERVATIONAL_NAMES = 500_000
+MAX_JSON_FILE_BYTES = 64 * 1024 * 1024
 
 
 class NameError(ValueError):
     """Raised when a value is not a canonical DNS name."""
+
+
+class ObservationalLimitError(ValueError):
+    """Raised when an observational output exceeds its unique-name budget."""
+
+
+def _raise_observational_limit() -> None:
+    raise ObservationalLimitError(
+        f"observational output exceeds {MAX_OBSERVATIONAL_NAMES} unique names"
+    )
+
+
+def _merge_observational_names(target: set[str], source: set[str]) -> None:
+    unseen = source.difference(target)
+    if len(unseen) > MAX_OBSERVATIONAL_NAMES - len(target):
+        _raise_observational_limit()
+    target.update(source)
 
 
 def _ascii_name(value: str) -> str:
@@ -96,19 +115,62 @@ def normalized_lines(
     return names, rejected
 
 
+def observational_lines(
+    lines: Iterable[str], domain: str
+) -> tuple[set[str], int, int]:
+    """Normalize concrete names while excluding wildcard patterns as evidence."""
+    names: set[str] = set()
+    rejected = 0
+    excluded_wildcards = 0
+    for line in lines:
+        candidate = line.strip()
+        if not candidate:
+            continue
+        if candidate.startswith("*."):
+            try:
+                normalize_fqdn(candidate[2:], domain, allow_apex=True)
+            except NameError:
+                rejected += 1
+            else:
+                excluded_wildcards += 1
+            continue
+        try:
+            normalized = normalize_candidate(candidate, domain)
+            if normalized is not None:
+                if (
+                    normalized not in names
+                    and len(names) >= MAX_OBSERVATIONAL_NAMES
+                ):
+                    _raise_observational_limit()
+                names.add(normalized)
+        except NameError:
+            rejected += 1
+    return names, rejected, excluded_wildcards
+
+
 def read_name_file(
     path: pathlib.Path, domain: str, *, allow_apex: bool = False
 ) -> tuple[set[str], int]:
     if not path.exists():
         return set(), 0
-    return normalized_lines(
-        path.read_text(encoding="utf-8", errors="replace").splitlines(),
-        domain,
-        allow_apex=allow_apex,
-    )
+    with path.open("r", encoding="utf-8", errors="replace") as handle:
+        return normalized_lines(handle, domain, allow_apex=allow_apex)
+
+
+def read_observational_name_file(
+    path: pathlib.Path, domain: str
+) -> tuple[set[str], int, int]:
+    if not path.exists():
+        return set(), 0, 0
+    with path.open("r", encoding="utf-8", errors="replace") as handle:
+        return observational_lines(handle, domain)
 
 
 def _json_records(path: pathlib.Path) -> Iterator[Any]:
+    if path.stat().st_size > MAX_JSON_FILE_BYTES:
+        raise ValueError(
+            f"JSON event file exceeds {MAX_JSON_FILE_BYTES} bytes: {path}"
+        )
     text = path.read_text(encoding="utf-8", errors="strict")
     try:
         document = json.loads(text)
@@ -148,7 +210,7 @@ def fellaga_names(path: pathlib.Path, domain: str) -> tuple[set[str], int, int]:
     return live, historical, rejected
 
 
-def bbot_names(directory: pathlib.Path, domain: str) -> tuple[set[str], int]:
+def dns_event_names(directory: pathlib.Path, domain: str) -> tuple[set[str], int]:
     names: set[str] = set()
     rejected = 0
     for path in sorted(directory.rglob("*.json")):
@@ -169,6 +231,45 @@ def bbot_names(directory: pathlib.Path, domain: str) -> tuple[set[str], int]:
             except NameError:
                 rejected += 1
     return names, rejected
+
+
+def dns_event_observational_names(
+    directory: pathlib.Path, domain: str
+) -> tuple[set[str], int, int]:
+    names: set[str] = set()
+    rejected = 0
+    excluded_wildcards = 0
+    for path in sorted(directory.rglob("*.json")):
+        for record in _json_records(path):
+            if not isinstance(record, dict):
+                continue
+            event_type = str(record.get("type", record.get("event_type", ""))).upper()
+            value = record.get("data")
+            if event_type != "DNS_NAME":
+                continue
+            if not isinstance(value, str):
+                rejected += 1
+                continue
+            candidate = value.strip()
+            if candidate.startswith("*."):
+                try:
+                    normalize_fqdn(candidate[2:], domain, allow_apex=True)
+                except NameError:
+                    rejected += 1
+                else:
+                    excluded_wildcards += 1
+                continue
+            try:
+                normalized = normalize_candidate(candidate, domain)
+            except NameError:
+                rejected += 1
+                continue
+            if normalized is None:
+                continue
+            if normalized not in names and len(names) >= MAX_OBSERVATIONAL_NAMES:
+                _raise_observational_limit()
+            names.add(normalized)
+    return names, rejected, excluded_wildcards
 
 
 def _write_names(names: Iterable[str]) -> None:
@@ -207,14 +308,24 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     normalize_parser.add_argument("domain")
     normalize_parser.add_argument("paths", type=pathlib.Path, nargs="+")
 
+    observation_parser = subparsers.add_parser("normalize-observational")
+    observation_parser.add_argument("domain")
+    observation_parser.add_argument("paths", type=pathlib.Path, nargs="+")
+
     fellaga_parser = subparsers.add_parser("fellaga")
     fellaga_parser.add_argument("domain")
     fellaga_parser.add_argument("path", type=pathlib.Path)
     fellaga_parser.add_argument("--metadata", type=pathlib.Path)
 
-    bbot_parser = subparsers.add_parser("bbot")
-    bbot_parser.add_argument("domain")
-    bbot_parser.add_argument("directory", type=pathlib.Path)
+    event_parser = subparsers.add_parser("dns-events")
+    event_parser.add_argument("domain")
+    event_parser.add_argument("directory", type=pathlib.Path)
+
+    event_observation_parser = subparsers.add_parser(
+        "dns-events-observational"
+    )
+    event_observation_parser.add_argument("domain")
+    event_observation_parser.add_argument("directory", type=pathlib.Path)
     return parser.parse_args(argv)
 
 
@@ -234,6 +345,27 @@ def main(argv: list[str] | None = None) -> int:
             print(f"rejected {rejected} malformed or out-of-scope name(s)", file=sys.stderr)
             return 3
         return 0
+    if args.action == "normalize-observational":
+        names: set[str] = set()
+        rejected = 0
+        excluded_wildcards = 0
+        for path in args.paths:
+            try:
+                normalized, path_rejected, path_wildcards = (
+                    read_observational_name_file(path, args.domain)
+                )
+                _merge_observational_names(names, normalized)
+            except ObservationalLimitError as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return 4
+            rejected += path_rejected
+            excluded_wildcards += path_wildcards
+        _write_names(names)
+        if excluded_wildcards:
+            print(f"excluded_wildcards={excluded_wildcards}", file=sys.stderr)
+        if rejected:
+            print(f"excluded_invalid_or_out_of_scope={rejected}", file=sys.stderr)
+        return 0
     if args.action == "fellaga":
         names, historical, rejected = fellaga_names(args.path, args.domain)
         _write_names(names)
@@ -249,12 +381,26 @@ def main(argv: list[str] | None = None) -> int:
             print(f"rejected {rejected} malformed or out-of-scope name(s)", file=sys.stderr)
             return 3
         return 0
-    if args.action == "bbot":
-        names, rejected = bbot_names(args.directory, args.domain)
+    if args.action == "dns-events":
+        names, rejected = dns_event_names(args.directory, args.domain)
         _write_names(names)
         if rejected:
             print(f"rejected {rejected} malformed or out-of-scope name(s)", file=sys.stderr)
             return 3
+        return 0
+    if args.action == "dns-events-observational":
+        try:
+            names, rejected, excluded_wildcards = dns_event_observational_names(
+                args.directory, args.domain
+            )
+        except ObservationalLimitError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 4
+        _write_names(names)
+        if excluded_wildcards:
+            print(f"excluded_wildcards={excluded_wildcards}", file=sys.stderr)
+        if rejected:
+            print(f"excluded_invalid_or_out_of_scope={rejected}", file=sys.stderr)
         return 0
     raise AssertionError("unreachable action")
 

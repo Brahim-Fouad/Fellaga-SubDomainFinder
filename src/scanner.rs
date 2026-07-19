@@ -17,9 +17,12 @@ use crate::model::{
     StopReason, WebObservation, WildcardVerdict,
 };
 use crate::passive::{
-    ApiKeyStore, PassivePageSink, current_commoncrawl_endpoint,
-    fetch_detailed_bounded_with_sink as fetch_passive_bounded, sanitize_external_error,
-    seed_commoncrawl_endpoint, source_metadata, source_policy,
+    ApiKeyStore, PassiveFetchResult, PassivePageSink, PassivePaginationContext,
+    PassivePaginationFinishSink, PassivePaginationPageSink, current_commoncrawl_endpoint,
+    fetch_detailed_bounded_with_pagination as fetch_passive_paginated,
+    fetch_detailed_bounded_with_sink as fetch_passive_bounded, numeric_pagination_contracts,
+    sanitize_external_error, seed_commoncrawl_endpoint, source_metadata, source_policy,
+    with_external_target_guard,
 };
 use crate::pipeline::DiscoveryPipeline;
 use crate::tls::discover as discover_tls_certificates;
@@ -28,18 +31,17 @@ use crate::util::{
     normalize_observed_name, now_epoch,
 };
 use crate::web_discovery::discover_web_bounded;
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use futures_util::{FutureExt, StreamExt, stream, stream::FuturesUnordered};
 use hickory_net::proto::rr::RecordType;
 use serde_json::json;
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::future::Future;
-use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     mpsc,
 };
 use std::time::{Duration, Instant};
@@ -48,6 +50,65 @@ const DNSSEC_WILDCARD_SUSPECT_CAP: usize = 4;
 const DNSSEC_WILDCARD_SUSPECT_BUDGET: Duration = Duration::from_secs(8);
 const METADATA_PHASE_BUDGET_CAP: Duration = Duration::from_secs(30);
 const METADATA_DNS_CONCURRENCY: usize = 4;
+const ENRICHMENT_VALIDATION_BATCH_SIZE: usize = 4_000;
+const PASSIVE_REFRESH_LEASE_GRACE: Duration = Duration::from_secs(60);
+static PASSIVE_REFRESH_LEASE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+struct PassiveRefreshLeaseGuard {
+    database: Database,
+    root_domain: String,
+    source: String,
+    owner: String,
+    ttl: Duration,
+}
+
+impl PassiveRefreshLeaseGuard {
+    fn try_acquire(
+        database: Database,
+        root_domain: &str,
+        source: &str,
+        ttl: Duration,
+    ) -> Result<Option<Self>> {
+        let sequence = PASSIVE_REFRESH_LEASE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let owner = domain_hash(&format!(
+            "passive-refresh-lease-v1:{}:{}:{sequence}:{root_domain}:{source}",
+            std::process::id(),
+            now_epoch()
+        ));
+        if !database.try_acquire_passive_refresh_lease(root_domain, source, &owner, ttl)? {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            database,
+            root_domain: root_domain.to_owned(),
+            source: source.to_owned(),
+            owner,
+            ttl,
+        }))
+    }
+
+    fn ensure_owned(&self) -> Result<()> {
+        if !self.database.renew_passive_refresh_lease(
+            &self.root_domain,
+            &self.source,
+            &self.owner,
+            self.ttl,
+        )? {
+            bail!("lease de rafraîchissement passif perdu");
+        }
+        Ok(())
+    }
+}
+
+impl Drop for PassiveRefreshLeaseGuard {
+    fn drop(&mut self) {
+        let _ = self.database.release_passive_refresh_lease(
+            &self.root_domain,
+            &self.source,
+            &self.owner,
+        );
+    }
+}
 
 fn metadata_phase_budget(web_budget_remaining: Option<Duration>) -> Duration {
     web_budget_remaining
@@ -178,6 +239,7 @@ pub struct ScanOptions {
     pub passive_concurrency: usize,
     pub max_passive: usize,
     pub passive_only: bool,
+    pub no_target_contact: bool,
     pub axfr: bool,
     pub axfr_timeout: Duration,
     pub refresh_cache: bool,
@@ -358,6 +420,13 @@ struct WildcardProfileObservation {
     current_probe_reliable: bool,
 }
 
+#[derive(Debug, Default)]
+struct WildcardProfilesBatch {
+    signatures: BTreeMap<String, BTreeSet<String>>,
+    reliable_zones: BTreeSet<String>,
+    deadline_exhausted: bool,
+}
+
 fn wildcard_profile_after_probe(
     cached_signature: Option<BTreeSet<String>>,
     probe: WildcardProbeOutcome,
@@ -447,29 +516,48 @@ fn wildcard_cache_algorithm_is_current(cached_version: i64, required_version: i6
 }
 
 fn unprofiled_deepest_parents(
-    parent_by_host: &HashMap<String, String>,
+    parents: impl IntoIterator<Item = String>,
     wildcard_by_parent: &BTreeMap<String, BTreeSet<String>>,
     selected: &BTreeSet<String>,
 ) -> BTreeSet<String> {
-    parent_by_host
-        .values()
-        .filter(|parent| !wildcard_by_parent.contains_key(*parent) && !selected.contains(*parent))
-        .cloned()
+    parents
+        .into_iter()
+        .filter(|parent| {
+            wildcard_by_parent
+                .get(parent)
+                .is_none_or(wildcard_signature_is_deferred)
+                && !selected.contains(parent)
+        })
         .collect()
 }
 
 const WILDCARD_INDETERMINATE: &str = "FELLAGA:WILDCARD_INDETERMINATE";
+const WILDCARD_DEFERRED: &str = "FELLAGA:WILDCARD_DEFERRED";
 
 fn indeterminate_wildcard_signature() -> BTreeSet<String> {
     BTreeSet::from([WILDCARD_INDETERMINATE.to_owned()])
 }
 
+fn deferred_wildcard_signature() -> BTreeSet<String> {
+    BTreeSet::from([WILDCARD_DEFERRED.to_owned()])
+}
+
 fn wildcard_signature_is_indeterminate(signature: &BTreeSet<String>) -> bool {
-    signature.contains(WILDCARD_INDETERMINATE)
+    signature.contains(WILDCARD_INDETERMINATE) || wildcard_signature_is_deferred(signature)
+}
+
+fn wildcard_signature_is_deferred(signature: &BTreeSet<String>) -> bool {
+    signature.contains(WILDCARD_DEFERRED)
 }
 
 fn wildcard_signature_is_confirmed(signature: &BTreeSet<String>) -> bool {
     !signature.is_empty() && !wildcard_signature_is_indeterminate(signature)
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct WildcardParentRegistration {
+    deadline_exhausted: bool,
+    deferred_parents: usize,
 }
 
 fn wilson_upper_bound(successes: usize, trials: usize) -> f64 {
@@ -1009,26 +1097,6 @@ fn refill_passive_union_from_cache(
         merge_passive_source_names_bounded(sources, entry.names, source, Some("cache"), limit);
     }
     Ok(sources.len().saturating_sub(before))
-}
-
-fn passive_name_fingerprints(names: &[String]) -> Vec<u64> {
-    let mut fingerprints = names
-        .iter()
-        .map(|name| {
-            let mut hasher = DefaultHasher::new();
-            name.hash(&mut hasher);
-            hasher.finish()
-        })
-        .collect::<Vec<_>>();
-    fingerprints.sort_unstable();
-    fingerprints.dedup();
-    fingerprints
-}
-
-fn passive_name_was_known(fingerprints: &[u64], name: &str) -> bool {
-    let mut hasher = DefaultHasher::new();
-    name.hash(&mut hasher);
-    fingerprints.binary_search(&hasher.finish()).is_ok()
 }
 
 fn automatic_bulk_source_limit(max_passive: usize) -> usize {
@@ -1627,6 +1695,46 @@ impl Scanner {
         root_wildcard
     }
 
+    fn applicable_wildcard_zone<'a>(
+        host: &str,
+        wildcard_by_parent: &'a BTreeMap<String, BTreeSet<String>>,
+    ) -> Option<&'a str> {
+        let mut current = host;
+        while let Some((_, parent)) = current.split_once('.') {
+            if let Some((zone, _)) = wildcard_by_parent.get_key_value(parent) {
+                return Some(zone.as_str());
+            }
+            current = parent;
+        }
+        None
+    }
+
+    fn has_reliable_wildcard_profile(
+        host: &str,
+        wildcard_by_parent: &BTreeMap<String, BTreeSet<String>>,
+        reliable_wildcard_zones: &BTreeSet<String>,
+    ) -> bool {
+        Self::applicable_wildcard_zone(host, wildcard_by_parent)
+            .is_some_and(|zone| reliable_wildcard_zones.contains(zone))
+    }
+
+    fn deferred_wildcard_hosts(
+        hosts: impl IntoIterator<Item = String>,
+        root_wildcard: &BTreeSet<String>,
+        wildcard_by_parent: &BTreeMap<String, BTreeSet<String>>,
+    ) -> BTreeSet<String> {
+        hosts
+            .into_iter()
+            .filter(|host| {
+                wildcard_signature_is_deferred(Self::applicable_wildcard_signature(
+                    host,
+                    root_wildcard,
+                    wildcard_by_parent,
+                ))
+            })
+            .collect()
+    }
+
     fn is_strict_enrichment_seed(
         answer: &ResolvedHost,
         root_wildcard: &BTreeSet<String>,
@@ -1742,7 +1850,7 @@ impl Scanner {
         Ok(nonexistent)
     }
 
-    async fn wildcard_signature_cached(&self, zone: &str) -> Option<BTreeSet<String>> {
+    async fn wildcard_profile_cached(&self, zone: &str) -> WildcardProfileObservation {
         let (dns, require_positive_consensus) = self
             .trusted_dns
             .as_ref()
@@ -1757,105 +1865,121 @@ impl Scanner {
             require_positive_consensus,
         )
         .await
-        .signature
     }
 
-    async fn wildcard_signatures_cached(
+    async fn wildcard_profiles_cached(
         &self,
         zones: Vec<String>,
-    ) -> BTreeMap<String, BTreeSet<String>> {
+    ) -> BTreeMap<String, WildcardProfileObservation> {
         let scanner = self;
         stream::iter(zones)
             .map(|zone| async move {
-                let signature = scanner
-                    .wildcard_signature_cached(&zone)
-                    .await
-                    .unwrap_or_else(indeterminate_wildcard_signature);
-                (zone, signature)
+                let observation = scanner.wildcard_profile_cached(&zone).await;
+                (zone, observation)
             })
             .buffer_unordered(16)
             .collect()
             .await
     }
 
-    async fn wildcard_signature_cached_bounded(
+    async fn wildcard_profile_cached_bounded(
         &self,
         zone: &str,
         deadline: Option<tokio::time::Instant>,
-    ) -> (BTreeSet<String>, bool) {
+    ) -> (WildcardProfileObservation, bool) {
         match deadline {
-            Some(deadline) if deadline <= tokio::time::Instant::now() => {
-                (indeterminate_wildcard_signature(), true)
-            }
+            Some(deadline) if deadline <= tokio::time::Instant::now() => (
+                WildcardProfileObservation {
+                    signature: Some(indeterminate_wildcard_signature()),
+                    current_probe_reliable: false,
+                },
+                true,
+            ),
             Some(deadline) => {
-                match tokio::time::timeout_at(deadline, self.wildcard_signature_cached(zone)).await
-                {
-                    Ok(signature) => (
-                        signature.unwrap_or_else(indeterminate_wildcard_signature),
-                        false,
+                match tokio::time::timeout_at(deadline, self.wildcard_profile_cached(zone)).await {
+                    Ok(observation) => (observation, false),
+                    Err(_) => (
+                        WildcardProfileObservation {
+                            signature: Some(indeterminate_wildcard_signature()),
+                            current_probe_reliable: false,
+                        },
+                        true,
                     ),
-                    Err(_) => (indeterminate_wildcard_signature(), true),
                 }
             }
-            None => (
-                self.wildcard_signature_cached(zone)
-                    .await
-                    .unwrap_or_else(indeterminate_wildcard_signature),
-                false,
-            ),
+            None => (self.wildcard_profile_cached(zone).await, false),
         }
     }
 
-    async fn wildcard_signatures_cached_bounded(
+    async fn wildcard_profiles_cached_bounded(
         &self,
         zones: Vec<String>,
         deadline: Option<tokio::time::Instant>,
-    ) -> (BTreeMap<String, BTreeSet<String>>, bool) {
+    ) -> WildcardProfilesBatch {
         if zones.is_empty() {
-            return (BTreeMap::new(), false);
+            return WildcardProfilesBatch::default();
         }
         if deadline.is_some_and(|deadline| deadline <= tokio::time::Instant::now()) {
-            return (
-                zones
+            return WildcardProfilesBatch {
+                signatures: zones
                     .into_iter()
                     .map(|zone| (zone, indeterminate_wildcard_signature()))
                     .collect(),
-                true,
-            );
+                reliable_zones: BTreeSet::new(),
+                deadline_exhausted: true,
+            };
         }
         let result = match deadline {
             Some(deadline) => {
-                tokio::time::timeout_at(deadline, self.wildcard_signatures_cached(zones.clone()))
+                tokio::time::timeout_at(deadline, self.wildcard_profiles_cached(zones.clone()))
                     .await
                     .ok()
             }
-            None => Some(self.wildcard_signatures_cached(zones.clone()).await),
+            None => Some(self.wildcard_profiles_cached(zones.clone()).await),
         };
         match result {
-            Some(signatures) => (signatures, false),
-            None => (
-                zones
+            Some(observations) => {
+                let mut batch = WildcardProfilesBatch::default();
+                for (zone, observation) in observations {
+                    if observation.current_probe_reliable {
+                        batch.reliable_zones.insert(zone.clone());
+                    }
+                    batch.signatures.insert(
+                        zone,
+                        observation
+                            .signature
+                            .unwrap_or_else(indeterminate_wildcard_signature),
+                    );
+                }
+                batch
+            }
+            None => WildcardProfilesBatch {
+                signatures: zones
                     .into_iter()
                     .map(|zone| (zone, indeterminate_wildcard_signature()))
                     .collect(),
-                true,
-            ),
+                reliable_zones: BTreeSet::new(),
+                deadline_exhausted: true,
+            },
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn register_wildcard_parents_bounded(
         &self,
         hosts: &[String],
         domain: &str,
-        parent_by_host: &mut HashMap<String, String>,
+        _parent_by_host: &mut HashMap<String, String>,
         wildcard_by_parent: &mut BTreeMap<String, BTreeSet<String>>,
+        reliable_wildcard_zones: &mut BTreeSet<String>,
         limit: usize,
         deadline: Option<tokio::time::Instant>,
-    ) -> bool {
+    ) -> WildcardParentRegistration {
         let mut counts = HashMap::<String, usize>::new();
+        let mut deepest_parents = BTreeSet::new();
         for host in hosts {
             if let Some(parent) = Self::parent_zone(host, domain) {
-                parent_by_host.insert(host.clone(), parent.clone());
+                deepest_parents.insert(parent);
             }
             for ancestor in Self::ancestor_zones(host, domain) {
                 let count = counts.entry(ancestor).or_default();
@@ -1869,49 +1993,64 @@ impl Scanner {
         let parents = parents
             .into_iter()
             .map(|(parent, _)| parent)
-            .filter(|parent| !wildcard_by_parent.contains_key(parent))
-            .take(limit)
+            .filter(|parent| {
+                wildcard_by_parent
+                    .get(parent)
+                    .is_none_or(wildcard_signature_is_deferred)
+            })
+            .take(limit.max(1))
             .collect::<Vec<_>>();
         let selected = parents.iter().cloned().collect::<BTreeSet<_>>();
         let omitted_deepest =
-            unprofiled_deepest_parents(parent_by_host, wildcard_by_parent, &selected);
-        let (signatures, timed_out) = self
-            .wildcard_signatures_cached_bounded(parents, deadline)
+            unprofiled_deepest_parents(deepest_parents, wildcard_by_parent, &selected);
+        let profiles = self
+            .wildcard_profiles_cached_bounded(parents, deadline)
             .await;
-        wildcard_by_parent.extend(signatures);
+        wildcard_by_parent.extend(profiles.signatures);
+        reliable_wildcard_zones.extend(profiles.reliable_zones);
         for parent in &omitted_deepest {
             wildcard_by_parent
                 .entry(parent.clone())
-                .or_insert_with(indeterminate_wildcard_signature);
+                .or_insert_with(deferred_wildcard_signature);
         }
-        timed_out || !omitted_deepest.is_empty()
+        WildcardParentRegistration {
+            deadline_exhausted: profiles.deadline_exhausted,
+            deferred_parents: omitted_deepest.len(),
+        }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn register_wildcard_parents_with_budget(
         &self,
         hosts: &[String],
         domain: &str,
         parent_by_host: &mut HashMap<String, String>,
         wildcard_by_parent: &mut BTreeMap<String, BTreeSet<String>>,
+        reliable_wildcard_zones: &mut BTreeSet<String>,
         limit: usize,
         remaining: &mut Option<Duration>,
-    ) -> bool {
+    ) -> WildcardParentRegistration {
         let started = Instant::now();
-        let timed_out = self
+        let deadline = phase_deadline(*remaining);
+        // Profile one bounded parent page per enrichment wave. Any omitted
+        // deepest parent is marked deferred and its hosts stay in SQLite for
+        // a later resume instead of extending this phase indefinitely.
+        let registration = self
             .register_wildcard_parents_bounded(
                 hosts,
                 domain,
                 parent_by_host,
                 wildcard_by_parent,
+                reliable_wildcard_zones,
                 limit,
-                phase_deadline(*remaining),
+                deadline,
             )
             .await;
         consume_phase_budget(remaining, started.elapsed());
-        if timed_out && remaining.is_some() {
+        if registration.deadline_exhausted && remaining.is_some() {
             *remaining = Some(Duration::ZERO);
         }
-        timed_out
+        registration
     }
 
     fn tls_endpoints(
@@ -2228,6 +2367,7 @@ impl Scanner {
     async fn collect_passive(
         &self,
         domain: &str,
+        contact_root_domain: &str,
         passive_deadline: Option<tokio::time::Instant>,
         sources: &mut BTreeMap<String, BTreeSet<String>>,
         warnings: &mut Vec<String>,
@@ -2285,11 +2425,33 @@ impl Scanner {
             }
         }
         let mut refresh = Vec::new();
-        let mut prior_passive_fingerprints = BTreeMap::<String, Vec<u64>>::new();
         for source in &self.options.passive_sources {
             let cached =
                 self.database
                     .passive_cache_bounded(domain, source, connector_working_set_limit)?;
+            let metadata = source_metadata(source);
+            if !metadata.available {
+                let names = cached.map(|entry| entry.names).unwrap_or_default();
+                self.emit(ProgressEvent::PassiveSource {
+                    source: source.clone(),
+                    status: format!(
+                        "source indisponible, aucune requête: {}",
+                        metadata
+                            .unavailable_reason
+                            .unwrap_or("source non enregistrée")
+                    ),
+                    names: names.len(),
+                });
+                passive_union_omitted =
+                    passive_union_omitted.saturating_add(merge_passive_source_names_bounded(
+                        sources,
+                        names,
+                        source,
+                        Some("unavailable"),
+                        self.options.max_passive,
+                    ));
+                continue;
+            }
             if source_requires_api_key(source) && !self.options.api_keys.has(source) {
                 let names = cached.map(|entry| entry.names).unwrap_or_default();
                 self.emit(ProgressEvent::PassiveSource {
@@ -2344,10 +2506,6 @@ impl Scanner {
                         self.options.max_passive,
                     ));
             } else {
-                if let Some(entry) = &cached {
-                    prior_passive_fingerprints
-                        .insert(source.clone(), passive_name_fingerprints(&entry.names));
-                }
                 refresh.push(source.clone());
             }
         }
@@ -2375,6 +2533,10 @@ impl Scanner {
         });
         let mut unfinished_sources = refresh.iter().cloned().collect::<BTreeSet<_>>();
         let active_sources = Arc::new(Mutex::new(BTreeMap::<String, Instant>::new()));
+        let external_target_guard = self
+            .options
+            .no_target_contact
+            .then(|| contact_root_domain.to_owned());
         let refresh_total = refresh.len();
         let mut refresh_finished = 0_usize;
         let mut phase_timed_out = false;
@@ -2385,6 +2547,7 @@ impl Scanner {
                 let passive_request_slots = self.passive_request_slots.clone();
                 let database = self.database.clone();
                 let root_domain = domain.to_owned();
+                let external_target_guard = external_target_guard.clone();
                 async move {
                     let _permit = passive_request_slots
                         .acquire_owned()
@@ -2400,29 +2563,228 @@ impl Scanner {
                         .unwrap_or(policy.total_timeout)
                         .min(policy.total_timeout);
                     if remaining.is_zero() {
-                        return (source, 0, None);
+                        return (source, 0, None, 0);
                     }
+                    let started = Instant::now();
+                    let lease_ttl = remaining.saturating_add(PASSIVE_REFRESH_LEASE_GRACE);
+                    let lease = match PassiveRefreshLeaseGuard::try_acquire(
+                        database.clone(),
+                        domain,
+                        &source,
+                        lease_ttl,
+                    ) {
+                        Ok(Some(lease)) => Arc::new(lease),
+                        Ok(None) => {
+                            return (
+                                source,
+                                started.elapsed().as_millis(),
+                                Some(Ok(PassiveFetchResult {
+                                    names: BTreeSet::new(),
+                                    partial_warning: Some(
+                                        "rafraîchissement déjà actif dans un autre processus; cache conservé"
+                                            .to_owned(),
+                                    ),
+                                    decoded_names: 0,
+                                    working_set_truncated: false,
+                                })),
+                                0,
+                            );
+                        }
+                        Err(error) => {
+                            return (
+                                source,
+                                started.elapsed().as_millis(),
+                                Some(Err(error.context(
+                                    "acquisition du lease de rafraîchissement passif",
+                                ))),
+                                0,
+                            );
+                        }
+                    };
                     if let Ok(mut active_sources) = active_sources.lock() {
                         active_sources.insert(source.clone(), Instant::now());
                     }
-                    let started = Instant::now();
+                    let durable_novel_names = Arc::new(AtomicUsize::new(0));
                     let sink_source = source.clone();
+                    let observation_database = database.clone();
+                    let observation_lease = Arc::clone(&lease);
+                    let page_novel_names = Arc::clone(&durable_novel_names);
                     let page_sink: PassivePageSink = Arc::new(move |names| {
-                        database
-                            .store_passive_observation_page(&root_domain, &sink_source, names)
-                            .map(|_| ())
+                        observation_lease.ensure_owned()?;
+                        let novel = observation_database.store_passive_observation_page(
+                            &root_domain,
+                            &sink_source,
+                            names,
+                        )?;
+                        page_novel_names.fetch_add(novel, Ordering::Relaxed);
+                        Ok(())
                     });
-                    let result = fetch_passive_bounded(
-                        &source,
-                        domain,
-                        policy.timeout,
-                        &keys,
-                        remaining,
-                        connector_working_set_limit,
-                        page_sink,
+                    let pagination_contracts = numeric_pagination_contracts(&source, domain);
+                    let pagination_context = if pagination_contracts.is_empty() {
+                        None
+                    } else {
+                        let expected = pagination_contracts
+                            .iter()
+                            .map(|contract| {
+                                (
+                                    contract.lane,
+                                    contract.contract_version,
+                                    contract.query_hash.as_str(),
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                        if let Err(error) =
+                            database.prepare_passive_pagination_source(domain, &source, &expected)
+                        {
+                            return (
+                                source,
+                                started.elapsed().as_millis(),
+                                Some(Err(error
+                                    .context("préparation de la reprise de pagination passive"))),
+                                0,
+                            );
+                        }
+                        let mut context = PassivePaginationContext::empty();
+                        for contract in pagination_contracts.iter().cloned() {
+                            let resume = match database.passive_pagination_resume(
+                                domain,
+                                &source,
+                                contract.lane,
+                                contract.contract_version,
+                                &contract.query_hash,
+                            ) {
+                                Ok(resume) => resume,
+                                Err(error) => {
+                                    return (
+                                        source,
+                                        started.elapsed().as_millis(),
+                                        Some(Err(error.context(
+                                            "chargement de la reprise de pagination passive",
+                                        ))),
+                                        0,
+                                    );
+                                }
+                            };
+                            let page_database = database.clone();
+                            let page_domain = domain.to_owned();
+                            let page_source = source.clone();
+                            let page_lane = contract.lane;
+                            let page_contract_version = contract.contract_version;
+                            let page_query_hash = contract.query_hash.clone();
+                            let page_lease = Arc::clone(&lease);
+                            let pagination_novel_names = Arc::clone(&durable_novel_names);
+                            let numeric_page_sink: PassivePaginationPageSink =
+                                Arc::new(move |page, names| {
+                                    page_lease.ensure_owned()?;
+                                    let novel = page_database.commit_passive_pagination_page(
+                                        &page_domain,
+                                        &page_source,
+                                        page_lane,
+                                        page_contract_version,
+                                        &page_query_hash,
+                                        page,
+                                        names,
+                                    )?;
+                                    pagination_novel_names.fetch_add(novel, Ordering::Relaxed);
+                                    Ok(())
+                                });
+                            let finish_database = database.clone();
+                            let finish_domain = domain.to_owned();
+                            let finish_source = source.clone();
+                            let finish_lane = contract.lane;
+                            let finish_contract_version = contract.contract_version;
+                            let finish_query_hash = contract.query_hash.clone();
+                            let finish_lease = Arc::clone(&lease);
+                            let finish_sink: PassivePaginationFinishSink = Arc::new(move || {
+                                finish_lease.ensure_owned()?;
+                                finish_database.finish_passive_pagination(
+                                    &finish_domain,
+                                    &finish_source,
+                                    finish_lane,
+                                    finish_contract_version,
+                                    &finish_query_hash,
+                                )
+                            });
+                            if let Err(error) =
+                                context.insert(contract, resume, numeric_page_sink, finish_sink)
+                            {
+                                return (
+                                    source,
+                                    started.elapsed().as_millis(),
+                                    Some(Err(error.context(
+                                        "construction du contexte de pagination passive",
+                                    ))),
+                                    0,
+                                );
+                            }
+                        }
+                        debug_assert!(!context.is_empty());
+                        Some(context)
+                    };
+                    let fetch = async {
+                        if let Some(pagination_context) = pagination_context {
+                            fetch_passive_paginated(
+                                &source,
+                                domain,
+                                policy.timeout,
+                                &keys,
+                                remaining,
+                                connector_working_set_limit,
+                                page_sink,
+                                pagination_context,
+                            )
+                            .await
+                        } else {
+                            fetch_passive_bounded(
+                                &source,
+                                domain,
+                                policy.timeout,
+                                &keys,
+                                remaining,
+                                connector_working_set_limit,
+                                page_sink,
+                            )
+                            .await
+                        }
+                    };
+                    let result = with_external_target_guard(external_target_guard, fetch).await;
+                    let result = match result {
+                        Ok(fetch) if fetch.partial_warning.is_none() => {
+                            let completion = lease.ensure_owned().and_then(|()| {
+                                if pagination_contracts.is_empty() {
+                                    database.mark_passive_cache_refresh(domain, &source, true)
+                                } else {
+                                    let expected = pagination_contracts
+                                        .iter()
+                                        .map(|contract| {
+                                            (
+                                                contract.lane,
+                                                contract.contract_version,
+                                                contract.query_hash.as_str(),
+                                            )
+                                        })
+                                        .collect::<Vec<_>>();
+                                    database.complete_passive_pagination_source(
+                                        domain, &source, &expected,
+                                    )
+                                }
+                            });
+                            completion
+                                .context("finalisation atomique de la source passive")
+                                .map(|()| fetch)
+                        }
+                        Ok(fetch) => database
+                            .mark_passive_cache_refresh(domain, &source, false)
+                            .context("conservation du rafraîchissement passif partiel")
+                            .map(|()| fetch),
+                        Err(error) => Err(error),
+                    };
+                    (
+                        source,
+                        started.elapsed().as_millis(),
+                        Some(result),
+                        durable_novel_names.load(Ordering::Relaxed),
                     )
-                    .await;
-                    (source, started.elapsed().as_millis(), Some(result))
                 }
             })
             // Providers use independent host-specific throttles; a slightly
@@ -2475,7 +2837,7 @@ impl Scanner {
                 phase_timed_out = true;
                 break;
             };
-            let Some((source, duration_ms, result)) = next else {
+            let Some((source, duration_ms, result, durable_novel_names)) = next else {
                 break;
             };
             refresh_finished = refresh_finished.saturating_add(1);
@@ -2483,9 +2845,6 @@ impl Scanner {
             if let Ok(mut active_sources) = active_sources.lock() {
                 active_sources.remove(&source);
             }
-            let previously_known = prior_passive_fingerprints
-                .remove(&source)
-                .unwrap_or_default();
             let stale = self.database.passive_cache_bounded(
                 domain,
                 &source,
@@ -2514,13 +2873,7 @@ impl Scanner {
                     let working_set_truncated = fetch.working_set_truncated;
                     let network_names = fetch.decoded_names;
                     let names = fetch.names;
-                    let novel_names = names
-                        .iter()
-                        .filter(|name| {
-                            !sources.contains_key(*name)
-                                && !passive_name_was_known(&previously_known, name)
-                        })
-                        .count();
+                    let mut novel_names = durable_novel_names;
                     if partial_warning
                         .as_deref()
                         .is_some_and(|warning| warning.contains("persistance SQLite"))
@@ -2528,14 +2881,11 @@ impl Scanner {
                         // Retry the bounded working set once when the page sink
                         // itself failed. Successful sinks must not increment
                         // observation counters a second time.
-                        self.database
-                            .store_passive_observation_page(domain, &source, &names)?;
+                        novel_names = novel_names.saturating_add(
+                            self.database
+                                .store_passive_observation_page(domain, &source, &names)?,
+                        );
                     }
-                    self.database.mark_passive_cache_refresh(
-                        domain,
-                        &source,
-                        partial_warning.is_none(),
-                    )?;
                     let stale_names = stale.map(|entry| entry.names).unwrap_or_default();
                     let retained_names = names
                         .len()
@@ -2686,7 +3036,6 @@ impl Scanner {
             for source in unfinished_sources {
                 let started_at = active_sources.get(&source).copied();
                 let started = started_at.is_some();
-                prior_passive_fingerprints.remove(&source);
                 let names = self
                     .database
                     .passive_cache_bounded(domain, &source, connector_working_set_limit)?
@@ -2905,12 +3254,13 @@ impl Scanner {
         };
         let before = sources.keys().cloned().collect::<BTreeSet<_>>();
         let mut tasks = Vec::new();
-        for zone in zones
-            .into_iter()
-            .filter(|zone| zone != root_domain)
-            .filter(|zone| queried_zones.insert(zone.clone()))
-            .take(zone_limit)
-        {
+        for zone in zones.into_iter().filter(|zone| zone != root_domain) {
+            if tasks.len() >= zone_limit {
+                break;
+            }
+            if queried_zones.contains(&zone) {
+                continue;
+            }
             let child_query = zone.ends_with(&format!(".{root_domain}"));
             let parent_query = root_domain.ends_with(&format!(".{zone}"));
             if !child_query && !parent_query {
@@ -2930,6 +3280,10 @@ impl Scanner {
             if compatible_sources.is_empty() {
                 continue;
             }
+            // A zone becomes "queried" only when a network task is actually
+            // scheduled. Zones beyond the batch cap or without a compatible
+            // connector must remain eligible for a later recursive pass.
+            queried_zones.insert(zone.clone());
             let mut options = self.options.clone();
             options.passive_sources = compatible_sources;
             let recursive_scanner = Scanner {
@@ -2946,26 +3300,31 @@ impl Scanner {
         let zone_total = tasks.len();
         let mut zone_completed = 0_usize;
         let recursive_deadline = passive_deadline;
+        let contact_root_domain = root_domain.to_owned();
         let mut pending = stream::iter(tasks)
-            .map(|(zone, child_query, recursive_scanner)| async move {
-                recursive_scanner.emit(ProgressEvent::Phase {
-                    name: "passif récursif".to_owned(),
-                    detail: format!(
-                        "zone {zone} ({})",
-                        if child_query { "fille" } else { "parente" }
-                    ),
-                });
-                let mut zone_sources = BTreeMap::new();
-                let mut zone_warnings = Vec::new();
-                let result = recursive_scanner
-                    .collect_passive(
-                        &zone,
-                        passive_deadline,
-                        &mut zone_sources,
-                        &mut zone_warnings,
-                    )
-                    .await;
-                (zone, zone_sources, zone_warnings, result)
+            .map(|(zone, child_query, recursive_scanner)| {
+                let contact_root_domain = contact_root_domain.clone();
+                async move {
+                    recursive_scanner.emit(ProgressEvent::Phase {
+                        name: "passif récursif".to_owned(),
+                        detail: format!(
+                            "zone {zone} ({})",
+                            if child_query { "fille" } else { "parente" }
+                        ),
+                    });
+                    let mut zone_sources = BTreeMap::new();
+                    let mut zone_warnings = Vec::new();
+                    let result = recursive_scanner
+                        .collect_passive(
+                            &zone,
+                            &contact_root_domain,
+                            passive_deadline,
+                            &mut zone_sources,
+                            &mut zone_warnings,
+                        )
+                        .await;
+                    (zone, zone_sources, zone_warnings, result)
+                }
             })
             .buffer_unordered(self.options.passive_zone_concurrency.clamp(1, 32));
         loop {
@@ -3270,6 +3629,129 @@ impl Scanner {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn finalize_no_target_contact_scan(
+        &self,
+        scan_id: i64,
+        domain: &str,
+        started: Instant,
+        sources: BTreeMap<String, BTreeSet<String>>,
+        ct_monitor: CtMonitorResult,
+        pipeline_metrics: PipelineMetrics,
+        mut phase_timings: Vec<PhaseTiming>,
+        mut warnings: Vec<String>,
+    ) -> Result<ScanResult> {
+        let resolver_metrics = merge_resolver_metrics(
+            self.dns.take_metrics(),
+            self.trusted_dns
+                .as_ref()
+                .map(DnsEngine::take_metrics)
+                .unwrap_or_default(),
+        );
+        let dns_queries = resolver_metrics
+            .iter()
+            .map(|metric| metric.requests)
+            .sum::<u64>();
+        if dns_queries != 0 {
+            bail!(
+                "no-target-contact invariant violated: {dns_queries} DNS request(s) were emitted"
+            );
+        }
+
+        let finalization_started = Instant::now();
+        let candidate_count = sources.len();
+        let mut findings = sources
+            .iter()
+            .map(|(fqdn, origins)| {
+                let evidence_families = evidence_families(origins);
+                let state = crate::model::ObservationState::Unverified;
+                let confidence = assess_confidence(origins, false, state, false);
+                Finding {
+                    fqdn: fqdn.clone(),
+                    records: Vec::new(),
+                    sources: origins.clone(),
+                    wildcard: false,
+                    from_cache: origins
+                        .iter()
+                        .all(|source| source.contains(":cache") || source.contains(":stale")),
+                    discovery_score: Some(f64::from(confidence.score) / 100.0),
+                    confidence,
+                    state,
+                    last_verified_at: None,
+                    evidence_families,
+                    authoritative_validation: false,
+                    wildcard_verdict: WildcardVerdict::NotProfiled,
+                    owner_proofs: BTreeSet::new(),
+                    generation_path: vec!["passive_provider_only".to_owned()],
+                }
+            })
+            .collect::<Vec<_>>();
+        findings.sort_by(|left, right| left.fqdn.cmp(&right.fqdn));
+
+        let warning =
+            "no-target-contact: passive-provider names were retained without DNS validation"
+                .to_owned();
+        self.emit(ProgressEvent::Warning(warning.clone()));
+        warnings.push(warning);
+        self.database.store_scan_observations(domain, &sources)?;
+        self.database
+            .persist_unverified_findings_preserving_state(scan_id, domain, &findings)?;
+        if self.options.only_live {
+            findings.clear();
+        }
+        self.database.persist_scan_snapshot(scan_id, &findings)?;
+        self.database.store_resolver_metrics(&resolver_metrics)?;
+        self.database
+            .store_pipeline_metrics(scan_id, &pipeline_metrics)?;
+        self.database.finalize_scan_with_learning(
+            scan_id,
+            domain,
+            &HashMap::new(),
+            &HashMap::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            candidate_count,
+            findings.len(),
+            0,
+            started.elapsed().as_millis(),
+            &warnings,
+        )?;
+        phase_timings.push(PhaseTiming {
+            phase: "finalization".to_owned(),
+            duration_ms: finalization_started.elapsed().as_millis(),
+        });
+
+        Ok(ScanResult {
+            scan_id,
+            domain: domain.to_owned(),
+            status: "completed".to_owned(),
+            resumable: false,
+            candidates: candidate_count,
+            resolved_from_network: 0,
+            cache_hits: 0,
+            duration_ms: started.elapsed().as_millis(),
+            phase_timings,
+            wildcard_detected: false,
+            findings,
+            axfr_attempts: Vec::new(),
+            tls_certificates: Vec::new(),
+            dns_edges: Vec::new(),
+            child_zones: BTreeSet::new(),
+            service_endpoints: Vec::new(),
+            web_observations: Vec::new(),
+            dnssec_walks: Vec::new(),
+            ct_monitor,
+            pipeline: pipeline_metrics,
+            resolver_metrics,
+            scheduler_metrics: SchedulerMetrics {
+                stop_reason: Some(StopReason::QueueDrained),
+                ..SchedulerMetrics::default()
+            },
+            warnings,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn resolve_batch(
         &self,
         scan_id: i64,
@@ -3281,6 +3763,7 @@ impl Scanner {
         root_wildcard: &BTreeSet<String>,
         parent_by_host: &HashMap<String, String>,
         wildcard_by_parent: &BTreeMap<String, BTreeSet<String>>,
+        reliable_wildcard_zones: &BTreeSet<String>,
     ) -> Result<(Vec<ResolvedHost>, usize, usize)> {
         let result = self
             .resolve_batch_with_deadline(
@@ -3293,6 +3776,7 @@ impl Scanner {
                 root_wildcard,
                 parent_by_host,
                 wildcard_by_parent,
+                reliable_wildcard_zones,
                 None,
                 BatchDnsMode::Conservative,
             )
@@ -3302,6 +3786,152 @@ impl Scanner {
             result.cache_hits,
             result.resolved_from_network,
         ))
+    }
+
+    /// Validate names produced by late discovery stages without letting them
+    /// escape the active DNS budget. Every name is first persisted in the
+    /// durable seed queue; only a bounded accepted slice is claimed now. A
+    /// deferred wildcard parent, an unstarted DNS future, or an indeterminate
+    /// answer is returned to SQLite for a later `--resume` run.
+    #[allow(clippy::too_many_arguments)]
+    async fn validate_enrichment_batch_bounded(
+        &self,
+        scan_id: i64,
+        domain: &str,
+        hosts: &[String],
+        phase: &str,
+        scan_started: &Instant,
+        sources: &BTreeMap<String, BTreeSet<String>>,
+        root_wildcard: &BTreeSet<String>,
+        parent_by_host: &mut HashMap<String, String>,
+        wildcard_by_parent: &mut BTreeMap<String, BTreeSet<String>>,
+        reliable_wildcard_zones: &mut BTreeSet<String>,
+        wildcard_parent_limit: usize,
+        remaining: &mut Option<Duration>,
+    ) -> Result<BatchResolution> {
+        if hosts.is_empty() {
+            return Ok(BatchResolution::default());
+        }
+
+        let mut payload = hosts
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .map(|fqdn| {
+                let origins = sources.get(&fqdn).cloned().unwrap_or_default();
+                let priority = seed_candidate_priority(&origins);
+                (fqdn, origins, priority)
+            })
+            .collect::<Vec<_>>();
+        payload.sort_by_key(|(fqdn, _, priority)| (Reverse(*priority), fqdn.clone()));
+        self.database
+            .persist_scan_seed_candidates(scan_id, &payload, self.options.max_passive)?;
+
+        // The named-claim API is intentionally bounded. Walk the ranked
+        // input until one validation page is full so already-terminal or
+        // cap-rejected names cannot starve later accepted names.
+        let ranked_hosts = payload
+            .iter()
+            .map(|(fqdn, _, _)| fqdn.clone())
+            .collect::<Vec<_>>();
+        let mut claimed = Vec::new();
+        let mut offset = 0_usize;
+        while claimed.len() < ENRICHMENT_VALIDATION_BATCH_SIZE && offset < ranked_hosts.len() {
+            let take =
+                (ENRICHMENT_VALIDATION_BATCH_SIZE - claimed.len()).min(ranked_hosts.len() - offset);
+            let end = offset + take;
+            claimed.extend(
+                self.database
+                    .claim_scan_seed_candidates_by_name(scan_id, &ranked_hosts[offset..end])?,
+            );
+            offset = end;
+        }
+        claimed.sort();
+        claimed.dedup();
+        if claimed.is_empty() {
+            return Ok(BatchResolution::default());
+        }
+
+        let registration = self
+            .register_wildcard_parents_with_budget(
+                &claimed,
+                domain,
+                parent_by_host,
+                wildcard_by_parent,
+                reliable_wildcard_zones,
+                wildcard_parent_limit,
+                remaining,
+            )
+            .await;
+        if registration.deferred_parents > 0 {
+            self.emit(ProgressEvent::Phase {
+                name: "wildcard".to_owned(),
+                detail: format!(
+                    "{} sous-zone(s) différée(s); leurs noms restent dans la file SQLite",
+                    registration.deferred_parents
+                ),
+            });
+        }
+
+        let deferred = Self::deferred_wildcard_hosts(
+            claimed.iter().cloned(),
+            root_wildcard,
+            wildcard_by_parent,
+        );
+        let runnable = claimed
+            .iter()
+            .filter(|host| !deferred.contains(*host))
+            .cloned()
+            .collect::<Vec<_>>();
+        let dns_started = Instant::now();
+        let mut resolution = if runnable.is_empty() {
+            BatchResolution::default()
+        } else {
+            self.resolve_batch_with_deadline(
+                scan_id,
+                domain,
+                &runnable,
+                phase,
+                scan_started,
+                sources,
+                root_wildcard,
+                parent_by_host,
+                wildcard_by_parent,
+                reliable_wildcard_zones,
+                phase_deadline(*remaining),
+                BatchDnsMode::Conservative,
+            )
+            .await?
+        };
+        consume_phase_budget(remaining, dns_started.elapsed());
+        if (registration.deadline_exhausted || resolution.deadline_exhausted) && remaining.is_some()
+        {
+            *remaining = Some(Duration::ZERO);
+        }
+
+        let outstanding = deferred
+            .iter()
+            .cloned()
+            .chain(resolution.not_started_hosts.iter().cloned())
+            .chain(resolution.indeterminate_hosts.iter().cloned())
+            .collect::<BTreeSet<_>>();
+        let outstanding_hosts = outstanding.iter().cloned().collect::<Vec<_>>();
+        self.database
+            .requeue_unstarted_scan_seed_candidates(scan_id, &outstanding_hosts)?;
+        let terminal = claimed
+            .iter()
+            .filter(|host| !outstanding.contains(*host))
+            .cloned()
+            .collect::<Vec<_>>();
+        self.database
+            .mark_scan_seed_candidates_done(scan_id, &terminal)?;
+        resolution
+            .not_started_hosts
+            .extend(deferred.iter().cloned());
+        resolution.not_started_hosts.sort();
+        resolution.not_started_hosts.dedup();
+        Ok(resolution)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3316,6 +3946,7 @@ impl Scanner {
         root_wildcard: &BTreeSet<String>,
         parent_by_host: &HashMap<String, String>,
         wildcard_by_parent: &BTreeMap<String, BTreeSet<String>>,
+        reliable_wildcard_zones: &BTreeSet<String>,
         deadline: Option<tokio::time::Instant>,
         mode: BatchDnsMode,
     ) -> Result<BatchResolution> {
@@ -3653,7 +4284,13 @@ impl Scanner {
         // cache/inventory untouched for the next scan.
         let quarantine_answers = current_exact_wildcard_matches
             .into_values()
-            .filter(|answer| answer.resolver_count >= 2 || answer.authoritative_validation)
+            .filter(|answer| {
+                Self::has_reliable_wildcard_profile(
+                    &answer.fqdn,
+                    wildcard_by_parent,
+                    reliable_wildcard_zones,
+                ) && (answer.resolver_count >= 2 || answer.authoritative_validation)
+            })
             .collect::<Vec<_>>();
         let quarantine_names = quarantine_answers
             .iter()
@@ -3766,6 +4403,7 @@ impl Scanner {
             "passive_concurrency": self.options.passive_concurrency,
             "max_passive": self.options.max_passive,
             "passive_only": self.options.passive_only,
+            "no_target_contact": self.options.no_target_contact,
             "axfr": self.options.axfr,
             "refresh_cache": self.options.refresh_cache,
             "verification_max_age_seconds": self.options.verification_max_age.as_secs(),
@@ -3985,7 +4623,7 @@ impl Scanner {
             (!self.options.web_phase_timeout.is_zero()).then_some(self.options.web_phase_timeout);
         let mut web_budget_exhausted = false;
         let initial_discovery_started = Instant::now();
-        let resume_from_discovery_checkpoint = self.options.resume.is_some()
+        let resume_has_discovery_state = self.options.resume.is_some()
             && (self.database.scan_seed_candidate_count(scan_id)? > 0
                 || self.database.scan_candidate_count(scan_id)? > 0
                 || self.database.scan_recursive_has_more(scan_id)?);
@@ -4009,6 +4647,7 @@ impl Scanner {
                     ),
                 });
                 self.collect_passive(
+                    domain,
                     domain,
                     deadline,
                     &mut passive_sources,
@@ -4045,14 +4684,14 @@ impl Scanner {
 
         let ct_task_started = Instant::now();
         let mut ct_tasks = tokio::task::JoinSet::new();
-        if !resume_from_discovery_checkpoint && self.options.ct_monitor {
+        if self.options.ct_monitor && !self.options.no_target_contact {
             let scanner = self.clone();
             let ct_domain = domain.to_owned();
             ct_tasks.spawn(async move { scanner.collect_incremental_ct(&ct_domain).await });
         }
 
         let axfr_phase = async {
-            if !self.options.axfr {
+            if !self.options.axfr || self.options.no_target_contact {
                 return (Vec::new(), Vec::new());
             }
             self.emit(ProgressEvent::Phase {
@@ -4082,31 +4721,65 @@ impl Scanner {
             passive_elapsed,
             axfr_attempts,
             axfr_warnings,
-        ) = if resume_from_discovery_checkpoint {
-            drop(passive_phase);
-            drop(axfr_phase);
+        ) = if resume_has_discovery_state {
             self.emit(ProgressEvent::Phase {
                 name: "reprise".to_owned(),
-                detail: "sources passives, CT et AXFR restaurées depuis le checkpoint".to_owned(),
+                detail:
+                    "cache passif réconcilié; CT incrémental et AXFR repris de façon idempotente"
+                        .to_owned(),
             });
+            // A completed connector is served from its fresh SQLite cache,
+            // while a source whose pagination was cancelled or partial keeps
+            // an old/zero freshness timestamp and is retried.  Never skip the
+            // whole passive phase merely because an active candidate queue
+            // exists: that previously made partial provider results permanent
+            // after `--resume`.
+            let (passive_result, (axfr_attempts, axfr_warnings)) =
+                tokio::join!(passive_phase, axfr_phase);
+            let (
+                mut passive_sources,
+                mut passive_warnings,
+                mut passive_zones_queried,
+                mut passive_elapsed,
+            ) = passive_result?;
             let restored_sources = self
                 .database
                 .scan_seed_candidates_for_output(scan_id)?
                 .into_iter()
                 .collect::<BTreeMap<_, _>>();
-            let mut restored_zones = BTreeSet::from([domain.to_owned()]);
-            restored_zones.extend(self.inferred_passive_zones(
-                domain,
-                restored_sources.keys().cloned(),
-                self.options.recursive_hosts.min(20),
-            ));
+            for (name, origins) in &restored_sources {
+                passive_sources
+                    .entry(name.clone())
+                    .or_default()
+                    .extend(origins.iter().cloned());
+            }
+            if self.options.passive {
+                let restored_zones = self.inferred_passive_zones(
+                    domain,
+                    restored_sources.keys().cloned(),
+                    self.options.recursive_hosts.min(20),
+                );
+                let recursive_started = Instant::now();
+                let recursive_budget =
+                    passive_budget_remaining.map(|budget| budget.saturating_sub(passive_elapsed));
+                self.collect_passive_recursively(
+                    domain,
+                    restored_zones,
+                    phase_deadline(recursive_budget),
+                    &mut passive_zones_queried,
+                    &mut passive_sources,
+                    &mut passive_warnings,
+                )
+                .await?;
+                passive_elapsed = passive_elapsed.saturating_add(recursive_started.elapsed());
+            }
             (
-                restored_sources,
-                Vec::new(),
-                restored_zones,
-                Duration::ZERO,
-                Vec::new(),
-                Vec::new(),
+                passive_sources,
+                passive_warnings,
+                passive_zones_queried,
+                passive_elapsed,
+                axfr_attempts,
+                axfr_warnings,
             )
         } else {
             let (passive_result, (axfr_attempts, axfr_warnings)) =
@@ -4124,10 +4797,17 @@ impl Scanner {
         };
 
         let mut ct_task_pending = false;
-        let (mut ct_monitor, ct_warnings) = if resume_from_discovery_checkpoint
-            || !self.options.ct_monitor
+        let (mut ct_monitor, ct_warnings) = if !self.options.ct_monitor
+            || self.options.no_target_contact
         {
-            (CtMonitorResult::default(), Vec::new())
+            let ct_warnings = if self.options.no_target_contact && self.options.ct_monitor {
+                let warning = "no-target-contact: direct CT-log collection disabled; CT provider connectors remain available".to_owned();
+                self.emit(ProgressEvent::Warning(warning.clone()));
+                vec![warning]
+            } else {
+                Vec::new()
+            };
+            (CtMonitorResult::default(), ct_warnings)
         } else {
             match ct_tasks.try_join_next() {
                 Some(Ok(Ok(result))) => result,
@@ -4190,6 +4870,20 @@ impl Scanner {
             duration_ms: initial_discovery_started.elapsed().as_millis(),
         });
 
+        if self.options.no_target_contact {
+            debug_assert!(!ct_task_pending);
+            return self.finalize_no_target_contact_scan(
+                scan_id,
+                domain,
+                started,
+                sources,
+                ct_monitor,
+                pipeline_metrics,
+                phase_timings,
+                warnings,
+            );
+        }
+
         let candidate_dns_started = Instant::now();
         self.emit(ProgressEvent::Phase {
             name: "candidats".to_owned(),
@@ -4213,7 +4907,7 @@ impl Scanner {
         let initial_seed_limit = self.options.max_passive.saturating_sub(late_ct_reserve);
         self.database
             .persist_scan_seed_candidates(scan_id, &seed_payload, initial_seed_limit)?;
-        let resumed_live_answers = if self.options.resume.is_some() {
+        let mut resumed_live_answers = if self.options.resume.is_some() {
             self.database.live_scan_answers(scan_id)?
         } else {
             Vec::new()
@@ -4309,7 +5003,7 @@ impl Scanner {
         let known_first_candidate_hosts = self
             .database
             .known_discovery_names(&first_candidate_hosts)?;
-        let first_wordlist_hosts = candidates
+        let mut first_wordlist_hosts = candidates
             .iter()
             .filter(|candidate| candidate.generator == "wordlist")
             .filter_map(|candidate| {
@@ -4317,7 +5011,7 @@ impl Scanner {
                 (!first_seed_hosts.contains(&fqdn)).then_some(fqdn)
             })
             .collect::<Vec<_>>();
-        let first_generated_hosts = candidates
+        let mut first_generated_hosts = candidates
             .iter()
             .filter_map(|candidate| {
                 let fqdn = format!("{}.{domain}", candidate.relative_name);
@@ -4331,7 +5025,7 @@ impl Scanner {
                 .then_some(fqdn)
             })
             .collect::<Vec<_>>();
-        let first_known_generated_hosts = candidates
+        let mut first_known_generated_hosts = candidates
             .iter()
             .filter_map(|candidate| {
                 let fqdn = format!("{}.{domain}", candidate.relative_name);
@@ -4346,7 +5040,7 @@ impl Scanner {
                 .then_some(fqdn)
             })
             .collect::<Vec<_>>();
-        let first_retry_hosts = candidates
+        let mut first_retry_hosts = candidates
             .iter()
             .filter(|candidate| {
                 resume_candidate_queue_draining && candidate.generator != "wordlist"
@@ -4381,17 +5075,27 @@ impl Scanner {
         });
         let wildcard_budget_started = Instant::now();
         let wildcard_deadline = phase_deadline(active_budget_remaining);
-        let (root_wildcard, root_wildcard_timed_out) = self
-            .wildcard_signature_cached_bounded(domain, wildcard_deadline)
+        let (root_wildcard_observation, root_wildcard_timed_out) = self
+            .wildcard_profile_cached_bounded(domain, wildcard_deadline)
             .await;
+        let root_wildcard_reliable = root_wildcard_observation.current_probe_reliable;
+        let root_wildcard = root_wildcard_observation
+            .signature
+            .unwrap_or_else(indeterminate_wildcard_signature);
         let mut wildcard_by_parent = BTreeMap::from([(domain.to_owned(), root_wildcard.clone())]);
+        let mut reliable_wildcard_zones = if root_wildcard_reliable {
+            BTreeSet::from([domain.to_owned()])
+        } else {
+            BTreeSet::new()
+        };
         let mut parent_by_host = HashMap::new();
-        let parent_wildcard_timed_out = self
+        let parent_wildcard_registration = self
             .register_wildcard_parents_bounded(
                 &initial_wildcard_hosts,
                 domain,
                 &mut parent_by_host,
                 &mut wildcard_by_parent,
+                &mut reliable_wildcard_zones,
                 64,
                 wildcard_deadline,
             )
@@ -4400,11 +5104,66 @@ impl Scanner {
             &mut active_budget_remaining,
             wildcard_budget_started.elapsed(),
         );
-        if (root_wildcard_timed_out || parent_wildcard_timed_out)
+        if parent_wildcard_registration.deferred_parents > 0 {
+            self.emit(ProgressEvent::Phase {
+                name: "wildcard".to_owned(),
+                detail: format!(
+                    "{} sous-zone(s) au-delà du lot initial restent indéterminées et pourront être profilées dans une vague suivante",
+                    parent_wildcard_registration.deferred_parents
+                ),
+            });
+        }
+        if (root_wildcard_timed_out || parent_wildcard_registration.deadline_exhausted)
             && active_budget_remaining.is_some()
         {
             active_budget_remaining = Some(Duration::ZERO);
         }
+        let resumed_wildcard_suspects = resumed_live_answers
+            .iter()
+            .filter(|(answer, _)| {
+                Self::answer_matches_confirmed_wildcard(answer, &root_wildcard, &wildcard_by_parent)
+                    && Self::has_reliable_wildcard_profile(
+                        &answer.fqdn,
+                        &wildcard_by_parent,
+                        &reliable_wildcard_zones,
+                    )
+            })
+            .map(|(answer, origins)| {
+                (
+                    answer.fqdn.clone(),
+                    origins.clone(),
+                    seed_candidate_priority(origins),
+                )
+            })
+            .collect::<Vec<_>>();
+        if !resumed_wildcard_suspects.is_empty() {
+            self.database.demote_and_requeue_scan_findings(
+                scan_id,
+                &resumed_wildcard_suspects,
+                "stored live answer matches a reliable current wildcard profile; fresh DNS validation required",
+            )?;
+            let suspect_names = resumed_wildcard_suspects
+                .iter()
+                .map(|(fqdn, _, _)| fqdn.clone())
+                .collect::<BTreeSet<_>>();
+            resumed_live_answers.retain(|(answer, _)| !suspect_names.contains(&answer.fqdn));
+            self.emit(ProgressEvent::Phase {
+                name: "wildcard".to_owned(),
+                detail: format!(
+                    "{} ancien(s) résultat(s) live déclassé(s) et remis en validation fraîche",
+                    resumed_wildcard_suspects.len()
+                ),
+            });
+        }
+        let initial_deferred_hosts = Self::deferred_wildcard_hosts(
+            initial_hosts.iter().cloned(),
+            &root_wildcard,
+            &wildcard_by_parent,
+        );
+        first_wordlist_hosts.retain(|host| !initial_deferred_hosts.contains(host));
+        first_generated_hosts.retain(|host| !initial_deferred_hosts.contains(host));
+        first_known_generated_hosts.retain(|host| !initial_deferred_hosts.contains(host));
+        first_retry_hosts.retain(|host| !initial_deferred_hosts.contains(host));
         let wildcard_parent_count = wildcard_by_parent
             .iter()
             .filter(|(zone, signature)| {
@@ -4437,7 +5196,11 @@ impl Scanner {
             detail: format!("{} candidat(s) à valider", initial_hosts.len()),
         });
         let mut initial_resolution = BatchResolution::default();
-        let first_seed_batch = first_seed_hosts.iter().cloned().collect::<Vec<_>>();
+        let first_seed_batch = first_seed_hosts
+            .iter()
+            .filter(|host| !initial_deferred_hosts.contains(*host))
+            .cloned()
+            .collect::<Vec<_>>();
         if !first_seed_batch.is_empty() {
             let (answers, cache_hits, resolved_from_network) = self
                 .resolve_batch(
@@ -4450,6 +5213,7 @@ impl Scanner {
                     &root_wildcard,
                     &parent_by_host,
                     &wildcard_by_parent,
+                    &reliable_wildcard_zones,
                 )
                 .await?;
             initial_resolution.merge(BatchResolution {
@@ -4475,6 +5239,7 @@ impl Scanner {
                     &root_wildcard,
                     &parent_by_host,
                     &wildcard_by_parent,
+                    &reliable_wildcard_zones,
                     phase_deadline(active_budget_remaining),
                     BatchDnsMode::Conservative,
                 )
@@ -4502,6 +5267,7 @@ impl Scanner {
                     &root_wildcard,
                     &parent_by_host,
                     &wildcard_by_parent,
+                    &reliable_wildcard_zones,
                     phase_deadline(active_budget_remaining),
                     BatchDnsMode::Conservative,
                 )
@@ -4532,6 +5298,7 @@ impl Scanner {
                     &root_wildcard,
                     &parent_by_host,
                     &wildcard_by_parent,
+                    &reliable_wildcard_zones,
                     phase_deadline(active_budget_remaining),
                     BatchDnsMode::Conservative,
                 )
@@ -4557,6 +5324,7 @@ impl Scanner {
                     &root_wildcard,
                     &parent_by_host,
                     &wildcard_by_parent,
+                    &reliable_wildcard_zones,
                     phase_deadline(active_budget_remaining),
                     BatchDnsMode::GeneratedDiscovery,
                 )
@@ -4594,6 +5362,9 @@ impl Scanner {
                 .filter(|host| first_candidate_hosts.contains(*host))
                 .cloned(),
         );
+        initial_resolution
+            .not_started_hosts
+            .extend(initial_deferred_hosts.iter().cloned());
         let BatchResolution {
             answers: initial_answers,
             mut cache_hits,
@@ -4640,7 +5411,9 @@ impl Scanner {
         self.database
             .requeue_unstarted_scan_candidates(scan_id, &initial_not_started)?;
         self.database
-            .mark_scan_seed_candidates_done(scan_id, &initial_hosts)?;
+            .requeue_unstarted_scan_seed_candidates(scan_id, &initial_not_started)?;
+        self.database
+            .mark_scan_seed_candidates_done(scan_id, &initial_terminal_hosts)?;
         let mut answers: BTreeMap<String, ResolvedHost> = initial_answers
             .into_iter()
             .map(|answer| (answer.fqdn.clone(), answer))
@@ -4915,12 +5688,13 @@ impl Scanner {
                 ),
             });
             let wave_wildcard_started = Instant::now();
-            let wave_wildcard_timed_out = self
+            let wave_wildcard_registration = self
                 .register_wildcard_parents_bounded(
                     &wave_hosts,
                     domain,
                     &mut parent_by_host,
                     &mut wildcard_by_parent,
+                    &mut reliable_wildcard_zones,
                     20,
                     phase_deadline(active_budget_remaining),
                 )
@@ -4929,11 +5703,33 @@ impl Scanner {
                 &mut active_budget_remaining,
                 wave_wildcard_started.elapsed(),
             );
-            if wave_wildcard_timed_out && active_budget_remaining.is_some() {
+            if wave_wildcard_registration.deferred_parents > 0 {
+                self.emit(ProgressEvent::Phase {
+                    name: "wildcard".to_owned(),
+                    detail: format!(
+                        "{} sous-zone(s) différée(s) par le lot de profilage de la vague {wave_number}",
+                        wave_wildcard_registration.deferred_parents
+                    ),
+                });
+            }
+            if wave_wildcard_registration.deadline_exhausted && active_budget_remaining.is_some() {
                 active_budget_remaining = Some(Duration::ZERO);
             }
+            let wave_deferred_hosts = Self::deferred_wildcard_hosts(
+                wave_hosts.iter().cloned(),
+                &root_wildcard,
+                &wildcard_by_parent,
+            );
+            wave_wordlist_hosts.retain(|host| !wave_deferred_hosts.contains(host));
+            wave_generated_hosts.retain(|host| !wave_deferred_hosts.contains(host));
+            wave_known_generated_hosts.retain(|host| !wave_deferred_hosts.contains(host));
+            wave_retry_hosts.retain(|host| !wave_deferred_hosts.contains(host));
             let mut wave_resolution = BatchResolution::default();
-            let wave_seed_batch = wave_seed_hosts.iter().cloned().collect::<Vec<_>>();
+            let wave_seed_batch = wave_seed_hosts
+                .iter()
+                .filter(|host| !wave_deferred_hosts.contains(*host))
+                .cloned()
+                .collect::<Vec<_>>();
             if !wave_seed_batch.is_empty() {
                 let (answers, cache_hits, resolved_from_network) = self
                     .resolve_batch(
@@ -4946,6 +5742,7 @@ impl Scanner {
                         &root_wildcard,
                         &parent_by_host,
                         &wildcard_by_parent,
+                        &reliable_wildcard_zones,
                     )
                     .await?;
                 wave_resolution.merge(BatchResolution {
@@ -4971,6 +5768,7 @@ impl Scanner {
                         &root_wildcard,
                         &parent_by_host,
                         &wildcard_by_parent,
+                        &reliable_wildcard_zones,
                         phase_deadline(active_budget_remaining),
                         BatchDnsMode::Conservative,
                     )
@@ -5000,6 +5798,7 @@ impl Scanner {
                         &root_wildcard,
                         &parent_by_host,
                         &wildcard_by_parent,
+                        &reliable_wildcard_zones,
                         phase_deadline(active_budget_remaining),
                         BatchDnsMode::Conservative,
                     )
@@ -5030,6 +5829,7 @@ impl Scanner {
                         &root_wildcard,
                         &parent_by_host,
                         &wildcard_by_parent,
+                        &reliable_wildcard_zones,
                         phase_deadline(active_budget_remaining),
                         BatchDnsMode::Conservative,
                     )
@@ -5055,6 +5855,7 @@ impl Scanner {
                         &root_wildcard,
                         &parent_by_host,
                         &wildcard_by_parent,
+                        &reliable_wildcard_zones,
                         phase_deadline(active_budget_remaining),
                         BatchDnsMode::GeneratedDiscovery,
                     )
@@ -5067,6 +5868,9 @@ impl Scanner {
                     .extend(generated_resolution.indeterminate_hosts.iter().cloned());
                 wave_resolution.merge(generated_resolution);
             }
+            wave_resolution
+                .not_started_hosts
+                .extend(wave_deferred_hosts.iter().cloned());
             if (!wave_known_generated_hosts.is_empty() || !wave_generated_hosts.is_empty())
                 && active_candidate_budget_exhausted(active_budget_remaining)
             {
@@ -5131,7 +5935,9 @@ impl Scanner {
             self.database
                 .requeue_unstarted_scan_candidates(scan_id, &wave_not_started)?;
             self.database
-                .mark_scan_seed_candidates_done(scan_id, &wave_hosts)?;
+                .requeue_unstarted_scan_seed_candidates(scan_id, &wave_not_started)?;
+            self.database
+                .mark_scan_seed_candidates_done(scan_id, &wave_terminal_hosts)?;
             cache_hits = cache_hits.saturating_add(wave_cache_hits);
             network_resolved = network_resolved.saturating_add(wave_network_resolved);
             if !wave_generated_hosts.is_empty() {
@@ -5307,23 +6113,37 @@ impl Scanner {
                 .filter(|name| !answers.contains_key(name))
                 .take(2_000)
                 .collect::<Vec<_>>();
-            let validation_hosts = self
+            let mut validation_hosts = self
                 .database
                 .claim_scan_seed_candidates_by_name(scan_id, &validation_hosts)?;
             if !validation_hosts.is_empty() {
+                let claimed_validation_hosts = validation_hosts.clone();
                 let late_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-                let parent_timed_out = self
+                let parent_registration = self
                     .register_wildcard_parents_bounded(
                         &validation_hosts,
                         domain,
                         &mut parent_by_host,
                         &mut wildcard_by_parent,
+                        &mut reliable_wildcard_zones,
                         20,
                         Some(late_deadline),
                     )
                     .await;
-                let late_resolution = self
-                    .resolve_batch_with_deadline(
+                let deferred_hosts = Self::deferred_wildcard_hosts(
+                    validation_hosts.iter().cloned(),
+                    &root_wildcard,
+                    &wildcard_by_parent,
+                );
+                self.database.requeue_unstarted_scan_seed_candidates(
+                    scan_id,
+                    &deferred_hosts.iter().cloned().collect::<Vec<_>>(),
+                )?;
+                validation_hosts.retain(|host| !deferred_hosts.contains(host));
+                let mut late_resolution = if validation_hosts.is_empty() {
+                    BatchResolution::default()
+                } else {
+                    self.resolve_batch_with_deadline(
                         scan_id,
                         domain,
                         &validation_hosts,
@@ -5333,16 +6153,21 @@ impl Scanner {
                         &root_wildcard,
                         &parent_by_host,
                         &wildcard_by_parent,
+                        &reliable_wildcard_zones,
                         Some(late_deadline),
                         BatchDnsMode::Conservative,
                     )
-                    .await?;
+                    .await?
+                };
+                late_resolution
+                    .not_started_hosts
+                    .extend(deferred_hosts.iter().cloned());
                 let not_started = late_resolution
                     .not_started_hosts
                     .iter()
                     .cloned()
                     .collect::<BTreeSet<_>>();
-                let terminal = validation_hosts
+                let terminal = claimed_validation_hosts
                     .iter()
                     .filter(|name| !not_started.contains(*name))
                     .cloned()
@@ -5354,7 +6179,10 @@ impl Scanner {
                 for answer in late_resolution.answers {
                     answers.insert(answer.fqdn.clone(), answer);
                 }
-                if parent_timed_out || late_resolution.deadline_exhausted {
+                if parent_registration.deadline_exhausted
+                    || parent_registration.deferred_parents > 0
+                    || late_resolution.deadline_exhausted
+                {
                     let warning = format!(
                         "CT incrémental: validation tardive bornée à 5s; {} nom(s) non démarré(s) restent non vérifiés",
                         late_resolution.not_started_hosts.len()
@@ -5493,34 +6321,26 @@ impl Scanner {
                 validation_rounds += 1;
                 pipeline_names_validated += graph_hosts.len();
             }
-            self.register_wildcard_parents_with_budget(
-                &graph_hosts,
-                domain,
-                &mut parent_by_host,
-                &mut wildcard_by_parent,
-                20,
-                &mut active_budget_remaining,
-            )
-            .await;
-            if !graph_hosts.is_empty() {
-                let (graph_answers, graph_cache_hits, graph_network_resolved) = self
-                    .resolve_batch(
-                        scan_id,
-                        domain,
-                        &graph_hosts,
-                        "DNS graphe",
-                        &started,
-                        &sources,
-                        &root_wildcard,
-                        &parent_by_host,
-                        &wildcard_by_parent,
-                    )
-                    .await?;
-                cache_hits += graph_cache_hits;
-                network_resolved += graph_network_resolved;
-                for answer in graph_answers {
-                    answers.insert(answer.fqdn.clone(), answer);
-                }
+            let graph_resolution = self
+                .validate_enrichment_batch_bounded(
+                    scan_id,
+                    domain,
+                    &graph_hosts,
+                    "DNS graphe",
+                    &started,
+                    &sources,
+                    &root_wildcard,
+                    &mut parent_by_host,
+                    &mut wildcard_by_parent,
+                    &mut reliable_wildcard_zones,
+                    20,
+                    &mut active_budget_remaining,
+                )
+                .await?;
+            cache_hits += graph_resolution.cache_hits;
+            network_resolved += graph_resolution.resolved_from_network;
+            for answer in graph_resolution.answers {
+                answers.insert(answer.fqdn.clone(), answer);
             }
             dns_edges = graph.edges.into_iter().collect();
             child_zones = graph.child_zones;
@@ -5548,34 +6368,26 @@ impl Scanner {
                 .into_iter()
                 .filter(|name| !answers.contains_key(name))
                 .collect::<Vec<_>>();
-            self.register_wildcard_parents_with_budget(
-                &recursive_names,
-                domain,
-                &mut parent_by_host,
-                &mut wildcard_by_parent,
-                20,
-                &mut active_budget_remaining,
-            )
-            .await;
-            if !recursive_names.is_empty() {
-                let (recursive_answers, recursive_cache_hits, recursive_network_resolved) = self
-                    .resolve_batch(
-                        scan_id,
-                        domain,
-                        &recursive_names,
-                        "DNS passif récursif",
-                        &started,
-                        &sources,
-                        &root_wildcard,
-                        &parent_by_host,
-                        &wildcard_by_parent,
-                    )
-                    .await?;
-                cache_hits += recursive_cache_hits;
-                network_resolved += recursive_network_resolved;
-                for answer in recursive_answers {
-                    answers.insert(answer.fqdn.clone(), answer);
-                }
+            let recursive_resolution = self
+                .validate_enrichment_batch_bounded(
+                    scan_id,
+                    domain,
+                    &recursive_names,
+                    "DNS passif récursif",
+                    &started,
+                    &sources,
+                    &root_wildcard,
+                    &mut parent_by_host,
+                    &mut wildcard_by_parent,
+                    &mut reliable_wildcard_zones,
+                    20,
+                    &mut active_budget_remaining,
+                )
+                .await?;
+            cache_hits += recursive_resolution.cache_hits;
+            network_resolved += recursive_resolution.resolved_from_network;
+            for answer in recursive_resolution.answers {
+                answers.insert(answer.fqdn.clone(), answer);
             }
         }
 
@@ -5662,34 +6474,26 @@ impl Scanner {
                 validation_rounds += 1;
                 pipeline_names_validated += nsec_hosts.len();
             }
-            self.register_wildcard_parents_with_budget(
-                &nsec_hosts,
-                domain,
-                &mut parent_by_host,
-                &mut wildcard_by_parent,
-                20,
-                &mut active_budget_remaining,
-            )
-            .await;
-            if !nsec_hosts.is_empty() {
-                let (nsec_answers, nsec_cache_hits, nsec_network_resolved) = self
-                    .resolve_batch(
-                        scan_id,
-                        domain,
-                        &nsec_hosts,
-                        "DNS NSEC",
-                        &started,
-                        &sources,
-                        &root_wildcard,
-                        &parent_by_host,
-                        &wildcard_by_parent,
-                    )
-                    .await?;
-                cache_hits += nsec_cache_hits;
-                network_resolved += nsec_network_resolved;
-                for answer in nsec_answers {
-                    answers.insert(answer.fqdn.clone(), answer);
-                }
+            let nsec_resolution = self
+                .validate_enrichment_batch_bounded(
+                    scan_id,
+                    domain,
+                    &nsec_hosts,
+                    "DNS NSEC",
+                    &started,
+                    &sources,
+                    &root_wildcard,
+                    &mut parent_by_host,
+                    &mut wildcard_by_parent,
+                    &mut reliable_wildcard_zones,
+                    20,
+                    &mut active_budget_remaining,
+                )
+                .await?;
+            cache_hits += nsec_resolution.cache_hits;
+            network_resolved += nsec_resolution.resolved_from_network;
+            for answer in nsec_resolution.answers {
+                answers.insert(answer.fqdn.clone(), answer);
             }
             dnssec_walks = walks;
         }
@@ -5794,17 +6598,8 @@ impl Scanner {
                     if !metadata_candidates.is_empty() {
                         validation_rounds += 1;
                         pipeline_names_validated += metadata_candidates.len();
-                        self.register_wildcard_parents_with_budget(
-                            &metadata_candidates,
-                            domain,
-                            &mut parent_by_host,
-                            &mut wildcard_by_parent,
-                            12,
-                            &mut active_budget_remaining,
-                        )
-                        .await;
-                        let (metadata_answers, metadata_cache_hits, metadata_network_resolved) =
-                            self.resolve_batch(
+                        let metadata_resolution = self
+                            .validate_enrichment_batch_bounded(
                                 scan_id,
                                 domain,
                                 &metadata_candidates,
@@ -5812,13 +6607,16 @@ impl Scanner {
                                 &started,
                                 &sources,
                                 &root_wildcard,
-                                &parent_by_host,
-                                &wildcard_by_parent,
+                                &mut parent_by_host,
+                                &mut wildcard_by_parent,
+                                &mut reliable_wildcard_zones,
+                                12,
+                                &mut active_budget_remaining,
                             )
                             .await?;
-                        cache_hits += metadata_cache_hits;
-                        network_resolved += metadata_network_resolved;
-                        for answer in metadata_answers {
+                        cache_hits += metadata_resolution.cache_hits;
+                        network_resolved += metadata_resolution.resolved_from_network;
+                        for answer in metadata_resolution.answers {
                             answers.insert(answer.fqdn.clone(), answer);
                         }
                     }
@@ -5949,34 +6747,26 @@ impl Scanner {
                 validation_rounds += 1;
                 pipeline_names_validated += web_hosts_to_validate.len();
             }
-            self.register_wildcard_parents_with_budget(
-                &web_hosts_to_validate,
-                domain,
-                &mut parent_by_host,
-                &mut wildcard_by_parent,
-                20,
-                &mut active_budget_remaining,
-            )
-            .await;
-            if !web_hosts_to_validate.is_empty() {
-                let (web_answers, web_cache_hits, web_network_resolved) = self
-                    .resolve_batch(
-                        scan_id,
-                        domain,
-                        &web_hosts_to_validate,
-                        "DNS web/JS",
-                        &started,
-                        &sources,
-                        &root_wildcard,
-                        &parent_by_host,
-                        &wildcard_by_parent,
-                    )
-                    .await?;
-                cache_hits += web_cache_hits;
-                network_resolved += web_network_resolved;
-                for answer in web_answers {
-                    answers.insert(answer.fqdn.clone(), answer);
-                }
+            let web_resolution = self
+                .validate_enrichment_batch_bounded(
+                    scan_id,
+                    domain,
+                    &web_hosts_to_validate,
+                    "DNS web/JS",
+                    &started,
+                    &sources,
+                    &root_wildcard,
+                    &mut parent_by_host,
+                    &mut wildcard_by_parent,
+                    &mut reliable_wildcard_zones,
+                    20,
+                    &mut active_budget_remaining,
+                )
+                .await?;
+            cache_hits += web_resolution.cache_hits;
+            network_resolved += web_resolution.resolved_from_network;
+            for answer in web_resolution.answers {
+                answers.insert(answer.fqdn.clone(), answer);
             }
             web_observations.extend(web.observations);
         }
@@ -6071,22 +6861,13 @@ impl Scanner {
                 validation_rounds += 1;
                 pipeline_names_validated += tls_hosts.len();
             }
-            self.register_wildcard_parents_with_budget(
-                &tls_hosts,
-                domain,
-                &mut parent_by_host,
-                &mut wildcard_by_parent,
-                20,
-                &mut active_budget_remaining,
-            )
-            .await;
             if !tls_hosts.is_empty() {
                 self.emit(ProgressEvent::Phase {
                     name: "DNS certificats TLS".to_owned(),
                     detail: format!("{} nouveau(x) nom(s) SAN/CN à valider", tls_hosts.len()),
                 });
-                let (tls_answers, tls_cache_hits, tls_network_resolved) = self
-                    .resolve_batch(
+                let tls_resolution = self
+                    .validate_enrichment_batch_bounded(
                         scan_id,
                         domain,
                         &tls_hosts,
@@ -6094,13 +6875,16 @@ impl Scanner {
                         &started,
                         &sources,
                         &root_wildcard,
-                        &parent_by_host,
-                        &wildcard_by_parent,
+                        &mut parent_by_host,
+                        &mut wildcard_by_parent,
+                        &mut reliable_wildcard_zones,
+                        20,
+                        &mut active_budget_remaining,
                     )
                     .await?;
-                cache_hits += tls_cache_hits;
-                network_resolved += tls_network_resolved;
-                for answer in tls_answers {
+                cache_hits += tls_resolution.cache_hits;
+                network_resolved += tls_resolution.resolved_from_network;
+                for answer in tls_resolution.answers {
                     answers.insert(answer.fqdn.clone(), answer);
                 }
             }
@@ -6344,17 +7128,8 @@ impl Scanner {
                 }
                 validation_rounds += 1;
                 pipeline_names_validated += new_hosts.len();
-                self.register_wildcard_parents_with_budget(
-                    &new_hosts,
-                    domain,
-                    &mut parent_by_host,
-                    &mut wildcard_by_parent,
-                    20,
-                    &mut active_budget_remaining,
-                )
-                .await;
-                let (new_answers, new_cache_hits, new_network_resolved) = self
-                    .resolve_batch(
+                let new_resolution = self
+                    .validate_enrichment_batch_bounded(
                         scan_id,
                         domain,
                         &new_hosts,
@@ -6362,13 +7137,16 @@ impl Scanner {
                         &started,
                         &sources,
                         &root_wildcard,
-                        &parent_by_host,
-                        &wildcard_by_parent,
+                        &mut parent_by_host,
+                        &mut wildcard_by_parent,
+                        &mut reliable_wildcard_zones,
+                        20,
+                        &mut active_budget_remaining,
                     )
                     .await?;
-                cache_hits += new_cache_hits;
-                network_resolved += new_network_resolved;
-                for answer in new_answers {
+                cache_hits += new_resolution.cache_hits;
+                network_resolved += new_resolution.resolved_from_network;
+                for answer in new_resolution.answers {
                     answers.insert(answer.fqdn.clone(), answer);
                 }
             }
@@ -6428,17 +7206,8 @@ impl Scanner {
                 if !hosts.is_empty() {
                     validation_rounds += 1;
                     pipeline_names_validated += hosts.len();
-                    self.register_wildcard_parents_with_budget(
-                        &hosts,
-                        domain,
-                        &mut parent_by_host,
-                        &mut wildcard_by_parent,
-                        20,
-                        &mut active_budget_remaining,
-                    )
-                    .await;
-                    let (resolved, extra_cache_hits, extra_network) = self
-                        .resolve_batch(
+                    let late_nsec_resolution = self
+                        .validate_enrichment_batch_bounded(
                             scan_id,
                             domain,
                             &hosts,
@@ -6446,13 +7215,16 @@ impl Scanner {
                             &started,
                             &sources,
                             &root_wildcard,
-                            &parent_by_host,
-                            &wildcard_by_parent,
+                            &mut parent_by_host,
+                            &mut wildcard_by_parent,
+                            &mut reliable_wildcard_zones,
+                            20,
+                            &mut active_budget_remaining,
                         )
                         .await?;
-                    cache_hits += extra_cache_hits;
-                    network_resolved += extra_network;
-                    for answer in resolved {
+                    cache_hits += late_nsec_resolution.cache_hits;
+                    network_resolved += late_nsec_resolution.resolved_from_network;
+                    for answer in late_nsec_resolution.answers {
                         answers.insert(answer.fqdn.clone(), answer);
                     }
                 }
@@ -6512,18 +7284,19 @@ impl Scanner {
                     .filter(|parent| !wildcard_by_parent.contains_key(*parent))
                     .cloned()
                     .collect::<Vec<_>>();
-                let (recursive_profiles, recursive_profiles_timed_out) = self
-                    .wildcard_signatures_cached_bounded(
+                let recursive_profiles = self
+                    .wildcard_profiles_cached_bounded(
                         unprofiled_parents,
                         phase_deadline(active_budget_remaining),
                     )
                     .await;
-                wildcard_by_parent.extend(recursive_profiles);
+                wildcard_by_parent.extend(recursive_profiles.signatures);
+                reliable_wildcard_zones.extend(recursive_profiles.reliable_zones);
                 consume_phase_budget(
                     &mut active_budget_remaining,
                     recursive_profiles_started.elapsed(),
                 );
-                if recursive_profiles_timed_out && active_budget_remaining.is_some() {
+                if recursive_profiles.deadline_exhausted && active_budget_remaining.is_some() {
                     active_budget_remaining = Some(Duration::ZERO);
                 }
                 if active_candidate_budget_exhausted(active_budget_remaining) {
@@ -6597,6 +7370,7 @@ impl Scanner {
                             &root_wildcard,
                             &parent_by_host,
                             &wildcard_by_parent,
+                            &reliable_wildcard_zones,
                             phase_deadline(active_budget_remaining),
                             BatchDnsMode::Conservative,
                         )
@@ -7824,26 +8598,26 @@ mod tests {
         automatic_bulk_source_limit, before_refresh_deadline, cache_requires_revalidation,
         candidate_refill_capacity, candidate_uses_active_budget,
         candidate_uses_discovery_fast_path, cap_exclusive_bulk_source_names, capped_phase_deadline,
-        collect_dns_outcomes_until, consume_phase_budget, dnssec_assessment_proves_nonexistence,
-        external_deferral_seconds, external_pause_status, external_retry_after_seconds,
-        finish_pending_ct_task_after_grace_with_hook, high_value_window_needs_materialization,
-        high_value_window_persist_limit, indeterminate_wildcard_signature,
-        is_missing_api_key_error, is_preflight_auth_error, late_ct_seed_reserve,
-        materialize_ct_fallback_bounded, merge_ct_fallback_names, merge_passive_names_bounded,
-        merge_resolver_metrics, metadata_phase_budget, passive_connector_working_set_limit,
-        persist_routed_dns_outcomes, phase_deadline, record_bounded_parent_candidate,
-        refill_passive_union_from_cache, refresh_allows_wildcard_purge,
-        refresh_can_demote_wildcard_ambiguity, refresh_deadline,
+        collect_dns_outcomes_until, consume_phase_budget, deferred_wildcard_signature,
+        dnssec_assessment_proves_nonexistence, external_deferral_seconds, external_pause_status,
+        external_retry_after_seconds, finish_pending_ct_task_after_grace_with_hook,
+        high_value_window_needs_materialization, high_value_window_persist_limit,
+        indeterminate_wildcard_signature, is_missing_api_key_error, is_preflight_auth_error,
+        late_ct_seed_reserve, materialize_ct_fallback_bounded, merge_ct_fallback_names,
+        merge_passive_names_bounded, merge_resolver_metrics, metadata_phase_budget,
+        passive_connector_working_set_limit, persist_routed_dns_outcomes, phase_deadline,
+        record_bounded_parent_candidate, refill_passive_union_from_cache,
+        refresh_allows_wildcard_purge, refresh_can_demote_wildcard_ambiguity, refresh_deadline,
         refresh_parent_selection_is_complete, refresh_wildcard_observation_is_reliable,
         refresh_wildcard_profile_is_reliable, route_dns_outcomes,
         select_bounded_mutation_observations, should_expand_adaptive_wave,
         should_retry_source_after_key_added, source_bootstrap_score, source_error_is_deferred,
         source_requires_api_key, unprofiled_deepest_parents, was_recently_verified,
         wildcard_cache_algorithm_is_current, wildcard_profile_after_probe,
-        wildcard_profile_observed, wilson_upper_bound,
+        wildcard_profile_observed, wildcard_signature_is_deferred, wilson_upper_bound,
     };
     use crate::candidate::CandidateProposal;
-    use crate::db::Database;
+    use crate::db::{CachedAnswer, Database};
     use crate::dns::{DnsEngine, DnsResolutionOutcome, WildcardProbeOutcome};
     use crate::dnssec_proof::{DnssecOwnerState, DnssecProofAssessment, DnssecProofKind};
     use crate::model::{
@@ -7855,7 +8629,7 @@ mod tests {
     use serde_json::json;
     use std::collections::{BTreeMap, BTreeSet, HashMap};
     use std::sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc,
     };
@@ -7878,6 +8652,7 @@ mod tests {
             passive_concurrency: 1,
             max_passive: 1,
             passive_only: false,
+            no_target_contact: false,
             axfr: false,
             axfr_timeout: Duration::from_millis(100),
             refresh_cache: false,
@@ -7970,6 +8745,252 @@ mod tests {
         (address, requests, task)
     }
 
+    #[tokio::test]
+    async fn scanner_scopes_no_target_contact_to_each_passive_fetch() {
+        let database = Database::in_memory().unwrap();
+        let dns = DnsEngine::new_with_rate(
+            4,
+            Duration::from_millis(50),
+            &["127.0.0.1".parse().unwrap()],
+            10,
+        )
+        .unwrap();
+        let mut options = scanner_test_options(false);
+        options.passive = true;
+        options.passive_sources = vec!["crtsh".to_owned()];
+        options.passive_refresh = Duration::ZERO;
+        options.no_target_contact = true;
+        options.max_passive = 10;
+        let scanner = Scanner::new(database, dns, options);
+        let mut sources = BTreeMap::new();
+        let mut warnings = Vec::new();
+
+        scanner
+            .collect_passive(
+                "crt.sh",
+                "crt.sh",
+                Some(tokio::time::Instant::now() + Duration::from_secs(1)),
+                &mut sources,
+                &mut warnings,
+            )
+            .await
+            .unwrap();
+
+        assert!(sources.is_empty());
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("no-target-contact"))
+        );
+    }
+
+    #[tokio::test]
+    async fn no_target_contact_keeps_passive_names_unverified_without_dns() {
+        let domain = "example.test";
+        let fqdn = "api.example.test";
+        let new_fqdn = "new.example.test";
+        let database = Database::in_memory().unwrap();
+        let previous_scan = database.create_scan(domain, &json!({})).unwrap();
+        database
+            .persist_findings(
+                previous_scan,
+                domain,
+                &[Finding {
+                    fqdn: fqdn.to_owned(),
+                    records: vec![DnsRecord {
+                        record_type: "A".to_owned(),
+                        value: "192.0.2.44".to_owned(),
+                        ttl: 60,
+                    }],
+                    sources: BTreeSet::from(["dns".to_owned()]),
+                    state: ObservationState::Live,
+                    last_verified_at: Some(1_234),
+                    evidence_families: BTreeSet::from([crate::model::EvidenceFamily::LiveDns]),
+                    ..Finding::default()
+                }],
+                86_400,
+            )
+            .unwrap();
+        database
+            .finalize_scan(previous_scan, 1, 1, 0, 1, &[])
+            .unwrap();
+        database
+            .store_passive_cache(domain, "crtsh", &[fqdn.to_owned(), new_fqdn.to_owned()])
+            .unwrap();
+        let (resolver_address, requests, resolver_task) = wildcard_test_resolver().await;
+        let (trusted_address, trusted_requests, trusted_task) = wildcard_test_resolver().await;
+        let dns = DnsEngine::new_with_socket_addresses(
+            4,
+            Duration::from_millis(250),
+            &[resolver_address],
+            0,
+        )
+        .unwrap();
+        let trusted_dns = DnsEngine::new_with_socket_addresses(
+            4,
+            Duration::from_millis(250),
+            &[trusted_address],
+            0,
+        )
+        .unwrap();
+        let mut options = scanner_test_options(false);
+        options.passive = true;
+        options.passive_sources = vec!["crtsh".to_owned()];
+        options.max_passive = 10;
+        options.passive_only = true;
+        options.no_target_contact = true;
+        options.profile = "passive".to_owned();
+        options.ct_monitor = true;
+        // The core barrier must remain safe even if a library caller leaves
+        // active feature flags enabled instead of going through CLI policy.
+        options.axfr = true;
+        options.pipeline = true;
+        options.tls_certificates = true;
+        options.dns_graph = true;
+        options.service_discovery = true;
+        options.ptr_pivot = true;
+        options.dnssec_nsec = true;
+        options.metadata_discovery = true;
+        options.web_discovery = true;
+
+        let result = Scanner::new(database.clone(), dns, options)
+            .with_trusted_dns(trusted_dns)
+            .scan(domain)
+            .await
+            .unwrap();
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+        assert_eq!(trusted_requests.load(Ordering::SeqCst), 0);
+        assert_eq!(result.resolved_from_network, 0);
+        assert_eq!(result.scheduler_metrics.dns_queries, 0);
+        assert_eq!(
+            result
+                .resolver_metrics
+                .iter()
+                .map(|metric| metric.requests)
+                .sum::<u64>(),
+            0
+        );
+        assert_eq!(result.findings.len(), 2);
+        let finding = result
+            .findings
+            .iter()
+            .find(|finding| finding.fqdn == fqdn)
+            .unwrap();
+        assert_eq!(finding.fqdn, fqdn);
+        assert_eq!(finding.state, ObservationState::Unverified);
+        assert!(finding.records.is_empty());
+        assert!(!finding.wildcard);
+        assert_eq!(
+            finding.wildcard_verdict,
+            crate::model::WildcardVerdict::NotProfiled
+        );
+        assert!(!finding.authoritative_validation);
+        assert!(finding.owner_proofs.is_empty());
+        assert_eq!(
+            finding.generation_path,
+            vec!["passive_provider_only".to_owned()]
+        );
+
+        assert_eq!(result.ct_monitor.logs_checked, 0);
+        assert_eq!(result.ct_monitor.entries_processed, 0);
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| { warning.contains("direct CT-log collection disabled") })
+        );
+
+        let inventory = database
+            .inventory(Some(domain), false)
+            .unwrap()
+            .into_iter()
+            .map(|entry| (entry.fqdn.clone(), entry))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(inventory.len(), 2);
+        assert_eq!(inventory[fqdn].state, ObservationState::Live);
+        assert_eq!(inventory[fqdn].last_verified_at, Some(1_234));
+        assert!(inventory[fqdn].sources.contains("dns"));
+        assert!(
+            inventory[fqdn]
+                .sources
+                .iter()
+                .any(|source| source.contains("crtsh"))
+        );
+        assert_eq!(inventory[new_fqdn].state, ObservationState::Unverified);
+        assert_eq!(inventory[new_fqdn].last_verified_at, None);
+        let explanation = database.explain(fqdn).unwrap();
+        assert_eq!(explanation["inventory"]["state"], "live");
+        assert_eq!(explanation["inventory"]["last_verified_at"], 1_234);
+        assert!(
+            explanation["dns_records"]
+                .as_array()
+                .is_some_and(|records| records.iter().any(|record| record["active"] == true))
+        );
+        assert!(
+            explanation["evidence"]
+                .as_array()
+                .is_some_and(|observations| observations.iter().any(|observation| {
+                    observation["source"]
+                        .as_str()
+                        .is_some_and(|source| source.contains("crtsh"))
+                }))
+        );
+        resolver_task.abort();
+        trusted_task.abort();
+    }
+
+    #[tokio::test]
+    async fn unavailable_library_source_uses_cache_without_health_or_network_attempt() {
+        let domain = "example.test";
+        let fqdn = "legacy.example.test";
+        let database = Database::in_memory().unwrap();
+        database
+            .store_passive_cache(domain, "binaryedge", &[fqdn.to_owned()])
+            .unwrap();
+        let (resolver_address, requests, resolver_task) = wildcard_test_resolver().await;
+        let dns = DnsEngine::new_with_socket_addresses(
+            4,
+            Duration::from_millis(100),
+            &[resolver_address],
+            0,
+        )
+        .unwrap();
+        let mut options = scanner_test_options(false);
+        options.passive = true;
+        options.passive_sources = vec!["binaryedge".to_owned()];
+        options.max_passive = 10;
+        options.passive_only = true;
+        options.no_target_contact = true;
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&events);
+        let result = Scanner::new(database.clone(), dns, options)
+            .with_progress(Arc::new(move |event| captured.lock().unwrap().push(event)))
+            .scan(domain)
+            .await
+            .unwrap();
+
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+        assert_eq!(result.findings.len(), 1);
+        assert_eq!(result.findings[0].fqdn, fqdn);
+        assert_eq!(result.findings[0].state, ObservationState::Unverified);
+        assert!(
+            !database
+                .source_diagnostics(Duration::from_secs(86_400))
+                .unwrap()
+                .contains_key("binaryedge"),
+            "an unavailable connector must not alter provider health counters"
+        );
+        assert!(events.lock().unwrap().iter().any(|event| matches!(
+            event,
+            super::ProgressEvent::PassiveSource { source, status, names }
+                if source == "binaryedge"
+                    && status.contains("indisponible")
+                    && !status.contains("clé API")
+                    && *names == 1
+        )));
+        resolver_task.abort();
+    }
+
     fn proven_dnssec_denial(kind: DnssecProofKind) -> DnssecProofAssessment {
         DnssecProofAssessment {
             state: DnssecOwnerState::DoesNotExist,
@@ -8052,6 +9073,8 @@ mod tests {
             let sources =
                 BTreeMap::from([(fqdn.clone(), BTreeSet::from(["dns-wave-1".to_owned()]))]);
             let root_wildcard = BTreeSet::from(["A:192.0.2.44".to_owned()]);
+            let wildcard_by_parent = BTreeMap::from([(domain.to_owned(), root_wildcard.clone())]);
+            let reliable_wildcard_zones = BTreeSet::from([domain.to_owned()]);
 
             let result = scanner
                 .resolve_batch_with_deadline(
@@ -8063,7 +9086,8 @@ mod tests {
                     &sources,
                     &root_wildcard,
                     &HashMap::new(),
-                    &BTreeMap::new(),
+                    &wildcard_by_parent,
+                    &reliable_wildcard_zones,
                     Some(tokio::time::Instant::now() + Duration::from_secs(2)),
                     BatchDnsMode::Conservative,
                 )
@@ -8106,6 +9130,121 @@ mod tests {
             trusted_one_task.abort();
             trusted_two_task.abort();
         }
+    }
+
+    #[tokio::test]
+    async fn stale_wildcard_guard_never_authorizes_destructive_purge() {
+        let (primary_address, _, primary_task) = wildcard_test_resolver().await;
+        let (trusted_one, _, trusted_one_task) = wildcard_test_resolver().await;
+        let (trusted_two, _, trusted_two_task) = wildcard_test_resolver().await;
+        let primary = DnsEngine::new_with_socket_addresses(
+            8,
+            Duration::from_millis(250),
+            &[primary_address],
+            0,
+        )
+        .unwrap();
+        let trusted = DnsEngine::new_with_socket_addresses(
+            8,
+            Duration::from_millis(250),
+            &[trusted_one, trusted_two],
+            0,
+        )
+        .unwrap();
+        let database = Database::in_memory().unwrap();
+        let domain = "example.com";
+        let fqdn = "legitimate.example.com".to_owned();
+        let answer = ResolvedHost {
+            fqdn: fqdn.clone(),
+            records: vec![DnsRecord {
+                record_type: "A".to_owned(),
+                value: "192.0.2.44".to_owned(),
+                ttl: 60,
+            }],
+            from_cache: false,
+            last_verified_at: Some(crate::util::now_epoch()),
+            authoritative_validation: false,
+            resolver_count: 2,
+        };
+        let seed_scan = database
+            .create_scan(domain, &json!({"seed": true}))
+            .unwrap();
+        database
+            .persist_findings(
+                seed_scan,
+                domain,
+                &[Finding {
+                    fqdn: fqdn.clone(),
+                    records: answer.records.clone(),
+                    sources: BTreeSet::from(["dns:seed".to_owned()]),
+                    state: ObservationState::Live,
+                    last_verified_at: answer.last_verified_at,
+                    ..Finding::default()
+                }],
+                86_400,
+            )
+            .unwrap();
+        database
+            .update_cache_outcomes(
+                Some(seed_scan),
+                std::slice::from_ref(&answer),
+                &[],
+                &[],
+                300,
+            )
+            .unwrap();
+
+        let signature = BTreeSet::from(["A:192.0.2.44".to_owned()]);
+        let observation = wildcard_profile_after_probe(
+            Some(signature.clone()),
+            WildcardProbeOutcome::Indeterminate,
+        );
+        assert!(!observation.current_probe_reliable);
+        let root_wildcard = observation.signature.unwrap();
+        let wildcard_by_parent = BTreeMap::from([(domain.to_owned(), root_wildcard.clone())]);
+        let reliable_wildcard_zones = BTreeSet::new();
+        let scan_id = database
+            .create_scan(domain, &json!({"stale": true}))
+            .unwrap();
+        let sources = BTreeMap::from([(fqdn.clone(), BTreeSet::from(["dns:cache".to_owned()]))]);
+        let scanner = Scanner::new(database.clone(), primary, scanner_test_options(false))
+            .with_trusted_dns(trusted);
+        let result = scanner
+            .resolve_batch_with_deadline(
+                scan_id,
+                domain,
+                std::slice::from_ref(&fqdn),
+                "stale wildcard guard regression",
+                &Instant::now(),
+                &sources,
+                &root_wildcard,
+                &HashMap::new(),
+                &wildcard_by_parent,
+                &reliable_wildcard_zones,
+                Some(tokio::time::Instant::now() + Duration::from_secs(2)),
+                BatchDnsMode::Conservative,
+            )
+            .await
+            .unwrap();
+
+        assert!(result.answers.is_empty());
+        assert!(matches!(
+            database.fresh_cache(std::slice::from_ref(&fqdn)).unwrap()[&fqdn],
+            CachedAnswer::Positive(_)
+        ));
+        let inventory = database.inventory(Some(domain), false).unwrap();
+        assert_eq!(inventory.len(), 1);
+        assert_eq!(inventory[0].state, ObservationState::Live);
+        assert_eq!(
+            database.explain(&fqdn).unwrap()["quarantine"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+        primary_task.abort();
+        trusted_one_task.abort();
+        trusted_two_task.abort();
     }
 
     #[tokio::test]
@@ -8178,6 +9317,7 @@ mod tests {
                 &root_wildcard,
                 &HashMap::new(),
                 &BTreeMap::new(),
+                &BTreeSet::new(),
                 Some(tokio::time::Instant::now() + Duration::from_secs(1)),
                 BatchDnsMode::Conservative,
             )
@@ -8257,6 +9397,9 @@ mod tests {
         )]);
         let before_requests = requests.load(Ordering::SeqCst);
         let scan_started = Instant::now();
+        let root_wildcard = BTreeSet::from(["A:192.0.2.44".to_owned()]);
+        let wildcard_by_parent = BTreeMap::from([(domain.to_owned(), root_wildcard.clone())]);
+        let reliable_wildcard_zones = BTreeSet::from([domain.to_owned()]);
         let result = scanner
             .resolve_batch_with_deadline(
                 insufficient_scan,
@@ -8265,9 +9408,10 @@ mod tests {
                 "single resolver wildcard regression",
                 &scan_started,
                 &sources,
-                &BTreeSet::from(["A:192.0.2.44".to_owned()]),
+                &root_wildcard,
                 &HashMap::new(),
-                &BTreeMap::new(),
+                &wildcard_by_parent,
+                &reliable_wildcard_zones,
                 Some(tokio::time::Instant::now() + Duration::from_secs(1)),
                 BatchDnsMode::Conservative,
             )
@@ -8746,7 +9890,7 @@ mod tests {
     }
 
     #[test]
-    fn omitted_child_wildcard_parents_are_marked_indeterminate() {
+    fn deferred_child_wildcard_parents_are_retryable_but_failed_probes_are_not() {
         let parent_by_host = HashMap::from([
             (
                 "a.prod.example.com".to_owned(),
@@ -8757,9 +9901,326 @@ mod tests {
         let profiled = BTreeMap::new();
         let selected = BTreeSet::from(["prod.example.com".to_owned()]);
         assert_eq!(
-            unprofiled_deepest_parents(&parent_by_host, &profiled, &selected),
+            unprofiled_deepest_parents(parent_by_host.values().cloned(), &profiled, &selected),
             BTreeSet::from(["dev.example.com".to_owned()])
         );
+
+        let retryable_profiled = BTreeMap::from([
+            ("dev.example.com".to_owned(), deferred_wildcard_signature()),
+            ("prod.example.com".to_owned(), BTreeSet::new()),
+        ]);
+        assert_eq!(
+            unprofiled_deepest_parents(
+                parent_by_host.values().cloned(),
+                &retryable_profiled,
+                &BTreeSet::new(),
+            ),
+            BTreeSet::from(["dev.example.com".to_owned()]),
+            "a deferred indeterminate parent must remain eligible for a later batch"
+        );
+
+        let failed_profile = BTreeMap::from([(
+            "dev.example.com".to_owned(),
+            indeterminate_wildcard_signature(),
+        )]);
+        assert!(
+            !unprofiled_deepest_parents(
+                parent_by_host.values().cloned(),
+                &failed_profile,
+                &BTreeSet::new(),
+            )
+            .contains("dev.example.com"),
+            "a completed but indeterminate probe must not be repeated in every wave"
+        );
+    }
+
+    #[tokio::test]
+    async fn wildcard_parent_batch_truncation_is_retryable_without_a_deadline_failure() {
+        let (address, _, server) = wildcard_test_resolver().await;
+        let database = Database::in_memory().unwrap();
+        let dns = DnsEngine::new_with_socket_addresses(128, Duration::from_secs(1), &[address], 0)
+            .unwrap();
+        let scanner = Scanner::new(database, dns, scanner_test_options(false));
+        let hosts = (0..65)
+            .map(|index| format!("www.zone-{index}.example.test"))
+            .collect::<Vec<_>>();
+        let mut parent_by_host = HashMap::new();
+        let mut wildcard_by_parent = BTreeMap::new();
+        let mut reliable_wildcard_zones = BTreeSet::new();
+
+        let first = scanner
+            .register_wildcard_parents_bounded(
+                &hosts,
+                "example.test",
+                &mut parent_by_host,
+                &mut wildcard_by_parent,
+                &mut reliable_wildcard_zones,
+                64,
+                None,
+            )
+            .await;
+        assert!(!first.deadline_exhausted);
+        assert_eq!(first.deferred_parents, 1);
+
+        let second = scanner
+            .register_wildcard_parents_bounded(
+                &hosts,
+                "example.test",
+                &mut parent_by_host,
+                &mut wildcard_by_parent,
+                &mut reliable_wildcard_zones,
+                64,
+                None,
+            )
+            .await;
+        assert!(!second.deadline_exhausted);
+        assert_eq!(second.deferred_parents, 0);
+        assert!(
+            wildcard_by_parent
+                .values()
+                .all(|signature| !super::wildcard_signature_is_indeterminate(signature))
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn deferred_wildcard_hosts_remain_in_the_durable_seed_queue() {
+        let (address, _, server) = wildcard_test_resolver().await;
+        let database = Database::in_memory().unwrap();
+        let scan_id = database
+            .create_scan("example.test", &serde_json::json!({}))
+            .unwrap();
+        let hosts = (0..65)
+            .map(|index| format!("www.zone-{index}.example.test"))
+            .collect::<Vec<_>>();
+        let seeds = hosts
+            .iter()
+            .map(|host| {
+                (
+                    host.clone(),
+                    BTreeSet::from(["passive:fixture".to_owned()]),
+                    1,
+                )
+            })
+            .collect::<Vec<_>>();
+        database
+            .persist_scan_seed_candidates(scan_id, &seeds, seeds.len())
+            .unwrap();
+        let claimed = database
+            .pending_scan_seed_candidates(scan_id, seeds.len())
+            .unwrap()
+            .into_iter()
+            .map(|(host, _, _)| host)
+            .collect::<Vec<_>>();
+        let dns = DnsEngine::new_with_socket_addresses(128, Duration::from_secs(1), &[address], 0)
+            .unwrap();
+        let scanner = Scanner::new(database.clone(), dns, scanner_test_options(false));
+        let root_wildcard = BTreeSet::new();
+        let mut parent_by_host = HashMap::new();
+        let mut wildcard_by_parent =
+            BTreeMap::from([("example.test".to_owned(), root_wildcard.clone())]);
+        let mut reliable_wildcard_zones = BTreeSet::new();
+
+        let first = scanner
+            .register_wildcard_parents_bounded(
+                &claimed,
+                "example.test",
+                &mut parent_by_host,
+                &mut wildcard_by_parent,
+                &mut reliable_wildcard_zones,
+                64,
+                None,
+            )
+            .await;
+        assert_eq!(first.deferred_parents, 1);
+        let deferred = Scanner::deferred_wildcard_hosts(
+            claimed.iter().cloned(),
+            &root_wildcard,
+            &wildcard_by_parent,
+        );
+        assert_eq!(deferred.len(), 1);
+        let deferred = deferred.into_iter().collect::<Vec<_>>();
+        database
+            .requeue_unstarted_scan_seed_candidates(scan_id, &deferred)
+            .unwrap();
+        let terminal = claimed
+            .iter()
+            .filter(|host| !deferred.contains(host))
+            .cloned()
+            .collect::<Vec<_>>();
+        database
+            .mark_scan_seed_candidates_done(scan_id, &terminal)
+            .unwrap();
+        assert_eq!(
+            database.pending_scan_seed_candidate_count(scan_id).unwrap(),
+            1
+        );
+
+        let retry = database
+            .pending_scan_seed_candidates(scan_id, 1)
+            .unwrap()
+            .into_iter()
+            .map(|(host, _, _)| host)
+            .collect::<Vec<_>>();
+        let second = scanner
+            .register_wildcard_parents_bounded(
+                &retry,
+                "example.test",
+                &mut parent_by_host,
+                &mut wildcard_by_parent,
+                &mut reliable_wildcard_zones,
+                64,
+                None,
+            )
+            .await;
+        assert_eq!(second.deferred_parents, 0);
+        assert!(
+            Scanner::deferred_wildcard_hosts(
+                retry.iter().cloned(),
+                &root_wildcard,
+                &wildcard_by_parent,
+            )
+            .is_empty()
+        );
+        database
+            .mark_scan_seed_candidates_done(scan_id, &retry)
+            .unwrap();
+        assert_eq!(
+            database.pending_scan_seed_candidate_count(scan_id).unwrap(),
+            0
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn wildcard_budget_page_ignores_deferred_parents_outside_the_current_batch() {
+        let (address, _, server) = wildcard_test_resolver().await;
+        let database = Database::in_memory().unwrap();
+        let dns = DnsEngine::new_with_socket_addresses(128, Duration::from_secs(1), &[address], 0)
+            .unwrap();
+        let scanner = Scanner::new(database, dns, scanner_test_options(false));
+        let hosts = vec!["www.new.example.test".to_owned()];
+        let mut parent_by_host = HashMap::from([(
+            "www.old.example.test".to_owned(),
+            "old.example.test".to_owned(),
+        )]);
+        let mut wildcard_by_parent =
+            BTreeMap::from([("old.example.test".to_owned(), deferred_wildcard_signature())]);
+        let mut reliable_wildcard_zones = BTreeSet::new();
+        let mut remaining = None;
+
+        let registration = tokio::time::timeout(
+            Duration::from_secs(1),
+            scanner.register_wildcard_parents_with_budget(
+                &hosts,
+                "example.test",
+                &mut parent_by_host,
+                &mut wildcard_by_parent,
+                &mut reliable_wildcard_zones,
+                20,
+                &mut remaining,
+            ),
+        )
+        .await
+        .expect("an unrelated deferred parent caused an unbounded profiling loop");
+
+        assert!(!registration.deadline_exhausted);
+        assert_eq!(registration.deferred_parents, 0);
+        assert!(wildcard_by_parent.contains_key("new.example.test"));
+        assert!(wildcard_signature_is_deferred(
+            &wildcard_by_parent["old.example.test"]
+        ));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn expired_enrichment_budget_sends_no_dns_and_keeps_seed_queued() {
+        let (address, requests, server) = wildcard_test_resolver().await;
+        let database = Database::in_memory().unwrap();
+        let scan_id = database
+            .create_scan("example.test", &json!({"enrichment": true}))
+            .unwrap();
+        let dns =
+            DnsEngine::new_with_socket_addresses(8, Duration::from_millis(100), &[address], 0)
+                .unwrap();
+        let scanner = Scanner::new(database.clone(), dns, scanner_test_options(false));
+        let fqdn = "api.example.test".to_owned();
+        let sources = BTreeMap::from([(
+            fqdn.clone(),
+            BTreeSet::from(["web:https://example.invalid".to_owned()]),
+        )]);
+        let root_wildcard = BTreeSet::new();
+        let mut parent_by_host = HashMap::new();
+        let mut wildcard_by_parent =
+            BTreeMap::from([("example.test".to_owned(), root_wildcard.clone())]);
+        let mut reliable_wildcard_zones = BTreeSet::new();
+        let mut remaining = Some(Duration::ZERO);
+
+        let resolution = scanner
+            .validate_enrichment_batch_bounded(
+                scan_id,
+                "example.test",
+                std::slice::from_ref(&fqdn),
+                "expired enrichment",
+                &Instant::now(),
+                &sources,
+                &root_wildcard,
+                &mut parent_by_host,
+                &mut wildcard_by_parent,
+                &mut reliable_wildcard_zones,
+                20,
+                &mut remaining,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+        assert!(resolution.deadline_exhausted);
+        assert_eq!(resolution.not_started_hosts, vec![fqdn.clone()]);
+        assert_eq!(
+            database.pending_scan_seed_candidate_count(scan_id).unwrap(),
+            1
+        );
+        let queued = database.pending_scan_seed_candidates(scan_id, 1).unwrap();
+        assert_eq!(queued[0].0, fqdn);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn recursive_passive_zones_are_marked_only_when_a_task_is_scheduled() {
+        let database = Database::in_memory().unwrap();
+        let dns = DnsEngine::new_with_rate(
+            8,
+            Duration::from_millis(50),
+            &["127.0.0.1".parse().unwrap()],
+            10,
+        )
+        .unwrap();
+        let mut options = scanner_test_options(false);
+        options.passive_sources.clear();
+        options.profile = "deep".to_owned();
+        let scanner = Scanner::new(database, dns, options);
+        let mut queried = BTreeSet::from(["example.test".to_owned()]);
+        let mut sources = BTreeMap::new();
+        let mut warnings = Vec::new();
+        let zones = (0..25)
+            .map(|index| format!("zone-{index}.example.test"))
+            .collect::<Vec<_>>();
+
+        let discovered = scanner
+            .collect_passive_recursively(
+                "example.test",
+                zones,
+                None,
+                &mut queried,
+                &mut sources,
+                &mut warnings,
+            )
+            .await
+            .unwrap();
+
+        assert!(discovered.is_empty());
+        assert_eq!(queried, BTreeSet::from(["example.test".to_owned()]));
     }
 
     #[test]
