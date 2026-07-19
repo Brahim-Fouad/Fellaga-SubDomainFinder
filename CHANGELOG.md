@@ -6,6 +6,12 @@ Published releases and downloadable artifacts are available on [GitHub Releases]
 
 ## [Unreleased]
 
+## [0.12.1] - 2026-07-19
+
+### Fixed
+
+- keep long-running passive-source progress on one live terminal line, include elapsed time and a final completion snapshot, and throttle unchanged redirected heartbeats to one per minute.
+
 ## [0.12.0] - 2026-07-19
 
 ### Added
@@ -331,7 +337,8 @@ Initial public release of Fellaga.
 - public MIT repository with security policy, contribution guide, third-party notices, and verifiable corpus provenance;
 - verifiable v0.8.0 release with x86-64 and ARM64 GNU/Linux archives, an amd64 Debian package, architecture SBOMs, checksums, a keyless Sigstore signature over the checksum manifest, and GitHub attestations.
 
-[Unreleased]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/compare/v0.12.0...HEAD
+[Unreleased]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/compare/v0.12.1...HEAD
+[0.12.1]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/tag/v0.12.1
 [0.12.0]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/tag/v0.12.0
 [0.11.1]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/tag/v0.11.1
 [0.11.0]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/tag/v0.11.0

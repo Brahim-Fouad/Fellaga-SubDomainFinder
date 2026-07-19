@@ -2,12 +2,32 @@ use fellaga_core::model::AxfrStatus;
 use fellaga_core::scanner::{PassiveSourceOutcome, ProgressEvent};
 use std::collections::BTreeMap;
 use std::io::{IsTerminal, Write};
+use std::time::{Duration, Instant};
 
 use super::text::{
     TerminalStyle, Tone, animation_enabled, format_duration, format_number, is_transient_phase,
     prefixed_lines, sanitize_terminal_text, should_render_axfr, should_render_passive_source,
     truncate_chars,
 };
+
+const PLAIN_TRANSIENT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
+
+#[derive(Debug, Clone)]
+pub(super) struct TransientPhaseState {
+    started_at: Instant,
+    last_logged_at: Instant,
+    progress_signature: String,
+}
+
+impl TransientPhaseState {
+    pub(super) fn new(now: Instant, detail: &str) -> Self {
+        Self {
+            started_at: now,
+            last_logged_at: now,
+            progress_signature: transient_progress_signature(detail),
+        }
+    }
+}
 
 pub(crate) struct ConsoleProgress {
     pub(super) interactive: bool,
@@ -16,7 +36,7 @@ pub(crate) struct ConsoleProgress {
     pub(super) line_active: bool,
     pub(super) active_context: Option<String>,
     pub(super) last_log_bucket: BTreeMap<(String, String), usize>,
-    pub(super) last_transient_phase: BTreeMap<(String, String), usize>,
+    pub(super) last_transient_phase: BTreeMap<(String, String), TransientPhaseState>,
     pub(super) stderr_style: TerminalStyle,
 }
 
@@ -85,7 +105,38 @@ impl ConsoleProgress {
         }
     }
 
+    pub(super) fn track_transient_phase(
+        &mut self,
+        context: &str,
+        name: &str,
+        detail: &str,
+        now: Instant,
+    ) -> (Duration, bool) {
+        let key = (context.to_owned(), name.to_owned());
+        let signature = transient_progress_signature(detail);
+        let Some(state) = self.last_transient_phase.get_mut(&key) else {
+            self.last_transient_phase
+                .insert(key, TransientPhaseState::new(now, detail));
+            return (Duration::ZERO, true);
+        };
+
+        let elapsed = now.saturating_duration_since(state.started_at);
+        let progress_changed = state.progress_signature != signature;
+        let heartbeat_due = now.saturating_duration_since(state.last_logged_at)
+            >= PLAIN_TRANSIENT_HEARTBEAT_INTERVAL;
+        let log_now = progress_changed || heartbeat_due;
+        if progress_changed {
+            state.progress_signature = signature;
+        }
+        if log_now {
+            state.last_logged_at = now;
+        }
+        (elapsed, log_now)
+    }
+
     fn write_transient_phase(&mut self, context: &str, name: &str, detail: &str) {
+        let now = Instant::now();
+        let (elapsed, log_now) = self.track_transient_phase(context, name, detail, now);
         let context_label = if self.multi_target {
             format!(
                 "{} · ",
@@ -96,12 +147,13 @@ impl ConsoleProgress {
             String::new()
         };
         let name = truncate_chars(name, 32);
+        let detail = transient_phase_detail(detail, elapsed);
         if self.interactive {
             let line = format!(
                 "{} {context_label}{} — {}",
                 self.stderr_style.badge("phase", Tone::Accent),
                 self.stderr_style.paint(Tone::Bold, &name),
-                truncate_chars(detail, 108)
+                truncate_chars(&detail, 108)
             );
             eprint!("\r\x1b[2K{line}");
             let _ = std::io::stderr().flush();
@@ -109,12 +161,6 @@ impl ConsoleProgress {
             self.active_context = Some(context.to_owned());
             return;
         }
-        let count = self
-            .last_transient_phase
-            .entry((context.to_owned(), name.clone()))
-            .or_default();
-        *count += 1;
-        let log_now = *count == 1 || (*count).is_multiple_of(3);
         if !log_now {
             return;
         }
@@ -122,7 +168,7 @@ impl ConsoleProgress {
             Some(context),
             "phase",
             Tone::Accent,
-            format!("{name} — {}", truncate_chars(detail, 108)),
+            format!("{name} — {}", truncate_chars(&detail, 108)),
         );
     }
 
@@ -393,6 +439,54 @@ impl ConsoleProgress {
             ProgressEvent::Complete => self.finish_target(context),
         }
     }
+}
+
+pub(super) fn transient_progress_signature(detail: &str) -> String {
+    let mut signature = sanitize_terminal_text(detail);
+    for marker in ["en cours depuis", "limite cumulative dans"] {
+        signature = normalize_duration_after(&signature, marker);
+    }
+    signature
+}
+
+fn normalize_duration_after(detail: &str, marker: &str) -> String {
+    let Some(marker_index) = detail.find(marker) else {
+        return detail.to_owned();
+    };
+    let duration_search_start = marker_index + marker.len();
+    let Some(duration_offset) =
+        detail[duration_search_start..].find(|value: char| !value.is_whitespace())
+    else {
+        return detail.to_owned();
+    };
+    let duration_start = duration_search_start + duration_offset;
+    if !detail[duration_start..].starts_with(|value: char| value.is_ascii_digit()) {
+        return detail.to_owned();
+    }
+    let duration_end = detail[duration_start..]
+        .find(|value: char| {
+            !(value.is_ascii_digit() || matches!(value, '.' | ':' | 'h' | 'm' | 's'))
+        })
+        .map_or(detail.len(), |offset| duration_start + offset);
+
+    format!(
+        "{}<elapsed>{}",
+        &detail[..duration_start],
+        &detail[duration_end..]
+    )
+}
+
+pub(super) fn transient_phase_detail(detail: &str, elapsed: Duration) -> String {
+    let detail = sanitize_terminal_text(detail);
+    if detail.contains("en cours depuis") {
+        return detail;
+    }
+    let elapsed = if elapsed < Duration::from_secs(1) {
+        "0s".to_owned()
+    } else {
+        format_duration(elapsed.as_millis())
+    };
+    format!("{detail} · écoulé {elapsed}")
 }
 
 impl Drop for ConsoleProgress {

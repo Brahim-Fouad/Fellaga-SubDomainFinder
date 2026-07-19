@@ -1,3 +1,11 @@
+fellaga (0.12.1-1) unstable; urgency=medium
+
+  * Keep passive progress on one live terminal line.
+  * Show elapsed time and an explicit final source count.
+  * Throttle unchanged progress in redirected logs.
+
+ -- Brahim-Fouad GUIA <170998597+Brahim-Fouad@users.noreply.github.com>  Sun, 19 Jul 2026 00:00:00 -0400
+
 fellaga (0.12.0-1) unstable; urgency=medium
 
   * Separate CLI, scanner, passive, DNS, and SQLite responsibilities.

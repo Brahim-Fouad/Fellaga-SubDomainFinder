@@ -1,3 +1,4 @@
+use super::passive_phase::passive_completion_snapshot_required;
 use super::refresh::*;
 use super::{
     BatchDnsMode, RefreshOptions, ScanOptions, ScanRunGuard, Scanner,
@@ -193,6 +194,15 @@ async fn scanner_scopes_no_target_contact_to_each_passive_fetch() {
             .iter()
             .any(|warning| warning.contains("no-target-contact"))
     );
+}
+
+#[test]
+fn passive_completion_snapshot_is_only_global_and_complete() {
+    assert!(passive_completion_snapshot_required(false, 9, 9, true));
+    assert!(!passive_completion_snapshot_required(true, 9, 9, true));
+    assert!(!passive_completion_snapshot_required(false, 9, 8, true));
+    assert!(!passive_completion_snapshot_required(false, 0, 0, true));
+    assert!(!passive_completion_snapshot_required(false, 3, 3, false));
 }
 
 #[tokio::test]

@@ -152,6 +152,7 @@ pub(super) fn is_transient_phase(name: &str, detail: &str) -> bool {
     name == "CT incrémental"
         || detail.contains("en cours depuis")
         || detail.contains("budget restant")
+        || (name == "passif" && detail.contains("source(s)") && detail.contains("active(s)"))
         || (name == "passif récursif" && detail.starts_with("zone "))
 }
 
