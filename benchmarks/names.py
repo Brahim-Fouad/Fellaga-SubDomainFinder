@@ -168,7 +168,9 @@ def read_observational_name_file(
 
 def _json_records(path: pathlib.Path) -> Iterator[Any]:
     if path.stat().st_size > MAX_JSON_FILE_BYTES:
-        raise ValueError(f"BBOT JSON file exceeds {MAX_JSON_FILE_BYTES} bytes: {path}")
+        raise ValueError(
+            f"JSON event file exceeds {MAX_JSON_FILE_BYTES} bytes: {path}"
+        )
     text = path.read_text(encoding="utf-8", errors="strict")
     try:
         document = json.loads(text)
@@ -208,7 +210,7 @@ def fellaga_names(path: pathlib.Path, domain: str) -> tuple[set[str], int, int]:
     return live, historical, rejected
 
 
-def bbot_names(directory: pathlib.Path, domain: str) -> tuple[set[str], int]:
+def dns_event_names(directory: pathlib.Path, domain: str) -> tuple[set[str], int]:
     names: set[str] = set()
     rejected = 0
     for path in sorted(directory.rglob("*.json")):
@@ -231,7 +233,7 @@ def bbot_names(directory: pathlib.Path, domain: str) -> tuple[set[str], int]:
     return names, rejected
 
 
-def bbot_observational_names(
+def dns_event_observational_names(
     directory: pathlib.Path, domain: str
 ) -> tuple[set[str], int, int]:
     names: set[str] = set()
@@ -315,13 +317,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     fellaga_parser.add_argument("path", type=pathlib.Path)
     fellaga_parser.add_argument("--metadata", type=pathlib.Path)
 
-    bbot_parser = subparsers.add_parser("bbot")
-    bbot_parser.add_argument("domain")
-    bbot_parser.add_argument("directory", type=pathlib.Path)
+    event_parser = subparsers.add_parser("dns-events")
+    event_parser.add_argument("domain")
+    event_parser.add_argument("directory", type=pathlib.Path)
 
-    bbot_observation_parser = subparsers.add_parser("bbot-observational")
-    bbot_observation_parser.add_argument("domain")
-    bbot_observation_parser.add_argument("directory", type=pathlib.Path)
+    event_observation_parser = subparsers.add_parser(
+        "dns-events-observational"
+    )
+    event_observation_parser.add_argument("domain")
+    event_observation_parser.add_argument("directory", type=pathlib.Path)
     return parser.parse_args(argv)
 
 
@@ -377,16 +381,16 @@ def main(argv: list[str] | None = None) -> int:
             print(f"rejected {rejected} malformed or out-of-scope name(s)", file=sys.stderr)
             return 3
         return 0
-    if args.action == "bbot":
-        names, rejected = bbot_names(args.directory, args.domain)
+    if args.action == "dns-events":
+        names, rejected = dns_event_names(args.directory, args.domain)
         _write_names(names)
         if rejected:
             print(f"rejected {rejected} malformed or out-of-scope name(s)", file=sys.stderr)
             return 3
         return 0
-    if args.action == "bbot-observational":
+    if args.action == "dns-events-observational":
         try:
-            names, rejected, excluded_wildcards = bbot_observational_names(
+            names, rejected, excluded_wildcards = dns_event_observational_names(
                 args.directory, args.domain
             )
         except ObservationalLimitError as exc:

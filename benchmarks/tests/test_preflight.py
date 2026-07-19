@@ -13,7 +13,11 @@ BENCHMARKS = pathlib.Path(__file__).resolve().parents[1]
 PREFLIGHT = BENCHMARKS / "preflight.py"
 sys.path.insert(0, str(BENCHMARKS))
 
-from preflight import disk_evidence, estimate_disk_bytes, puredns_evidence
+from preflight import (
+    active_resolver_capacity_evidence,
+    disk_evidence,
+    estimate_disk_bytes,
+)
 
 
 class PreflightTests(unittest.TestCase):
@@ -30,13 +34,13 @@ class PreflightTests(unittest.TestCase):
         self.assertEqual(result["required_free_bytes"], 1_000)
         self.assertEqual(result["shortfall_bytes"], 1)
 
-    def test_puredns_capacity_reports_required_rate(self) -> None:
-        result = puredns_evidence(1_000_000, 100, 1_860, 125)
+    def test_active_resolver_capacity_reports_required_rate(self) -> None:
+        result = active_resolver_capacity_evidence(1_000_000, 100, 1_860, 125)
         self.assertEqual(result["status"], "incoherent")
         self.assertEqual(result["estimated_minimum_seconds"], 12_500)
         self.assertEqual(result["minimum_coherent_rate_qps"], 673)
 
-        coherent = puredns_evidence(1_000_000, 1_000, 1_860, 125)
+        coherent = active_resolver_capacity_evidence(1_000_000, 1_000, 1_860, 125)
         self.assertEqual(coherent["status"], "coherent")
         self.assertEqual(coherent["estimated_minimum_seconds"], 1_250)
 
@@ -50,7 +54,7 @@ class PreflightTests(unittest.TestCase):
                 [
                     sys.executable,
                     str(PREFLIGHT),
-                    "puredns",
+                    "active-resolver",
                     "--corpus",
                     str(corpus),
                     "--rate-qps",
@@ -69,6 +73,7 @@ class PreflightTests(unittest.TestCase):
             self.assertEqual(completed.returncode, 1)
             evidence = json.loads(output.read_text(encoding="utf-8"))
             self.assertEqual(evidence["status"], "incoherent")
+            self.assertEqual(evidence["check"], "active_resolver_capacity")
             self.assertEqual(evidence["corpus_candidates"], 2)
 
     def test_cli_records_filesystem_inspection_errors(self) -> None:

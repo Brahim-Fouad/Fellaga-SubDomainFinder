@@ -1,3 +1,11 @@
+fellaga (0.10.0-1) unstable; urgency=medium
+
+  * Expand and type the passive connector registry.
+  * Add crash-safe multi-lane pagination and generation-idempotent evidence.
+  * Add process-safe provider refresh leases and neutral benchmark toolsets.
+
+ -- Brahim-Fouad GUIA <170998597+Brahim-Fouad@users.noreply.github.com>  Sat, 18 Jul 2026 00:00:00 -0400
+
 fellaga (0.9.2-1) unstable; urgency=medium
 
   * Add final raw FQDN output with scan --show.

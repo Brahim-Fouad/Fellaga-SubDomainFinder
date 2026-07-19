@@ -35,6 +35,14 @@ const MAX_DISCOVERY_ACTIONS: usize = 4_096;
 const MAX_DISCOVERY_ACTION_CLAIM: usize = 512;
 const MAX_DISCOVERY_OUTCOME_JSON: usize = 64 * 1024;
 const MAX_NAMED_SEED_CLAIM: usize = 4_096;
+const MAX_PASSIVE_PAGINATION_IDENTIFIER: usize = 128;
+const PASSIVE_PAGINATION_HASH_LENGTH: usize = 64;
+// Refresh generations are operational restart state, not observations. After
+// three months an unfinished generation is closed and numeric progress is
+// reset, while every discovered name and evidence row remains permanent.
+const PASSIVE_REFRESH_ABANDONED_AFTER_SECS: i64 = 90 * 24 * 60 * 60;
+const PASSIVE_REFRESH_GC_BATCH: usize = 256;
+const PASSIVE_REFRESH_LEASE_GC_BATCH: usize = 256;
 const CT_MATERIALIZATION_PAGE_SIZE: usize = 128;
 const CT_MATERIALIZATION_LOCK_RETRY: Duration = Duration::from_millis(2);
 const CT_COMMIT_HASH_CHUNK_SIZE: usize = 64 * 1024;
@@ -50,6 +58,57 @@ fn usize_to_i64_saturating(value: usize) -> i64 {
 
 fn u64_to_i64_saturating(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+fn validate_passive_pagination_identifier(value: &str, field: &str) -> Result<()> {
+    if value.is_empty()
+        || value.len() > MAX_PASSIVE_PAGINATION_IDENTIFIER
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"-_".contains(&byte))
+    {
+        bail!("identifiant {field} invalide pour la pagination passive");
+    }
+    Ok(())
+}
+
+fn validate_passive_pagination_hash(value: &str, field: &str) -> Result<()> {
+    if value.len() != PASSIVE_PAGINATION_HASH_LENGTH
+        || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        bail!("{field} invalide pour la pagination passive");
+    }
+    Ok(())
+}
+
+fn validate_passive_pagination_key(
+    root_domain: &str,
+    source: &str,
+    lane: &str,
+    contract_version: u32,
+    query_hash: &str,
+) -> Result<()> {
+    if root_domain.is_empty()
+        || root_domain.len() > 253
+        || root_domain.starts_with('.')
+        || root_domain.ends_with('.')
+        || !root_domain.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'.')
+        })
+    {
+        bail!("domaine invalide pour la pagination passive");
+    }
+    validate_passive_pagination_identifier(source, "source")?;
+    validate_passive_pagination_identifier(lane, "lane")?;
+    if contract_version == 0 {
+        bail!("version de contrat nulle pour la pagination passive");
+    }
+    validate_passive_pagination_hash(query_hash, "hash de requête")
+}
+
+fn passive_pagination_counter(value: u64, field: &str) -> Result<i64> {
+    i64::try_from(value)
+        .with_context(|| format!("compteur {field} trop grand pour la pagination passive"))
 }
 
 fn is_strict_subdomain(fqdn: &str, root_domain: &str) -> bool {
@@ -454,6 +513,36 @@ pub struct PassiveCacheEntry {
     pub updated_at: i64,
 }
 
+/// Durable numeric progress for a passive connector lane. The state contains
+/// only public query metadata and counters; opaque cursors, request URLs and
+/// credentials are deliberately excluded from the schema.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PassivePaginationState {
+    pub contract_version: u32,
+    pub query_hash: String,
+    pub next_position: u64,
+    pub records_seen: u64,
+    pub expected_records: Option<u64>,
+    pub expected_pages: Option<u64>,
+    pub last_page_hash: String,
+    pub last_page_records: u64,
+    pub done: bool,
+    pub updated_at: i64,
+}
+
+/// A validated numeric page transition. `position` is the page just decoded;
+/// `next_position` is persisted in the same transaction as its observations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PassivePaginationPage {
+    pub position: u64,
+    pub next_position: u64,
+    pub records_seen: u64,
+    pub expected_records: Option<u64>,
+    pub expected_pages: Option<u64>,
+    pub page_hash: String,
+    pub page_records: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct ScanCheckpoint {
     pub scan_id: i64,
@@ -643,7 +732,8 @@ pub struct ObservationInput {
 struct WriterMessage {
     root_domain: String,
     observations: Vec<ObservationInput>,
-    reply: mpsc::Sender<std::result::Result<usize, String>>,
+    passive_refresh_source: Option<String>,
+    reply: mpsc::Sender<std::result::Result<ObservationWriteStats, String>>,
 }
 
 struct ObservationWriter {
@@ -679,11 +769,19 @@ impl ObservationWriter {
                     return;
                 }
                 for message in receiver {
-                    let result = insert_observations(
-                        &mut connection,
-                        &message.root_domain,
-                        &message.observations,
-                    )
+                    let result = match message.passive_refresh_source.as_deref() {
+                        Some(source) => insert_passive_observations_with_stats(
+                            &mut connection,
+                            &message.root_domain,
+                            source,
+                            &message.observations,
+                        ),
+                        None => insert_observations_with_stats(
+                            &mut connection,
+                            &message.root_domain,
+                            &message.observations,
+                        ),
+                    }
                     .map_err(|error| format!("{error:#}"));
                     let _ = message.reply.send(result);
                 }
@@ -691,15 +789,44 @@ impl ObservationWriter {
         Ok(Self { sender })
     }
 
-    fn submit(&self, root_domain: &str, observations: Vec<ObservationInput>) -> Result<usize> {
+    fn submit_with_stats(
+        &self,
+        root_domain: &str,
+        observations: Vec<ObservationInput>,
+    ) -> Result<ObservationWriteStats> {
         if observations.is_empty() {
-            return Ok(0);
+            return Ok(ObservationWriteStats::default());
         }
         let (reply, response) = mpsc::channel();
         self.sender
             .send(WriterMessage {
                 root_domain: root_domain.to_owned(),
                 observations,
+                passive_refresh_source: None,
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("writer SQLite arrêté"))?;
+        response
+            .recv()
+            .map_err(|_| anyhow::anyhow!("réponse du writer SQLite absente"))?
+            .map_err(anyhow::Error::msg)
+    }
+
+    fn submit_passive_page_with_stats(
+        &self,
+        root_domain: &str,
+        source: &str,
+        observations: Vec<ObservationInput>,
+    ) -> Result<ObservationWriteStats> {
+        // Even an empty provider page is durable progress: it starts or
+        // refreshes the restart session and creates the incomplete cache
+        // marker in one transaction, so it must still reach the writer.
+        let (reply, response) = mpsc::channel();
+        self.sender
+            .send(WriterMessage {
+                root_domain: root_domain.to_owned(),
+                observations,
+                passive_refresh_source: Some(source.to_owned()),
                 reply,
             })
             .map_err(|_| anyhow::anyhow!("writer SQLite arrêté"))?;
@@ -715,13 +842,50 @@ fn insert_observations(
     root_domain: &str,
     observations: &[ObservationInput],
 ) -> Result<usize> {
+    Ok(insert_observations_with_stats(connection, root_domain, observations)?.written)
+}
+
+fn insert_observations_with_stats(
+    connection: &mut Connection,
+    root_domain: &str,
+    observations: &[ObservationInput],
+) -> Result<ObservationWriteStats> {
     if observations.is_empty() {
-        return Ok(0);
+        return Ok(ObservationWriteStats::default());
     }
     let transaction = connection.transaction()?;
-    let written = insert_observation_rows(&transaction, root_domain, observations)?;
+    let stats = insert_observation_rows_with_stats(&transaction, root_domain, observations)?;
     transaction.commit()?;
-    Ok(written)
+    Ok(stats)
+}
+
+fn insert_passive_observations_with_stats(
+    connection: &mut Connection,
+    root_domain: &str,
+    source: &str,
+    observations: &[ObservationInput],
+) -> Result<ObservationWriteStats> {
+    let transaction = connection.transaction()?;
+    let stats = insert_passive_observation_rows_with_stats(
+        &transaction,
+        root_domain,
+        source,
+        observations,
+    )?;
+    transaction.execute(
+        r#"INSERT OR IGNORE INTO passive_cache(
+               root_domain, source, names_json, updated_at
+           ) VALUES (?1, ?2, '[]', 0)"#,
+        params![root_domain, source],
+    )?;
+    transaction.commit()?;
+    Ok(stats)
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ObservationWriteStats {
+    written: usize,
+    novel_names: usize,
 }
 
 fn insert_observation_rows(
@@ -729,40 +893,215 @@ fn insert_observation_rows(
     root_domain: &str,
     observations: &[ObservationInput],
 ) -> Result<usize> {
+    Ok(insert_observation_rows_with_stats(connection, root_domain, observations)?.written)
+}
+
+fn insert_observation_rows_with_stats(
+    connection: &Connection,
+    root_domain: &str,
+    observations: &[ObservationInput],
+) -> Result<ObservationWriteStats> {
+    insert_observation_rows_with_refresh_stats(connection, root_domain, None, observations)
+}
+
+fn cleanup_abandoned_passive_refresh_sessions(connection: &Connection, now: i64) -> Result<usize> {
+    let cutoff = now.saturating_sub(PASSIVE_REFRESH_ABANDONED_AFTER_SECS);
+    let limit = usize_to_i64_saturating(PASSIVE_REFRESH_GC_BATCH);
+    connection.execute(
+        r#"DELETE FROM passive_pagination_state
+           WHERE (root_domain, source) IN (
+               SELECT root_domain, source
+               FROM passive_refresh_sessions
+               WHERE active=1 AND updated_at < ?1
+               ORDER BY updated_at, root_domain, source
+               LIMIT ?2
+           )"#,
+        params![cutoff, limit],
+    )?;
+    let deactivated = connection.execute(
+        r#"UPDATE passive_refresh_sessions
+           SET active=0, updated_at=?1
+           WHERE (root_domain, source) IN (
+               SELECT root_domain, source
+               FROM passive_refresh_sessions
+               WHERE active=1 AND updated_at < ?2
+               ORDER BY updated_at, root_domain, source
+               LIMIT ?3
+           )"#,
+        params![now, cutoff, limit],
+    )?;
+    // Rows from the first replay-safe implementation are no longer used.
+    // Remove them in a bounded batch so a million-name source never creates a
+    // single blocking cascade transaction.
+    connection.execute(
+        r#"DELETE FROM passive_refresh_seen
+           WHERE (root_domain, source, name_id) IN (
+               SELECT seen.root_domain, seen.source, seen.name_id
+               FROM passive_refresh_seen AS seen
+               LEFT JOIN passive_refresh_sessions AS sessions
+                 ON sessions.root_domain=seen.root_domain
+                AND sessions.source=seen.source
+               WHERE sessions.active=0 OR sessions.active IS NULL
+               ORDER BY seen.root_domain, seen.source, seen.name_id
+               LIMIT ?1
+           )"#,
+        [usize_to_i64_saturating(PASSIVE_REFRESH_GC_BATCH * 16)],
+    )?;
+    Ok(deactivated)
+}
+
+fn cleanup_expired_passive_refresh_leases(connection: &Connection, now: i64) -> Result<usize> {
+    connection
+        .execute(
+            r#"DELETE FROM passive_refresh_leases
+               WHERE (root_domain, source) IN (
+                   SELECT root_domain, source
+                   FROM passive_refresh_leases
+                   WHERE expires_at<=?1
+                   ORDER BY expires_at, root_domain, source
+                   LIMIT ?2
+               )"#,
+            params![now, usize_to_i64_saturating(PASSIVE_REFRESH_LEASE_GC_BATCH)],
+        )
+        .map_err(Into::into)
+}
+
+fn begin_passive_refresh_session(
+    connection: &Connection,
+    root_domain: &str,
+    source: &str,
+    now: i64,
+) -> Result<i64> {
+    cleanup_abandoned_passive_refresh_sessions(connection, now)?;
+    connection.execute(
+        r#"INSERT INTO passive_refresh_sessions(
+               root_domain, source, started_at, updated_at, generation, active
+           ) VALUES (?1, ?2, ?3, ?3, 1, 1)
+           ON CONFLICT(root_domain, source) DO UPDATE SET
+               generation=CASE
+                   WHEN passive_refresh_sessions.active=0
+                   THEN passive_refresh_sessions.generation+1
+                   ELSE passive_refresh_sessions.generation
+               END,
+               started_at=CASE
+                   WHEN passive_refresh_sessions.active=0 THEN excluded.started_at
+                   ELSE passive_refresh_sessions.started_at
+               END,
+               active=1,
+               updated_at=excluded.updated_at"#,
+        params![root_domain, source, now],
+    )?;
+    connection
+        .query_row(
+            r#"SELECT generation FROM passive_refresh_sessions
+               WHERE root_domain=?1 AND source=?2 AND active=1"#,
+            params![root_domain, source],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+}
+
+fn clear_passive_refresh_session(
+    connection: &Connection,
+    root_domain: &str,
+    source: &str,
+) -> Result<()> {
+    // Keep one tiny generation counter per source. Evidence records carry the
+    // generation they last observed, so completion never cascades through a
+    // million-name replay set.
+    connection.execute(
+        r#"UPDATE passive_refresh_sessions
+           SET active=0, updated_at=?3
+           WHERE root_domain=?1 AND source=?2"#,
+        params![root_domain, source, now_epoch()],
+    )?;
+    Ok(())
+}
+
+fn insert_passive_observation_rows_with_stats(
+    connection: &Connection,
+    root_domain: &str,
+    source: &str,
+    observations: &[ObservationInput],
+) -> Result<ObservationWriteStats> {
+    insert_observation_rows_with_refresh_stats(connection, root_domain, Some(source), observations)
+}
+
+fn insert_observation_rows_with_refresh_stats(
+    connection: &Connection,
+    root_domain: &str,
+    passive_refresh_source: Option<&str>,
+    observations: &[ObservationInput],
+) -> Result<ObservationWriteStats> {
     let now = now_epoch();
-    let mut written = 0;
+    let refresh_generation = passive_refresh_source
+        .map(|source| begin_passive_refresh_session(connection, root_domain, source, now))
+        .transpose()?;
+    let mut stats = ObservationWriteStats::default();
     for observation in observations {
-        connection.execute(
-            r#"INSERT INTO observed_names(fqdn, reversed_name, first_seen, last_seen)
-               VALUES (?1, ?2, ?3, ?3)
-               ON CONFLICT(fqdn) DO UPDATE SET last_seen=excluded.last_seen"#,
+        let inserted = connection.execute(
+            r#"INSERT OR IGNORE INTO observed_names(
+                   fqdn, reversed_name, first_seen, last_seen
+               ) VALUES (?1, ?2, ?3, ?3)"#,
             params![observation.fqdn, reverse_hostname(&observation.fqdn), now],
         )?;
+        if inserted == 0 {
+            connection.execute(
+                "UPDATE observed_names SET last_seen=?2 WHERE fqdn=?1",
+                params![observation.fqdn, now],
+            )?;
+        }
+        stats.novel_names = stats.novel_names.saturating_add(inserted);
         let name_id: i64 = connection.query_row(
             "SELECT id FROM observed_names WHERE fqdn=?1",
             [&observation.fqdn],
             |row| row.get(0),
         )?;
-        connection.execute(
-            r#"INSERT INTO observation_evidence(
-               root_domain, name_id, kind, source, value,
-               first_seen, last_seen, times_seen
-               ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, 1)
-               ON CONFLICT(root_domain, name_id, kind, source, value)
-               DO UPDATE SET last_seen=excluded.last_seen,
-                             times_seen=observation_evidence.times_seen+1"#,
-            params![
-                root_domain,
-                name_id,
-                observation.kind,
-                observation.source,
-                observation.value,
-                now
-            ],
-        )?;
-        written += 1;
+        if let Some(refresh_generation) = refresh_generation {
+            connection.execute(
+                r#"INSERT INTO observation_evidence(
+                   root_domain, name_id, kind, source, value,
+                   first_seen, last_seen, times_seen, passive_refresh_generation
+                   ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, 1, ?7)
+                   ON CONFLICT(root_domain, name_id, kind, source, value)
+                   DO UPDATE SET last_seen=excluded.last_seen,
+                                 times_seen=observation_evidence.times_seen+
+                                   CASE WHEN observation_evidence.passive_refresh_generation=
+                                                  excluded.passive_refresh_generation
+                                        THEN 0 ELSE 1 END,
+                                 passive_refresh_generation=
+                                   excluded.passive_refresh_generation"#,
+                params![
+                    root_domain,
+                    name_id,
+                    observation.kind,
+                    observation.source,
+                    observation.value,
+                    now,
+                    refresh_generation
+                ],
+            )?;
+        } else {
+            connection.execute(
+                r#"INSERT INTO observation_evidence(
+                   root_domain, name_id, kind, source, value,
+                   first_seen, last_seen, times_seen
+                   ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, 1)
+                   ON CONFLICT(root_domain, name_id, kind, source, value)
+                   DO UPDATE SET last_seen=excluded.last_seen"#,
+                params![
+                    root_domain,
+                    name_id,
+                    observation.kind,
+                    observation.source,
+                    observation.value,
+                    now
+                ],
+            )?;
+        }
+        stats.written = stats.written.saturating_add(1);
     }
-    Ok(written)
+    Ok(stats)
 }
 
 fn migrate_legacy_observations(
@@ -1401,6 +1740,25 @@ impl Database {
                 PRIMARY KEY(root_domain, source)
             );
 
+            CREATE TABLE IF NOT EXISTS passive_pagination_state (
+                root_domain TEXT NOT NULL,
+                source TEXT NOT NULL,
+                lane TEXT NOT NULL,
+                contract_version INTEGER NOT NULL CHECK(contract_version > 0),
+                query_hash TEXT NOT NULL CHECK(length(query_hash) = 64),
+                next_position INTEGER NOT NULL CHECK(next_position > 0),
+                records_seen INTEGER NOT NULL CHECK(records_seen >= 0),
+                expected_records INTEGER CHECK(expected_records >= 0),
+                expected_pages INTEGER CHECK(expected_pages >= 0),
+                last_page_hash TEXT NOT NULL CHECK(length(last_page_hash) = 64),
+                last_page_records INTEGER NOT NULL CHECK(last_page_records >= 0),
+                done INTEGER NOT NULL DEFAULT 0 CHECK(done IN (0, 1)),
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY(root_domain, source, lane)
+            ) WITHOUT ROWID;
+            CREATE INDEX IF NOT EXISTS idx_passive_pagination_updated
+                ON passive_pagination_state(updated_at);
+
             CREATE TABLE IF NOT EXISTS candidate_priors (
                 relative_name TEXT PRIMARY KEY,
                 priority INTEGER NOT NULL,
@@ -1567,10 +1925,46 @@ impl Database {
                 first_seen INTEGER NOT NULL,
                 last_seen INTEGER NOT NULL,
                 times_seen INTEGER NOT NULL DEFAULT 1,
+                passive_refresh_generation INTEGER NOT NULL DEFAULT 0
+                    CHECK(passive_refresh_generation >= 0),
                 PRIMARY KEY(root_domain, name_id, kind, source, value)
             );
             CREATE INDEX IF NOT EXISTS idx_observation_root_source
                 ON observation_evidence(root_domain, source, name_id);
+
+            CREATE TABLE IF NOT EXISTS passive_refresh_sessions (
+                root_domain TEXT NOT NULL,
+                source TEXT NOT NULL,
+                started_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                generation INTEGER NOT NULL DEFAULT 1 CHECK(generation > 0),
+                active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0, 1)),
+                PRIMARY KEY(root_domain, source)
+            ) WITHOUT ROWID;
+            CREATE INDEX IF NOT EXISTS idx_passive_refresh_sessions_updated
+                ON passive_refresh_sessions(updated_at);
+
+            CREATE TABLE IF NOT EXISTS passive_refresh_seen (
+                root_domain TEXT NOT NULL,
+                source TEXT NOT NULL,
+                name_id INTEGER NOT NULL REFERENCES observed_names(id) ON DELETE CASCADE,
+                seen_at INTEGER NOT NULL,
+                PRIMARY KEY(root_domain, source, name_id),
+                FOREIGN KEY(root_domain, source)
+                    REFERENCES passive_refresh_sessions(root_domain, source)
+                    ON DELETE CASCADE
+            ) WITHOUT ROWID;
+
+            CREATE TABLE IF NOT EXISTS passive_refresh_leases (
+                root_domain TEXT NOT NULL,
+                source TEXT NOT NULL,
+                owner TEXT NOT NULL,
+                expires_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY(root_domain, source)
+            ) WITHOUT ROWID;
+            CREATE INDEX IF NOT EXISTS idx_passive_refresh_leases_expires
+                ON passive_refresh_leases(expires_at);
 
             CREATE TABLE IF NOT EXISTS wildcard_cache (
                 zone TEXT PRIMARY KEY,
@@ -1880,6 +2274,21 @@ impl Database {
                 "learning_applied INTEGER NOT NULL DEFAULT 0",
             ),
             (
+                "observation_evidence",
+                "passive_refresh_generation",
+                "passive_refresh_generation INTEGER NOT NULL DEFAULT 0 CHECK(passive_refresh_generation >= 0)",
+            ),
+            (
+                "passive_refresh_sessions",
+                "generation",
+                "generation INTEGER NOT NULL DEFAULT 1 CHECK(generation > 0)",
+            ),
+            (
+                "passive_refresh_sessions",
+                "active",
+                "active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0, 1))",
+            ),
+            (
                 "source_stats",
                 "novel_names",
                 "novel_names INTEGER NOT NULL DEFAULT 0",
@@ -1952,6 +2361,10 @@ impl Database {
                ON scan_candidates(scan_id) WHERE learning_recorded=0"#,
             [],
         )?;
+        // Operational refresh markers are bounded independently from the
+        // permanent observations they protect. Cleanup is additive and never
+        // deletes observed_names or observation_evidence.
+        cleanup_abandoned_passive_refresh_sessions(&connection, now_epoch())?;
         if migrating_to_v8 {
             connection.execute(
                 "UPDATE dns_cache SET expires_at=?1 WHERE status='positive' AND expires_at<>?1",
@@ -2077,11 +2490,21 @@ impl Database {
         root_domain: &str,
         observations: Vec<ObservationInput>,
     ) -> Result<usize> {
+        Ok(self
+            .store_observations_with_stats(root_domain, observations)?
+            .written)
+    }
+
+    fn store_observations_with_stats(
+        &self,
+        root_domain: &str,
+        observations: Vec<ObservationInput>,
+    ) -> Result<ObservationWriteStats> {
         if let Some(writer) = &self.writer {
-            writer.submit(root_domain, observations)
+            writer.submit_with_stats(root_domain, observations)
         } else {
             let mut connection = self.lock()?;
-            insert_observations(&mut connection, root_domain, &observations)
+            insert_observations_with_stats(&mut connection, root_domain, &observations)
         }
     }
 
@@ -5206,6 +5629,92 @@ impl Database {
         Ok(())
     }
 
+    /// Atomically demote completed findings whose stored positive now matches
+    /// a reliable wildcard profile and reopen them for bounded DNS
+    /// revalidation. The positive cache is intentionally retained: the scan
+    /// resolver recognizes a wildcard-shaped cached answer and forces a fresh
+    /// network check before it can become live again.
+    pub fn demote_and_requeue_scan_findings(
+        &self,
+        scan_id: i64,
+        candidates: &[(String, BTreeSet<String>, i64)],
+        reason: &str,
+    ) -> Result<()> {
+        if candidates.is_empty() {
+            return Ok(());
+        }
+        let now = now_epoch();
+        let details = serde_json::to_string(&json!({ "reason": reason }))?;
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        {
+            let mut select_seed = transaction.prepare(
+                "SELECT sources_json, priority FROM scan_seed_candidates WHERE scan_id=?1 AND fqdn=?2",
+            )?;
+            let mut update_seed = transaction.prepare(
+                r#"UPDATE scan_seed_candidates
+                   SET sources_json=?3, priority=?4, status='queued', attempts=0
+                   WHERE scan_id=?1 AND fqdn=?2"#,
+            )?;
+            let mut insert_seed = transaction.prepare(
+                r#"INSERT INTO scan_seed_candidates(
+                       scan_id, fqdn, priority, sources_json, status, attempts
+                   ) VALUES (?1, ?2, ?3, ?4, 'queued', 0)"#,
+            )?;
+            for (fqdn, sources, priority) in candidates {
+                transaction.execute(
+                    "UPDATE subdomains SET active=0, verification_state='unverified', last_verified_at=NULL WHERE fqdn=?1",
+                    [fqdn],
+                )?;
+                transaction.execute("UPDATE dns_records SET active=0 WHERE fqdn=?1", [fqdn])?;
+                transaction.execute(
+                    r#"UPDATE scan_findings
+                       SET state='unverified', last_verified_at=NULL,
+                           authoritative_validation=0, wildcard_verdict='ambiguous'
+                       WHERE scan_id=?1 AND fqdn=?2"#,
+                    params![scan_id, fqdn],
+                )?;
+                transaction.execute(
+                    r#"INSERT INTO dns_verifications(
+                       scan_id, fqdn, checked_at, outcome, resolver_count,
+                       authoritative, records_hash, details_json
+                       ) VALUES (?1, ?2, ?3, 'unverified', 0, 0, NULL, ?4)"#,
+                    params![scan_id, fqdn, now, details],
+                )?;
+
+                if let Some((sources_json, existing_priority)) = select_seed
+                    .query_row(params![scan_id, fqdn], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                    })
+                    .optional()?
+                {
+                    let mut merged = serde_json::from_str::<BTreeSet<String>>(&sources_json)
+                        .context("provenance de candidat passif SQLite invalide")?;
+                    merged.extend(sources.iter().cloned());
+                    update_seed.execute(params![
+                        scan_id,
+                        fqdn,
+                        serde_json::to_string(&merged)?,
+                        existing_priority.max(*priority)
+                    ])?;
+                } else {
+                    insert_seed.execute(params![
+                        scan_id,
+                        fqdn,
+                        priority,
+                        serde_json::to_string(sources)?
+                    ])?;
+                }
+                transaction.execute(
+                    "DELETE FROM scan_candidates WHERE scan_id=?1 AND fqdn=?2",
+                    params![scan_id, fqdn],
+                )?;
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn stage_refresh_wildcard_candidates(
         &self,
         scan_id: i64,
@@ -5629,6 +6138,597 @@ impl Database {
             .map_err(Into::into)
     }
 
+    /// Atomically reserves one provider refresh for a single process/task.
+    /// The lease is deliberately independent from permanent observations and
+    /// expires after the caller's bounded source deadline if the process dies.
+    pub fn try_acquire_passive_refresh_lease(
+        &self,
+        root_domain: &str,
+        source: &str,
+        owner: &str,
+        ttl: Duration,
+    ) -> Result<bool> {
+        if ttl.is_zero() {
+            bail!("durée de lease passive nulle");
+        }
+        validate_passive_pagination_key(root_domain, source, "lease", 1, owner)?;
+        let now = now_epoch();
+        let expires_at = now.saturating_add(u64_to_i64_saturating(ttl.as_secs().max(1)));
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        cleanup_expired_passive_refresh_leases(&transaction, now)?;
+        let acquired = transaction.execute(
+            r#"INSERT INTO passive_refresh_leases(
+                   root_domain, source, owner, expires_at, updated_at
+               ) VALUES (?1, ?2, ?3, ?4, ?5)
+               ON CONFLICT(root_domain, source) DO UPDATE SET
+                   owner=excluded.owner,
+                   expires_at=excluded.expires_at,
+                   updated_at=excluded.updated_at
+               WHERE passive_refresh_leases.expires_at<=?5
+                  OR passive_refresh_leases.owner=excluded.owner"#,
+            params![root_domain, source, owner, expires_at, now],
+        )? == 1;
+        transaction.commit()?;
+        Ok(acquired)
+    }
+
+    /// Extends a refresh lease only while the caller still owns it. A false
+    /// result means another bounded task took over after expiry, so the stale
+    /// task must stop before writing another provider page.
+    pub fn renew_passive_refresh_lease(
+        &self,
+        root_domain: &str,
+        source: &str,
+        owner: &str,
+        ttl: Duration,
+    ) -> Result<bool> {
+        if ttl.is_zero() {
+            bail!("durée de renouvellement passive nulle");
+        }
+        validate_passive_pagination_key(root_domain, source, "lease", 1, owner)?;
+        let now = now_epoch();
+        let expires_at = now.saturating_add(u64_to_i64_saturating(ttl.as_secs().max(1)));
+        let connection = self.lock()?;
+        Ok(connection.execute(
+            r#"UPDATE passive_refresh_leases
+               SET expires_at=?1, updated_at=?2
+               WHERE root_domain=?3 AND source=?4 AND owner=?5"#,
+            params![expires_at, now, root_domain, source, owner],
+        )? == 1)
+    }
+
+    /// Releases a lease only for its owner. Releasing a stale guard can never
+    /// remove a newer process's reservation.
+    pub fn release_passive_refresh_lease(
+        &self,
+        root_domain: &str,
+        source: &str,
+        owner: &str,
+    ) -> Result<bool> {
+        validate_passive_pagination_key(root_domain, source, "lease", 1, owner)?;
+        let connection = self.lock()?;
+        Ok(connection.execute(
+            r#"DELETE FROM passive_refresh_leases
+               WHERE root_domain=?1 AND source=?2 AND owner=?3"#,
+            params![root_domain, source, owner],
+        )? == 1)
+    }
+
+    /// Removes only obsolete lane contracts before a source refresh starts.
+    /// Valid unfinished or completed lanes remain durable across crashes.
+    pub fn prepare_passive_pagination_source(
+        &self,
+        root_domain: &str,
+        source: &str,
+        expected_contracts: &[(&str, u32, &str)],
+    ) -> Result<()> {
+        if expected_contracts.is_empty() {
+            bail!("aucun contrat attendu pour la préparation passive");
+        }
+        let mut expected = BTreeMap::new();
+        for &(lane, contract_version, query_hash) in expected_contracts {
+            validate_passive_pagination_key(
+                root_domain,
+                source,
+                lane,
+                contract_version,
+                query_hash,
+            )?;
+            if expected
+                .insert(lane.to_owned(), (contract_version, query_hash.to_owned()))
+                .is_some()
+            {
+                bail!("voie de pagination passive attendue dupliquée: {lane}");
+            }
+        }
+
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        cleanup_abandoned_passive_refresh_sessions(&transaction, now_epoch())?;
+        let stored = {
+            let mut statement = transaction.prepare(
+                r#"SELECT lane, contract_version, query_hash
+                   FROM passive_pagination_state
+                   WHERE root_domain=?1 AND source=?2"#,
+            )?;
+            statement
+                .query_map(params![root_domain, source], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for (lane, contract_version, query_hash) in stored {
+            let compatible =
+                expected
+                    .get(&lane)
+                    .is_some_and(|(expected_version, expected_hash)| {
+                        contract_version == i64::from(*expected_version)
+                            && query_hash == *expected_hash
+                    });
+            if !compatible {
+                transaction.execute(
+                    r#"DELETE FROM passive_pagination_state
+                       WHERE root_domain=?1 AND source=?2 AND lane=?3"#,
+                    params![root_domain, source, lane],
+                )?;
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Loads a compatible numeric connector checkpoint. A contract or query
+    /// change discards only the small progress row; permanent observations are
+    /// intentionally untouched and the connector restarts from position one.
+    pub fn passive_pagination_resume(
+        &self,
+        root_domain: &str,
+        source: &str,
+        lane: &str,
+        contract_version: u32,
+        query_hash: &str,
+    ) -> Result<Option<PassivePaginationState>> {
+        validate_passive_pagination_key(root_domain, source, lane, contract_version, query_hash)?;
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        let row = transaction
+            .query_row(
+                r#"SELECT contract_version, query_hash, next_position, records_seen,
+                          expected_records, expected_pages, last_page_hash,
+                          last_page_records, done, updated_at
+                   FROM passive_pagination_state
+                   WHERE root_domain=?1 AND source=?2 AND lane=?3"#,
+                params![root_domain, source, lane],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                        row.get::<_, Option<i64>>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, i64>(7)?,
+                        row.get::<_, i64>(8)?,
+                        row.get::<_, i64>(9)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((
+            stored_contract,
+            stored_query_hash,
+            next_position,
+            records_seen,
+            expected_records,
+            expected_pages,
+            last_page_hash,
+            last_page_records,
+            done,
+            updated_at,
+        )) = row
+        else {
+            transaction.commit()?;
+            return Ok(None);
+        };
+        if stored_contract != i64::from(contract_version) || stored_query_hash != query_hash {
+            transaction.execute(
+                r#"DELETE FROM passive_pagination_state
+                   WHERE root_domain=?1 AND source=?2 AND lane=?3"#,
+                params![root_domain, source, lane],
+            )?;
+            transaction.commit()?;
+            return Ok(None);
+        }
+        validate_passive_pagination_hash(&last_page_hash, "hash de dernière page")?;
+        let to_u64 = |value: i64, field: &str| -> Result<u64> {
+            u64::try_from(value)
+                .with_context(|| format!("compteur {field} négatif dans la pagination passive"))
+        };
+        let state = PassivePaginationState {
+            contract_version,
+            query_hash: stored_query_hash,
+            next_position: to_u64(next_position, "next_position")?,
+            records_seen: to_u64(records_seen, "records_seen")?,
+            expected_records: expected_records
+                .map(|value| to_u64(value, "expected_records"))
+                .transpose()?,
+            expected_pages: expected_pages
+                .map(|value| to_u64(value, "expected_pages"))
+                .transpose()?,
+            last_page_hash,
+            last_page_records: to_u64(last_page_records, "last_page_records")?,
+            done: done != 0,
+            updated_at,
+        };
+        if state.next_position == 0 || state.last_page_records > state.records_seen {
+            bail!("état de pagination passive incohérent");
+        }
+        transaction.commit()?;
+        Ok(Some(state))
+    }
+
+    /// Atomically stores one validated provider page and advances its numeric
+    /// resume position. Any SQLite error rolls back both evidence and progress,
+    /// so the same page is retried on the next run.
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_passive_pagination_page(
+        &self,
+        root_domain: &str,
+        source: &str,
+        lane: &str,
+        contract_version: u32,
+        query_hash: &str,
+        page: &PassivePaginationPage,
+        names: &BTreeSet<String>,
+    ) -> Result<usize> {
+        validate_passive_pagination_key(root_domain, source, lane, contract_version, query_hash)?;
+        validate_passive_pagination_hash(&page.page_hash, "hash de page")?;
+        if page.position == 0
+            || page.next_position != page.position.saturating_add(1)
+            || page.records_seen < page.page_records
+            || page
+                .expected_records
+                .is_some_and(|expected| page.records_seen > expected)
+            || page.expected_pages.is_some_and(|expected| {
+                expected == 0
+                    && (page.position != 1 || page.page_records != 0 || page.records_seen != 0)
+            })
+        {
+            bail!("transition de page passive incohérente");
+        }
+        let position = passive_pagination_counter(page.position, "position")?;
+        let next_position = passive_pagination_counter(page.next_position, "next_position")?;
+        let records_seen = passive_pagination_counter(page.records_seen, "records_seen")?;
+        let expected_records = page
+            .expected_records
+            .map(|value| passive_pagination_counter(value, "expected_records"))
+            .transpose()?;
+        let expected_pages = page
+            .expected_pages
+            .map(|value| passive_pagination_counter(value, "expected_pages"))
+            .transpose()?;
+        let page_records = passive_pagination_counter(page.page_records, "page_records")?;
+
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        let mut overlap_replay = false;
+        let current = transaction
+            .query_row(
+                r#"SELECT contract_version, query_hash, next_position, records_seen,
+                          expected_records, expected_pages, last_page_hash,
+                          last_page_records, done
+                   FROM passive_pagination_state
+                   WHERE root_domain=?1 AND source=?2 AND lane=?3"#,
+                params![root_domain, source, lane],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                        row.get::<_, Option<i64>>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, i64>(7)?,
+                        row.get::<_, i64>(8)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if let Some((
+            stored_contract,
+            stored_query_hash,
+            stored_next_position,
+            stored_records_seen,
+            stored_expected_records,
+            stored_expected_pages,
+            stored_last_page_hash,
+            stored_last_page_records,
+            done,
+        )) = current
+        {
+            if stored_contract != i64::from(contract_version)
+                || stored_query_hash != query_hash
+                || done != 0
+            {
+                bail!("contrat de pagination passive modifié pendant la collecte");
+            }
+            let forward = position == stored_next_position;
+            let overlap = position.saturating_add(1) == stored_next_position
+                && next_position == stored_next_position;
+            if !forward && !overlap {
+                bail!(
+                    "position de pagination passive inattendue: {position}, attendue {stored_next_position}"
+                );
+            }
+            if stored_expected_records.is_some() && stored_expected_records != expected_records
+                || stored_expected_pages.is_some() && stored_expected_pages != expected_pages
+            {
+                bail!("totaux de pagination passive modifiés pendant la collecte");
+            }
+            let base_records = if overlap {
+                if page.page_hash != stored_last_page_hash
+                    || page_records != stored_last_page_records
+                {
+                    bail!("la page de chevauchement passive a changé depuis son commit");
+                }
+                overlap_replay = true;
+                stored_records_seen
+                    .checked_sub(stored_last_page_records)
+                    .context("compteurs de chevauchement passif incohérents")?
+            } else {
+                stored_records_seen
+            };
+            if records_seen != base_records.saturating_add(page_records) {
+                bail!("compteur de résultats passifs incohérent avec la page validée");
+            }
+        } else if position != 1 || records_seen != page_records {
+            bail!("la pagination passive sans checkpoint doit commencer à la position 1");
+        }
+
+        if overlap_replay {
+            // The previous transaction already made both evidence and progress
+            // durable. Do not increment evidence counters for the deliberate
+            // one-page overlap used to verify restart continuity.
+            transaction.commit()?;
+            return Ok(0);
+        }
+
+        let observations = names
+            .iter()
+            .map(|fqdn| ObservationInput {
+                fqdn: fqdn.clone(),
+                kind: "passive".to_owned(),
+                source: format!("passive:{source}"),
+                value: String::new(),
+            })
+            .collect::<Vec<_>>();
+        let stats = insert_passive_observation_rows_with_stats(
+            &transaction,
+            root_domain,
+            source,
+            &observations,
+        )?;
+        transaction.execute(
+            r#"INSERT OR IGNORE INTO passive_cache(
+                   root_domain, source, names_json, updated_at
+               ) VALUES (?1, ?2, '[]', 0)"#,
+            params![root_domain, source],
+        )?;
+        let now = now_epoch();
+        transaction.execute(
+            r#"INSERT INTO passive_pagination_state(
+                   root_domain, source, lane, contract_version, query_hash,
+                   next_position, records_seen, expected_records, expected_pages,
+                   last_page_hash, last_page_records, done, updated_at
+               ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0, ?12)
+               ON CONFLICT(root_domain, source, lane) DO UPDATE SET
+                   contract_version=excluded.contract_version,
+                   query_hash=excluded.query_hash,
+                   next_position=excluded.next_position,
+                   records_seen=excluded.records_seen,
+                   expected_records=excluded.expected_records,
+                   expected_pages=excluded.expected_pages,
+                   last_page_hash=excluded.last_page_hash,
+                   last_page_records=excluded.last_page_records,
+                   done=0,
+                   updated_at=excluded.updated_at"#,
+            params![
+                root_domain,
+                source,
+                lane,
+                i64::from(contract_version),
+                query_hash,
+                next_position,
+                records_seen,
+                expected_records,
+                expected_pages,
+                page.page_hash,
+                page_records,
+                now,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(stats.novel_names)
+    }
+
+    /// Marks one numeric lane complete without publishing source freshness.
+    /// The durable `done` row is intentionally retained so a crash between
+    /// connector completion and source completion cannot force a page-one
+    /// replay or make a partial multi-lane refresh appear complete.
+    pub fn finish_passive_pagination(
+        &self,
+        root_domain: &str,
+        source: &str,
+        lane: &str,
+        contract_version: u32,
+        query_hash: &str,
+    ) -> Result<()> {
+        validate_passive_pagination_key(root_domain, source, lane, contract_version, query_hash)?;
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        let now = now_epoch();
+        let (records_seen, expected_records, next_position, expected_pages, last_page_records): (
+            i64,
+            Option<i64>,
+            i64,
+            Option<i64>,
+            i64,
+        ) = transaction
+            .query_row(
+                r#"SELECT records_seen, expected_records, next_position,
+                          expected_pages, last_page_records
+                   FROM passive_pagination_state
+                   WHERE root_domain=?1 AND source=?2 AND lane=?3
+                     AND contract_version=?4 AND query_hash=?5"#,
+                params![
+                    root_domain,
+                    source,
+                    lane,
+                    i64::from(contract_version),
+                    query_hash
+                ],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .optional()?
+            .context("état de pagination passive absent lors de la finalisation")?;
+        if expected_records.is_some_and(|expected| records_seen != expected) {
+            bail!("total de résultats passifs incomplet lors de la finalisation");
+        }
+        if let Some(expected_pages) = expected_pages {
+            let pages_complete = if expected_pages == 0 {
+                records_seen == 0 && last_page_records == 0 && next_position == 2
+            } else {
+                next_position == expected_pages.saturating_add(1)
+            };
+            if !pages_complete {
+                bail!("total de pages passives incomplet lors de la finalisation");
+            }
+        }
+        let finished = transaction.execute(
+            r#"UPDATE passive_pagination_state
+               SET done=1, updated_at=?1
+               WHERE root_domain=?2 AND source=?3 AND lane=?4
+                 AND contract_version=?5 AND query_hash=?6"#,
+            params![
+                now,
+                root_domain,
+                source,
+                lane,
+                i64::from(contract_version),
+                query_hash
+            ],
+        )?;
+        if finished != 1 {
+            bail!("état de pagination passive absent lors de la finalisation");
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Publishes one passive source refresh only when its durable lane set is
+    /// exactly the expected contract set and every lane is marked complete.
+    /// Freshness publication, checkpoint removal and refresh-marker cleanup
+    /// form a single transaction.
+    pub fn complete_passive_pagination_source(
+        &self,
+        root_domain: &str,
+        source: &str,
+        expected_contracts: &[(&str, u32, &str)],
+    ) -> Result<()> {
+        if expected_contracts.is_empty() {
+            bail!("aucun contrat attendu pour la finalisation passive");
+        }
+        let mut expected = BTreeMap::new();
+        for &(lane, contract_version, query_hash) in expected_contracts {
+            validate_passive_pagination_key(
+                root_domain,
+                source,
+                lane,
+                contract_version,
+                query_hash,
+            )?;
+            if expected
+                .insert(lane.to_owned(), (contract_version, query_hash.to_owned()))
+                .is_some()
+            {
+                bail!("voie de pagination passive attendue dupliquée: {lane}");
+            }
+        }
+
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        let actual = {
+            let mut statement = transaction.prepare(
+                r#"SELECT lane, contract_version, query_hash, done
+                   FROM passive_pagination_state
+                   WHERE root_domain=?1 AND source=?2
+                   ORDER BY lane"#,
+            )?;
+            statement
+                .query_map(params![root_domain, source], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        if actual.len() != expected.len() {
+            bail!(
+                "ensemble de voies passives incomplet: {} présente(s), {} attendue(s)",
+                actual.len(),
+                expected.len()
+            );
+        }
+        for (lane, contract_version, query_hash, done) in &actual {
+            let Some((expected_version, expected_hash)) = expected.get(lane) else {
+                bail!("voie de pagination passive inattendue: {lane}");
+            };
+            if *contract_version != i64::from(*expected_version)
+                || query_hash != expected_hash
+                || *done != 1
+            {
+                bail!("voie de pagination passive incomplète ou incompatible: {lane}");
+            }
+        }
+
+        transaction.execute(
+            r#"INSERT INTO passive_cache(root_domain, source, names_json, updated_at)
+               VALUES (?1, ?2, '[]', ?3)
+               ON CONFLICT(root_domain, source) DO UPDATE SET
+               updated_at=excluded.updated_at"#,
+            params![root_domain, source, now_epoch()],
+        )?;
+        let removed = transaction.execute(
+            r#"DELETE FROM passive_pagination_state
+               WHERE root_domain=?1 AND source=?2"#,
+            params![root_domain, source],
+        )?;
+        if removed != expected.len() {
+            bail!("suppression incomplète des checkpoints de pagination passive");
+        }
+        clear_passive_refresh_session(&transaction, root_domain, source)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn passive_cache(&self, domain: &str, source: &str) -> Result<Option<PassiveCacheEntry>> {
         self.passive_cache_bounded(domain, source, usize::MAX)
     }
@@ -5695,18 +6795,7 @@ impl Database {
         names: &[String],
         complete: bool,
     ) -> Result<Vec<String>> {
-        self.store_observations(
-            domain,
-            names
-                .iter()
-                .map(|fqdn| ObservationInput {
-                    fqdn: fqdn.clone(),
-                    kind: "passive".to_owned(),
-                    source: format!("passive:{source}"),
-                    value: String::new(),
-                })
-                .collect(),
-        )?;
+        self.store_passive_observation_page(domain, source, &names.iter().cloned().collect())?;
         self.mark_passive_cache_refresh(domain, source, complete)?;
         Ok(self
             .passive_cache(domain, source)?
@@ -5714,29 +6803,32 @@ impl Database {
             .unwrap_or_default())
     }
 
+    /// Persist one complete provider page and return the number of hostnames
+    /// that were not present in the durable global name index beforehand.
+    /// This count remains exact even when the connector retains only a small
+    /// in-memory working set.
     pub fn store_passive_observation_page(
         &self,
         domain: &str,
         source: &str,
         names: &BTreeSet<String>,
     ) -> Result<usize> {
-        let written = self.store_observations(
-            domain,
-            names
-                .iter()
-                .map(|fqdn| ObservationInput {
-                    fqdn: fqdn.clone(),
-                    kind: "passive".to_owned(),
-                    source: format!("passive:{source}"),
-                    value: String::new(),
-                })
-                .collect(),
-        )?;
-        // A page is durable but does not prove that the provider pagination
-        // completed. Keep the prior freshness timestamp (or zero for a new
-        // cache row) until the connector explicitly marks a complete refresh.
-        self.mark_passive_cache_refresh(domain, source, false)?;
-        Ok(written)
+        let observations = names
+            .iter()
+            .map(|fqdn| ObservationInput {
+                fqdn: fqdn.clone(),
+                kind: "passive".to_owned(),
+                source: format!("passive:{source}"),
+                value: String::new(),
+            })
+            .collect::<Vec<_>>();
+        let stats = if let Some(writer) = &self.writer {
+            writer.submit_passive_page_with_stats(domain, source, observations)?
+        } else {
+            let mut connection = self.lock()?;
+            insert_passive_observations_with_stats(&mut connection, domain, source, &observations)?
+        };
+        Ok(stats.novel_names)
     }
 
     fn store_passive_observation_page_if_absent(
@@ -5837,23 +6929,30 @@ impl Database {
         source: &str,
         complete: bool,
     ) -> Result<()> {
-        let connection = self.lock()?;
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
         if complete {
-            connection.execute(
+            transaction.execute(
                 r#"INSERT INTO passive_cache(root_domain, source, names_json, updated_at)
                    VALUES (?1, ?2, '[]', ?3)
                    ON CONFLICT(root_domain, source) DO UPDATE SET
                    updated_at=excluded.updated_at"#,
                 params![domain, source, now_epoch()],
             )?;
+            // Freshness publication and replay-marker removal are one atomic
+            // completion boundary. A crash can therefore expose either a
+            // resumable unfinished generation or a fully fresh cache, never a
+            // half-completed mix of both.
+            clear_passive_refresh_session(&transaction, domain, source)?;
         } else {
-            connection.execute(
+            transaction.execute(
                 r#"INSERT OR IGNORE INTO passive_cache(
                        root_domain, source, names_json, updated_at
                    ) VALUES (?1, ?2, '[]', 0)"#,
                 params![domain, source],
             )?;
         }
+        transaction.commit()?;
         Ok(())
     }
 
@@ -7919,6 +9018,10 @@ impl Database {
         let now = now_epoch();
         let mut connection = self.lock()?;
         let transaction = connection.transaction()?;
+        // A resumed scan reruns AXFR because the previous phase may have been
+        // interrupted at any point. Replace that scan's snapshot atomically so
+        // retries do not inflate success/error counts with duplicate attempts.
+        transaction.execute("DELETE FROM axfr_attempts WHERE scan_id=?1", [scan_id])?;
         for attempt in attempts {
             transaction.execute(
                 r#"INSERT INTO axfr_attempts(
@@ -9071,6 +10174,29 @@ mod tests {
         assert_eq!(
             connection
                 .query_row(
+                    r#"SELECT COUNT(*) FROM sqlite_master
+                       WHERE type='table' AND name IN (
+                           'passive_refresh_sessions', 'passive_refresh_seen',
+                           'passive_refresh_leases'
+                       )"#,
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            3,
+            "same-version additive repair must install replay-safe refresh state"
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row(
                     "SELECT COUNT(*) FROM migration_state WHERE name='intelligence-v9'",
                     [],
                     |row| row.get::<_, i64>(0),
@@ -9435,6 +10561,96 @@ mod tests {
             )
             .unwrap();
         assert_eq!((subdomain_active, record_active), (0, 0));
+    }
+
+    #[test]
+    fn wildcard_suspect_demotion_and_seed_requeue_are_atomic() {
+        let db = Database::in_memory().unwrap();
+        let scan_id = db.create_scan("example.com", &json!({})).unwrap();
+        let fqdn = "api.example.com".to_owned();
+        let answer = ResolvedHost {
+            fqdn: fqdn.clone(),
+            records: vec![DnsRecord {
+                record_type: "A".to_owned(),
+                value: "192.0.2.44".to_owned(),
+                ttl: 60,
+            }],
+            from_cache: false,
+            last_verified_at: Some(now_epoch()),
+            authoritative_validation: false,
+            resolver_count: 2,
+        };
+        db.persist_findings(
+            scan_id,
+            "example.com",
+            &[Finding {
+                fqdn: fqdn.clone(),
+                records: answer.records.clone(),
+                sources: BTreeSet::from(["dns:seed".to_owned()]),
+                state: ObservationState::Live,
+                last_verified_at: answer.last_verified_at,
+                ..Finding::default()
+            }],
+            86_400,
+        )
+        .unwrap();
+        db.update_cache_outcomes(Some(scan_id), &[answer], &[], &[], 300)
+            .unwrap();
+        let initial_sources = BTreeSet::from(["passive:first".to_owned()]);
+        db.persist_scan_seed_candidates(scan_id, &[(fqdn.clone(), initial_sources, 10)], 10)
+            .unwrap();
+        let claimed = db.pending_scan_seed_candidates(scan_id, 1).unwrap();
+        db.mark_scan_seed_candidates_started(scan_id, std::slice::from_ref(&fqdn))
+            .unwrap();
+        db.mark_scan_seed_candidates_done(scan_id, std::slice::from_ref(&fqdn))
+            .unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(db.pending_scan_seed_candidate_count(scan_id).unwrap(), 0);
+
+        db.demote_and_requeue_scan_findings(
+            scan_id,
+            &[(
+                fqdn.clone(),
+                BTreeSet::from(["dns:resume-wildcard".to_owned()]),
+                50,
+            )],
+            "test revalidation",
+        )
+        .unwrap();
+
+        let inventory = db.inventory(Some("example.com"), false).unwrap();
+        assert_eq!(inventory.len(), 1);
+        assert_eq!(inventory[0].state, ObservationState::Unverified);
+        assert!(matches!(
+            db.fresh_cache(std::slice::from_ref(&fqdn)).unwrap()[&fqdn],
+            CachedAnswer::Positive(_)
+        ));
+        let queued = db.pending_scan_seed_candidates(scan_id, 1).unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].0, fqdn);
+        assert!(queued[0].1.contains("passive:first"));
+        assert!(queued[0].1.contains("dns:resume-wildcard"));
+        assert_eq!(queued[0].2, 50);
+        let connection = db.lock().unwrap();
+        let (finding_state, verdict, active_record, latest_outcome): (String, String, i64, String) =
+            connection
+                .query_row(
+                    r#"SELECT finding.state, finding.wildcard_verdict, record.active,
+                          verification.outcome
+                   FROM scan_findings AS finding
+                   JOIN dns_records AS record ON record.fqdn=finding.fqdn
+                   JOIN dns_verifications AS verification ON verification.id=(
+                       SELECT MAX(id) FROM dns_verifications WHERE fqdn=finding.fqdn
+                   )
+                   WHERE finding.scan_id=?1 AND finding.fqdn=?2"#,
+                    params![scan_id, fqdn],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .unwrap();
+        assert_eq!(finding_state, "unverified");
+        assert_eq!(verdict, "ambiguous");
+        assert_eq!(active_record, 0);
+        assert_eq!(latest_outcome, "unverified");
     }
 
     #[test]
@@ -12471,6 +13687,429 @@ mod tests {
     }
 
     #[test]
+    fn numeric_passive_pagination_is_additive_atomic_and_resume_safe() {
+        let db = Database::in_memory().unwrap();
+        let query_hash = domain_hash("viewdns:pages:v1:example.com:output=json");
+        let page_one_hash = domain_hash("api.example.com\0mail.example.com");
+        let page_one = PassivePaginationPage {
+            position: 1,
+            next_position: 2,
+            records_seen: 2,
+            expected_records: Some(3),
+            expected_pages: Some(2),
+            page_hash: page_one_hash.clone(),
+            page_records: 2,
+        };
+        let first_names =
+            BTreeSet::from(["api.example.com".to_owned(), "mail.example.com".to_owned()]);
+        db.commit_passive_pagination_page(
+            "example.com",
+            "viewdns",
+            "pages",
+            1,
+            &query_hash,
+            &page_one,
+            &first_names,
+        )
+        .unwrap();
+
+        let state = db
+            .passive_pagination_resume("example.com", "viewdns", "pages", 1, &query_hash)
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.next_position, 2);
+        assert_eq!(state.records_seen, 2);
+        assert_eq!(state.last_page_records, 2);
+        assert_eq!(state.last_page_hash, page_one_hash);
+
+        // A resumed connector deliberately overlaps the last complete page.
+        // The cumulative counter remains stable instead of double-counting it.
+        db.commit_passive_pagination_page(
+            "example.com",
+            "viewdns",
+            "pages",
+            1,
+            &query_hash,
+            &page_one,
+            &first_names,
+        )
+        .unwrap();
+        assert_eq!(
+            db.passive_pagination_resume("example.com", "viewdns", "pages", 1, &query_hash)
+                .unwrap()
+                .unwrap()
+                .records_seen,
+            2
+        );
+        let overlap_times_seen: i64 = db
+            .lock()
+            .unwrap()
+            .query_row(
+                r#"SELECT evidence.times_seen
+                   FROM observation_evidence evidence
+                   JOIN observed_names names ON names.id=evidence.name_id
+                   WHERE evidence.root_domain='example.com'
+                     AND evidence.source='passive:viewdns'
+                     AND names.fqdn='api.example.com'"#,
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(overlap_times_seen, 1, "overlap must be idempotent");
+        assert!(
+            db.finish_passive_pagination("example.com", "viewdns", "pages", 1, &query_hash)
+                .is_err(),
+            "a lane cannot finish before its advertised records and pages are complete"
+        );
+
+        db.lock()
+            .unwrap()
+            .execute_batch(
+                r#"CREATE TRIGGER fail_passive_page_advance
+                   BEFORE UPDATE ON passive_pagination_state
+                   WHEN NEW.next_position=3
+                   BEGIN SELECT RAISE(ABORT, 'forced pagination failure'); END;"#,
+            )
+            .unwrap();
+        let page_two = PassivePaginationPage {
+            position: 2,
+            next_position: 3,
+            records_seen: 3,
+            expected_records: Some(3),
+            expected_pages: Some(2),
+            page_hash: domain_hash("www.example.com"),
+            page_records: 1,
+        };
+        assert!(
+            db.commit_passive_pagination_page(
+                "example.com",
+                "viewdns",
+                "pages",
+                1,
+                &query_hash,
+                &page_two,
+                &BTreeSet::from(["www.example.com".to_owned()]),
+            )
+            .is_err()
+        );
+        assert_eq!(
+            db.passive_pagination_resume("example.com", "viewdns", "pages", 1, &query_hash)
+                .unwrap()
+                .unwrap()
+                .next_position,
+            2,
+            "a failed SQLite transaction must not advance the page"
+        );
+        assert!(
+            db.observation_names("example.com", "passive:viewdns")
+                .unwrap()
+                .iter()
+                .all(|name| name != "www.example.com"),
+            "the page evidence must roll back with its progress row"
+        );
+
+        db.lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER fail_passive_page_advance")
+            .unwrap();
+        db.commit_passive_pagination_page(
+            "example.com",
+            "viewdns",
+            "pages",
+            1,
+            &query_hash,
+            &page_two,
+            &BTreeSet::from(["www.example.com".to_owned()]),
+        )
+        .unwrap();
+        db.finish_passive_pagination("example.com", "viewdns", "pages", 1, &query_hash)
+            .unwrap();
+        assert!(
+            db.passive_pagination_resume("example.com", "viewdns", "pages", 1, &query_hash)
+                .unwrap()
+                .is_some_and(|state| state.done),
+            "lane completion must remain durable until source publication"
+        );
+        assert!(
+            db.passive_cache("example.com", "viewdns")
+                .unwrap()
+                .is_some_and(|cache| cache.updated_at == 0),
+            "finishing one lane must not publish source freshness"
+        );
+        assert_eq!(
+            db.lock()
+                .unwrap()
+                .query_row(
+                    r#"SELECT COUNT(*) FROM passive_refresh_sessions
+                       WHERE root_domain='example.com' AND source='viewdns'
+                         AND active=1"#,
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1,
+            "lane completion must retain replay markers until source completion"
+        );
+        db.complete_passive_pagination_source(
+            "example.com",
+            "viewdns",
+            &[("pages", 1, query_hash.as_str())],
+        )
+        .unwrap();
+        assert!(
+            db.passive_pagination_resume("example.com", "viewdns", "pages", 1, &query_hash)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.passive_cache("example.com", "viewdns")
+                .unwrap()
+                .is_some_and(|cache| cache.updated_at > 0),
+            "source completion must publish cache freshness atomically"
+        );
+        assert_eq!(
+            db.lock()
+                .unwrap()
+                .query_row(
+                    r#"SELECT COUNT(*) FROM passive_refresh_sessions
+                       WHERE root_domain='example.com' AND source='viewdns'
+                         AND active=1"#,
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0,
+            "source completion must close the replay generation atomically"
+        );
+        assert_eq!(
+            db.observation_names("example.com", "passive:viewdns")
+                .unwrap()
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "api.example.com".to_owned(),
+                "mail.example.com".to_owned(),
+                "www.example.com".to_owned(),
+            ])
+        );
+    }
+
+    #[test]
+    fn passive_source_completion_requires_every_expected_lane_atomically() {
+        let db = Database::in_memory().unwrap();
+        let lane_a_hash = domain_hash("fixture:lane-a:v1:example.com");
+        let lane_b_hash = domain_hash("fixture:lane-b:v1:example.com");
+        let expected = [
+            ("lane_a", 1, lane_a_hash.as_str()),
+            ("lane_b", 1, lane_b_hash.as_str()),
+        ];
+        db.prepare_passive_pagination_source("example.com", "fixture", &expected)
+            .unwrap();
+        let page = |name: &str| PassivePaginationPage {
+            position: 1,
+            next_position: 2,
+            records_seen: 1,
+            expected_records: Some(1),
+            expected_pages: Some(1),
+            page_hash: domain_hash(name),
+            page_records: 1,
+        };
+
+        db.commit_passive_pagination_page(
+            "example.com",
+            "fixture",
+            "lane_a",
+            1,
+            &lane_a_hash,
+            &page("api.example.com"),
+            &BTreeSet::from(["api.example.com".to_owned()]),
+        )
+        .unwrap();
+        db.finish_passive_pagination("example.com", "fixture", "lane_a", 1, &lane_a_hash)
+            .unwrap();
+
+        assert!(
+            db.complete_passive_pagination_source("example.com", "fixture", &expected)
+                .is_err(),
+            "a missing lane must fail closed"
+        );
+        assert!(
+            db.passive_cache("example.com", "fixture")
+                .unwrap()
+                .is_some_and(|cache| cache.updated_at == 0),
+            "an incomplete lane set must never publish freshness"
+        );
+        assert!(
+            db.passive_pagination_resume("example.com", "fixture", "lane_a", 1, &lane_a_hash,)
+                .unwrap()
+                .is_some_and(|state| state.done),
+            "a completed lane must survive the failed source completion"
+        );
+
+        db.commit_passive_pagination_page(
+            "example.com",
+            "fixture",
+            "lane_b",
+            1,
+            &lane_b_hash,
+            &page("www.example.com"),
+            &BTreeSet::from(["www.example.com".to_owned()]),
+        )
+        .unwrap();
+        db.finish_passive_pagination("example.com", "fixture", "lane_b", 1, &lane_b_hash)
+            .unwrap();
+        db.complete_passive_pagination_source("example.com", "fixture", &expected)
+            .unwrap();
+
+        let connection = db.lock().unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    r#"SELECT COUNT(*) FROM passive_pagination_state
+                       WHERE root_domain='example.com' AND source='fixture'"#,
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    r#"SELECT COUNT(*) FROM passive_refresh_sessions
+                       WHERE root_domain='example.com' AND source='fixture'
+                         AND active=1"#,
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        drop(connection);
+        assert!(
+            db.passive_cache("example.com", "fixture")
+                .unwrap()
+                .is_some_and(|cache| cache.updated_at > 0)
+        );
+        assert!(
+            db.complete_passive_pagination_source("example.com", "fixture", &expected)
+                .is_err(),
+            "a concurrent duplicate completion must fail closed"
+        );
+    }
+
+    #[test]
+    fn passive_pagination_preparation_prunes_only_obsolete_lane_contracts() {
+        let db = Database::in_memory().unwrap();
+        let old_hash = domain_hash("fixture:retired:v1:example.com");
+        let current_hash = domain_hash("fixture:current:v1:example.com");
+        let page = PassivePaginationPage {
+            position: 1,
+            next_position: 2,
+            records_seen: 1,
+            expected_records: Some(2),
+            expected_pages: Some(2),
+            page_hash: domain_hash("api.example.com"),
+            page_records: 1,
+        };
+        db.commit_passive_pagination_page(
+            "example.com",
+            "fixture",
+            "retired",
+            1,
+            &old_hash,
+            &page,
+            &BTreeSet::from(["api.example.com".to_owned()]),
+        )
+        .unwrap();
+        db.commit_passive_pagination_page(
+            "example.com",
+            "fixture",
+            "current",
+            1,
+            &current_hash,
+            &page,
+            &BTreeSet::from(["api.example.com".to_owned()]),
+        )
+        .unwrap();
+
+        db.prepare_passive_pagination_source(
+            "example.com",
+            "fixture",
+            &[("current", 1, current_hash.as_str())],
+        )
+        .unwrap();
+        assert!(
+            db.passive_pagination_resume("example.com", "fixture", "retired", 1, &old_hash,)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            db.passive_pagination_resume("example.com", "fixture", "current", 1, &current_hash,)
+                .unwrap()
+                .unwrap()
+                .next_position,
+            2
+        );
+        assert_eq!(
+            db.observation_names("example.com", "passive:fixture")
+                .unwrap(),
+            vec!["api.example.com"],
+            "contract cleanup must not delete permanent observations"
+        );
+    }
+
+    #[test]
+    fn passive_pagination_contract_change_restarts_without_deleting_observations() {
+        let db = Database::in_memory().unwrap();
+        let old_hash = domain_hash("viewdns:pages:v1:example.com:output=json");
+        db.commit_passive_pagination_page(
+            "example.com",
+            "viewdns",
+            "pages",
+            1,
+            &old_hash,
+            &PassivePaginationPage {
+                position: 1,
+                next_position: 2,
+                records_seen: 1,
+                expected_records: Some(2),
+                expected_pages: Some(2),
+                page_hash: domain_hash("api.example.com"),
+                page_records: 1,
+            },
+            &BTreeSet::from(["api.example.com".to_owned()]),
+        )
+        .unwrap();
+        let new_hash = domain_hash("viewdns:pages:v2:example.com:output=json");
+        assert!(
+            db.passive_pagination_resume("example.com", "viewdns", "pages", 2, &new_hash)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            db.observation_names("example.com", "passive:viewdns")
+                .unwrap(),
+            vec!["api.example.com"]
+        );
+        let (version, opaque_columns): (i64, i64) = db
+            .lock()
+            .unwrap()
+            .query_row(
+                r#"SELECT (SELECT user_version FROM pragma_user_version),
+                          (SELECT COUNT(*) FROM pragma_table_info('passive_pagination_state')
+                           WHERE lower(name) LIKE '%cursor%'
+                              OR lower(name) LIKE '%token%'
+                              OR lower(name) LIKE '%url%')"#,
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(version, 9, "the additive table must not bump user_version");
+        assert_eq!(opaque_columns, 0, "opaque pagination state is forbidden");
+    }
+
+    #[test]
     fn permanent_knowledge_keeps_words_patterns_and_passive_results() {
         let db = Database::in_memory().unwrap();
         let attempted = BTreeSet::from(["api".to_owned(), "dev".to_owned()]);
@@ -12560,6 +14199,445 @@ mod tests {
                 .unwrap()
                 .names,
             full_page.into_iter().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn passive_page_novelty_counts_durable_names_outside_any_working_set() {
+        let db = Database::in_memory().unwrap();
+        let already_known = (0..100)
+            .map(|index| format!("known-{index:03}.example.com"))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            db.store_passive_observation_page("example.com", "prior", &already_known)
+                .unwrap(),
+            already_known.len()
+        );
+        let mut large_page = already_known;
+        large_page.extend(
+            (0..500)
+                .map(|index| format!("zz-new-{index:03}.example.com"))
+                .collect::<BTreeSet<_>>(),
+        );
+        // A scanner working set capped to the lexicographically first 100
+        // names would retain only the old entries. The durable page commit
+        // still reports every globally new name for source learning.
+        assert_eq!(
+            db.store_passive_observation_page("example.com", "large", &large_page)
+                .unwrap(),
+            500
+        );
+        assert_eq!(
+            db.store_passive_observation_page("example.com", "large", &large_page)
+                .unwrap(),
+            0,
+            "replaying a page must not manufacture novelty"
+        );
+        assert_eq!(
+            db.passive_cache_bounded("example.com", "large", 100)
+                .unwrap()
+                .unwrap()
+                .names
+                .len(),
+            100
+        );
+        assert_eq!(
+            db.passive_cache("example.com", "large")
+                .unwrap()
+                .unwrap()
+                .names
+                .len(),
+            600
+        );
+    }
+
+    #[test]
+    fn passive_refresh_replay_is_idempotent_across_database_reopen() {
+        let temporary = tempfile::NamedTempFile::new().unwrap();
+        let page = BTreeSet::from(["api.example.com".to_owned(), "mail.example.com".to_owned()]);
+        {
+            let db = Database::open(temporary.path()).unwrap();
+            assert_eq!(
+                db.store_passive_observation_page("example.com", "fixture", &page)
+                    .unwrap(),
+                2
+            );
+            db.mark_passive_cache_refresh("example.com", "fixture", false)
+                .unwrap();
+        }
+
+        {
+            let db = Database::open(temporary.path()).unwrap();
+            assert_eq!(
+                db.store_passive_observation_page("example.com", "fixture", &page)
+                    .unwrap(),
+                0
+            );
+            let connection = db.lock().unwrap();
+            assert_eq!(
+                connection
+                    .query_row(
+                        r#"SELECT MIN(evidence.times_seen)
+                           FROM observation_evidence evidence
+                           WHERE evidence.root_domain='example.com'
+                             AND evidence.source='passive:fixture'"#,
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                1,
+                "an unfinished refresh replay must not inflate evidence"
+            );
+            assert_eq!(
+                connection
+                    .query_row("SELECT COUNT(*) FROM passive_refresh_seen", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .unwrap(),
+                0,
+                "generation ids replace per-name replay marker rows"
+            );
+            drop(connection);
+            db.mark_passive_cache_refresh("example.com", "fixture", true)
+                .unwrap();
+            let connection = db.lock().unwrap();
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM passive_refresh_sessions WHERE active=1",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                0
+            );
+            assert_eq!(
+                connection
+                    .query_row("SELECT COUNT(*) FROM passive_refresh_seen", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .unwrap(),
+                0
+            );
+        }
+
+        let db = Database::open(temporary.path()).unwrap();
+        db.store_passive_observation_page("example.com", "fixture", &page)
+            .unwrap();
+        assert_eq!(
+            db.lock()
+                .unwrap()
+                .query_row(
+                    r#"SELECT MIN(evidence.times_seen)
+                       FROM observation_evidence evidence
+                       WHERE evidence.root_domain='example.com'
+                         AND evidence.source='passive:fixture'"#,
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            2,
+            "a new generation after successful completion is a new observation"
+        );
+    }
+
+    #[test]
+    fn passive_refresh_sessions_are_isolated_by_domain_and_source() {
+        let db = Database::in_memory().unwrap();
+        let page = BTreeSet::from(["shared.example.com".to_owned()]);
+        db.store_passive_observation_page("example.com", "alpha", &page)
+            .unwrap();
+        db.store_passive_observation_page("example.com", "alpha", &page)
+            .unwrap();
+        db.store_passive_observation_page("example.com", "beta", &page)
+            .unwrap();
+        db.store_passive_observation_page("example.net", "alpha", &page)
+            .unwrap();
+
+        let connection = db.lock().unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM passive_refresh_sessions WHERE active=1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT MAX(times_seen) FROM observation_evidence",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        drop(connection);
+
+        db.mark_passive_cache_refresh("example.com", "alpha", true)
+            .unwrap();
+        let connection = db.lock().unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM passive_refresh_sessions WHERE active=1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    r#"SELECT COUNT(*) FROM passive_refresh_sessions
+                       WHERE active=1 AND (
+                           (root_domain='example.com' AND source='beta')
+                           OR (root_domain='example.net' AND source='alpha')
+                       )"#,
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn passive_refresh_lease_is_exclusive_and_owner_safe() {
+        let db = Database::in_memory().unwrap();
+        let owner_a = domain_hash("lease-owner-a");
+        let owner_b = domain_hash("lease-owner-b");
+        let ttl = Duration::from_secs(30);
+
+        assert!(
+            db.try_acquire_passive_refresh_lease("example.com", "fixture", &owner_a, ttl)
+                .unwrap()
+        );
+        assert!(
+            !db.try_acquire_passive_refresh_lease("example.com", "fixture", &owner_b, ttl)
+                .unwrap(),
+            "a concurrent owner must be deferred"
+        );
+        assert!(
+            db.renew_passive_refresh_lease("example.com", "fixture", &owner_a, ttl)
+                .unwrap()
+        );
+        assert!(
+            !db.renew_passive_refresh_lease("example.com", "fixture", &owner_b, ttl)
+                .unwrap()
+        );
+        assert!(
+            !db.release_passive_refresh_lease("example.com", "fixture", &owner_b)
+                .unwrap(),
+            "a stale guard cannot release another owner's lease"
+        );
+        assert!(
+            db.release_passive_refresh_lease("example.com", "fixture", &owner_a)
+                .unwrap()
+        );
+        assert!(
+            db.try_acquire_passive_refresh_lease("example.com", "fixture", &owner_b, ttl)
+                .unwrap()
+        );
+
+        db.lock()
+            .unwrap()
+            .execute(
+                r#"UPDATE passive_refresh_leases SET expires_at=?1
+                   WHERE root_domain='example.com' AND source='fixture'"#,
+                [now_epoch().saturating_sub(1)],
+            )
+            .unwrap();
+        assert!(
+            db.try_acquire_passive_refresh_lease("example.com", "fixture", &owner_a, ttl)
+                .unwrap(),
+            "an expired owner must not block a bounded takeover"
+        );
+        assert!(
+            !db.release_passive_refresh_lease("example.com", "fixture", &owner_b)
+                .unwrap()
+        );
+        assert!(
+            db.release_passive_refresh_lease("example.com", "fixture", &owner_a)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn passive_page_failure_rolls_back_observations_and_restart_markers() {
+        let db = Database::in_memory().unwrap();
+        db.lock()
+            .unwrap()
+            .execute_batch(
+                r#"CREATE TRIGGER fail_passive_cache_marker
+                   BEFORE INSERT ON passive_cache
+                   BEGIN SELECT RAISE(ABORT, 'forced cache marker failure'); END;"#,
+            )
+            .unwrap();
+        assert!(
+            db.store_passive_observation_page(
+                "example.com",
+                "fixture",
+                &BTreeSet::from(["api.example.com".to_owned()]),
+            )
+            .is_err()
+        );
+        let connection = db.lock().unwrap();
+        for table in [
+            "observed_names",
+            "observation_evidence",
+            "passive_refresh_sessions",
+            "passive_refresh_seen",
+        ] {
+            let count: i64 = connection
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 0, "{table} must roll back with the failed page");
+        }
+    }
+
+    #[test]
+    fn abandoned_refresh_cleanup_keeps_permanent_observations() {
+        let db = Database::in_memory().unwrap();
+        db.store_passive_observation_page(
+            "example.com",
+            "abandoned",
+            &BTreeSet::from(["old.example.com".to_owned()]),
+        )
+        .unwrap();
+        db.lock()
+            .unwrap()
+            .execute(
+                r#"UPDATE passive_refresh_sessions
+                   SET updated_at=?1
+                   WHERE root_domain='example.com' AND source='abandoned'"#,
+                [now_epoch()
+                    .saturating_sub(PASSIVE_REFRESH_ABANDONED_AFTER_SECS)
+                    .saturating_sub(1)],
+            )
+            .unwrap();
+
+        db.store_passive_observation_page(
+            "example.net",
+            "current",
+            &BTreeSet::from(["new.example.net".to_owned()]),
+        )
+        .unwrap();
+        let connection = db.lock().unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    r#"SELECT COUNT(*) FROM passive_refresh_sessions
+                       WHERE root_domain='example.com' AND source='abandoned'
+                         AND active=1"#,
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    r#"SELECT COUNT(*)
+                       FROM observation_evidence evidence
+                       JOIN observed_names names ON names.id=evidence.name_id
+                       WHERE evidence.root_domain='example.com'
+                         AND evidence.source='passive:abandoned'
+                         AND names.fqdn='old.example.com'"#,
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1,
+            "cleanup may remove restart metadata but never observations"
+        );
+    }
+
+    #[test]
+    fn abandoned_numeric_refresh_restarts_without_deleting_observations() {
+        let db = Database::in_memory().unwrap();
+        let query_hash = domain_hash("fixture:pages:v1:example.com");
+        db.commit_passive_pagination_page(
+            "example.com",
+            "fixture",
+            "pages",
+            1,
+            &query_hash,
+            &PassivePaginationPage {
+                position: 1,
+                next_position: 2,
+                records_seen: 1,
+                expected_records: Some(2),
+                expected_pages: Some(2),
+                page_hash: domain_hash("api.example.com"),
+                page_records: 1,
+            },
+            &BTreeSet::from(["api.example.com".to_owned()]),
+        )
+        .unwrap();
+        db.lock()
+            .unwrap()
+            .execute(
+                r#"UPDATE passive_refresh_sessions
+                   SET updated_at=?1
+                   WHERE root_domain='example.com' AND source='fixture'"#,
+                [now_epoch()
+                    .saturating_sub(PASSIVE_REFRESH_ABANDONED_AFTER_SECS)
+                    .saturating_sub(1)],
+            )
+            .unwrap();
+
+        db.store_passive_observation_page(
+            "example.net",
+            "current",
+            &BTreeSet::from(["new.example.net".to_owned()]),
+        )
+        .unwrap();
+        let connection = db.lock().unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    r#"SELECT COUNT(*) FROM passive_refresh_sessions
+                       WHERE root_domain='example.com' AND source='fixture'
+                         AND active=1"#,
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0,
+            "an abandoned generation must be closed"
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    r#"SELECT COUNT(*) FROM passive_pagination_state
+                       WHERE root_domain='example.com' AND source='fixture'"#,
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0,
+            "an abandoned numeric lane must restart at page one"
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    r#"SELECT COUNT(*) FROM observation_evidence
+                       WHERE root_domain='example.com'
+                         AND source='passive:fixture'"#,
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1,
+            "cleanup must retain permanent observations"
         );
     }
 
@@ -14475,5 +16553,46 @@ mod tests {
             .unwrap();
         let expected = usize_to_i64_saturating(usize::MAX);
         assert_eq!(stored, (expected, expected, expected, i64::MAX));
+    }
+
+    #[test]
+    fn resumed_axfr_snapshot_replaces_attempts_without_duplicate_metrics() {
+        let db = Database::in_memory().unwrap();
+        let scan_id = db.create_scan("example.com", &json!({})).unwrap();
+        let attempt = |nameserver: &str, status| AxfrAttempt {
+            nameserver: nameserver.to_owned(),
+            address: "192.0.2.53:53".to_owned(),
+            status,
+            error: None,
+            records: Vec::new(),
+            names: BTreeSet::new(),
+        };
+        db.save_axfr_attempts(
+            scan_id,
+            &[
+                attempt("ns1.example.com", crate::model::AxfrStatus::Refused),
+                attempt("ns2.example.com", crate::model::AxfrStatus::Timeout),
+            ],
+        )
+        .unwrap();
+        db.save_axfr_attempts(
+            scan_id,
+            &[attempt(
+                "ns1.example.com",
+                crate::model::AxfrStatus::Success,
+            )],
+        )
+        .unwrap();
+
+        let rows = db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*), SUM(status='success') FROM axfr_attempts WHERE scan_id=?1",
+                [scan_id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .unwrap();
+        assert_eq!(rows, (1, 1));
     }
 }

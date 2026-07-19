@@ -11,7 +11,7 @@ import math
 import os
 import pathlib
 import platform
-import shlex
+import re
 import shutil
 import statistics
 import subprocess
@@ -22,13 +22,23 @@ from typing import Any
 
 from names import NameError as BenchmarkNameError
 from names import MAX_OBSERVATIONAL_NAMES, normalize_candidate, normalize_domain
+from toolset import (
+    capture_identity,
+    load_toolset,
+    normalized_snapshot,
+    render_argv,
+    render_output,
+    render_preflight_argv,
+    snapshot_hash,
+)
 
 
 BENCHMARKS = pathlib.Path(__file__).resolve().parent
 REPOSITORY = BENCHMARKS.parent
 DEFAULT_SOURCE_MANIFEST = BENCHMARKS / "data" / "tranco-74J5X-top30.json"
-TOOLS = ("fellaga", "subfinder", "amass", "bbot")
+DEFAULT_TOOLSET = BENCHMARKS / "toolset.local.json"
 CAMPAIGN_KIND = "passive-top30-observational"
+TOOLSET_CAMPAIGN = "passive-observational"
 RAW_TREE_MAX_FILES = 10_000
 PREFLIGHT_MAX_FILES = 500
 PREFLIGHT_MAX_BYTES = 128 * 1024 * 1024
@@ -57,6 +67,7 @@ HARNESS_FILES = {
     "redact.py": BENCHMARKS / "redact.py",
     "run-passive-top30.sh": BENCHMARKS / "run-passive-top30.sh",
     "timed.py": BENCHMARKS / "timed.py",
+    "toolset.py": BENCHMARKS / "toolset.py",
     "data/tranco-74J5X-top30.csv": BENCHMARKS
     / "data"
     / "tranco-74J5X-top30.csv",
@@ -64,75 +75,6 @@ HARNESS_FILES = {
     "data/tranco-74J5X-top30.txt": BENCHMARKS
     / "data"
     / "tranco-74J5X-top30.txt",
-}
-VERSION_ARGUMENTS = {
-    "fellaga": ["--version"],
-    "subfinder": ["-version"],
-    "amass": ["-version"],
-    "bbot": ["--version"],
-}
-
-COMMAND_TEMPLATES: dict[str, list[str]] = {
-    "fellaga": [
-        "fellaga",
-        "--db",
-        "{state_db}",
-        "scan",
-        "--profile",
-        "passive",
-        "--no-target-contact",
-        "--all-sources",
-        "--passive-concurrency",
-        "{fellaga_passive_concurrency}",
-        "--passive-zone-concurrency",
-        "1",
-        "--show",
-        "{domain}",
-    ],
-    "subfinder": [
-        "subfinder",
-        "-silent",
-        "-duc",
-        "-all",
-        "-rl",
-        "{subfinder_rate_limit}",
-        "-d",
-        "{domain}",
-    ],
-    "amass": [
-        "amass",
-        "enum",
-        "-passive",
-        "-config",
-        "/dev/null",
-        "-d",
-        "{domain}",
-    ],
-    "bbot": [
-        "bbot",
-        "-y",
-        "-t",
-        "{domain}",
-        "-f",
-        "subdomain-enum",
-        "-rf",
-        "passive",
-        "-c",
-        "dns.disable=true",
-        "speculate=false",
-        "-om",
-        "json",
-        "-o",
-        "{output_directory}",
-    ],
-}
-
-SOURCE_SELECTION_POLICY = {
-    "fellaga_request": "all_registered_sources",
-    "subfinder_request": "all_registered_sources",
-    "selection_mode_symmetric": True,
-    "provider_catalog_comparable": False,
-    "runtime_availability_comparable": False,
 }
 
 BASE_QUALIFICATION_FAILURES = [
@@ -168,6 +110,69 @@ def _write_json(path: pathlib.Path, value: dict[str, Any]) -> None:
         json.dumps(value, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
+
+
+def _passive_tool_ids(toolset: dict[str, Any]) -> tuple[str, ...]:
+    campaign = toolset.get("campaigns", {}).get(TOOLSET_CAMPAIGN)
+    if not isinstance(campaign, dict):
+        raise ValueError("toolset does not define the passive-observational campaign")
+    discoverers = campaign.get("discoverers")
+    if (
+        not isinstance(discoverers, list)
+        or not discoverers
+        or any(not isinstance(tool, str) or not tool for tool in discoverers)
+        or len(set(discoverers)) != len(discoverers)
+    ):
+        raise ValueError("passive-observational discoverers are invalid")
+    tools = toolset.get("tools")
+    if not isinstance(tools, dict) or any(tool not in tools for tool in discoverers):
+        raise ValueError("passive-observational discoverer metadata is missing")
+    return tuple(discoverers)
+
+
+def _load_passive_toolset(path: pathlib.Path) -> dict[str, Any]:
+    toolset = load_toolset(path)
+    if not isinstance(toolset, dict):
+        raise ValueError("toolset loader returned an invalid document")
+    _passive_tool_ids(toolset)
+    return toolset
+
+
+def _bound_toolset(manifest: dict[str, Any]) -> dict[str, Any]:
+    binding = manifest.get("toolset")
+    if not isinstance(binding, dict):
+        raise ValueError("campaign toolset binding is missing")
+    snapshot = binding.get("snapshot")
+    expected_hash = binding.get("sha256")
+    if not isinstance(snapshot, dict) or not isinstance(expected_hash, str):
+        raise ValueError("campaign toolset binding is invalid")
+    if snapshot_hash(snapshot) != expected_hash:
+        raise ValueError("campaign toolset snapshot hash does not match")
+    _passive_tool_ids(snapshot)
+    return snapshot
+
+
+def _validate_toolset_artifact(
+    campaign: pathlib.Path, manifest: dict[str, Any]
+) -> None:
+    binding = manifest.get("toolset")
+    if not isinstance(binding, dict):
+        raise ValueError("campaign toolset binding is missing")
+    relative = binding.get("artifact")
+    if relative != "toolset.snapshot.json":
+        raise ValueError("campaign toolset artifact path is invalid")
+    artifact = campaign / relative
+    observed = _read_json(artifact)
+    expected = _bound_toolset(manifest)
+    if observed != expected or snapshot_hash(observed) != binding.get("sha256"):
+        raise ValueError("campaign toolset artifact changed")
+
+
+def _write_nul(values: list[str]) -> None:
+    for value in values:
+        if "\0" in value:
+            raise ValueError("NUL is not allowed in toolset output fields")
+        sys.stdout.buffer.write(value.encode("utf-8") + b"\0")
 
 
 def _manifest_file(base: pathlib.Path, value: Any, field: str) -> pathlib.Path:
@@ -645,148 +650,19 @@ def _validate_harness(campaign: pathlib.Path, manifest: dict[str, Any]) -> None:
 
 
 def _tool_identity(
-    campaign: pathlib.Path, tool: str, executable: str
+    tool: str,
+    executable: str,
+    toolset: dict[str, Any],
 ) -> dict[str, Any]:
     path = pathlib.Path(executable).expanduser().resolve()
     if not path.is_file():
         raise ValueError(f"runnable tool does not resolve to a file: {tool}")
-    identity: dict[str, Any] = {
-        "executable": str(path),
-        "sha256": _sha256(path),
-        "version": None,
-        "version_probe_status": "error",
-    }
-    probe_root = campaign / "preflight" / "identities" / tool
-    environment = _no_key_environment(probe_root)
-    timing_path = probe_root / "version.timing.json"
-    stdout_path = probe_root / "version.stdout.txt"
-    stderr_path = probe_root / "version.stderr.txt"
-    try:
-        with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    str(BENCHMARKS / "timed.py"),
-                    "--timeout",
-                    "10",
-                    "--grace",
-                    "1",
-                    "--max-file-bytes",
-                    str(1024 * 1024),
-                    str(timing_path),
-                    "--",
-                    str(path),
-                    *VERSION_ARGUMENTS[tool],
-                ],
-                check=False,
-                stdout=stdout,
-                stderr=stderr,
-                env=environment,
-            )
-    except OSError:
-        return identity
-    try:
-        timing = _read_json(timing_path)
-        output = " ".join(
-            (
-                stdout_path.read_text(encoding="utf-8", errors="replace")
-                + "\n"
-                + stderr_path.read_text(encoding="utf-8", errors="replace")
-            ).split()
-        )[:512]
-    except (OSError, ValueError):
-        return identity
-    identity["version"] = output or None
-    probe_status = timing.get("status")
-    if probe_status == "timeout":
-        identity["version_probe_status"] = "timeout"
-    elif result.returncode == 0 and probe_status == "success":
-        identity["version_probe_status"] = "success"
-    else:
-        identity["version_probe_status"] = "error"
-    if tool == "bbot":
-        identity["python_distribution"] = _python_distribution_identity(
-            path, environment, "bbot"
-        )
-        if identity["python_distribution"].get("status") != "success":
-            raise ValueError("BBOT Python distribution identity is unavailable")
+    identity_toolset = normalized_snapshot(toolset)
+    identity_toolset["tools"][tool]["executable"] = str(path)
+    identity = capture_identity(identity_toolset, tool)
+    if identity.get("executable") != str(path):
+        raise ValueError(f"tool identity resolved an unexpected executable: {tool}")
     return identity
-
-
-def _python_distribution_identity(
-    executable: pathlib.Path, environment: dict[str, str], distribution: str
-) -> dict[str, Any]:
-    identity: dict[str, Any] = {"status": "unavailable"}
-    try:
-        first_line = executable.open("rb").readline(4096).decode("utf-8").strip()
-        if not first_line.startswith("#!"):
-            return identity
-        command = shlex.split(first_line[2:])
-        if not command or not pathlib.Path(command[0]).is_absolute():
-            return identity
-        launcher = pathlib.Path(command[0])
-        if not launcher.is_file():
-            return identity
-        resolved_interpreter = launcher.resolve(strict=True)
-    except (OSError, UnicodeError, ValueError):
-        return identity
-    script = r'''
-import hashlib
-import importlib.metadata
-import json
-import pathlib
-import sys
-
-distribution = importlib.metadata.distribution(sys.argv[1])
-digest = hashlib.sha256()
-count = 0
-total = 0
-for relative in sorted(distribution.files or [], key=str):
-    path = pathlib.Path(distribution.locate_file(relative))
-    if not path.is_file():
-        continue
-    payload_size = path.stat().st_size
-    count += 1
-    total += payload_size
-    if count > 10000 or total > 536870912:
-        raise RuntimeError("distribution identity limit exceeded")
-    digest.update(str(relative).encode("utf-8"))
-    digest.update(b"\0")
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1048576), b""):
-            digest.update(block)
-print(json.dumps({
-    "status": "success",
-    "version": distribution.version,
-    "location": str(distribution.locate_file("")),
-    "file_count": count,
-    "total_bytes": total,
-    "tree_sha256": digest.hexdigest(),
-}, sort_keys=True))
-'''
-    try:
-        completed = subprocess.run(
-            [str(launcher), *command[1:], "-c", script, distribution],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=30,
-            env=environment,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return identity
-    if completed.returncode != 0:
-        return identity
-    try:
-        value = json.loads(completed.stdout)
-    except json.JSONDecodeError:
-        return identity
-    if not isinstance(value, dict) or value.get("status") != "success":
-        return identity
-    value["interpreter_launcher"] = str(launcher)
-    value["interpreter_resolved"] = str(resolved_interpreter)
-    value["interpreter_sha256"] = _sha256(resolved_interpreter)
-    return value
 
 
 def _verify_tool_identity(
@@ -803,16 +679,6 @@ def _verify_tool_identity(
     executable_path = pathlib.Path(executable)
     if not executable_path.is_file() or _sha256(executable_path) != executable_hash:
         raise ValueError(f"tool executable changed during the campaign: {tool}")
-    if tool == "bbot":
-        expected = metadata.get("python_distribution")
-        identity_root = campaign / "identity-check"
-        try:
-            environment = _no_key_environment(identity_root / tool)
-            observed = _python_distribution_identity(executable_path, environment, "bbot")
-        finally:
-            shutil.rmtree(identity_root, ignore_errors=True)
-        if not isinstance(expected, dict) or observed != expected:
-            raise ValueError("BBOT Python distribution changed during the campaign")
 
 
 def verify_campaign_tool(campaign: pathlib.Path, tool: str) -> None:
@@ -820,6 +686,7 @@ def verify_campaign_tool(campaign: pathlib.Path, tool: str) -> None:
     if manifest.get("campaign_kind") != CAMPAIGN_KIND:
         raise ValueError("not a passive top-30 campaign")
     _validate_campaign_policy(manifest)
+    _validate_toolset_artifact(campaign, manifest)
     _validate_harness(campaign, manifest)
     _validate_preflight_evidence(campaign, manifest)
     metadata = manifest.get("tools", {}).get(tool)
@@ -835,14 +702,13 @@ def prepare_campaign(
     missing: dict[str, str],
     skipped: dict[str, str],
     source_manifest: pathlib.Path = DEFAULT_SOURCE_MANIFEST,
+    toolset_path: pathlib.Path = DEFAULT_TOOLSET,
     discovery_timeout_seconds: float = 900.0,
     timeout_grace_seconds: float = 5.0,
     preflight_timeout_seconds: float = 60.0,
     campaign_max_runtime_seconds: float = 7200.0,
     cooldown_seconds: float = 1.0,
     consecutive_failure_threshold: int = 3,
-    subfinder_rate_limit: int = 5,
-    fellaga_passive_concurrency: int = 4,
     cleanup_timeout_seconds: int = 60,
     redaction_timeout_seconds: int = 60,
     max_file_bytes: int = 268_435_456,
@@ -862,8 +728,6 @@ def prepare_campaign(
             raise ValueError(f"{label} must be finite and greater than zero")
     for label, value, minimum, maximum in (
         ("consecutive failure threshold", consecutive_failure_threshold, 1, 10),
-        ("Subfinder rate limit", subfinder_rate_limit, 1, 20),
-        ("Fellaga passive concurrency", fellaga_passive_concurrency, 1, 8),
         ("cleanup timeout", cleanup_timeout_seconds, 1, 60),
         ("redaction timeout", redaction_timeout_seconds, 1, 60),
         ("maximum file bytes", max_file_bytes, 1_048_576, 1_073_741_824),
@@ -877,18 +741,29 @@ def prepare_campaign(
     ):
         if type(value) is not int or not minimum <= value <= maximum:
             raise ValueError(f"{label} must be between {minimum} and {maximum}")
+    toolset = _load_passive_toolset(toolset_path)
+    tools = _passive_tool_ids(toolset)
+    snapshot = normalized_snapshot(toolset)
+    if not isinstance(snapshot, dict):
+        raise ValueError("normalized toolset snapshot is invalid")
+    snapshot_artifact = campaign / "toolset.snapshot.json"
+    if snapshot_artifact.exists():
+        if _read_json(snapshot_artifact) != snapshot:
+            raise ValueError("preflight toolset snapshot does not match prepare input")
+    else:
+        _write_json(snapshot_artifact, snapshot)
     classifications = [set(runnable), set(missing), set(skipped)]
     if any(left & right for index, left in enumerate(classifications) for right in classifications[index + 1 :]):
         raise ValueError("each tool must have exactly one status")
-    if set().union(*classifications) != set(TOOLS):
-        raise ValueError("all supported tools must have an explicit status")
+    if set().union(*classifications) != set(tools):
+        raise ValueError("all configured passive tools must have an explicit status")
 
     source, ranked = validate_source_manifest(source_manifest)
     harness = _snapshot_harness(campaign)
     tool_status: dict[str, dict[str, Any]] = {}
-    for tool in TOOLS:
+    for tool in tools:
         if tool in runnable:
-            identity = _tool_identity(campaign, tool, runnable[tool])
+            identity = _tool_identity(tool, runnable[tool], toolset)
             tool_status[tool] = {"status": "runnable", "reason": None, **identity}
         elif tool in missing:
             tool_status[tool] = {
@@ -906,7 +781,7 @@ def prepare_campaign(
     preflight_evidence = _preflight_evidence(campaign)
 
     manifest = {
-        "schema_version": 1,
+        "schema_version": 2,
         "campaign_kind": CAMPAIGN_KIND,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "repository_commit": _git_commit(),
@@ -920,8 +795,6 @@ def prepare_campaign(
             "campaign_max_runtime_seconds": campaign_max_runtime_seconds,
             "cooldown_seconds": cooldown_seconds,
             "consecutive_failure_threshold": consecutive_failure_threshold,
-            "subfinder_rate_limit": subfinder_rate_limit,
-            "fellaga_passive_concurrency": fellaga_passive_concurrency,
             "cleanup_timeout_seconds": cleanup_timeout_seconds,
             "redaction_timeout_seconds": redaction_timeout_seconds,
             "max_file_bytes": max_file_bytes,
@@ -944,15 +817,21 @@ def prepare_campaign(
         },
         "domains": [{"rank": rank, "domain": domain} for rank, domain in ranked],
         "tools": tool_status,
-        "command_policy": COMMAND_TEMPLATES,
-        "source_selection_policy": SOURCE_SELECTION_POLICY,
+        "toolset": {
+            "schema_version": snapshot.get("schema_version"),
+            "subject": snapshot.get("subject"),
+            "campaign": TOOLSET_CAMPAIGN,
+            "sha256": snapshot_hash(snapshot),
+            "artifact": "toolset.snapshot.json",
+            "snapshot": snapshot,
+        },
         "contact_policy": {
             "target_contact": "prohibited",
             "direct_dns_resolution": False,
             "direct_http_or_tls": False,
             "third_party_passive_provider_requests": True,
-            "bbot_requires_no_dns_preflight": True,
-            "bbot_dns_fallback_allowed": False,
+            "toolset_policy_required": True,
+            "policy_relaxation_allowed": False,
         },
         "credential_policy": {
             "mode": "no-key",
@@ -993,10 +872,19 @@ def _campaign_relative(campaign: pathlib.Path, path: pathlib.Path) -> str:
 
 
 def _validate_campaign_policy(manifest: dict[str, Any]) -> None:
-    if manifest.get("command_policy") != COMMAND_TEMPLATES:
-        raise ValueError("campaign command policy does not match the passive allowlist")
-    if manifest.get("source_selection_policy") != SOURCE_SELECTION_POLICY:
-        raise ValueError("campaign source-selection policy is not symmetric")
+    if manifest.get("schema_version") != 2:
+        raise ValueError("campaign manifest schema is unsupported")
+    toolset = _bound_toolset(manifest)
+    tools = _passive_tool_ids(toolset)
+    if set(manifest.get("tools", {})) != set(tools):
+        raise ValueError("campaign tools do not match the bound toolset")
+    binding = manifest["toolset"]
+    if (
+        binding.get("campaign") != TOOLSET_CAMPAIGN
+        or binding.get("subject") != toolset.get("subject")
+        or binding.get("schema_version") != toolset.get("schema_version")
+    ):
+        raise ValueError("campaign toolset binding metadata is invalid")
     contact = manifest.get("contact_policy")
     if not isinstance(contact, dict) or any(
         (
@@ -1004,8 +892,8 @@ def _validate_campaign_policy(manifest: dict[str, Any]) -> None:
             contact.get("direct_dns_resolution") is not False,
             contact.get("direct_http_or_tls") is not False,
             contact.get("third_party_passive_provider_requests") is not True,
-            contact.get("bbot_requires_no_dns_preflight") is not True,
-            contact.get("bbot_dns_fallback_allowed") is not False,
+            contact.get("toolset_policy_required") is not True,
+            contact.get("policy_relaxation_allowed") is not False,
         )
     ):
         raise ValueError("campaign contact policy is not fail-closed")
@@ -1048,8 +936,6 @@ def _validate_campaign_policy(manifest: dict[str, Any]) -> None:
             raise ValueError("campaign execution limits are invalid")
     for field, minimum, maximum in (
         ("consecutive_failure_threshold", 1, 10),
-        ("subfinder_rate_limit", 1, 20),
-        ("fellaga_passive_concurrency", 1, 8),
         ("cleanup_timeout_seconds", 1, 60),
         ("redaction_timeout_seconds", 1, 60),
         ("max_file_bytes", 1_048_576, 1_073_741_824),
@@ -1187,10 +1073,11 @@ def record_run(
     if manifest.get("campaign_kind") != CAMPAIGN_KIND:
         raise ValueError("not a passive top-30 campaign")
     _validate_campaign_policy(manifest)
+    _validate_toolset_artifact(campaign, manifest)
     _validate_harness(campaign, manifest)
     _validate_preflight_evidence(campaign, manifest)
     enforce_campaign_quota(campaign, manifest)
-    if tool not in TOOLS or manifest["tools"].get(tool, {}).get("status") != "runnable":
+    if manifest["tools"].get(tool, {}).get("status") != "runnable":
         raise ValueError(f"tool is not runnable in this campaign: {tool}")
     tool_metadata = manifest["tools"][tool]
     _verify_tool_identity(campaign, tool, tool_metadata)
@@ -1220,7 +1107,7 @@ def record_run(
         "raw_tree": raw_tree_path,
     }
     row = {
-        "schema_version": 1,
+        "schema_version": 2,
         "tool": tool,
         "domain": domain,
         "rank": rank,
@@ -1363,7 +1250,7 @@ def _verified_names_for_row(
 ) -> set[str]:
     if (
         type(row.get("schema_version")) is not int
-        or row.get("schema_version") != 1
+        or row.get("schema_version") != 2
         or type(row.get("rank")) is not int
         or row.get("rank") != expected_rank
     ):
@@ -1464,8 +1351,10 @@ def build_report(campaign: pathlib.Path) -> dict[str, Any]:
     if manifest.get("campaign_kind") != CAMPAIGN_KIND:
         raise ValueError("not a passive top-30 campaign")
     _validate_campaign_policy(manifest)
+    _validate_toolset_artifact(campaign, manifest)
     _validate_harness(campaign, manifest)
     _validate_preflight_evidence(campaign, manifest)
+    tools = _passive_tool_ids(_bound_toolset(manifest))
     source, ranked = validate_source_manifest(DEFAULT_SOURCE_MANIFEST)
     if manifest.get("source", {}).get("list_id") != source["list_id"]:
         raise ValueError("campaign source does not match the pinned Tranco source")
@@ -1480,7 +1369,7 @@ def build_report(campaign: pathlib.Path) -> dict[str, Any]:
     issues.extend(quota_issues)
     repetitions = int(manifest.get("repetitions", 0))
     runnable_tools = [
-        tool for tool in TOOLS if manifest["tools"].get(tool, {}).get("status") == "runnable"
+        tool for tool in tools if manifest["tools"].get(tool, {}).get("status") == "runnable"
     ]
     expected = {
         (tool, domain, repetition)
@@ -1533,7 +1422,7 @@ def build_report(campaign: pathlib.Path) -> dict[str, Any]:
         issues.append("failed_runs")
 
     summaries: dict[str, dict[str, Any]] = {}
-    for tool in TOOLS:
+    for tool in tools:
         tool_meta = manifest["tools"].get(tool, {})
         tool_rows = [row for row in valid_rows if row.get("tool") == tool]
         successful_rows = [row for row in tool_rows if row.get("status") == "success"]
@@ -1578,10 +1467,10 @@ def build_report(campaign: pathlib.Path) -> dict[str, Any]:
         }
 
     missing_tools = [
-        tool for tool in TOOLS if manifest["tools"].get(tool, {}).get("status") == "missing"
+        tool for tool in tools if manifest["tools"].get(tool, {}).get("status") == "missing"
     ]
     skipped_tools = [
-        tool for tool in TOOLS if manifest["tools"].get(tool, {}).get("status") == "skipped"
+        tool for tool in tools if manifest["tools"].get(tool, {}).get("status") == "skipped"
     ]
     qualification_failures = list(BASE_QUALIFICATION_FAILURES)
     if missing_tools:
@@ -1599,8 +1488,10 @@ def build_report(campaign: pathlib.Path) -> dict[str, Any]:
         bool(runnable_tools) and not missing_runs and not failed_runs and not issues
     )
     report = {
-        "schema_version": 1,
+        "schema_version": 2,
         "campaign_kind": CAMPAIGN_KIND,
+        "subject": manifest["toolset"]["subject"],
+        "toolset_sha256": manifest["toolset"]["sha256"],
         "source": manifest["source"],
         "summary": {
             "descriptive_only": True,
@@ -1627,16 +1518,103 @@ def build_report(campaign: pathlib.Path) -> dict[str, Any]:
     return report
 
 
-def _mapping(values: list[str], option: str) -> dict[str, str]:
+def _mapping(
+    values: list[str], option: str, supported_tools: tuple[str, ...]
+) -> dict[str, str]:
     result: dict[str, str] = {}
     for value in values:
         name, separator, detail = value.partition("=")
-        if not separator or name not in TOOLS or not detail:
-            raise ValueError(f"{option} requires TOOL=VALUE for a supported tool")
+        if not separator or name not in supported_tools or not detail:
+            raise ValueError(f"{option} requires TOOL=VALUE for a configured tool")
         if name in result:
             raise ValueError(f"duplicate {option} value for {name}")
         result[name] = detail
     return result
+
+
+def _context_mapping(values: list[str]) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for value in values:
+        name, separator, detail = value.partition("=")
+        if not separator or not name or "\0" in name or "\0" in detail:
+            raise ValueError("--context requires KEY=VALUE without NUL bytes")
+        if name in result:
+            raise ValueError(f"duplicate --context value for {name}")
+        result[name] = detail
+    return result
+
+
+def _tool_metadata(toolset: dict[str, Any], tool: str) -> dict[str, Any]:
+    if tool not in _passive_tool_ids(toolset):
+        raise ValueError(f"tool is not a passive-observational discoverer: {tool}")
+    metadata = toolset["tools"].get(tool)
+    if not isinstance(metadata, dict):
+        raise ValueError(f"tool metadata is invalid: {tool}")
+    return metadata
+
+
+def _command_output(toolset: dict[str, Any], tool: str) -> dict[str, Any]:
+    metadata = _tool_metadata(toolset, tool)
+    commands = metadata.get("commands")
+    command = commands.get(TOOLSET_CAMPAIGN) if isinstance(commands, dict) else None
+    output = command.get("output") if isinstance(command, dict) else None
+    if not isinstance(output, dict):
+        raise ValueError(f"passive output contract is missing: {tool}")
+    return output
+
+
+def _phase_context(
+    toolset: dict[str, Any],
+    tool: str,
+    phase: str,
+    supplied: dict[str, str],
+) -> dict[str, str]:
+    metadata = _tool_metadata(toolset, tool)
+    if phase == "preflight":
+        definition = metadata.get("preflight")
+    else:
+        commands = metadata.get("commands")
+        definition = commands.get(phase) if isinstance(commands, dict) else None
+    if not isinstance(definition, dict):
+        raise ValueError(f"tool does not define phase {phase}: {tool}")
+    required = definition.get("required_context", [])
+    if not isinstance(required, list):
+        raise ValueError(f"phase context metadata is invalid: {tool}")
+    parameters = metadata.get("parameters", {})
+    if not isinstance(parameters, dict):
+        raise ValueError(f"tool parameter metadata is invalid: {tool}")
+    missing = [key for key in required if key not in supplied]
+    if missing:
+        raise ValueError(f"phase context is missing {missing[0]}: {tool}")
+    return {
+        key: value
+        for key, value in supplied.items()
+        if key == "executable" or key in required or key in parameters
+    }
+
+
+def _check_preflight_output(
+    toolset: dict[str, Any], tool: str, stdout: pathlib.Path, stderr: pathlib.Path
+) -> None:
+    metadata = _tool_metadata(toolset, tool)
+    preflight = metadata.get("preflight")
+    if preflight is None:
+        return
+    if not isinstance(preflight, dict):
+        raise ValueError(f"preflight metadata is invalid: {tool}")
+    try:
+        combined = stdout.read_text(encoding="utf-8", errors="replace") + "\n" + stderr.read_text(
+            encoding="utf-8", errors="replace"
+        )
+    except OSError as exc:
+        raise ValueError(f"cannot read preflight evidence: {tool}: {exc}") from exc
+    required = preflight.get("required_literals", [])
+    forbidden = preflight.get("forbidden_regexes", [])
+    if any(literal not in combined for literal in required):
+        raise ValueError(f"preflight required output is missing: {tool}")
+    for expression in forbidden:
+        if re.search(expression, combined, flags=re.IGNORECASE | re.MULTILINE):
+            raise ValueError(f"preflight forbidden output matched: {tool}")
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -1648,6 +1626,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
     prepare = subparsers.add_parser("prepare")
     prepare.add_argument("campaign", type=pathlib.Path)
+    prepare.add_argument("--toolset", type=pathlib.Path, required=True)
     prepare.add_argument("--repetitions", type=int, required=True)
     prepare.add_argument("--discovery-timeout", type=float, required=True)
     prepare.add_argument("--timeout-grace", type=float, required=True)
@@ -1655,8 +1634,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     prepare.add_argument("--campaign-max-runtime", type=float, required=True)
     prepare.add_argument("--cooldown", type=float, required=True)
     prepare.add_argument("--failure-threshold", type=int, required=True)
-    prepare.add_argument("--subfinder-rate-limit", type=int, required=True)
-    prepare.add_argument("--fellaga-passive-concurrency", type=int, required=True)
     prepare.add_argument("--cleanup-timeout", type=int, required=True)
     prepare.add_argument("--redaction-timeout", type=int, required=True)
     prepare.add_argument("--max-file-bytes", type=int, required=True)
@@ -1668,7 +1645,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
     record = subparsers.add_parser("record")
     record.add_argument("campaign", type=pathlib.Path)
-    record.add_argument("--tool", required=True, choices=TOOLS)
+    record.add_argument("--tool", required=True)
     record.add_argument("--domain", required=True)
     record.add_argument("--rank", required=True, type=int)
     record.add_argument("--repetition", required=True, type=int)
@@ -1703,7 +1680,35 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
     verify_tool = subparsers.add_parser("verify-tool")
     verify_tool.add_argument("campaign", type=pathlib.Path)
-    verify_tool.add_argument("tool", choices=TOOLS)
+    verify_tool.add_argument("tool")
+
+    tool_list = subparsers.add_parser("tool-list")
+    tool_list.add_argument("--toolset", type=pathlib.Path, required=True)
+
+    snapshot_toolset = subparsers.add_parser("snapshot-toolset")
+    snapshot_toolset.add_argument("--toolset", type=pathlib.Path, required=True)
+    snapshot_toolset.add_argument("output", type=pathlib.Path)
+
+    tool_metadata = subparsers.add_parser("tool-metadata")
+    tool_metadata.add_argument("--toolset", type=pathlib.Path, required=True)
+    tool_metadata.add_argument("tool")
+
+    render = subparsers.add_parser("render-argv")
+    render.add_argument("--toolset", type=pathlib.Path, required=True)
+    render.add_argument("tool")
+    render.add_argument("phase")
+    render.add_argument("--context", action="append", default=[])
+
+    output = subparsers.add_parser("output-contract")
+    output.add_argument("--toolset", type=pathlib.Path, required=True)
+    output.add_argument("tool")
+    output.add_argument("--context", action="append", default=[])
+
+    preflight_check = subparsers.add_parser("preflight-check")
+    preflight_check.add_argument("--toolset", type=pathlib.Path, required=True)
+    preflight_check.add_argument("tool")
+    preflight_check.add_argument("stdout", type=pathlib.Path)
+    preflight_check.add_argument("stderr", type=pathlib.Path)
     return parser.parse_args(argv)
 
 
@@ -1723,21 +1728,105 @@ def main(argv: list[str] | None = None) -> int:
                 )
             )
             return 0
+        if args.action == "tool-list":
+            toolset = _load_passive_toolset(args.toolset)
+            _write_nul(list(_passive_tool_ids(toolset)))
+            return 0
+        if args.action == "snapshot-toolset":
+            toolset = _load_passive_toolset(args.toolset)
+            snapshot = normalized_snapshot(toolset)
+            if args.output.exists():
+                raise ValueError(f"toolset snapshot already exists: {args.output}")
+            _write_json(args.output, snapshot)
+            return 0
+        if args.action == "tool-metadata":
+            toolset = _load_passive_toolset(args.toolset)
+            metadata = _tool_metadata(toolset, args.tool)
+            executable = metadata.get("executable")
+            if not isinstance(executable, str) or not executable or "\0" in executable:
+                raise ValueError(f"tool executable is invalid: {args.tool}")
+            output = _command_output(toolset, args.tool)
+            kind = output.get("kind")
+            if kind not in {"line_stdout", "line_file", "finding_json", "dns_event_tree"}:
+                raise ValueError(f"passive output kind is invalid: {args.tool}")
+            _write_nul(
+                [
+                    executable,
+                    str(kind),
+                    "1" if metadata.get("preflight") is not None else "0",
+                ]
+            )
+            return 0
+        if args.action == "render-argv":
+            toolset = _load_passive_toolset(args.toolset)
+            _tool_metadata(toolset, args.tool)
+            context = _phase_context(
+                toolset,
+                args.tool,
+                args.phase,
+                _context_mapping(args.context),
+            )
+            rendered = (
+                render_preflight_argv(toolset, args.tool, context)
+                if args.phase == "preflight"
+                else render_argv(toolset, args.tool, args.phase, context)
+            )
+            if not isinstance(rendered, list) or any(
+                not isinstance(argument, str) for argument in rendered
+            ):
+                raise ValueError("toolset renderer returned invalid argv")
+            _write_nul(rendered)
+            return 0
+        if args.action == "output-contract":
+            toolset = _load_passive_toolset(args.toolset)
+            supplied = _context_mapping(args.context)
+            context = _phase_context(
+                toolset, args.tool, TOOLSET_CAMPAIGN, supplied
+            )
+            output = render_output(
+                toolset, args.tool, TOOLSET_CAMPAIGN, context
+            )
+            kind = output.get("kind")
+            if kind == "line_stdout":
+                if output.get("path") not in (None, ""):
+                    raise ValueError("line_stdout output cannot define a path")
+                _write_nul([kind, ""])
+                return 0
+            context_key = (
+                "output_directory" if kind == "dns_event_tree" else "output_file"
+            )
+            expected = context.get(context_key)
+            rendered_path = output.get("path")
+            if not isinstance(rendered_path, str) or not isinstance(expected, str):
+                raise ValueError(f"output path context is missing: {args.tool}")
+            if rendered_path != expected:
+                raise ValueError(
+                    f"output path must use the isolated {context_key} context: {args.tool}"
+                )
+            _write_nul([str(kind), rendered_path])
+            return 0
+        if args.action == "preflight-check":
+            toolset = _load_passive_toolset(args.toolset)
+            _check_preflight_output(
+                toolset, args.tool, args.stdout, args.stderr
+            )
+            return 0
         if args.action == "prepare":
+            toolset = _load_passive_toolset(args.toolset)
+            tools = _passive_tool_ids(toolset)
             prepare_campaign(
                 args.campaign,
                 args.repetitions,
-                _mapping(args.runnable, "--runnable"),
-                _mapping(args.missing, "--missing"),
-                _mapping(args.skipped, "--skipped"),
+                _mapping(args.runnable, "--runnable", tools),
+                _mapping(args.missing, "--missing", tools),
+                _mapping(args.skipped, "--skipped", tools),
+                toolset_path=args.toolset,
                 discovery_timeout_seconds=args.discovery_timeout,
                 timeout_grace_seconds=args.timeout_grace,
                 preflight_timeout_seconds=args.preflight_timeout,
                 campaign_max_runtime_seconds=args.campaign_max_runtime,
                 cooldown_seconds=args.cooldown,
                 consecutive_failure_threshold=args.failure_threshold,
-                subfinder_rate_limit=args.subfinder_rate_limit,
-                fellaga_passive_concurrency=args.fellaga_passive_concurrency,
                 cleanup_timeout_seconds=args.cleanup_timeout,
                 redaction_timeout_seconds=args.redaction_timeout,
                 max_file_bytes=args.max_file_bytes,

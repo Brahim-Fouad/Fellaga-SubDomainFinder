@@ -11,11 +11,28 @@ BENCHMARKS = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BENCHMARKS))
 
 from report import (
-    DNS_CONTROL_REQUIREMENTS,
-    REQUIRED_TOOLS,
+    _canonical_sha256,
     build_report,
     main as report_main,
 )
+
+
+SUBJECT = "subject_engine"
+REQUIRED_TOOLS = (SUBJECT, "finder_alpha", "finder_beta", "capacity_probe")
+PROVENANCE_TOOLS = (*REQUIRED_TOOLS, "validator", "transport_helper")
+CREDENTIAL_PARTICIPANTS = [SUBJECT, "finder_alpha", "finder_beta"]
+DNS_CONTROL_REQUIREMENTS = {
+    SUBJECT: {"resolver_list", "trusted_resolver_list", "rate_limit", "concurrency"},
+    "finder_alpha": {"resolver_list"},
+    "finder_beta": {"resolver_list", "concurrency"},
+    "capacity_probe": {
+        "resolver_list",
+        "trusted_resolver_list",
+        "rate_limit",
+        "trusted_rate_limit",
+    },
+    "validator": {"resolver_list", "rate_limit", "concurrency"},
+}
 
 
 class ReportTests(unittest.TestCase):
@@ -28,28 +45,86 @@ class ReportTests(unittest.TestCase):
         self.truth.mkdir(parents=True)
         self.domains = [f"d{index:02d}.example" for index in range(30)]
         self.campaign_id = "campaign-test-0001"
-        self.fellaga_sha256 = "a" * 64
+        self.subject = SUBJECT
+        self.subject_sha256 = "a" * 64
         self.pipeline_sha256 = "b" * 64
-        versions = {tool: f"{tool} test-version" for tool in (*REQUIRED_TOOLS, "massdns", "dnsx")}
+        versions = {tool: f"{tool} test-version" for tool in PROVENANCE_TOOLS}
         executables = {
             tool: {
                 "version": version,
-                "sha256": self.fellaga_sha256 if tool == "fellaga" else "c" * 64,
+                "sha256": self.subject_sha256 if tool == self.subject else "c" * 64,
             }
             for tool, version in versions.items()
+        }
+        identity = {
+            "version_argv": ["{executable}", "--version"],
+            "extra_kind": "none",
+        }
+        active_command = {
+            "argv": ["{executable}", "active", "{domain}"],
+            "required_context": ["domain"],
+            "output": {"kind": "line_stdout"},
+        }
+        toolset_tools = {
+            tool: {
+                "executable": tool,
+                "identity": identity,
+                "dns_controls": sorted(DNS_CONTROL_REQUIREMENTS.get(tool, set())),
+                "commands": ({"active": active_command} if tool in REQUIRED_TOOLS else {}),
+            }
+            for tool in PROVENANCE_TOOLS
+        }
+        toolset_tools["validator"]["commands"] = {
+            "validate": {
+                "argv": ["{executable}", "validate", "{input_file}"],
+                "required_context": ["input_file"],
+                "output": {"kind": "line_stdout"},
+            }
+        }
+        toolset_tools[self.subject]["commands"]["passive-observational"] = {
+            "argv": ["{executable}", "passive", "{domain}"],
+            "required_context": ["domain"],
+            "output": {"kind": "line_stdout"},
+        }
+        toolset_tools[self.subject]["passive_policy"] = {
+            "target_contact": "prohibited",
+            "direct_dns": False,
+            "direct_http_or_tls": False,
+        }
+        toolset_snapshot = {
+            "schema_version": 1,
+            "subject": self.subject,
+            "campaigns": {
+                "active": {
+                    "discoverers": list(REQUIRED_TOOLS),
+                    "validator": "validator",
+                    "capacity_guard": "capacity_probe",
+                    "provenance_only": ["transport_helper"],
+                    "credential_participants": CREDENTIAL_PARTICIPANTS,
+                },
+                "passive-observational": {"discoverers": [self.subject]},
+            },
+            "tools": toolset_tools,
         }
         (self.campaign / "manifest.json").write_text(
             json.dumps(
                 {
-                    "schema_version": 2,
+                    "schema_version": 3,
                     "campaign_id": self.campaign_id,
                     "mode": "no-key",
                     "authorized_domains": self.domains,
                     "repetitions": 3,
                     "versions": versions,
+                    "toolset": {
+                        "campaign": "active",
+                        "sha256": _canonical_sha256(toolset_snapshot),
+                        "snapshot": toolset_snapshot,
+                    },
                     "configuration": {
                         "required_repetitions": 3,
-                        "fellaga_active_max_runtime_seconds": 1_800,
+                        "required_tools": list(REQUIRED_TOOLS),
+                        "subject": self.subject,
+                        "subject_active_max_runtime_seconds": 1_800,
                         "discovery_timeout_seconds": 1_860,
                         "validation_timeout_seconds": 300,
                         "dns_transport_timeout_seconds": 900,
@@ -64,8 +139,8 @@ class ReportTests(unittest.TestCase):
                         "candidate_pipeline_bytes_per_candidate": 2_048,
                         "candidate_pipeline_fixed_bytes": 2_147_483_648,
                         "candidate_pipeline_disk_margin_percent": 125,
-                        "puredns_headroom_percent": 125,
-                        "fellaga_profile_baselines": [],
+                        "capacity_guard_headroom_percent": 125,
+                        "subject_profile_baselines": [],
                     },
                     "provenance": {
                         "repository": {"commit": "d" * 40, "dirty": False},
@@ -77,6 +152,7 @@ class ReportTests(unittest.TestCase):
                             "active_corpus_candidates": 1_000_000,
                             "pipeline_corpus_sha256": self.pipeline_sha256,
                             "resolvers_sha256": "2" * 64,
+                            "toolset_sha256": _canonical_sha256(toolset_snapshot),
                             "keys_manifest_sha256": None,
                         },
                     },
@@ -100,9 +176,10 @@ class ReportTests(unittest.TestCase):
                             "available_free_bytes": 40_000_000_000,
                             "shortfall_bytes": 0,
                         },
-                        "puredns_capacity": {
+                        "capacity_guard": {
                             "schema_version": 1,
-                            "check": "puredns_capacity",
+                            "check": "active_resolver_capacity",
+                            "tool": "capacity_probe",
                             "status": "coherent",
                             "corpus_candidates": 1_000_000,
                             "rate_limit_qps": 1_000,
@@ -133,7 +210,7 @@ class ReportTests(unittest.TestCase):
                     "status": "success",
                     "exit_code": 0,
                     "campaign_id": self.campaign_id,
-                    "fellaga_sha256": self.fellaga_sha256,
+                    "subject_sha256": self.subject_sha256,
                     "queries": 100_000,
                     "queries_per_second": 30_000,
                     "loss_rate": 0.0,
@@ -150,10 +227,9 @@ class ReportTests(unittest.TestCase):
                     "exit_code": 0,
                     "schema_version": 1,
                     "benchmark": "candidate_pipeline",
-                    "engine": "fellaga_core",
                     "campaign_id": self.campaign_id,
-                    "fellaga_sha256": self.fellaga_sha256,
-                    "binary_sha256": self.fellaga_sha256,
+                    "subject_sha256": self.subject_sha256,
+                    "binary_sha256": self.subject_sha256,
                     "corpus_sha256": self.pipeline_sha256,
                     "wordlist_sha256": self.pipeline_sha256,
                     "candidates": 10_000_000,
@@ -179,11 +255,11 @@ class ReportTests(unittest.TestCase):
             )
             for repetition in range(1, 4):
                 for tool in REQUIRED_TOOLS:
-                    found = truth_names if tool == "fellaga" else truth_names[:1]
+                    found = truth_names if tool == self.subject else truth_names[:1]
                     (self.campaign / "live" / f"{domain}.{tool}.r{repetition}.txt").write_text(
                         "\n".join(found) + "\n", encoding="utf-8"
                     )
-                    duration = 1.5 if tool == "fellaga" else 1.0
+                    duration = 1.5 if tool == self.subject else 1.0
                     self.rows.append(
                         {
                             "campaign_id": self.campaign_id,
@@ -214,7 +290,7 @@ class ReportTests(unittest.TestCase):
         summary = report["summary"]
         self.assertTrue(summary["qualification_passed"])
         self.assertEqual(summary["ranked_domains"], 30)
-        self.assertEqual(summary["fellaga_wins"], 30)
+        self.assertEqual(summary["subject_wins"], 30)
         self.assertEqual(summary["true_positives"], 60)
         self.assertEqual(summary["false_positives"], 0)
         self.assertEqual(summary["false_negatives"], 0)
@@ -235,7 +311,7 @@ class ReportTests(unittest.TestCase):
 
         self.assertEqual(summary["recall"], 2 / 3)
         self.assertEqual(summary["false_negatives"], 30)
-        self.assertEqual(summary["fellaga_win_rate"], 1.0)
+        self.assertEqual(summary["subject_win_rate"], 1.0)
         self.assertEqual(summary["validated_gain"], 1.0)
         self.assertEqual(summary["false_discovery_rate"], 0.0)
         self.assertTrue(summary["deep_within_2x_best_coverage"])
@@ -244,20 +320,20 @@ class ReportTests(unittest.TestCase):
             summary["qualification_failures"],
             [
                 "aggregate_ground_truth_recall_below_100_percent",
-                "fellaga_run_ground_truth_recall_below_100_percent",
+                "subject_run_ground_truth_recall_below_100_percent",
             ],
         )
 
     def test_tp_fp_fn_precision_recall_and_false_discovery_rate(self) -> None:
         domain = self.domains[0]
-        path = self.campaign / "live" / f"{domain}.fellaga.r1.txt"
+        path = self.campaign / "live" / f"{domain}.{self.subject}.r1.txt"
         path.write_text(f"a.{domain}\nfalse.{domain}\n", encoding="utf-8")
         report = build_report(self.campaign, self.truth)
         row = next(
             row
             for row in report["results"]
             if row.get("domain") == domain
-            and row.get("tool") == "fellaga"
+            and row.get("tool") == self.subject
             and row.get("repetition") == 1
         )
         self.assertEqual(row["true_positives"], 1)
@@ -353,23 +429,23 @@ class ReportTests(unittest.TestCase):
         )
         self.assertIn(expected_label, summary["missing_required_runs"])
 
-    def test_each_fellaga_repetition_requires_full_recall(self) -> None:
+    def test_each_subject_repetition_requires_full_recall(self) -> None:
         domain = self.domains[0]
-        (self.campaign / "live" / f"{domain}.fellaga.r1.txt").write_text(
+        (self.campaign / "live" / f"{domain}.{self.subject}.r1.txt").write_text(
             f"a.{domain}\n", encoding="utf-8"
         )
-        (self.campaign / "live" / f"{domain}.fellaga.r2.txt").write_text(
+        (self.campaign / "live" / f"{domain}.{self.subject}.r2.txt").write_text(
             f"b.{domain}\n", encoding="utf-8"
         )
         summary = build_report(self.campaign, self.truth)["summary"]
         self.assertEqual(summary["recall"], 1.0)
         self.assertIn(
-            "fellaga_run_ground_truth_recall_below_100_percent",
+            "subject_run_ground_truth_recall_below_100_percent",
             summary["qualification_failures"],
         )
         self.assertEqual(
-            summary["incomplete_fellaga_ground_truth_runs"],
-            [f"{domain}/fellaga/r1", f"{domain}/fellaga/r2"],
+            summary["incomplete_subject_ground_truth_runs"],
+            [f"{domain}/{self.subject}/r1", f"{domain}/{self.subject}/r2"],
         )
 
     def test_missing_or_inconsistent_timing_fails_closed(self) -> None:
@@ -425,20 +501,21 @@ class ReportTests(unittest.TestCase):
     def test_false_positives_do_not_improve_win_ranking(self) -> None:
         for domain in self.domains:
             for repetition in range(1, 4):
-                path = self.campaign / "live" / f"{domain}.subfinder.r{repetition}.txt"
+                path = self.campaign / "live" / f"{domain}.finder_alpha.r{repetition}.txt"
                 false_names = "".join(
                     f"false-{index}.{domain}\n" for index in range(20)
                 )
                 path.write_text(f"a.{domain}\n{false_names}", encoding="utf-8")
         summary = build_report(self.campaign, self.truth)["summary"]
-        self.assertEqual(summary["fellaga_wins"], 30)
+        self.assertEqual(summary["subject_wins"], 30)
+        self.assertEqual(summary["best_alternative_true_positive_total"], 30)
         self.assertEqual(summary["best_competitor_true_positive_total"], 30)
 
     def test_artifacts_must_match_campaign_and_binary(self) -> None:
         path = self.campaign / "candidate-pipeline.json"
         pipeline = json.loads(path.read_text(encoding="utf-8"))
         pipeline["campaign_id"] = "different-campaign"
-        pipeline["fellaga_sha256"] = "9" * 64
+        pipeline["subject_sha256"] = "9" * 64
         path.write_text(json.dumps(pipeline), encoding="utf-8")
         summary = build_report(self.campaign, self.truth)["summary"]
         self.assertIn(
@@ -458,12 +535,9 @@ class ReportTests(unittest.TestCase):
             "providers": [
                 {
                     "name": "provider",
-                    "fellaga_env": "PROVIDER_API_KEY",
+                    "subject_env": "PROVIDER_API_KEY",
                     "configured_tools": [
-                        "fellaga",
-                        "subfinder",
-                        "amass",
-                        "bbot",
+                        *CREDENTIAL_PARTICIPANTS,
                     ],
                 }
             ],
@@ -480,28 +554,30 @@ class ReportTests(unittest.TestCase):
     def test_missing_version_hash_and_dns_fairness_fail_manifest(self) -> None:
         manifest_path = self.campaign / "manifest.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        manifest["versions"]["massdns"] = ""
-        manifest["provenance"]["executables"]["fellaga"]["sha256"] = "bad"
+        manifest["versions"]["transport_helper"] = ""
+        manifest["provenance"]["executables"][self.subject]["sha256"] = "bad"
         manifest["dns_fairness"]["resolvers_sha256"] = "9" * 64
         manifest["configuration"]["dns_transport_queries"] = 99_999
         manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
         summary = build_report(self.campaign, self.truth)["summary"]
         self.assertFalse(summary["qualification_passed"])
-        self.assertIn("missing_version:massdns", summary["manifest_issues"])
-        self.assertIn("invalid_executable_hash:fellaga", summary["manifest_issues"])
+        self.assertIn("missing_version:transport_helper", summary["manifest_issues"])
+        self.assertIn(
+            f"invalid_executable_hash:{self.subject}", summary["manifest_issues"]
+        )
         self.assertIn("dns_resolver_hash_mismatch", summary["manifest_issues"])
         self.assertIn(
             "invalid_configuration:dns_transport_queries",
             summary["manifest_issues"],
         )
 
-    def test_schema_two_capacity_preflights_fail_closed(self) -> None:
+    def test_capacity_preflights_fail_closed(self) -> None:
         manifest_path = self.campaign / "manifest.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         manifest["preflight"]["candidate_pipeline_disk"][
             "available_free_bytes"
         ] = 1
-        manifest["preflight"]["puredns_capacity"][
+        manifest["preflight"]["capacity_guard"][
             "estimated_minimum_seconds"
         ] = 1
         manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
@@ -509,9 +585,9 @@ class ReportTests(unittest.TestCase):
         summary = build_report(self.campaign, self.truth)["summary"]
         self.assertFalse(summary["qualification_passed"])
         self.assertIn("invalid_disk_preflight", summary["manifest_issues"])
-        self.assertIn("invalid_puredns_preflight", summary["manifest_issues"])
+        self.assertIn("invalid_capacity_guard_preflight", summary["manifest_issues"])
 
-    def test_puredns_preflight_must_match_manifest_corpus_count(self) -> None:
+    def test_capacity_guard_preflight_must_match_manifest_corpus_count(self) -> None:
         manifest_path = self.campaign / "manifest.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         manifest["provenance"]["inputs"]["active_corpus_candidates"] = 999_999
@@ -519,27 +595,17 @@ class ReportTests(unittest.TestCase):
 
         summary = build_report(self.campaign, self.truth)["summary"]
         self.assertFalse(summary["qualification_passed"])
-        self.assertIn("invalid_puredns_preflight", summary["manifest_issues"])
+        self.assertIn("invalid_capacity_guard_preflight", summary["manifest_issues"])
 
-    def test_schema_one_campaign_remains_compatible(self) -> None:
+    def test_legacy_manifest_schema_cannot_qualify(self) -> None:
         manifest_path = self.campaign / "manifest.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         manifest["schema_version"] = 1
-        manifest.pop("preflight")
-        for field in (
-            "fellaga_active_max_runtime_seconds",
-            "candidate_pipeline_bytes_per_candidate",
-            "candidate_pipeline_fixed_bytes",
-            "candidate_pipeline_disk_margin_percent",
-            "puredns_headroom_percent",
-            "fellaga_profile_baselines",
-        ):
-            manifest["configuration"].pop(field)
-        manifest["provenance"]["inputs"].pop("active_corpus_candidates")
         manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
         summary = build_report(self.campaign, self.truth)["summary"]
-        self.assertTrue(summary["qualification_passed"])
+        self.assertFalse(summary["qualification_passed"])
+        self.assertIn("invalid_manifest_schema", summary["manifest_issues"])
 
     def test_require_pass_returns_nonzero_for_failed_qualification(self) -> None:
         self.assertEqual(

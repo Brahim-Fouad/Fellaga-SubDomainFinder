@@ -18,65 +18,19 @@ pub fn evidence_family(source: &str) -> Option<EvidenceFamily> {
     {
         return Some(EvidenceFamily::LiveDns);
     }
-    if source.starts_with("tls-cert:")
-        || source.starts_with("passive:crtsh")
-        || source.starts_with("passive:certspotter")
-        || source.starts_with("passive:ct-direct")
-        || source.starts_with("passive:google-ct")
-        || source.starts_with("passive:merklemap")
-        || source.starts_with("passive:shodanct")
-        || source.starts_with("passive:digitorus")
-        || source.starts_with("passive:certificatedetails")
-        || source.starts_with("passive:censys")
-    {
+    if source.starts_with("tls-cert:") {
         return Some(EvidenceFamily::CertificateTransparency);
     }
-    if source.starts_with("passive:wayback") || source.starts_with("passive:waybackarchive") {
-        return Some(EvidenceFamily::WebArchive);
-    }
-    if source.starts_with("web:")
-        || source.starts_with("passive:commoncrawl")
-        || source.starts_with("passive:urlscan")
-        || source.starts_with("passive:brave")
-    {
+    if source.starts_with("web:") {
         return Some(EvidenceFamily::WebCrawl);
     }
-    if source.starts_with("passive:github") || source.starts_with("passive:gitlab") {
-        return Some(EvidenceFamily::CodeSearch);
-    }
-    if [
-        "otx",
-        "alienvault",
-        "bufferover",
-        "c99",
-        "circl",
-        "securitytrails",
-        "shodan",
-        "virustotal",
-        "chaos",
-        "dnsdb",
-        "dnsdumpster",
-        "dnsrepo",
-        "fullhunt",
-        "bevigil",
-        "leakix",
-        "onyphe",
-        "robtex",
-        "rsecloud",
-        "thc",
-        "threatbook",
-        "whoisxml",
-        "whoisxmlapi",
-        "netlas",
-        "binaryedge",
-    ]
-    .iter()
-    .any(|name| source.starts_with(&format!("passive:{name}")))
-    {
-        return Some(EvidenceFamily::PassiveDns);
-    }
-    if source.starts_with("passive:") {
-        return Some(EvidenceFamily::Aggregator);
+
+    if let Some(passive_source) = source.strip_prefix("passive:") {
+        let connector = passive_source.split(':').next().unwrap_or_default();
+        if matches!(connector, "ct-direct" | "google-ct") {
+            return Some(EvidenceFamily::CertificateTransparency);
+        }
+        return crate::passive::passive_source_evidence_family(connector);
     }
     None
 }
@@ -268,6 +222,42 @@ mod tests {
             evidence_family("passive:waybackarchive"),
             Some(EvidenceFamily::WebArchive)
         );
+        assert_eq!(
+            evidence_family("passive:postman"),
+            Some(EvidenceFamily::CodeSearch)
+        );
+        assert_eq!(
+            evidence_family("passive:viewdns"),
+            Some(EvidenceFamily::PassiveDns)
+        );
+    }
+
+    #[test]
+    fn every_registered_connector_uses_its_typed_registry_family() {
+        for status in crate::passive::source_statuses(&crate::passive::ApiKeyStore::default()) {
+            let source = format!("passive:{}", status.name);
+            let qualified = format!("{source}:cache");
+            assert_eq!(
+                evidence_family(&source),
+                Some(status.metadata.evidence_family),
+                "{}",
+                status.name
+            );
+            assert_eq!(
+                evidence_family(&qualified),
+                Some(status.metadata.evidence_family),
+                "{} qualified provenance",
+                status.name
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_or_prefix_colliding_passive_names_have_no_evidence_family() {
+        assert_eq!(evidence_family("passive:unknown-source"), None);
+        assert_eq!(evidence_family("passive:crtsh-lookalike"), None);
+        assert_eq!(evidence_family("passive:github-lookalike:cache"), None);
+        assert_eq!(evidence_family("passive:"), None);
     }
 
     #[test]

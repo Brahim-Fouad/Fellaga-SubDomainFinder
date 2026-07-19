@@ -131,7 +131,7 @@ def check_repository(root: Path) -> list[str]:
         require_tokens(
             "docs/sources.md",
             read(root / "docs/sources.md"),
-            [f"Fellaga {version} registers 30 passive connectors"],
+            ["The current Fellaga registry contains 67 connector names"],
         )
     )
 

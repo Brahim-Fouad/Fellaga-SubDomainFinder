@@ -149,7 +149,9 @@ class NameNormalizationTests(unittest.TestCase):
         self.assertIn("exceeds 2 unique names", stderr.getvalue())
         self.assertNotIn("Traceback", stderr.getvalue())
 
-    def test_bbot_observational_parser_counts_exclusions_without_failing(self) -> None:
+    def test_dns_event_observational_parser_counts_exclusions_without_failing(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
             (root / "output.json").write_text(
@@ -168,7 +170,7 @@ class NameNormalizationTests(unittest.TestCase):
                 [
                     sys.executable,
                     str(BENCHMARKS / "names.py"),
-                    "bbot-observational",
+                    "dns-events-observational",
                     "example.com",
                     str(root),
                 ],
@@ -183,7 +185,9 @@ class NameNormalizationTests(unittest.TestCase):
         self.assertIn("excluded_wildcards=1", completed.stderr)
         self.assertIn("excluded_invalid_or_out_of_scope=2", completed.stderr)
 
-    def test_bbot_observational_name_limit_is_fatal_without_a_traceback(self) -> None:
+    def test_dns_event_observational_name_limit_is_fatal_without_a_traceback(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
             (root / "output.json").write_text(
@@ -204,7 +208,7 @@ class NameNormalizationTests(unittest.TestCase):
                 contextlib.redirect_stderr(stderr),
             ):
                 result = benchmark_names.main(
-                    ["bbot-observational", "example.com", str(root)]
+                    ["dns-events-observational", "example.com", str(root)]
                 )
 
         self.assertEqual(result, 4)
@@ -249,7 +253,7 @@ class NameNormalizationTests(unittest.TestCase):
         self.assertEqual(completed.stdout, "api.example.com\n")
         self.assertEqual(metadata_value["rejected_names"], 2)
 
-    def test_bbot_parser_fails_closed_on_invalid_dns_events(self) -> None:
+    def test_dns_event_parser_fails_closed_on_invalid_dns_events(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
             (root / "output.json").write_text(
@@ -269,7 +273,7 @@ class NameNormalizationTests(unittest.TestCase):
                 [
                     sys.executable,
                     str(BENCHMARKS / "names.py"),
-                    "bbot",
+                    "dns-events",
                     "example.com",
                     str(root),
                 ],

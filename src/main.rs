@@ -473,7 +473,7 @@ struct ScanArgs {
     exclude_sources: Vec<String>,
     #[arg(
         long,
-        help = "Select every connector; key-gated sources without credentials are skipped"
+        help = "Select every available connector; key-gated sources without credentials are skipped"
     )]
     all_sources: bool,
     #[arg(
@@ -1551,33 +1551,70 @@ fn collect_names_from_json(value: &serde_json::Value, names: &mut Vec<String>) {
     }
 }
 
-fn parse_import_names(content: &str, format: ImportFormat, domain: &str) -> BTreeSet<String> {
+fn collect_names_from_text(content: &str, raw_names: &mut Vec<String>) {
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(name) = line.split_whitespace().next() {
+            raw_names.push(name.to_owned());
+        }
+    }
+}
+
+fn collect_names_from_jsonl(content: &str, raw_names: &mut Vec<String>) -> Result<()> {
+    for (line_index, line) in content.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let value = serde_json::from_str::<serde_json::Value>(line).map_err(|error| {
+            anyhow::anyhow!("invalid JSONL import at line {}: {error}", line_index + 1)
+        })?;
+        collect_names_from_json(&value, raw_names);
+    }
+    Ok(())
+}
+
+fn parse_import_names(
+    content: &str,
+    format: ImportFormat,
+    domain: &str,
+) -> Result<BTreeSet<String>> {
     let mut raw_names = Vec::new();
-    if matches!(format, ImportFormat::Json | ImportFormat::Auto)
-        && let Ok(value) = serde_json::from_str::<serde_json::Value>(content)
-    {
-        collect_names_from_json(&value, &mut raw_names);
-    } else {
-        for line in content.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            if matches!(format, ImportFormat::Jsonl | ImportFormat::Auto)
-                && let Ok(value) = serde_json::from_str::<serde_json::Value>(line)
-            {
+    match format {
+        ImportFormat::Json => {
+            let value = serde_json::from_str::<serde_json::Value>(content)
+                .map_err(|error| anyhow::anyhow!("invalid JSON import: {error}"))?;
+            collect_names_from_json(&value, &mut raw_names);
+        }
+        ImportFormat::Jsonl => collect_names_from_jsonl(content, &mut raw_names)?,
+        ImportFormat::Text | ImportFormat::DnsText => {
+            collect_names_from_text(content, &mut raw_names);
+        }
+        ImportFormat::Auto => {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(content) {
                 collect_names_from_json(&value, &mut raw_names);
-                continue;
-            }
-            if let Some(name) = line.split_whitespace().next() {
-                raw_names.push(name.to_owned());
+            } else {
+                for line in content.lines() {
+                    let line = line.trim();
+                    if line.is_empty() || line.starts_with('#') {
+                        continue;
+                    }
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
+                        collect_names_from_json(&value, &mut raw_names);
+                    } else if let Some(name) = line.split_whitespace().next() {
+                        raw_names.push(name.to_owned());
+                    }
+                }
             }
         }
     }
-    raw_names
+    Ok(raw_names
         .into_iter()
         .filter_map(|name| util::normalize_observed_name(&name, domain))
-        .collect()
+        .collect())
 }
 
 fn csv_field(value: &str) -> String {
@@ -1756,6 +1793,7 @@ async fn main() -> Result<()> {
             let mut passive_sources = if args.all_sources {
                 source_statuses(&api_keys)
                     .into_iter()
+                    .filter(|source| source.metadata.available)
                     .map(|source| source.name)
                     .collect::<Vec<_>>()
             } else if args.passive_sources.is_empty() {
@@ -1770,6 +1808,18 @@ async fn main() -> Result<()> {
                 .cloned()
                 .collect::<BTreeSet<_>>();
             passive_sources.retain(|source| !excluded.contains(source));
+            if let Some(source) = passive_sources
+                .iter()
+                .find(|source| !passive::source_metadata(source).available)
+            {
+                let metadata = passive::source_metadata(source);
+                bail!(
+                    "passive source {source} is unavailable: {}",
+                    metadata
+                        .unavailable_reason
+                        .unwrap_or("provider unavailable")
+                );
+            }
             passive_sources.sort();
             passive_sources.dedup();
             if !args.no_passive && passive_sources.is_empty() {
@@ -2176,6 +2226,16 @@ async fn main() -> Result<()> {
                         let api_keys = api_keys.clone();
                         let target = target.clone();
                         async move {
+                            if !source.metadata.available {
+                                return serde_json::json!({
+                                    "name": source.name,
+                                    "status": "skipped_unavailable",
+                                    "names": 0,
+                                    "duration_ms": 0,
+                                    "error": source.metadata.unavailable_reason,
+                                    "metadata": source.metadata
+                                });
+                            }
                             if source.requires_key && !source.configured {
                                 return serde_json::json!({
                                     "name": source.name,
@@ -2309,7 +2369,15 @@ async fn main() -> Result<()> {
                 println!("Configuration: {}", config_path.display());
                 for source in statuses {
                     let diagnostic = diagnostics.get(&source.name);
-                    let state = if let Some(wait) =
+                    let state = if !source.metadata.available {
+                        format!(
+                            "unavailable ({})",
+                            source
+                                .metadata
+                                .unavailable_reason
+                                .unwrap_or("provider unavailable")
+                        )
+                    } else if let Some(wait) =
                         diagnostic.and_then(|diagnostic| diagnostic.retry_in_seconds)
                     {
                         format!("paused {}", wait_label(wait))
@@ -2492,7 +2560,7 @@ async fn main() -> Result<()> {
             } else {
                 std::fs::read_to_string(&args.input)?
             };
-            let names = parse_import_names(&content, args.format, &domain);
+            let names = parse_import_names(&content, args.format, &domain)?;
             let source = format!("import:{:?}", args.format).to_ascii_lowercase();
             let database = Database::open(&database_path)?;
             let written = database.import_inventory(&domain, &names, &source)?;
@@ -2696,29 +2764,103 @@ mod tests {
     }
 
     #[test]
-    fn generic_import_formats_extract_only_in_scope_names() {
+    fn json_import_extracts_only_in_scope_names() {
         assert_eq!(
             parse_import_names(
                 r#"{"results":[{"host":"api.example.com"},{"host":"evil.test"}]}"#,
                 ImportFormat::Json,
                 "example.com",
-            ),
+            )
+            .unwrap(),
             BTreeSet::from(["api.example.com".to_owned()])
         );
+    }
+
+    #[test]
+    fn json_import_rejects_invalid_content() {
+        let error = parse_import_names(
+            r#"{"host":"api.example.com""#,
+            ImportFormat::Json,
+            "example.com",
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().starts_with("invalid JSON import:"));
+    }
+
+    #[test]
+    fn jsonl_import_extracts_valid_rows() {
         assert_eq!(
             parse_import_names(
                 "{\"name\":\"www.example.com\"}\n{\"fqdn\":\"dev.example.com\"}\n",
                 ImportFormat::Jsonl,
                 "example.com",
-            ),
+            )
+            .unwrap(),
             BTreeSet::from(["dev.example.com".to_owned(), "www.example.com".to_owned()])
         );
+    }
+
+    #[test]
+    fn jsonl_import_rejects_the_first_invalid_row() {
+        let error = parse_import_names(
+            "{\"name\":\"www.example.com\"}\nnot-json\n{\"fqdn\":\"dev.example.com\"}\n",
+            ImportFormat::Jsonl,
+            "example.com",
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .starts_with("invalid JSONL import at line 2:")
+        );
+    }
+
+    #[test]
+    fn auto_import_detects_json_and_mixed_line_formats() {
+        assert_eq!(
+            parse_import_names(
+                r#"{"hosts":["api.example.com","outside.test"]}"#,
+                ImportFormat::Auto,
+                "example.com",
+            )
+            .unwrap(),
+            BTreeSet::from(["api.example.com".to_owned()])
+        );
+        assert_eq!(
+            parse_import_names(
+                "{\"hostname\":\"www.example.com\"}\nmail.example.com A 192.0.2.1\nnot-json\n",
+                ImportFormat::Auto,
+                "example.com",
+            )
+            .unwrap(),
+            BTreeSet::from(["mail.example.com".to_owned(), "www.example.com".to_owned()])
+        );
+    }
+
+    #[test]
+    fn text_import_stays_text_and_filters_invalid_names() {
+        assert_eq!(
+            parse_import_names(
+                "api.example.com metadata\n{\"name\":\"json.example.com\"}\noutside.test\ninvalid\n",
+                ImportFormat::Text,
+                "example.com",
+            )
+            .unwrap(),
+            BTreeSet::from(["api.example.com".to_owned()])
+        );
+    }
+
+    #[test]
+    fn dns_text_import_extracts_the_first_column() {
         assert_eq!(
             parse_import_names(
                 "# ignored\nmail.example.com A 192.0.2.1\noutside.test\n",
                 ImportFormat::DnsText,
                 "example.com",
-            ),
+            )
+            .unwrap(),
             BTreeSet::from(["mail.example.com".to_owned()])
         );
     }

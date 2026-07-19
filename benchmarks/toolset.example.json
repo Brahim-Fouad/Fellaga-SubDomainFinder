@@ -1,0 +1,192 @@
+{
+  "schema_version": 1,
+  "subject": "subject_cli",
+  "campaigns": {
+    "active": {
+      "discoverers": [
+        "subject_cli",
+        "alternate_cli"
+      ],
+      "validator": "validation_cli",
+      "capacity_guard": "subject_cli",
+      "provenance_only": [],
+      "credential_participants": [
+        "subject_cli",
+        "alternate_cli"
+      ]
+    },
+    "passive-observational": {
+      "discoverers": [
+        "subject_cli",
+        "alternate_cli"
+      ]
+    }
+  },
+  "tools": {
+    "subject_cli": {
+      "executable": "/absolute/path/to/subject-cli",
+      "identity": {
+        "version_argv": [
+          "{executable}",
+          "--version"
+        ],
+        "extra_kind": "none"
+      },
+      "dns_controls": [
+        "rate_limit",
+        "resolvers_file"
+      ],
+      "parameters": {
+        "rate_limit": "1000"
+      },
+      "commands": {
+        "active": {
+          "argv": [
+            "{executable}",
+            "enumerate",
+            "--domain",
+            "{domain}",
+            "--rate",
+            "{rate_limit}",
+            "--resolvers",
+            "{resolvers_file}",
+            "--json",
+            "{output_file}"
+          ],
+          "required_context": [
+            "domain",
+            "resolvers_file",
+            "output_file"
+          ],
+          "output": {
+            "kind": "finding_json",
+            "path": "{output_file}"
+          }
+        },
+        "passive-observational": {
+          "argv": [
+            "{executable}",
+            "enumerate",
+            "--passive",
+            "--no-target-contact",
+            "--domain",
+            "{domain}"
+          ],
+          "required_context": [
+            "domain"
+          ],
+          "output": {
+            "kind": "line_stdout"
+          }
+        }
+      },
+      "passive_policy": {
+        "target_contact": "prohibited",
+        "direct_dns": false,
+        "direct_http_or_tls": false
+      }
+    },
+    "alternate_cli": {
+      "executable": "/absolute/path/to/alternate-cli",
+      "identity": {
+        "version_argv": [
+          "{executable}",
+          "version"
+        ],
+        "extra_kind": "none"
+      },
+      "dns_controls": [],
+      "commands": {
+        "active": {
+          "argv": [
+            "{executable}",
+            "--target",
+            "{domain}",
+            "--output",
+            "{output_file}"
+          ],
+          "required_context": [
+            "domain",
+            "output_file"
+          ],
+          "output": {
+            "kind": "line_file",
+            "path": "{output_file}"
+          }
+        },
+        "passive-observational": {
+          "argv": [
+            "{executable}",
+            "--target",
+            "{domain}",
+            "--passive-only"
+          ],
+          "required_context": [
+            "domain"
+          ],
+          "output": {
+            "kind": "line_stdout"
+          }
+        }
+      },
+      "preflight": {
+        "argv": [
+          "{executable}",
+          "check",
+          "--home",
+          "{output_directory}"
+        ],
+        "required_context": [
+          "output_directory"
+        ],
+        "required_literals": [
+          "passive-only: enabled"
+        ],
+        "forbidden_regexes": [
+          "(?i)direct[ -]target[ -]contact:[ ]*enabled"
+        ]
+      },
+      "passive_policy": {
+        "target_contact": "prohibited",
+        "direct_dns": false,
+        "direct_http_or_tls": false
+      }
+    },
+    "validation_cli": {
+      "executable": "/absolute/path/to/validation-cli",
+      "identity": {
+        "version_argv": [
+          "{executable}",
+          "--version"
+        ],
+        "extra_kind": "none"
+      },
+      "dns_controls": [
+        "rate_limit",
+        "resolvers_file"
+      ],
+      "commands": {
+        "validate": {
+          "argv": [
+            "{executable}",
+            "--input",
+            "{input_file}",
+            "--event-tree",
+            "{output_dir}",
+            "--resolvers",
+            "{resolvers_file}"
+          ],
+          "required_context": [
+            "input_file",
+            "output_dir",
+            "resolvers_file"
+          ],
+          "output": {
+            "kind": "dns_event_tree",
+            "path": "{output_dir}"
+          }
+        }
+      }
+    }
+  }
+}

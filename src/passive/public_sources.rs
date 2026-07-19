@@ -7,7 +7,7 @@
 
 use super::{
     ApiKeyStore, client, commit_result_page, compact_external_error, response_bytes_limited_to,
-    response_json, send_external, send_external_streaming,
+    response_json, send_external, send_external_idempotent, send_external_streaming,
 };
 use crate::util::{extract_observed_names, normalize_domain, normalize_observed_name};
 use anyhow::{Context, Result, bail};
@@ -318,7 +318,7 @@ pub(super) async fn thc(domain: &str, timeout: Duration) -> Result<BTreeSet<Stri
             page_state: &page_state,
             limit: THC_PAGE_SIZE,
         };
-        let response = send_external(
+        let response = send_external_idempotent(
             "thc",
             http.post("https://ip.thc.org/api/v1/lookup/subdomains")
                 .json(&body),
@@ -547,13 +547,11 @@ pub(super) async fn reconeer(
     keys: &ApiKeyStore,
 ) -> Result<BTreeSet<String>> {
     let domain = canonical_domain(domain)?;
-    let http = client(timeout)?;
-    let mut request = http
+    let token = keys.pick("reconeer")?;
+    let request = client(timeout)?
         .get(format!("https://www.reconeer.com/api/domain/{domain}"))
-        .header(reqwest::header::ACCEPT, "application/json");
-    if let Some(token) = keys.optional("reconeer") {
-        request = request.header("X-API-KEY", token);
-    }
+        .header(reqwest::header::ACCEPT, "application/json")
+        .header("X-API-KEY", token);
     let response = send_external("reconeer", request, &domain).await?;
     let response = response_json::<ReconeERResponse>(response, "ReconeER").await?;
     Ok(reconeer_names(&response, &domain))

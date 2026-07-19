@@ -3,21 +3,30 @@
   "providers": [
     {
       "name": "virustotal",
-      "fellaga_env": "VIRUSTOTAL_API_KEY",
-      "competitors_configured": false,
-      "configured_tools": []
+      "subject_env": "VIRUSTOTAL_API_KEY",
+      "participants_configured": false,
+      "configured_tools": [
+        "subject_cli",
+        "alternate_cli"
+      ]
     },
     {
       "name": "securitytrails",
-      "fellaga_env": "SECURITYTRAILS_API_KEY",
-      "competitors_configured": false,
-      "configured_tools": []
+      "subject_env": "SECURITYTRAILS_API_KEY",
+      "participants_configured": false,
+      "configured_tools": [
+        "subject_cli",
+        "alternate_cli"
+      ]
     },
     {
       "name": "shodan",
-      "fellaga_env": "SHODAN_API_KEY",
-      "competitors_configured": false,
-      "configured_tools": []
+      "subject_env": "SHODAN_API_KEY",
+      "participants_configured": false,
+      "configured_tools": [
+        "subject_cli",
+        "alternate_cli"
+      ]
     }
   ]
 }

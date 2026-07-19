@@ -7,22 +7,22 @@ NAMES="$ROOT/benchmarks/names.py"
 TIMED="$ROOT/benchmarks/timed.py"
 REDACT="$ROOT/benchmarks/redact.py"
 SOURCE_CSV="$ROOT/benchmarks/data/tranco-74J5X-top30.csv"
+TOOLSET="${FELLAGA_PASSIVE_TOP30_TOOLSET:-$ROOT/benchmarks/toolset.local.json}"
 
 REPETITIONS="${FELLAGA_PASSIVE_TOP30_REPETITIONS:-1}"
 DISCOVERY_TIMEOUT="${FELLAGA_PASSIVE_TOP30_TIMEOUT:-180}"
 TIMEOUT_GRACE="${FELLAGA_PASSIVE_TOP30_TIMEOUT_GRACE:-5}"
-PREFLIGHT_TIMEOUT="${FELLAGA_PASSIVE_TOP30_PREFLIGHT_TIMEOUT:-${FELLAGA_PASSIVE_TOP30_BBOT_PREFLIGHT_TIMEOUT:-60}}"
+PREFLIGHT_TIMEOUT="${FELLAGA_PASSIVE_TOP30_PREFLIGHT_TIMEOUT:-60}"
 CAMPAIGN_MAX_RUNTIME="${FELLAGA_PASSIVE_TOP30_MAX_RUNTIME:-7200}"
 COOLDOWN="${FELLAGA_PASSIVE_TOP30_COOLDOWN:-1}"
 FAILURE_THRESHOLD="${FELLAGA_PASSIVE_TOP30_FAILURE_THRESHOLD:-3}"
-SUBFINDER_RATE_LIMIT="${FELLAGA_PASSIVE_TOP30_SUBFINDER_RATE_LIMIT:-5}"
-FELLAGA_PASSIVE_CONCURRENCY="${FELLAGA_PASSIVE_TOP30_FELLAGA_CONCURRENCY:-4}"
 CLEANUP_TIMEOUT="${FELLAGA_PASSIVE_TOP30_CLEANUP_TIMEOUT:-60}"
 REDACTION_TIMEOUT="${FELLAGA_PASSIVE_TOP30_REDACTION_TIMEOUT:-60}"
 MAX_FILE_BYTES="${FELLAGA_PASSIVE_TOP30_MAX_FILE_BYTES:-268435456}"
 MAX_CAMPAIGN_FILES="${FELLAGA_PASSIVE_TOP30_MAX_CAMPAIGN_FILES:-50000}"
 MAX_CAMPAIGN_BYTES="${FELLAGA_PASSIVE_TOP30_MAX_CAMPAIGN_BYTES:-2147483648}"
 OUT="${FELLAGA_PASSIVE_TOP30_OUT:-$ROOT/benchmarks/results/passive-top30-$(date -u +%Y%m%dT%H%M%SZ)}"
+ISOLATED_PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 integer_between() {
   local value="$1" minimum="$2" maximum="$3" label="$4"
@@ -61,8 +61,6 @@ integer_between "$PREFLIGHT_TIMEOUT" 1 600 FELLAGA_PASSIVE_TOP30_PREFLIGHT_TIMEO
 integer_between "$CAMPAIGN_MAX_RUNTIME" 60 86400 FELLAGA_PASSIVE_TOP30_MAX_RUNTIME
 integer_between "$COOLDOWN" 1 60 FELLAGA_PASSIVE_TOP30_COOLDOWN
 integer_between "$FAILURE_THRESHOLD" 1 10 FELLAGA_PASSIVE_TOP30_FAILURE_THRESHOLD
-integer_between "$SUBFINDER_RATE_LIMIT" 1 20 FELLAGA_PASSIVE_TOP30_SUBFINDER_RATE_LIMIT
-integer_between "$FELLAGA_PASSIVE_CONCURRENCY" 1 8 FELLAGA_PASSIVE_TOP30_FELLAGA_CONCURRENCY
 integer_between "$CLEANUP_TIMEOUT" 1 60 FELLAGA_PASSIVE_TOP30_CLEANUP_TIMEOUT
 integer_between "$REDACTION_TIMEOUT" 1 60 FELLAGA_PASSIVE_TOP30_REDACTION_TIMEOUT
 integer_between "$MAX_FILE_BYTES" 1048576 1073741824 FELLAGA_PASSIVE_TOP30_MAX_FILE_BYTES
@@ -75,11 +73,16 @@ if [[ -e "$OUT" ]]; then
 fi
 
 python3 "$REPORT" verify-source >/dev/null
+python3 "$REPORT" tool-list --toolset "$TOOLSET" >/dev/null
 mkdir -p "$OUT"/{logs,names,preflight,raw,state}
+python3 "$REPORT" snapshot-toolset --toolset "$TOOLSET" "$OUT/toolset.snapshot.json"
+TOOLSET="$OUT/toolset.snapshot.json"
+mapfile -d '' -t configured_tools < <(
+  python3 "$REPORT" tool-list --toolset "$TOOLSET"
+)
 
-# Fellaga and Amass protect their private configuration with POSIX modes.
-# Windows-mounted WSL filesystems can reject chmod even though normal writes
-# succeed, so fail before any real-domain provider request is attempted.
+# Private per-run configuration needs POSIX permissions. Windows-mounted WSL
+# filesystems can reject chmod even when ordinary writes succeed.
 if ! python3 - "$OUT" <<'PY'
 import pathlib
 import stat
@@ -110,7 +113,6 @@ then
   exit 6
 fi
 
-# Invoked through the EXIT trap below.
 # shellcheck disable=SC2329
 finalize_campaign() {
   local original_exit=$?
@@ -146,19 +148,10 @@ finalize_campaign() {
     else
       echo "[passive-top30] report generation failed" >&2
     fi
-    if (( report_exit == 3 )); then
-      echo "[passive-top30] campaign incomplete or invalid; see report.json" >&2
-    fi
   fi
-  if (( original_exit != 0 )); then
-    exit "$original_exit"
-  fi
-  if (( cleanup_exit != 0 )); then
-    exit "$cleanup_exit"
-  fi
-  if (( redaction_exit != 0 )); then
-    exit "$redaction_exit"
-  fi
+  if (( original_exit != 0 )); then exit "$original_exit"; fi
+  if (( cleanup_exit != 0 )); then exit "$cleanup_exit"; fi
+  if (( redaction_exit != 0 )); then exit "$redaction_exit"; fi
   exit "$report_exit"
 }
 trap finalize_campaign EXIT
@@ -171,24 +164,19 @@ declare -a runnable_args=()
 declare -a missing_args=()
 declare -a skipped_args=()
 declare -a runnable_tools=()
-ISOLATED_PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 resolve_tool() {
-  local tool="$1" variable="$2" override="" executable=""
-  override="${!variable-}"
-  if [[ -n "$override" ]]; then
-    if [[ -x "$override" && ! -d "$override" ]]; then
-      executable="$override"
-    else
-      missing_args+=(--missing "$tool=configured_executable_not_found")
-      return
+  local tool="$1" spec="$2" executable=""
+  if [[ "$spec" == */* ]]; then
+    if [[ -x "$spec" && ! -d "$spec" ]]; then
+      executable="$spec"
     fi
   else
-    executable="$(command -v "$tool" 2>/dev/null || true)"
-    if [[ -z "$executable" ]]; then
-      missing_args+=(--missing "$tool=executable_not_found")
-      return
-    fi
+    executable="$(PATH="$ISOLATED_PATH" type -P -- "$spec" 2>/dev/null || true)"
+  fi
+  if [[ -z "$executable" ]]; then
+    missing_args+=(--missing "$tool=executable_not_found")
+    return
   fi
   executable="$(python3 - "$executable" <<'PY'
 import pathlib
@@ -204,134 +192,76 @@ PY
   tool_bins["$tool"]="$executable"
 }
 
-resolve_tool fellaga FELLAGA_PASSIVE_TOP30_FELLAGA_BIN
-resolve_tool subfinder FELLAGA_PASSIVE_TOP30_SUBFINDER_BIN
-resolve_tool amass FELLAGA_PASSIVE_TOP30_AMASS_BIN
-resolve_tool bbot FELLAGA_PASSIVE_TOP30_BBOT_BIN
-
-standard_preflight() {
-  local tool="$1"
-  local directory="$OUT/preflight/$tool"
-  local exit_code=0
-  local pattern
-  local -a command=()
-  local -a required_patterns=()
-  mkdir -p "$directory"/{home,config,data,cache,state}
-  case "$tool" in
-    fellaga)
-      command=("${tool_bins[$tool]}" scan --help)
-      required_patterns=(--profile --no-target-contact --all-sources --show --passive-concurrency)
-      ;;
-    subfinder)
-      command=("${tool_bins[$tool]}" -duc -h)
-      required_patterns=(-duc -all -rl -d)
-      ;;
-    amass)
-      command=("${tool_bins[$tool]}" enum -h)
-      required_patterns=(-passive -config -d)
-      ;;
-    *)
-      return 2
-      ;;
-  esac
-  python3 "$TIMED" \
-    --timeout "$PREFLIGHT_TIMEOUT" --grace "$TIMEOUT_GRACE" \
-    --max-file-bytes "$MAX_FILE_BYTES" \
-    "$directory/timing.json" -- \
-    env -i -- \
-      "PATH=$ISOLATED_PATH" "LANG=C.UTF-8" "LC_ALL=C.UTF-8" \
-      "TZ=UTC" "NO_COLOR=1" \
-      "HOME=$directory/home" \
-      "XDG_CONFIG_HOME=$directory/config" \
-      "XDG_DATA_HOME=$directory/data" \
-      "XDG_CACHE_HOME=$directory/cache" \
-      "XDG_STATE_HOME=$directory/state" \
-      "${command[@]}" \
-    > "$directory/stdout.txt" 2> "$directory/stderr.txt" || exit_code=$?
-  if ! python3 "$REDACT" "$directory" >/dev/null 2>&1; then
-    echo "passive top-30 preflight redaction failed: $tool" >&2
-    return 9
+for tool in "${configured_tools[@]}"; do
+  metadata_file="$OUT/preflight/$tool.metadata.nul"
+  if ! python3 "$REPORT" tool-metadata --toolset "$TOOLSET" "$tool" > "$metadata_file"; then
+    echo "invalid tool metadata: $tool" >&2
+    exit 2
   fi
-  if (( exit_code != 0 )); then
-    skipped_args+=(--skipped "$tool=help_preflight_failed")
-    unset "tool_bins[$tool]"
-    return
+  mapfile -d '' -t metadata < "$metadata_file"
+  rm -f -- "$metadata_file"
+  if (( ${#metadata[@]} != 3 )); then
+    echo "invalid tool metadata field count: $tool" >&2
+    exit 2
   fi
-  for pattern in "${required_patterns[@]}"; do
-    if ! grep -Fq -- "$pattern" "$directory/stdout.txt" "$directory/stderr.txt"; then
-      skipped_args+=(--skipped "$tool=required_flag_missing")
-      unset "tool_bins[$tool]"
-      return
-    fi
-  done
-  runnable_tools+=("$tool")
-  runnable_args+=(--runnable "$tool=${tool_bins[$tool]}")
-}
-
-for tool in fellaga subfinder amass; do
+  resolve_tool "$tool" "${metadata[0]}"
   if [[ -n "${tool_bins[$tool]+present}" ]]; then
-    standard_preflight "$tool"
+    if [[ "${metadata[2]}" == 1 ]]; then
+      directory="$OUT/preflight/$tool"
+      mkdir -p "$directory"/{home,config,data,cache,state,output}
+      argv_file="$directory/argv.nul"
+      if ! python3 "$REPORT" render-argv --toolset "$TOOLSET" "$tool" preflight \
+        --context "executable=${tool_bins[$tool]}" \
+        --context "domain=example.invalid" \
+        --context "state_db=$directory/state/preflight.sqlite" \
+        --context "output_file=$directory/output/preflight.txt" \
+        --context "output_directory=$directory/output" > "$argv_file"; then
+        rm -f -- "$argv_file"
+        skipped_args+=(--skipped "$tool=preflight_command_invalid")
+        unset 'tool_bins[$tool]'
+        continue
+      fi
+      mapfile -d '' -t preflight_argv < "$argv_file"
+      rm -f -- "$argv_file"
+      preflight_exit=0
+      python3 "$TIMED" \
+        --timeout "$PREFLIGHT_TIMEOUT" --grace "$TIMEOUT_GRACE" \
+        --max-file-bytes "$MAX_FILE_BYTES" \
+        "$directory/timing.json" -- \
+        env -i -- \
+          "PATH=$ISOLATED_PATH" "LANG=C.UTF-8" "LC_ALL=C.UTF-8" \
+          "TZ=UTC" "NO_COLOR=1" \
+          "HOME=$directory/home" \
+          "XDG_CONFIG_HOME=$directory/config" \
+          "XDG_DATA_HOME=$directory/data" \
+          "XDG_CACHE_HOME=$directory/cache" \
+          "XDG_STATE_HOME=$directory/state" \
+          "${preflight_argv[@]}" \
+        > "$directory/stdout.txt" 2> "$directory/stderr.txt" || preflight_exit=$?
+      if ! python3 "$REDACT" "$directory" >/dev/null 2>&1; then
+        echo "passive top-30 preflight redaction failed: $tool" >&2
+        exit 9
+      fi
+      if (( preflight_exit != 0 )) || ! python3 "$REPORT" preflight-check \
+        --toolset "$TOOLSET" "$tool" "$directory/stdout.txt" "$directory/stderr.txt"; then
+        skipped_args+=(--skipped "$tool=passive_policy_preflight_failed")
+        unset 'tool_bins[$tool]'
+        continue
+      fi
+    fi
+    runnable_tools+=("$tool")
+    runnable_args+=(--runnable "$tool=${tool_bins[$tool]}")
   fi
 done
 
-if [[ -n "${tool_bins[bbot]+present}" ]]; then
-  bbot_preflight="$OUT/preflight/bbot"
-  mkdir -p "$bbot_preflight"/{home,config,data,cache,state,output}
-  declare -a bbot_preflight_env=(
-    env -i
-    --
-    "PATH=$ISOLATED_PATH"
-    "LANG=C.UTF-8"
-    "LC_ALL=C.UTF-8"
-    "TZ=UTC"
-    "NO_COLOR=1"
-    "HOME=$bbot_preflight/home"
-    "XDG_CONFIG_HOME=$bbot_preflight/config"
-    "XDG_DATA_HOME=$bbot_preflight/data"
-    "XDG_CACHE_HOME=$bbot_preflight/cache"
-    "XDG_STATE_HOME=$bbot_preflight/state"
-  )
-  preflight_exit=0
-  python3 "$TIMED" \
-    --timeout "$PREFLIGHT_TIMEOUT" --grace "$TIMEOUT_GRACE" \
-    --max-file-bytes "$MAX_FILE_BYTES" \
-    "$bbot_preflight/timing.json" -- \
-    "${bbot_preflight_env[@]}" "${tool_bins[bbot]}" -y -t example.invalid \
-      -f subdomain-enum -rf passive \
-      -c dns.disable=true speculate=false \
-      -om json -o "$bbot_preflight/output" --dry-run \
-    > "$bbot_preflight/stdout.txt" 2> "$bbot_preflight/stderr.txt" || preflight_exit=$?
-  if ! python3 "$REDACT" "$bbot_preflight" >/dev/null 2>&1; then
-    echo "passive top-30 preflight redaction failed: bbot" >&2
-    exit 9
-  fi
-  bbot_preflight_semantic_error=0
-  if grep -Eiq '\[ERRR\]|dnsresolve[^[:cntrl:]]*(is required|required)|required[^[:cntrl:]]*dnsresolve' \
-    "$bbot_preflight/stdout.txt" "$bbot_preflight/stderr.txt"; then
-    bbot_preflight_semantic_error=1
-  fi
-  if (( preflight_exit == 0 && bbot_preflight_semantic_error == 0 )); then
-    runnable_tools+=(bbot)
-    runnable_args+=(--runnable "bbot=${tool_bins[bbot]}")
-  else
-    if (( bbot_preflight_semantic_error != 0 )); then
-      skipped_args+=(--skipped "bbot=no_dns_preflight_semantic_error")
-    else
-      skipped_args+=(--skipped "bbot=no_dns_preflight_failed")
-    fi
-    unset 'tool_bins[bbot]'
-  fi
-fi
-
-python3 "$REPORT" prepare "$OUT" --repetitions "$REPETITIONS" \
+python3 "$REPORT" prepare "$OUT" --toolset "$TOOLSET" \
+  --repetitions "$REPETITIONS" \
   --discovery-timeout "$DISCOVERY_TIMEOUT" \
   --timeout-grace "$TIMEOUT_GRACE" \
   --preflight-timeout "$PREFLIGHT_TIMEOUT" \
   --campaign-max-runtime "$CAMPAIGN_MAX_RUNTIME" \
   --cooldown "$COOLDOWN" \
   --failure-threshold "$FAILURE_THRESHOLD" \
-  --subfinder-rate-limit "$SUBFINDER_RATE_LIMIT" \
-  --fellaga-passive-concurrency "$FELLAGA_PASSIVE_CONCURRENCY" \
   --cleanup-timeout "$CLEANUP_TIMEOUT" \
   --redaction-timeout "$REDACTION_TIMEOUT" \
   --max-file-bytes "$MAX_FILE_BYTES" \
@@ -343,17 +273,20 @@ python3 "$REPORT" quota-check "$OUT" >/dev/null
 
 run_one() {
   local tool="$1" rank="$2" domain="$3" repetition="$4"
-  local base
+  local base timing stdout stderr parser_stderr raw_tree raw_tree_directory
+  local names parse_status isolation state_db output_file output_kind output_path
   base="$(printf '%02d' "$rank")-$domain.$tool.r$repetition"
-  local timing="$OUT/logs/$base.timing.json"
-  local stdout="$OUT/raw/$base.stdout.txt"
-  local stderr="$OUT/logs/$base.stderr.txt"
-  local parser_stderr="$OUT/logs/$base.parser.stderr.txt"
-  local raw_tree="$OUT/logs/$base.raw-tree.json"
-  local raw_tree_directory="$OUT/raw/$base.extra"
-  local names="$OUT/names/$base.txt"
-  local parse_status=success
-  local isolation="$OUT/isolation/$base"
+  timing="$OUT/logs/$base.timing.json"
+  stdout="$OUT/raw/$base.stdout.txt"
+  stderr="$OUT/logs/$base.stderr.txt"
+  parser_stderr="$OUT/logs/$base.parser.stderr.txt"
+  raw_tree="$OUT/logs/$base.raw-tree.json"
+  raw_tree_directory="$OUT/raw/$base.extra"
+  names="$OUT/names/$base.txt"
+  parse_status=success
+  isolation="$OUT/isolation/$base"
+  state_db="$OUT/state/$base.sqlite"
+  output_file="$raw_tree_directory/output.dat"
   mkdir -p "$isolation"/{home,config,data,cache,state}
   mkdir -p "$raw_tree_directory"
   local -a isolated_env=(
@@ -376,74 +309,64 @@ run_one() {
   : > "$parser_stderr"
   : > "$names"
 
-  # Fail before execution if the binary (or BBOT package tree) changed after
-  # the isolated preflight and campaign manifest were created.
   python3 "$REPORT" verify-tool "$OUT" "$tool"
 
-  case "$tool" in
-    fellaga)
-      python3 "$TIMED" \
-        --timeout "$current_run_timeout" --grace "$TIMEOUT_GRACE" \
-        --max-file-bytes "$MAX_FILE_BYTES" \
-        "$timing" -- \
-        "${isolated_env[@]}" "${tool_bins[fellaga]}" \
-          --db "$OUT/state/$base.sqlite" \
-          scan --profile passive --no-target-contact --all-sources \
-          --passive-concurrency "$FELLAGA_PASSIVE_CONCURRENCY" \
-          --passive-zone-concurrency 1 --show "$domain" \
-        > "$stdout" 2> "$stderr" || true
-      if ! python3 "$NAMES" normalize-observational "$domain" "$stdout" \
-        > "$names" 2> "$parser_stderr"; then
-        parse_status=error
-      fi
+  local argv_file="$isolation/argv.nul"
+  python3 "$REPORT" render-argv --toolset "$TOOLSET" "$tool" passive-observational \
+    --context "executable=${tool_bins[$tool]}" \
+    --context "domain=$domain" \
+    --context "state_db=$state_db" \
+    --context "output_file=$output_file" \
+    --context "output_directory=$raw_tree_directory" > "$argv_file"
+  local -a command_argv=()
+  mapfile -d '' -t command_argv < "$argv_file"
+  rm -f -- "$argv_file"
+
+  local output_contract_file="$isolation/output-contract.nul"
+  python3 "$REPORT" output-contract --toolset "$TOOLSET" "$tool" \
+    --context "executable=${tool_bins[$tool]}" \
+    --context "domain=$domain" \
+    --context "output_file=$output_file" \
+    --context "output_directory=$raw_tree_directory" > "$output_contract_file"
+  local -a output_contract=()
+  mapfile -d '' -t output_contract < "$output_contract_file"
+  rm -f -- "$output_contract_file"
+  if (( ${#output_contract[@]} != 2 )); then
+    echo "invalid output contract: $tool" >&2
+    return 2
+  fi
+  output_kind="${output_contract[0]}"
+  output_path="${output_contract[1]}"
+
+  python3 "$TIMED" \
+    --timeout "$current_run_timeout" --grace "$TIMEOUT_GRACE" \
+    --max-file-bytes "$MAX_FILE_BYTES" \
+    "$timing" -- \
+    "${isolated_env[@]}" "${command_argv[@]}" \
+    > "$stdout" 2> "$stderr" || true
+
+  local -a parser_argv=()
+  case "$output_kind" in
+    line_stdout)
+      parser_argv=(normalize-observational "$domain" "$stdout")
       ;;
-    subfinder)
-      python3 "$TIMED" \
-        --timeout "$current_run_timeout" --grace "$TIMEOUT_GRACE" \
-        --max-file-bytes "$MAX_FILE_BYTES" \
-        "$timing" -- \
-        "${isolated_env[@]}" "${tool_bins[subfinder]}" \
-          -silent -duc -all -rl "$SUBFINDER_RATE_LIMIT" -d "$domain" \
-        > "$stdout" 2> "$stderr" || true
-      if ! python3 "$NAMES" normalize-observational "$domain" "$stdout" \
-        > "$names" 2> "$parser_stderr"; then
-        parse_status=error
-      fi
+    line_file)
+      parser_argv=(normalize-observational "$domain" "$output_path")
       ;;
-    amass)
-      python3 "$TIMED" \
-        --timeout "$current_run_timeout" --grace "$TIMEOUT_GRACE" \
-        --max-file-bytes "$MAX_FILE_BYTES" \
-        "$timing" -- \
-        "${isolated_env[@]}" "${tool_bins[amass]}" \
-          enum -passive -config /dev/null -d "$domain" \
-        > "$stdout" 2> "$stderr" || true
-      if ! python3 "$NAMES" normalize-observational "$domain" "$stdout" \
-        > "$names" 2> "$parser_stderr"; then
-        parse_status=error
-      fi
+    finding_json)
+      parser_argv=(fellaga "$domain" "$output_path")
       ;;
-    bbot)
-      local directory="$raw_tree_directory"
-      python3 "$TIMED" \
-        --timeout "$current_run_timeout" --grace "$TIMEOUT_GRACE" \
-        --max-file-bytes "$MAX_FILE_BYTES" \
-        "$timing" -- \
-        "${isolated_env[@]}" "${tool_bins[bbot]}" -y -t "$domain" \
-          -f subdomain-enum -rf passive \
-          -c dns.disable=true speculate=false \
-          -om json -o "$directory" \
-        > "$stdout" 2> "$stderr" || true
-      if ! python3 "$NAMES" bbot-observational "$domain" "$directory" \
-        > "$names" 2> "$parser_stderr"; then
-        parse_status=error
-      fi
+    dns_event_tree)
+      parser_argv=(dns-events-observational "$domain" "$output_path")
       ;;
     *)
-      echo "unsupported passive tool: $tool" >&2
+      echo "unsupported passive output kind: $output_kind" >&2
       return 2
       ;;
   esac
+  if ! python3 "$NAMES" "${parser_argv[@]}" > "$names" 2> "$parser_stderr"; then
+    parse_status=error
+  fi
 
   if ! python3 "$REDACT" "$stdout" "$stderr" "$parser_stderr" \
     "$raw_tree_directory" >/dev/null 2>&1; then
@@ -468,7 +391,7 @@ status = timing["status"] if timing["status"] != "success" else sys.argv[3]
 print(f"{status}\t{float(timing['duration_seconds']):.3f}\t{len(names)}")
 PY
   )
-  python3 "$REPORT" cleanup-run "$OUT" "$isolation" "$OUT/state/$base.sqlite"
+  python3 "$REPORT" cleanup-run "$OUT" "$isolation" "$state_db"
   python3 "$REPORT" quota-check "$OUT" >/dev/null
 }
 
@@ -488,9 +411,7 @@ for (( repetition = 1; repetition <= REPETITIONS; repetition++ )); do
       done
     fi
     for tool in "${ordered_tools[@]}"; do
-      if [[ -n "${disabled_tools[$tool]+disabled}" ]]; then
-        continue
-      fi
+      if [[ -n "${disabled_tools[$tool]+disabled}" ]]; then continue; fi
       elapsed=$(( $(date +%s) - campaign_started_epoch ))
       remaining=$(( CAMPAIGN_MAX_RUNTIME - elapsed ))
       if (( remaining <= 0 )); then
@@ -498,9 +419,7 @@ for (( repetition = 1; repetition <= REPETITIONS; repetition++ )); do
         break 3
       fi
       current_run_timeout="$DISCOVERY_TIMEOUT"
-      if (( remaining < current_run_timeout )); then
-        current_run_timeout="$remaining"
-      fi
+      if (( remaining < current_run_timeout )); then current_run_timeout="$remaining"; fi
       next_run=$((completed_runs + 1))
       printf '[passive-top30] start %d/%d repetition=%d rank=%s tool=%s domain=%s\n' \
         "$next_run" "$total_runs" "$repetition" "$rank" "$tool" "$domain" >&2

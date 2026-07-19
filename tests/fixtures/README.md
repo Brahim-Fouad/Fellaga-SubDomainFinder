@@ -1,6 +1,6 @@
 # Connector fixtures
 
-This directory contains sanitized normal-response fixtures for WhoisXML, Netlas, BinaryEdge, MerkleMap, Brave Search, Censys, and Driftnet. They are intentionally minimal and contain no secret or personal data. The tests validate connector parsing, pagination fields represented by those fixtures, and strict in-scope name filtering. Other connectors use small inline payloads next to their parser tests when a separate redistributable fixture would add no coverage.
+This directory contains sanitized normal-response fixtures for WhoisXML, Netlas, MerkleMap, Brave Search, Censys, Driftnet, ViewDNS, and Postman Search. They are intentionally minimal and contain no secret or personal data. The tests validate connector parsing, pagination fields represented by those fixtures, and strict in-scope name filtering. Other connectors use small inline payloads next to their parser tests when a separate redistributable fixture would add no coverage.
 
 Generic HTTP handling for `429`, `Retry-After`, partial bodies, structured errors, excessive response size, and credential-safe pagination is tested in `src/passive.rs`.
 

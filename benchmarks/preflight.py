@@ -85,14 +85,14 @@ def count_corpus_candidates(path: pathlib.Path) -> int:
         return sum(1 for line in corpus if line.strip())
 
 
-def puredns_evidence(
+def active_resolver_capacity_evidence(
     corpus_candidates: int,
     rate_qps: int,
     timeout_seconds: int,
     headroom_percent: int,
 ) -> dict[str, Any]:
     if corpus_candidates <= 0:
-        raise ValueError("the PureDNS corpus must contain at least one candidate")
+        raise ValueError("the active-resolver corpus must contain at least one candidate")
     if rate_qps <= 0 or timeout_seconds <= 0:
         raise ValueError("rate_qps and timeout_seconds must be positive")
     if headroom_percent < 100:
@@ -107,7 +107,7 @@ def puredns_evidence(
     status = "coherent" if estimated_seconds <= timeout_seconds else "incoherent"
     return {
         "schema_version": 1,
-        "check": "puredns_capacity",
+        "check": "active_resolver_capacity",
         "status": status,
         "corpus_candidates": corpus_candidates,
         "rate_limit_qps": rate_qps,
@@ -151,14 +151,17 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     disk.add_argument("--margin-percent", type=_percentage, required=True)
     disk.add_argument("--output", type=pathlib.Path, required=True)
 
-    puredns = subparsers.add_parser(
-        "puredns", help="check that corpus, QPS, and timeout are coherent"
+    active_resolver = subparsers.add_parser(
+        "active-resolver",
+        help="check that active-resolver corpus, QPS, and timeout are coherent",
     )
-    puredns.add_argument("--corpus", type=pathlib.Path, required=True)
-    puredns.add_argument("--rate-qps", type=_positive, required=True)
-    puredns.add_argument("--timeout-seconds", type=_positive, required=True)
-    puredns.add_argument("--headroom-percent", type=_percentage, required=True)
-    puredns.add_argument("--output", type=pathlib.Path, required=True)
+    active_resolver.add_argument("--corpus", type=pathlib.Path, required=True)
+    active_resolver.add_argument("--rate-qps", type=_positive, required=True)
+    active_resolver.add_argument("--timeout-seconds", type=_positive, required=True)
+    active_resolver.add_argument(
+        "--headroom-percent", type=_percentage, required=True
+    )
+    active_resolver.add_argument("--output", type=pathlib.Path, required=True)
     return parser.parse_args(argv)
 
 
@@ -177,7 +180,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             passed = result["status"] == "sufficient"
         else:
-            result = puredns_evidence(
+            result = active_resolver_capacity_evidence(
                 count_corpus_candidates(args.corpus),
                 args.rate_qps,
                 args.timeout_seconds,

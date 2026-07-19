@@ -1,112 +1,110 @@
 # Fellaga benchmark suite
 
-For the pinned worldwide Tranco top-30 corpus, use the separate
-[no-target-contact passive observation](PASSIVE_TOP30.md). It permits an
-available safe subset of Fellaga, Subfinder, Amass, and BBOT, records missing
-or policy-incompatible tools, isolates every run in no-key mode, and reports
-observational counts without a ranking. Do not pass that third-party corpus
-to the active runner described below.
+This directory contains two separate workflows:
 
-The suite produces separate `no-key` and `equal-keys` campaigns. Every campaign runs at least three repetitions and rotates tool order between repetitions. Each Fellaga repetition starts with a fresh SQLite database and configuration file. Each `summary.jsonl` row records discovery, validation, and end-to-end status and duration, peak memory, raw names, names validated by `dnsx`, DNS-query count, and log paths.
+- `run.sh` performs an active, qualification-grade comparison on controlled or explicitly authorized domains.
+- `run-passive-top30.sh` performs a no-target-contact observation on the pinned worldwide top-30 corpus. Never give that third-party corpus to the active runner.
 
-The manifest binds the campaign ID, repository commit, executable hashes and versions, input hashes, credential mode, resolver set, DNS controls, and capacity preflights. The runner refuses an existing output directory so an earlier artifact cannot be reused accidentally.
+The active runner is product-neutral. Executables, commands, output formats, DNS controls, and campaign roles come from a local toolset file. Product names and command-line assumptions do not live in the runner or report generator.
 
-Every discovery and validation command has a process-group wall timeout. A timed-out or externally interrupted command receives a graceful interrupt followed by forced termination of the complete process group. Failed and timed-out runs remain in the report and are excluded from rankings.
+## Toolset
 
-When the benchmark runs as root with `tshark`, DNS queries are counted from network traffic. Otherwise Fellaga exposes its internal count and competitor counts remain `null`.
+Copy [`toolset.example.json`](toolset.example.json) to the default local path and replace every placeholder executable and command with the adapters installed on this machine:
 
-## Requirements
+```bash
+cp benchmarks/toolset.example.json benchmarks/toolset.local.json
+python3 benchmarks/toolset.py validate --config benchmarks/toolset.local.json
+```
 
-Install `fellaga`, `subfinder`, `amass`, `bbot`, `puredns`, `massdns`, `dnsx`, `jq`, `python3`, `zstd`, GNU `timeout`, `git`, `sha256sum`, `readlink`, and `awk`. `tshark` is optional. Puredns requires `massdns` and an explicit curated resolver list.
+Alternatively, set `FELLAGA_BENCH_TOOLSET` to another absolute or repository-relative JSON file. The active campaign defines these roles:
 
-The target file must contain only domains that are explicitly authorized for every active technique invoked by the compared tools. The `FELLAGA_BENCH_AUTHORIZED=YES` guard is mandatory.
+- `subject`: the engine being evaluated.
+- `discoverers`: every engine included in qualification and ranking. The subject and capacity guard must be members.
+- `validator`: the common final DNS validator used for every successful discovery output.
+- `capacity_guard`: the discoverer whose candidate-corpus capacity is checked before target work begins.
+- `provenance_only`: helper executables whose identity must be bound even though they do not receive a target directly.
+- `credential_participants`: discoverers that must receive the same provider credentials in `equal-keys` mode.
 
-## Run without API keys
+Commands are argv arrays. They are rendered as NUL-delimited arguments and are never evaluated by a shell. The supported output contracts are `line_stdout`, `line_file`, `finding_json`, and `dns_event_tree`. Every non-stdout output path is confined to the fresh campaign directory.
+
+At campaign creation, the runner validates the complete toolset, captures executable versions and hashes, and embeds both the normalized toolset snapshot and its SHA-256 hash in manifest schema 3. The report derives all participants and requirements from that embedded snapshot; it does not trust a later local configuration file.
+
+## Requirements and authorization
+
+Install the executables configured in the toolset, plus `bash`, `jq`, `python3`, `zstd`, GNU `timeout`, `git`, `sha256sum`, and `awk`. Packet capture with `tshark` is optional. When packet capture is available to root, DNS request counts come from traffic; otherwise only subject-provided internal counts may be available.
+
+The domain file must contain only domains for which every configured active technique is explicitly authorized. `FELLAGA_BENCH_AUTHORIZED=YES` is a mandatory written-scope acknowledgement.
+
+The runner refuses an existing output directory. Each command receives a process-group wall timeout. Interruptions and timeouts stop the complete process group, and failed runs remain visible but cannot enter rankings. Logs are redacted after every command and again during exit cleanup.
+
+## No-key campaign
 
 ```bash
 cp benchmarks/authorized-domains.example.txt benchmarks/authorized-domains.txt
-# Replace the placeholder with authorized domains before continuing.
+# Replace the placeholder domains and review their written authorization.
 FELLAGA_BENCH_AUTHORIZED=YES \
+FELLAGA_BENCH_TOOLSET=benchmarks/toolset.local.json \
 FELLAGA_BENCH_RESOLVERS_FILE=/absolute/path/to/curated-resolvers.txt \
   benchmarks/run.sh no-key benchmarks/authorized-domains.txt
 ```
 
-The no-key campaign uses an isolated home and clears supported provider variables before launching each tool.
+No-key mode uses an isolated home and removes credential-shaped environment variables before launching participants. Identity probes run with a minimal environment that contains no provider credentials.
 
-## Run with equal credentials
+## Equal-keys campaign
 
 ```bash
 cp benchmarks/keys-manifest.example.json benchmarks/keys-manifest.json
-# Complete the provider evidence only after configuring the same keys for each listed tool.
+# Make configured_tools equal the toolset's credential_participants list,
+# then set participants_configured=true only after every adapter is configured.
 FELLAGA_BENCH_AUTHORIZED=YES \
+FELLAGA_BENCH_TOOLSET=benchmarks/toolset.local.json \
 FELLAGA_BENCH_RESOLVERS_FILE=/absolute/path/to/curated-resolvers.txt \
 FELLAGA_BENCH_KEYS_HOME=/absolute/path/to/prepared-isolated-home \
 KEYS_MANIFEST=benchmarks/keys-manifest.json \
   benchmarks/run.sh equal-keys benchmarks/authorized-domains.txt
 ```
 
-`equal-keys` requires at least one provider. Every provider needs a unique name and environment variable, `competitors_configured: true`, and `configured_tools` containing `fellaga`, `subfinder`, `amass`, and `bbot`. The corresponding Fellaga environment variable must exist. `FELLAGA_BENCH_KEYS_HOME` points to a prepared home containing competitor configuration files; the runner copies it to a temporary isolated home and removes that copy on exit. The result manifest records provider identifiers, configured tool names, isolation status, and the key-manifest hash without recording credential values.
+Each provider entry needs a unique `name`, a unique `subject_env`, `participants_configured: true`, and a `configured_tools` array exactly equal to the active toolset's `credential_participants` set. The variable named by `subject_env` must exist. Credential values are never copied into artifacts. The prepared home is copied to a temporary isolated home and deleted on exit.
 
-Text logs are redacted after each command and again from the exit trap. `SIGINT`, `SIGTERM`, and `SIGHUP` stop active process groups and packet capture before the final redaction pass. Binary packet captures and SQLite files are not rewritten.
+## Ground truth and qualification
 
-## Ground truth
+Add `ground-truth/<domain>.txt` for every authorized domain. Each file contains the expected live names for that controlled zone. A qualification campaign needs at least 30 domains and at least three repetitions.
 
-Add `ground-truth/<domain>.txt` containing the expected live names for each controlled domain. `report.py` calculates true positives, false positives, false negatives, precision, recall, F1, false discovery rate, validated exclusives, and wins per domain. Qualification requires ground truth for every domain, successful discovery and validation runs for every required tool, at least 30 authorized domains, at least three repetitions, and full Fellaga recall for every domain and repetition.
+For every successful discovery run, the same configured validator produces the final live-name set. `report.py` calculates true positives, false positives, false negatives, precision, recall, F1, false-discovery rate, validated exclusives, per-domain wins, duration, and memory. It fails closed on missing runs, duplicate runs, malformed outputs, inconsistent timing, changed provenance, incomplete ground truth, or a toolset snapshot mismatch.
 
-## Runtime controls
+The subject qualifies only when all existing gates pass, including:
 
-The defaults are intended for a full coverage campaign. Override them explicitly when developing the harness:
+- 100% ground-truth recall on every subject run and in aggregate.
+- less than 0.5% aggregate false-discovery rate.
+- a win on at least 80% of ranked domains.
+- at least 10% more validated true positives in aggregate than the best alternative per domain.
+- end-to-end duration no more than twice that best-coverage alternative.
+- at least 25,000 controlled DNS queries per second with less than 1% loss.
+- a complete ten-million-candidate pipeline with less than 1% loss and less than 1 GiB peak memory.
 
-- `FELLAGA_BENCH_MAX_RUNTIME`: Fellaga's internal per-domain runtime, default `1800` seconds.
-- `FELLAGA_BENCH_ACTIVE_MAX_RUNTIME`: Fellaga's active discovery budget, defaulting to `FELLAGA_BENCH_MAX_RUNTIME` (`1800` seconds by default). Set it to `0` to disable the active-phase deadline. The default leaves the full hard per-domain runtime available to active discovery.
-- `FELLAGA_BENCH_DISCOVERY_TIMEOUT`: wall timeout for every discovery tool, default internal runtime plus 60 seconds.
-- `FELLAGA_BENCH_VALIDATION_TIMEOUT`: wall timeout for every `dnsx` validation, default `300` seconds.
-- `FELLAGA_BENCH_DNS_ENGINE_TIMEOUT`: wall timeout for the controlled DNS transport benchmark, default `900` seconds.
-- `FELLAGA_BENCH_PIPELINE_TIMEOUT`: wall timeout for the ten-million-candidate pipeline benchmark, default `5400` seconds.
+`FELLAGA_BENCH_REQUIRE_PASS=1` is the default. Set it to `0` only while developing the harness.
+
+## Runtime and capacity controls
+
+- `FELLAGA_BENCH_MAX_RUNTIME`: subject per-domain runtime, default `1800` seconds.
+- `FELLAGA_BENCH_ACTIVE_MAX_RUNTIME`: subject active-phase budget, defaulting to the maximum runtime; `0` disables only this internal active deadline.
+- `FELLAGA_BENCH_DISCOVERY_TIMEOUT`: wall timeout for every discoverer, default maximum runtime plus 60 seconds.
+- `FELLAGA_BENCH_VALIDATION_TIMEOUT`: wall timeout for the common validator, default `300` seconds.
+- `FELLAGA_BENCH_DNS_ENGINE_TIMEOUT`: controlled subject transport timeout, default `900` seconds.
+- `FELLAGA_BENCH_PIPELINE_TIMEOUT`: ten-million-candidate subject pipeline timeout, default `5400` seconds.
 - `FELLAGA_BENCH_TIMEOUT_GRACE`: interrupt-to-kill grace period, default `5` seconds.
-- `FELLAGA_BENCH_REPETITIONS`: repetitions per domain and tool, minimum and default `3`.
-- `FELLAGA_BENCH_DNS_RATE`: shared DNS request limit for tools that expose a strict QPS control, default `1000`.
-- `FELLAGA_BENCH_DNS_CONCURRENCY`: shared DNS concurrency where the CLI exposes it, default `100`.
-- `FELLAGA_BENCH_RESOLVERS_FILE`: required curated resolver list used by Fellaga, puredns, dnsx, Subfinder, Amass, and BBOT brute-force DNS.
-- `FELLAGA_BENCH_RESOLVER_QUERIES`: controlled transport query count, minimum and default `100000`; this representative sample takes about four seconds at the 25,000 qps gate.
-- `FELLAGA_BENCH_PIPELINE_CANDIDATES`: deterministic candidate-pipeline size, exactly `10000000`, matching the Rust benchmark limit.
-- `FELLAGA_BENCH_PIPELINE_BYTES_PER_CANDIDATE`: conservative disk estimate per pipeline candidate, default `2048` bytes.
-- `FELLAGA_BENCH_PIPELINE_FIXED_BYTES`: fixed allowance for the permanent corpus, SQLite base, journals, and temporary files, default `2147483648` bytes (2 GiB).
-- `FELLAGA_BENCH_PIPELINE_DISK_MARGIN_PERCENT`: safety multiplier applied to the disk estimate, default `125` percent.
-- `FELLAGA_BENCH_PUREDNS_HEADROOM_PERCENT`: capacity allowance for PureDNS work beyond one corpus query per candidate, default `125` percent.
-- `FELLAGA_BENCH_PROFILE_BASELINES`: optional Fellaga end-to-end profile baselines; use `all`, `none`, or a comma-separated subset of `deep,balanced,passive,turbo`. The default is `none`.
-- `FELLAGA_BENCH_REQUIRE_PASS`: return a non-zero exit status when a qualification gate fails, default `1`; set it to `0` only while developing the harness.
+- `FELLAGA_BENCH_REPETITIONS`: repetitions per domain and discoverer, minimum and default `3`.
+- `FELLAGA_BENCH_DNS_RATE`: shared DNS rate supplied to adapters that expose it, default `1000`.
+- `FELLAGA_BENCH_DNS_CONCURRENCY`: shared DNS concurrency supplied to adapters that expose it, default `100`.
+- `FELLAGA_BENCH_RESOLVERS_FILE`: required curated resolver list.
+- `FELLAGA_BENCH_RESOLVER_QUERIES`: controlled transport sample, minimum and default `100000`.
+- `FELLAGA_BENCH_PIPELINE_CANDIDATES`: fixed at `10000000` for qualification.
+- `FELLAGA_BENCH_PIPELINE_BYTES_PER_CANDIDATE`: disk estimate, default `2048` bytes.
+- `FELLAGA_BENCH_PIPELINE_FIXED_BYTES`: fixed disk allowance, default `2147483648` bytes.
+- `FELLAGA_BENCH_PIPELINE_DISK_MARGIN_PERCENT`: disk safety multiplier, default `125` percent.
+- `FELLAGA_BENCH_CAPACITY_GUARD_HEADROOM_PERCENT`: candidate-corpus capacity allowance, default `125` percent.
+- `FELLAGA_BENCH_PROFILE_BASELINES`: `none`, `all`, or a comma-separated subset of `deep,balanced,passive,turbo`; the subject adapter must expose a `profile` context or parameter.
 
-Fellaga, puredns, and the common dnsx validation receive the same resolver set and explicit QPS limit. Subfinder and Amass receive the same resolver set, and Amass receives the same concurrency cap. BBOT receives the resolver list for brute-force DNS and the same concurrency cap; its CLI does not expose a strict global DNS QPS limit, which is recorded in `manifest.json`.
+Before generating the large pipeline fixture, `disk-preflight.json` proves that the output filesystem has sufficient space. After the one-million-name corpus is decompressed, `capacity-guard-preflight.json` proves that the configured DNS rate and discovery timeout can cover the corpus with the requested headroom. Both calculations are embedded in the manifest and revalidated by the report.
 
-## Capacity preflights
-
-The ten-million-candidate pipeline starts only when the output filesystem has enough free space. The default estimate is:
-
-```text
-required bytes = (10,000,000 x 2,048 + 2,147,483,648) x 125%
-               = 28,284,354,560 bytes
-```
-
-Tune the per-candidate and fixed values only from measurements made on the same Fellaga schema and filesystem. A failed filesystem inspection, an invalid estimate, or insufficient space stops the campaign before the large fixture is generated. The complete calculation is saved in `disk-preflight.json` and copied into `manifest.json`.
-
-After the one-million-name active corpus is decompressed, the runner also checks PureDNS capacity. It calculates `ceil(corpus candidates x headroom / QPS)` and refuses a discovery timeout shorter than that lower bound. The default one-million-name corpus, 125 percent headroom, and 1,000 QPS require at least 1,250 seconds, which fits the default 1,860-second discovery wall timeout. `puredns-preflight.json` records the corpus size, estimated minimum duration, capacity, and minimum coherent QPS. The manifest independently records `provenance.inputs.active_corpus_candidates`, and report generation requires it to match the PureDNS preflight exactly.
-
-## Fellaga profile baselines
-
-Profile baselines can be added to the same isolated campaign:
-
-```bash
-FELLAGA_BENCH_AUTHORIZED=YES \
-FELLAGA_BENCH_RESOLVERS_FILE=/absolute/path/to/curated-resolvers.txt \
-FELLAGA_BENCH_PROFILE_BASELINES=all \
-  benchmarks/run.sh no-key benchmarks/authorized-domains.txt
-```
-
-The runner measures `deep`, `balanced`, `passive`, and `turbo` with the same end-to-end discovery and `dnsx` validation path. Each non-deep run receives a fresh SQLite database and configuration. The existing qualification run supplies the `deep` baseline, avoiding duplicate network work. Baseline rows are written only to `fellaga-profile-baselines.jsonl`; `summary.jsonl`, competitor rankings, and qualification gates remain unchanged.
-
-## Performance gates
-
-`dns-transport.json` measures native resolver throughput on a controlled loopback server. `candidate-pipeline.json` is produced by Fellaga from a fresh deterministic ten-million-name fixture and measures loading, SQLite persistence, scheduling, and DNS dispatch. Qualification requires every stage count to equal the requested count and peak memory to remain below 1 GiB. Both artifacts must match the campaign ID and Fellaga binary hash; the candidate result must also match the generated fixture hash.
-
-`report.py --require-pass` returns non-zero unless all timing fields are finite and internally consistent, every required run is present, every Fellaga domain/repetition has full controlled-ground-truth recall, the artifacts match campaign provenance, and every other qualification gate passes. Extra repetitions are rejected. Wins and validated gain use true positives rather than raw output size.
+Optional profile rows are written to `subject-profile-baselines.jsonl`; they never alter qualification rows or ranking inputs. `dns-transport.json` and `candidate-pipeline.json` are bound to the campaign ID, subject binary hash, and relevant corpus hash.

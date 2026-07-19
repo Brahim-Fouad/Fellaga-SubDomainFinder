@@ -1,164 +1,141 @@
-# Passive Tranco top-30 observation
+# Passive top-30 observation campaign
 
-This campaign compares the names returned by passive provider workflows for a
-pinned public popularity corpus. It prohibits direct contact with the target
-domains. It is separate from the authorized active benchmark and must not be
-run through `benchmarks/run.sh`.
+This campaign compares passive-observational subdomain output over a pinned
+public popularity corpus. It does not contact, resolve, probe, or validate the
+listed domains. It is separate from the authorized active benchmark and must
+not be run through `benchmarks/run.sh`.
 
 The corpus is the first 30 rows of Tranco list `74J5X`, generated on
 2026-07-17 from rankings covering 2026-06-18 through 2026-07-17. The permanent
-snapshot is <https://tranco-list.eu/list/74J5X/1000000>. Infrastructure domains
-are present because Tranco ranks pay-level domains, not only browser-facing
-websites.
+snapshot is <https://tranco-list.eu/list/74J5X/1000000>. A popularity ranking is
+not authorization to assess a domain.
 
-Being present in a popularity list is not authorization to assess a domain.
-This runner therefore has no mode that performs target validation, DNS brute
-force, resolver-based enrichment, HTTP probing, or TLS probing. Passive data
-providers still observe requests about the named domains; review their terms,
-credentials, and rate limits before running the campaign.
+Passive providers still receive requests about the named domains. Review each
+provider's terms, credentials, and rate limits before running the campaign.
 
-This is deliberately a no-key comparison. Every tool run starts from an empty
-environment and receives only a fixed `PATH`, locale, UTC timezone, `NO_COLOR`,
-and fresh `HOME`, `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_CACHE_HOME`, and
-`XDG_STATE_HOME`. Credentials, proxy variables, cloud configuration, SSH
-agents, netrc settings, existing user configuration, and API keys are neither
-read nor copied. The manifest records this allowlist policy.
+## Local toolset
 
-## Tool policy
+The runner has no built-in comparison-tool names, package names, commands, or
+special cases. It reads the `passive-observational` campaign from a validated
+local toolset. The default path is:
 
-The runner recognizes four tools and invokes only these modes:
+```text
+benchmarks/toolset.local.json
+```
 
-- Fellaga: `scan --profile passive --no-target-contact --all-sources --show`
-  with a fresh state database for every run. Direct CT-log indexing is
-  disabled; CT names can still be returned by third-party provider connectors.
-- Subfinder: its `-all` passive source workflow with update checks disabled,
-  without its active switch or a resolver override.
-- Amass: `enum -passive` with an explicit empty configuration file, without a
-  resolver override or inherited system credentials.
-- BBOT: passive subdomain modules with `dns.disable=true` and
-  `speculate=false`.
+Override it with `FELLAGA_PASSIVE_TOP30_TOOLSET`. The local file defines:
 
-Before BBOT is admitted, the runner performs a dry-run against the reserved
-`example.invalid` name with the exact no-DNS policy. Some BBOT versions reject
-DNS-disabled configurations when an enabled module consumes DNS events. A
-failed preflight marks BBOT as skipped; the runner never forces the scan and
-never relaxes the DNS prohibition. Its preflight uses a separate empty no-key
-home with the same XDG isolation.
+- a neutral ID for each discoverer and the subject ID;
+- the real executable name or path;
+- identity and version-probe metadata;
+- a `passive-observational` argv template;
+- an optional no-target preflight;
+- a generic output contract;
+- the mandatory passive contact policy.
 
-Fellaga, Subfinder, and Amass must also pass a no-target help preflight proving
-that every required safety flag exists. An incompatible binary is skipped
-before any listed domain is processed. Subfinder is capped at five HTTP
-requests per second, Fellaga at four passive connector tasks, and every tool is
-run serially with a one-second cooldown. Amass and BBOT do not expose equivalent
-global HTTP controls, so wall times are recorded observations, not comparable
-performance measurements.
+Every passive discoverer must declare this fail-closed policy:
 
-The Fellaga/Subfinder comparison is symmetric at the source-selection level:
-both commands explicitly request every source registered by that installed
-binary. This does not make their provider catalogs, credentials, pagination,
-rate policies, or runtime availability equivalent. In this no-key campaign,
-required-key Fellaga connectors are skipped locally without a request, and
-Subfinder applies its own no-key availability rules. Optional and public
-connectors can still return authentication failures, anti-bot pages, retired
-API responses, schema changes, rate limits, or timeouts. Those outcomes remain
-part of the evidence; the runner does not bypass authentication, CAPTCHA, or
-provider controls.
+```json
+{
+  "target_contact": "prohibited",
+  "direct_dns": false,
+  "direct_http_or_tls": false
+}
+```
 
-Tools that are not installed are recorded as missing. The available safe
-subset still runs. Executable paths can be pinned with these optional
-variables:
+The generic output kinds are `line_stdout`, `line_file`, `finding_json`, and
+`dns_event_tree`. File and tree outputs must use the isolated `output_file` or
+`output_directory` context supplied by the runner. Commands are rendered as
+NUL-delimited argument arrays. Shell evaluation and command-string execution
+are not used.
 
-- `FELLAGA_PASSIVE_TOP30_FELLAGA_BIN`
-- `FELLAGA_PASSIVE_TOP30_SUBFINDER_BIN`
-- `FELLAGA_PASSIVE_TOP30_AMASS_BIN`
-- `FELLAGA_PASSIVE_TOP30_BBOT_BIN`
+The runner never invents an executable name. If a configured executable cannot
+be resolved inside the fixed system path, that tool is recorded as missing.
+An optional preflight is rendered from the same toolset and checked against its
+required literals and forbidden regular expressions. A failed preflight marks
+only that tool as skipped; the contact policy is never relaxed.
+
+## Isolation and safety
+
+Every run starts with an empty environment. It receives only a fixed system
+`PATH`, C UTF-8 locale, UTC timezone, `NO_COLOR`, and fresh `HOME` and XDG
+directories. Credentials, proxy variables, cloud configuration, SSH agents,
+netrc files, existing configuration, and API keys are not inherited.
+
+The runner also provides isolated state and output paths. A command may use
+only the placeholders declared by its toolset contract. The campaign rejects
+output paths outside the corresponding isolated context.
+
+The normalized toolset snapshot and its canonical SHA-256 hash are embedded in
+the campaign manifest. The manifest also records resolved executable paths,
+executable hashes, bounded identity probes, repository state, contact policy,
+timeouts, and the preflight evidence inventory. Executable hashes are checked
+before every launch and again when a run is recorded.
 
 ## Run
 
-Linux or WSL with Bash and Python 3 is required. The default is one repetition,
-a 180-second wall deadline per tool and domain, and a two-hour discovery
-campaign deadline.
+Linux or WSL with Bash and Python 3 is required. Validate the corpus and local
+toolset first:
 
 ```bash
 python3 benchmarks/passive_top30_report.py verify-source
+python3 benchmarks/toolset.py validate --config benchmarks/toolset.local.json
+```
 
+Then start the campaign:
+
+```bash
 FELLAGA_PASSIVE_TOP30_OUT=benchmarks/results/passive-top30-74J5X \
   bash benchmarks/run-passive-top30.sh
 ```
 
-Fellaga and Amass require real POSIX permissions for their isolated private
-configuration. When the repository is under `/mnt/c` in WSL, place the output
-on the Linux filesystem instead:
+Private per-run configuration needs real POSIX permissions. If the repository
+is under `/mnt/c` in WSL, put the output on the Linux filesystem:
 
 ```bash
 FELLAGA_PASSIVE_TOP30_OUT="$HOME/fellaga-results/passive-top30-74J5X" \
   bash benchmarks/run-passive-top30.sh
 ```
 
-The runner verifies `chmod` semantics before any listed domain is sent to a
-provider and exits with a clear error on an incompatible output filesystem.
+The runner verifies permission semantics before any domain is sent to a passive
+provider.
 
 Optional controls:
 
-- `FELLAGA_PASSIVE_TOP30_REPETITIONS`: `1` to `10`, default `1`.
-- `FELLAGA_PASSIVE_TOP30_TIMEOUT`: per-run wall deadline, default `180`.
-- `FELLAGA_PASSIVE_TOP30_TIMEOUT_GRACE`: shutdown grace, default `5`.
-- `FELLAGA_PASSIVE_TOP30_PREFLIGHT_TIMEOUT`: help and BBOT safety preflight
-  deadline, default `60`. The older
-  `FELLAGA_PASSIVE_TOP30_BBOT_PREFLIGHT_TIMEOUT` name remains an alias.
-- `FELLAGA_PASSIVE_TOP30_MAX_RUNTIME`: discovery campaign deadline, default
-  `7200` seconds.
-- `FELLAGA_PASSIVE_TOP30_COOLDOWN`: delay between runs, default `1` second.
-- `FELLAGA_PASSIVE_TOP30_FAILURE_THRESHOLD`: consecutive failures before a
-  tool circuit breaker opens, default `3`.
-- `FELLAGA_PASSIVE_TOP30_SUBFINDER_RATE_LIMIT`: global Subfinder HTTP rate,
-  default `5` requests per second.
-- `FELLAGA_PASSIVE_TOP30_FELLAGA_CONCURRENCY`: Fellaga passive connector
-  concurrency, default `4`.
-- `FELLAGA_PASSIVE_TOP30_CLEANUP_TIMEOUT`: final ephemeral-state cleanup
-  deadline, default `60` seconds.
-- `FELLAGA_PASSIVE_TOP30_REDACTION_TIMEOUT`: final redaction deadline, default
-  `60` seconds.
-- `FELLAGA_PASSIVE_TOP30_MAX_FILE_BYTES`: per-process regular-file limit,
-  default `268435456` bytes.
-- `FELLAGA_PASSIVE_TOP30_MAX_CAMPAIGN_FILES`: cumulative retained-file limit,
-  default `50000`.
-- `FELLAGA_PASSIVE_TOP30_MAX_CAMPAIGN_BYTES`: cumulative retained-size limit,
-  default `2147483648` bytes (2 GiB).
+- `FELLAGA_PASSIVE_TOP30_TOOLSET`: local toolset path; default
+  `benchmarks/toolset.local.json`.
+- `FELLAGA_PASSIVE_TOP30_REPETITIONS`: `1` to `10`; default `1`.
+- `FELLAGA_PASSIVE_TOP30_TIMEOUT`: per-run wall deadline; default `180` seconds.
+- `FELLAGA_PASSIVE_TOP30_TIMEOUT_GRACE`: shutdown grace; default `5` seconds.
+- `FELLAGA_PASSIVE_TOP30_PREFLIGHT_TIMEOUT`: preflight deadline; default `60`.
+- `FELLAGA_PASSIVE_TOP30_MAX_RUNTIME`: campaign deadline; default `7200`.
+- `FELLAGA_PASSIVE_TOP30_COOLDOWN`: delay between runs; default `1` second.
+- `FELLAGA_PASSIVE_TOP30_FAILURE_THRESHOLD`: consecutive failures before the
+  per-tool circuit breaker opens; default `3`.
+- `FELLAGA_PASSIVE_TOP30_CLEANUP_TIMEOUT`: cleanup deadline; default `60`.
+- `FELLAGA_PASSIVE_TOP30_REDACTION_TIMEOUT`: redaction deadline; default `60`.
+- `FELLAGA_PASSIVE_TOP30_MAX_FILE_BYTES`: per-process file limit; default
+  `268435456` bytes.
+- `FELLAGA_PASSIVE_TOP30_MAX_CAMPAIGN_FILES`: retained-file limit; default
+  `50000`.
+- `FELLAGA_PASSIVE_TOP30_MAX_CAMPAIGN_BYTES`: retained-size limit; default
+  `2147483648` bytes.
 
-The output directory must not already exist. It contains a campaign manifest,
-per-run timings and normalized names, a JSON-lines run ledger, the BBOT
-preflight evidence when applicable, and `report.json`. The manifest records
-each runnable executable's resolved path, SHA-256 hash, bounded version probe,
-the repository commit and worktree state, and every wall-time limit. It also
-records that Fellaga `--all-sources` and Subfinder `-all` request all locally
-registered sources while runtime source availability remains non-comparable.
-The executable is hashed immediately before every launch and again when each run
-is recorded. BBOT also binds and rechecks its installed Python distribution
-tree. Retained preflight and
-per-run artifacts are hash-verified during report generation, including an
-exact path-and-hash inventory of BBOT's JSON tree. A tool cannot leave a child
-process running after its leader exits: the supervisor terminates the process
-group and marks that run as failed. Per-run homes and Fellaga SQLite state are
-deleted immediately after their evidence is recorded. Final cleanup is bounded
-and verified before the report can be complete. Wildcard patterns are counted
-and excluded; they are never converted into concrete hosts. Malformed,
-non-host, and out-of-scope output lines are also counted and excluded without
-turning an otherwise successful provider run into a parser failure. A parser
-still fails the run on malformed structured output or when a tool returns more
-than 500,000 unique in-scope names, so unbounded output cannot silently enter
-the report. Tool order rotates
-across both domains and repetitions, so a one-repetition campaign does not
-always favor the same first tool. Three consecutive failures disable only that
-tool; the other safe tools continue. The final report is regenerated after the
-bounded redaction pass. The runner exits non-zero if any tool is missing or
-skipped, a run is absent or failed, a circuit breaker or deadline is reached,
-or artifact integrity fails; `report.json` is still retained when it can be
-validated. The cumulative campaign quota is checked after every run.
+The output directory must not already exist. It contains the bound manifest,
+per-run timings, normalized names, a JSON-lines ledger, retained preflight
+evidence, and `report.json`. Tool order rotates across domains and repetitions.
+Failures disable only the affected tool. Process groups are terminated on
+timeout, per-run private state is removed after evidence is recorded, retained
+artifacts are redacted, and cumulative quotas are checked after every run.
+
+Wildcard patterns, malformed names, non-host values, and out-of-scope values
+are excluded and counted. Failed, timed-out, interrupted, or structurally
+unparseable runs do not contribute to coverage or success medians.
 
 ## Interpretation limits
 
-`report.json` provides descriptive counts and timings only. It always sets:
+The report derives its complete tool list and subject from the bound toolset.
+It provides descriptive counts and timings only and always sets:
 
 ```json
 {
@@ -170,22 +147,15 @@ validated. The cumulative campaign quota is checked after every run.
 }
 ```
 
-The corpus has no controlled ground truth and the policy prohibits direct
-validation. More returned names do not prove greater recall, accuracy, or
-superiority. Missing or skipped tools and failed runs are recorded as
-additional reason codes, never hidden. Names from failed, timed-out,
-interrupted, or structurally unparseable runs remain available as evidence but
-are excluded from coverage and median-success metrics. A process exit code
-cannot normalize provider health across different tools; successful runs
-therefore retain `source_health: unknown`, and empty successes are reported
-explicitly. Source-tree coverage and an all-source command flag are
-implementation properties, not proof that every provider was reachable or
-productive during a campaign.
+The corpus has no controlled ground truth and direct validation is prohibited.
+More returned names do not prove greater recall, accuracy, or superiority.
+Missing tools, skipped tools, failed runs, and artifact-integrity failures are
+reported explicitly.
 
 ## Attribution and data terms
 
 The pinned rows, hashes, URLs, provider composition, citation, and explicit
 non-MIT notice are in `benchmarks/data/tranco-74J5X-top30.json` and
-`benchmarks/data/README.md`. No single license is asserted for the Tranco
-aggregate or the excerpt. Preserve the requested Tranco citation and review
-the mixed upstream terms before redistribution or commercial use.
+`benchmarks/data/README.md`. No single license is asserted for the aggregate or
+excerpt. Preserve the requested citation and review the mixed upstream terms
+before redistribution or commercial use.

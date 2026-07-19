@@ -29,6 +29,7 @@
 /SHA256SUMS*
 /benchmarks/authorized-domains.txt
 /benchmarks/keys-manifest.json
+/benchmarks/toolset.local.json
 /benchmarks/ground-truth/
 __pycache__/
 .idea/

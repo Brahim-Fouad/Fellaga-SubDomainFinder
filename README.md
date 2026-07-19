@@ -13,15 +13,15 @@ Fellaga is a fast, adaptive subdomain enumerator written in Rust for Kali Linux 
 ## Highlights
 
 - Native asynchronous DNS engine with correlated UDP queries, EDNS0, TCP fallback, resolver balancing, retries, and one shared adaptive network governor for discovery, consensus, DNSSEC, Web, and TLS preparation.
-- Adaptive `deep` scan by default: 65 registered passive connector names across canonical, Fellaga-native, and compatibility integrations, Certificate Transparency, a one-million-candidate corpus, recursive DNS, AXFR, DNSSEC/NSEC, Web and JavaScript discovery, TLS/STARTTLS, and bounded PTR pivots.
+- Adaptive `deep` scan by default: 67 registered passive connector names across canonical, Fellaga-native, and compatibility integrations, Certificate Transparency, a one-million-candidate corpus, recursive DNS, AXFR, DNSSEC/NSEC, Web and JavaScript discovery, TLS/STARTTLS, and bounded PTR pivots.
 - Protocol-aware DNS discovery follows bounded DNS-SD, NAPTR, URI, SPF, DMARC, MTA-STS, TLS reporting, and BIMI relationships without querying names outside the authorized root.
 - Target-local grammar induction learns service, environment, region, cloud, separator, and numeric conventions from retained names, then emits a bounded ranked candidate beam.
 - Static CT tiles provide a durable fallback when a log no longer exposes the legacy entry API; tile payloads, checkpoint identity, extracted names, and cursors are committed together in SQLite.
 - Standardized metadata and semantic static analysis extract names from API catalogs, OpenID/OAuth metadata, SSH known-hosts data, Terraform discovery, HTML, JSON, JavaScript, source maps, and bounded Common Crawl WARC records without executing scripts.
 - Differential TLS compares a small prioritized set of SNI and no-SNI certificates, exposing default virtual-host names while sharing one deadline and never turning an out-of-scope SAN into active work.
-- BinaryEdge and Brave Search use a two-page ceiling. MerkleMap follows validated provider totals for up to 1,000 pages, preserving every completed page under the connector wall deadline.
+- Brave Search follows provider totals for up to ten 20-result pages. MerkleMap follows validated provider totals for up to 1,000 pages, preserving every completed page under the connector wall deadline. The retired BinaryEdge compatibility connector remains visible for legacy configuration and provenance, but it is unavailable and never selected automatically.
 - High-volume SubMD results are consumed as a bounded line stream and checkpointed in batches of at most 1,000 names and before the next network read. THC cursor pagination can consume up to 1,000 pages of 1,000 records, rejects repeated states, and remains constrained by the connector wall deadline.
-- The default `deep` profile selects every locally accessible canonical and Fellaga-native connector, including experimental providers; only four duplicate compatibility names remain opt-in, and every provider still obeys connection, rate, response-size, and wall-time safeguards.
+- The default `deep` profile selects every locally accessible connector whose metadata permits automatic execution, including eligible experimental providers. Four duplicate compatibility names remain opt-in, the retired BinaryEdge entry remains unavailable, and every provider still obeys connection, rate, response-size, and wall-time safeguards.
 - Persistent, lazy candidate scheduling: passive/authoritative seeds and active word generators are consumed in bounded SQLite-backed waves instead of being materialized in memory before DNS starts.
 - Yield-aware source scheduling learns each connector's marginal unique-name yield, reliability, and latency; complete pages remain usable when a later page reaches its deadline, and source checks distinguish `success`, `empty`, `degraded`, `deferred_budget`, `skipped_missing_key`, `rate_limited`, `auth_required`, `anti_bot`, `upstream_error`, `transport_error`, `tls_error`, `schema_error`, `timeout`, and the uncategorized `error` fallback.
 - Hierarchical wildcard detection, rotating-answer recognition, exact-signature filtering, trusted-resolver consensus, authoritative validation, and locally validated DNSSEC denial proofs for purging proven synthesized owners.
@@ -39,8 +39,8 @@ Fellaga is a fast, adaptive subdomain enumerator written in Rust for Kali Linux 
 Download the release package and install it with APT. Checksums, a Sigstore-signed manifest, and GitHub attestations are available for independent verification:
 
 ```bash
-curl -fLO https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/download/v0.9.2/fellaga_0.9.2-1_amd64.deb
-sudo apt install ./fellaga_0.9.2-1_amd64.deb
+curl -fLO https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/download/v0.10.0/fellaga_0.10.0-1_amd64.deb
+sudo apt install ./fellaga_0.10.0-1_amd64.deb
 fellaga --version
 ```
 
@@ -135,7 +135,7 @@ fellaga refresh your-domain.example
 
 Run `fellaga <command> --help` for the complete option list.
 
-Required and optional provider credentials can be supplied through environment variables or `~/.config/fellaga/config.json`; missing required keys are skipped locally. Fellaga sends a transparent `Fellaga/<version>` HTTP user agent with the project URL by default, and `FELLAGA_USER_AGENT` provides an optional organization-specific override. See [passive sources and credentials](docs/sources.md) for all 65 registry names, accepted variables, experimental provider behavior, bounded connector semantics, and health statuses.
+Required and optional provider credentials can be supplied through environment variables or `~/.config/fellaga/config.json`; missing required keys are skipped locally. Fellaga sends a transparent `Fellaga/<version>` HTTP user agent with the project URL by default, and `FELLAGA_USER_AGENT` provides an optional organization-specific override. See [passive sources and credentials](docs/sources.md) for all 67 registry names, accepted variables, experimental provider behavior, bounded connector semantics, and health statuses.
 
 ## Documentation
 

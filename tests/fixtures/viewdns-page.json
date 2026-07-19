@@ -1,0 +1,28 @@
+{
+  "query": {
+    "tool": "subdomains_PRO",
+    "domain": "example.com"
+  },
+  "response": {
+    "subdomain_count": "3",
+    "total_pages": "1",
+    "current_page": "1",
+    "subdomains": [
+      {
+        "name": "api.example.com",
+        "ips": ["192.0.2.1"],
+        "last_resolved": "2026-07-01"
+      },
+      {
+        "name": "mail.dev.example.com",
+        "ips": [],
+        "last_resolved": null
+      },
+      {
+        "name": "outside.example.net",
+        "ips": [],
+        "last_resolved": null
+      }
+    ]
+  }
+}
