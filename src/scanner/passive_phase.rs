@@ -1,5 +1,14 @@
 use super::*;
 
+pub(super) const fn passive_completion_snapshot_required(
+    phase_timed_out: bool,
+    refresh_total: usize,
+    refresh_finished: usize,
+    is_root_zone: bool,
+) -> bool {
+    !phase_timed_out && refresh_total > 0 && refresh_finished == refresh_total && is_root_zone
+}
+
 impl Scanner {
     pub(super) async fn collect_passive(
         &self,
@@ -182,6 +191,7 @@ impl Scanner {
         let refresh_total = refresh.len();
         let mut refresh_finished = 0_usize;
         let mut phase_timed_out = false;
+        let refresh_started = Instant::now();
         let mut results = stream::iter(refresh)
             .map(|source| {
                 let keys = keys.clone();
@@ -457,7 +467,8 @@ impl Scanner {
                     self.emit(ProgressEvent::Phase {
                         name: "passif".to_owned(),
                         detail: format!(
-                            "{refresh_finished}/{refresh_total} source(s), {active} active(s), {remaining}"
+                            "{refresh_finished}/{refresh_total} source(s), {active} active(s), en cours depuis {}s, {remaining}",
+                            refresh_started.elapsed().as_secs()
                         ),
                     });
                     continue;
@@ -671,6 +682,20 @@ impl Scanner {
                     }
                 }
             }
+        }
+        if passive_completion_snapshot_required(
+            phase_timed_out,
+            refresh_total,
+            refresh_finished,
+            domain == contact_root_domain,
+        ) {
+            self.emit(ProgressEvent::Phase {
+                name: "passif".to_owned(),
+                detail: format!(
+                    "{refresh_finished}/{refresh_total} source(s), terminé en {}s",
+                    refresh_started.elapsed().as_secs()
+                ),
+            });
         }
         drop(results);
         if phase_timed_out {

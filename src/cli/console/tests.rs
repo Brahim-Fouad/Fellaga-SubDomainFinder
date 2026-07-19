@@ -1,4 +1,6 @@
-use super::progress::ConsoleProgress;
+use super::progress::{
+    ConsoleProgress, TransientPhaseState, transient_phase_detail, transient_progress_signature,
+};
 use super::render::{finding_line, render_scan_findings, render_scan_summary};
 use super::text::{
     NoticeKind, TerminalStyle, animation_enabled, classify_notice, format_duration, format_number,
@@ -11,6 +13,7 @@ use fellaga_core::model::{
 };
 use fellaga_core::scanner::PassiveSourceOutcome;
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::{Duration, Instant};
 
 fn finding(fqdn: &str, state: ObservationState, wildcard: bool) -> Finding {
     Finding {
@@ -122,7 +125,91 @@ fn repeated_long_running_phases_are_recognized_as_transient() {
         "zone api.example.com (fille)"
     ));
     assert!(is_transient_phase("CT incrémental", "journal 1/2, lot 4"));
+    assert!(is_transient_phase(
+        "passif",
+        "8/9 source(s), 1 active(s), sans limite cumulative"
+    ));
+    assert!(!is_transient_phase(
+        "passif",
+        "9/9 source(s), terminé en 42s"
+    ));
     assert!(!is_transient_phase("wildcard", "racine normale"));
+}
+
+#[test]
+fn passive_heartbeat_tracks_elapsed_time_without_changing_its_progress_signature() {
+    assert_eq!(
+        transient_progress_signature("lecture bornée; en cours depuis 10s; 1 restante"),
+        "lecture bornée; en cours depuis <elapsed>; 1 restante"
+    );
+    assert_eq!(
+        transient_progress_signature("lecture bornée; en cours depuis 12.5s; 1 restante"),
+        "lecture bornée; en cours depuis <elapsed>; 1 restante"
+    );
+    assert_ne!(
+        transient_progress_signature("lecture bornée; en cours depuis 85s; 1 restante"),
+        transient_progress_signature("lecture bornée; en cours depuis 85s; 0 restante")
+    );
+    assert_eq!(
+        transient_progress_signature(
+            "8/9 source(s), 1 active(s), en cours depuis 10s, limite cumulative dans 20s"
+        ),
+        transient_progress_signature(
+            "8/9 source(s), 1 active(s), en cours depuis 11s, limite cumulative dans 19s"
+        )
+    );
+    assert_eq!(
+        transient_phase_detail(
+            "8/9 source(s), 1 active(s), sans limite cumulative",
+            Duration::from_secs(85)
+        ),
+        "8/9 source(s), 1 active(s), sans limite cumulative · écoulé 1m25s"
+    );
+}
+
+#[test]
+fn plain_transient_progress_logs_changes_and_throttles_identical_heartbeats() {
+    let mut progress = ConsoleProgress {
+        interactive: false,
+        multi_target: false,
+        verbosity: 0,
+        line_active: false,
+        active_context: None,
+        last_log_bucket: BTreeMap::new(),
+        last_transient_phase: BTreeMap::new(),
+        stderr_style: TerminalStyle::plain(),
+    };
+    let started = Instant::now();
+    let detail = "8/9 source(s), 1 active(s), sans limite cumulative";
+
+    let (elapsed, log_now) =
+        progress.track_transient_phase("example.com", "passif", detail, started);
+    assert_eq!(elapsed, Duration::ZERO);
+    assert!(log_now);
+
+    let (_, log_now) = progress.track_transient_phase(
+        "example.com",
+        "passif",
+        detail,
+        started + Duration::from_secs(10),
+    );
+    assert!(!log_now);
+
+    let (_, log_now) = progress.track_transient_phase(
+        "example.com",
+        "passif",
+        "9/9 source(s), 0 active(s), sans limite cumulative",
+        started + Duration::from_secs(11),
+    );
+    assert!(log_now);
+
+    let (_, log_now) = progress.track_transient_phase(
+        "example.com",
+        "passif",
+        "9/9 source(s), 0 active(s), sans limite cumulative",
+        started + Duration::from_secs(71),
+    );
+    assert!(log_now);
 }
 
 #[test]
@@ -150,6 +237,7 @@ fn dumb_term_disables_animation_even_for_a_tty() {
 
 #[test]
 fn completing_one_target_keeps_another_targets_active_line() {
+    let now = Instant::now();
     let mut progress = ConsoleProgress {
         interactive: false,
         multi_target: true,
@@ -161,8 +249,14 @@ fn completing_one_target_keeps_another_targets_active_line() {
             (("second.example".to_owned(), "dns".to_owned()), 3),
         ]),
         last_transient_phase: BTreeMap::from([
-            (("first.example".to_owned(), "ct".to_owned()), 1),
-            (("second.example".to_owned(), "ct".to_owned()), 1),
+            (
+                ("first.example".to_owned(), "ct".to_owned()),
+                TransientPhaseState::new(now, "journal 1/2"),
+            ),
+            (
+                ("second.example".to_owned(), "ct".to_owned()),
+                TransientPhaseState::new(now, "journal 1/2"),
+            ),
         ]),
         stderr_style: TerminalStyle::plain(),
     };
