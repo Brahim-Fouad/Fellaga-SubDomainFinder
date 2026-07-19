@@ -871,7 +871,7 @@ mod tests {
     }
 
     #[test]
-    fn openssh_syntax_skips_hashes_and_out_of_scope_patterns() {
+    fn openssh_syntax_skips_wildcards_hashes_and_out_of_scope_patterns() {
         let base = Url::parse("https://example.com/.well-known/ssh-known-hosts").unwrap();
         let parsed = parse_metadata_document(
             MetadataEndpoint::SshKnownHosts,
@@ -883,11 +883,7 @@ mod tests {
         );
         assert_eq!(
             parsed.names,
-            BTreeSet::from([
-                "bastion.example.com".to_owned(),
-                "git.example.com".to_owned(),
-                "ssh.example.com".to_owned(),
-            ])
+            BTreeSet::from(["git.example.com".to_owned(), "ssh.example.com".to_owned(),])
         );
     }
 

@@ -1,3 +1,11 @@
+fellaga (0.10.1-1) unstable; urgency=medium
+
+  * Reject wildcard-only passive observations before they become host findings.
+  * Honor passive concurrency settings and cancel abandoned CT database work.
+  * Improve bounded high-volume pagination and raw-output diagnostics.
+
+ -- Brahim-Fouad GUIA <170998597+Brahim-Fouad@users.noreply.github.com>  Sat, 18 Jul 2026 00:00:00 -0400
+
 fellaga (0.10.0-1) unstable; urgency=medium
 
   * Expand and type the passive connector registry.

@@ -1012,15 +1012,28 @@ fn source_bootstrap_score(source: &str) -> i64 {
         "medium" => 100,
         _ => -100,
     };
-    family + cost + if metadata.experimental { -150 } else { 50 }
+    // High-volume providers need the full phase window on a cold database.
+    // Their learned marginal yield replaces this bootstrap bonus after the
+    // first run, so local evidence remains authoritative over time.
+    let cold_start_yield = match source {
+        "submd" => 550,
+        "thc" => 450,
+        _ => 0,
+    };
+    family + cost + cold_start_yield + if metadata.experimental { -150 } else { 50 }
 }
 
-const PASSIVE_REQUEST_CONCURRENCY: usize = 8;
+const MAX_PASSIVE_REQUEST_CONCURRENCY: usize = 32;
 
-fn passive_connector_working_set_limit(max_passive: usize) -> usize {
+fn effective_passive_concurrency(configured: usize) -> usize {
+    configured.clamp(1, MAX_PASSIVE_REQUEST_CONCURRENCY)
+}
+
+fn passive_connector_working_set_limit(max_passive: usize, concurrency: usize) -> usize {
+    let concurrency = effective_passive_concurrency(concurrency);
     max_passive
-        .saturating_add(PASSIVE_REQUEST_CONCURRENCY - 1)
-        .saturating_div(PASSIVE_REQUEST_CONCURRENCY)
+        .saturating_add(concurrency - 1)
+        .saturating_div(concurrency)
 }
 
 #[cfg(test)]
@@ -1599,7 +1612,7 @@ impl BatchResolution {
 
 impl Scanner {
     pub fn new(database: Database, dns: DnsEngine, options: ScanOptions) -> Self {
-        let passive_concurrency = options.passive_concurrency.clamp(1, 32);
+        let passive_concurrency = effective_passive_concurrency(options.passive_concurrency);
         Self {
             database,
             dns,
@@ -2374,8 +2387,9 @@ impl Scanner {
     ) -> Result<()> {
         let now = now_epoch();
         let freshness = self.options.passive_refresh.as_secs().min(i64::MAX as u64) as i64;
+        let passive_concurrency = effective_passive_concurrency(self.options.passive_concurrency);
         let connector_working_set_limit =
-            passive_connector_working_set_limit(self.options.max_passive);
+            passive_connector_working_set_limit(self.options.max_passive, passive_concurrency);
         let mut passive_union_omitted = 0_usize;
         // Candidate-wave adaptivity and provider health are independent. An
         // exhaustive brute-force scan must not repeatedly block on a provider
@@ -2790,7 +2804,7 @@ impl Scanner {
             // Providers use independent host-specific throttles; a slightly
             // wider scheduler avoids one slow service holding unrelated fast
             // sources while keeping the network footprint bounded.
-            .buffer_unordered(PASSIVE_REQUEST_CONCURRENCY);
+            .buffer_unordered(passive_concurrency);
         let deadline_sleep = async move {
             if let Some(deadline) = passive_deadline {
                 tokio::time::sleep_until(deadline).await;
@@ -8599,15 +8613,16 @@ mod tests {
         candidate_refill_capacity, candidate_uses_active_budget,
         candidate_uses_discovery_fast_path, cap_exclusive_bulk_source_names, capped_phase_deadline,
         collect_dns_outcomes_until, consume_phase_budget, deferred_wildcard_signature,
-        dnssec_assessment_proves_nonexistence, external_deferral_seconds, external_pause_status,
-        external_retry_after_seconds, finish_pending_ct_task_after_grace_with_hook,
-        high_value_window_needs_materialization, high_value_window_persist_limit,
-        indeterminate_wildcard_signature, is_missing_api_key_error, is_preflight_auth_error,
-        late_ct_seed_reserve, materialize_ct_fallback_bounded, merge_ct_fallback_names,
-        merge_passive_names_bounded, merge_resolver_metrics, metadata_phase_budget,
-        passive_connector_working_set_limit, persist_routed_dns_outcomes, phase_deadline,
-        record_bounded_parent_candidate, refill_passive_union_from_cache,
-        refresh_allows_wildcard_purge, refresh_can_demote_wildcard_ambiguity, refresh_deadline,
+        dnssec_assessment_proves_nonexistence, effective_passive_concurrency,
+        external_deferral_seconds, external_pause_status, external_retry_after_seconds,
+        finish_pending_ct_task_after_grace_with_hook, high_value_window_needs_materialization,
+        high_value_window_persist_limit, indeterminate_wildcard_signature,
+        is_missing_api_key_error, is_preflight_auth_error, late_ct_seed_reserve,
+        materialize_ct_fallback_bounded, merge_ct_fallback_names, merge_passive_names_bounded,
+        merge_resolver_metrics, metadata_phase_budget, passive_connector_working_set_limit,
+        persist_routed_dns_outcomes, phase_deadline, record_bounded_parent_candidate,
+        refill_passive_union_from_cache, refresh_allows_wildcard_purge,
+        refresh_can_demote_wildcard_ambiguity, refresh_deadline,
         refresh_parent_selection_is_complete, refresh_wildcard_observation_is_reliable,
         refresh_wildcard_profile_is_reliable, route_dns_outcomes,
         select_bounded_mutation_observations, should_expand_adaptive_wave,
@@ -9812,7 +9827,7 @@ mod tests {
 
     #[test]
     fn passive_union_cap_keeps_existing_multi_source_provenance() {
-        assert_eq!(passive_connector_working_set_limit(25_000), 3_125);
+        assert_eq!(passive_connector_working_set_limit(25_000, 8), 3_125);
         let mut sources = BTreeMap::new();
         assert_eq!(
             merge_passive_names_bounded(
@@ -9847,6 +9862,19 @@ mod tests {
             ]))
         );
         assert!(!sources.contains_key("two.example.com"));
+    }
+
+    #[test]
+    fn passive_scheduler_honors_full_cli_range_and_partitions_memory() {
+        assert_eq!(effective_passive_concurrency(0), 1);
+        assert_eq!(effective_passive_concurrency(8), 8);
+        assert_eq!(effective_passive_concurrency(16), 16);
+        assert_eq!(effective_passive_concurrency(32), 32);
+        assert_eq!(effective_passive_concurrency(64), 32);
+
+        assert_eq!(passive_connector_working_set_limit(25_000, 8), 3_125);
+        assert_eq!(passive_connector_working_set_limit(25_000, 16), 1_563);
+        assert_eq!(passive_connector_working_set_limit(25_000, 32), 782);
     }
 
     #[test]
@@ -10395,6 +10423,8 @@ mod tests {
     fn unseen_targeted_sources_start_ahead_of_expensive_archives() {
         assert!(source_bootstrap_score("securitytrails") > source_bootstrap_score("wayback"));
         assert!(source_bootstrap_score("merklemap") > source_bootstrap_score("commoncrawl"));
+        assert!(source_bootstrap_score("submd") > source_bootstrap_score("securitytrails"));
+        assert!(source_bootstrap_score("thc") > source_bootstrap_score("securitytrails"));
     }
 
     #[test]

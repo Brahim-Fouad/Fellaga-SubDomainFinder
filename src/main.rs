@@ -7,7 +7,8 @@ use fellaga_core::dns::DnsEngine;
 use fellaga_core::model::{AxfrStatus, Finding, ObservationState, ScanResult};
 use fellaga_core::network_governor::NetworkControl;
 use fellaga_core::passive::{
-    ApiKeyStore, automatic_sources_for_profile, source_statuses, validate_sources,
+    ApiKeyStore, all_unique_sources, automatic_sources_for_profile, source_statuses,
+    validate_sources,
 };
 use fellaga_core::scanner::{
     ProgressEvent, RefreshOptions, RefreshProgressCallback, ScanOptions, Scanner,
@@ -169,8 +170,12 @@ const fn stream_jsonl_mode(enabled: bool, only_live: bool) -> StreamJsonlMode {
     }
 }
 
-const fn scan_progress_enabled(quiet: bool, show: bool, stream_jsonl: bool) -> bool {
-    (!quiet && !show) || stream_jsonl
+const fn scan_progress_enabled(quiet: bool, _show: bool, stream_jsonl: bool) -> bool {
+    !quiet || stream_jsonl
+}
+
+const fn raw_output_diagnostic_event(event: &ProgressEvent) -> bool {
+    !matches!(event, ProgressEvent::Finding(_))
 }
 
 fn metadata_discovery_enabled(
@@ -473,7 +478,7 @@ struct ScanArgs {
     exclude_sources: Vec<String>,
     #[arg(
         long,
-        help = "Select every available connector; key-gated sources without credentials are skipped"
+        help = "Select every unique available connector; compatibility aliases are not executed twice and key-gated sources without credentials are skipped"
     )]
     all_sources: bool,
     #[arg(
@@ -1135,15 +1140,17 @@ fn stream_finding_line(finding: &Finding) -> String {
 struct ConsoleProgress {
     interactive: bool,
     json_output: bool,
+    raw_output: bool,
     line_active: bool,
     last_log_bucket: Option<(String, usize)>,
 }
 
 impl ConsoleProgress {
-    fn new(json_output: bool) -> Self {
+    fn new(json_output: bool, raw_output: bool) -> Self {
         Self {
             interactive: std::io::stderr().is_terminal(),
             json_output,
+            raw_output,
             line_active: false,
             last_log_bucket: None,
         }
@@ -1159,7 +1166,7 @@ impl ConsoleProgress {
 
     fn write_streamed(&mut self, line: &str) {
         self.clear_progress_line();
-        if self.json_output {
+        if self.json_output || self.raw_output {
             eprintln!("{line}");
         } else {
             println!("{line}");
@@ -1791,11 +1798,7 @@ async fn main() -> Result<()> {
             validate_sources(&args.passive_sources)?;
             validate_sources(&args.exclude_sources)?;
             let mut passive_sources = if args.all_sources {
-                source_statuses(&api_keys)
-                    .into_iter()
-                    .filter(|source| source.metadata.available)
-                    .map(|source| source.name)
-                    .collect::<Vec<_>>()
+                all_unique_sources()
             } else if args.passive_sources.is_empty() {
                 automatic_sources_for_profile(&api_keys, args.profile == ScanProfile::Deep)
             } else {
@@ -1948,8 +1951,10 @@ async fn main() -> Result<()> {
             let callback: Option<scanner::ProgressCallback> = if progress_enabled {
                 let printer = Arc::new(Mutex::new(ConsoleProgress::new(
                     args.json || args.jsonl || args.stream_jsonl,
+                    args.show,
                 )));
                 let quiet = args.quiet;
+                let show = args.show;
                 Some(Arc::new(move |event| {
                     if stream_mode == StreamJsonlMode::Realtime
                         && let ProgressEvent::Finding(finding) = &event
@@ -1957,7 +1962,10 @@ async fn main() -> Result<()> {
                         println!("{}", stream_finding_line(finding));
                         let _ = std::io::stdout().flush();
                     }
-                    if !quiet && let Ok(mut printer) = printer.lock() {
+                    if !quiet
+                        && (!show || raw_output_diagnostic_event(&event))
+                        && let Ok(mut printer) = printer.lock()
+                    {
                         printer.handle(event);
                     }
                 }))
@@ -2666,11 +2674,28 @@ mod tests {
     }
 
     #[test]
-    fn show_disables_progress_without_requiring_quiet() {
+    fn show_keeps_stderr_diagnostics_and_quiet_disables_them() {
         assert!(scan_progress_enabled(false, false, false));
-        assert!(!scan_progress_enabled(false, true, false));
+        assert!(scan_progress_enabled(false, true, false));
         assert!(!scan_progress_enabled(true, false, false));
         assert!(scan_progress_enabled(true, false, true));
+        assert!(raw_output_diagnostic_event(&ProgressEvent::Phase {
+            name: "passive".to_owned(),
+            detail: "one source".to_owned(),
+        }));
+        assert!(!raw_output_diagnostic_event(&ProgressEvent::Finding(
+            Finding::default()
+        )));
+        assert!(raw_output_diagnostic_event(&ProgressEvent::AxfrAttempt(
+            fellaga_core::model::AxfrAttempt {
+                nameserver: String::new(),
+                address: String::new(),
+                status: AxfrStatus::Empty,
+                error: None,
+                records: Vec::new(),
+                names: BTreeSet::new(),
+            }
+        )));
     }
 
     #[test]

@@ -6,6 +6,22 @@ Published releases and downloadable artifacts are available on [GitHub Releases]
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-07-18
+
+### Changed
+
+- make `--all-sources` execute every unique canonical or Fellaga-native implementation once, including experimental connectors, while keeping compatibility aliases explicitly selectable;
+- keep `scan --show` output as a raw sorted FQDN stream on standard output while reporting progress, connector status, and warnings on standard error unless `--quiet` is set;
+- prioritize high-volume passive providers on a cold database so they receive the available profile budget before lower-yield connectors;
+- increase bounded THC pagination throughput to five paced page requests per second with a 75-second connector ceiling.
+
+### Fixed
+
+- reject wildcard certificate patterns instead of converting them into false concrete host findings while retaining concrete names from the same response;
+- honor the configured passive connector concurrency across the full 1-32 range and partition each connector's working set accordingly;
+- give crt.sh HTTP a bounded head start before PostgreSQL fallback and prefer reachable IPv4 addresses before IPv6 for PostgreSQL;
+- abort a pending CT database connection task when its caller is cancelled or times out so detached work cannot outlive the scan.
+
 ## [0.10.0] - 2026-07-18
 
 ### Added
@@ -270,7 +286,8 @@ Initial public release of Fellaga.
 - public MIT repository with security policy, contribution guide, third-party notices, and verifiable corpus provenance;
 - verifiable v0.8.0 release with x86-64 and ARM64 GNU/Linux archives, an amd64 Debian package, architecture SBOMs, checksums, a keyless Sigstore signature over the checksum manifest, and GitHub attestations.
 
-[Unreleased]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/compare/v0.10.1...HEAD
+[0.10.1]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/tag/v0.10.1
 [0.10.0]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/tag/v0.10.0
 [0.9.2]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/tag/v0.9.2
 [0.9.1]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/tag/v0.9.1

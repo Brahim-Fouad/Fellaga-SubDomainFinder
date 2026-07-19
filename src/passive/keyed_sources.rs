@@ -1992,10 +1992,7 @@ mod tests {
             "*.API.Example.COM. https://cdn.example.com:8443/path example.com evil-example.com",
             "example.com",
         );
-        assert_eq!(
-            names,
-            BTreeSet::from(["api.example.com".to_owned(), "cdn.example.com".to_owned()])
-        );
+        assert_eq!(names, BTreeSet::from(["cdn.example.com".to_owned()]));
         assert_eq!(
             normalize_host_or_url("HTTPS://WWW.EXAMPLE.COM:443/path", "example.com"),
             Some("www.example.com".to_owned())

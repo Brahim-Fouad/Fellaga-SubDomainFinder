@@ -73,6 +73,8 @@ These 19 connectors require no configured credential: `anubis`, `anubisdb`, `cer
 
 Five connectors accept an optional credential and still run without it: `certspotter`, `hackertarget`, `postman`, `submd`, and `urlscan`. Every other credentialed connector is skipped locally when its required value is absent.
 
+`crtsh` gives its public HTTP interface an eight-second head start. A failed or stalled HTTP request falls back to PostgreSQL with the remaining request budget; a valid HTTP response, including an empty result, avoids a duplicate database query. PostgreSQL addresses are resolved once per request, deduplicated, and attempted with IPv4 before IPv6 so an unavailable local IPv6 route cannot prevent the fallback.
+
 | Connector | Requirement | Accepted environment variable(s) |
 | --- | --- | --- |
 | `certspotter` | Optional | `CERTSPOTTER_API_TOKEN` or `CERTSPOTTER_API_KEY` |
@@ -149,7 +151,7 @@ Driftnet requires `DRIFTNET_API_KEY` and queries four authenticated summary fami
 
 `submd` reads the provider's line-oriented response as a stream instead of buffering the complete feed. A configured `SUBMD_API_KEY` is sent as a Bearer token. The stream is capped at 64 MiB, each unfinished record at 64 KiB, and normalized names are checkpointed after at most 1,000 distinct names and before every subsequent network read. Completed records therefore survive a later stream error or deadline even when a transport chunk contains fewer than 1,000 names.
 
-`thc` requests 1,000 records per page, checkpoints every completely decoded page, and accepts up to 1,000 pages within the connector wall deadline. Empty pagination state completes the query; a repeated state, a state longer than 4,096 bytes, or a thousandth page that still advertises more work is reported as a bounded provider failure rather than allowing an endless loop.
+`thc` requests 1,000 records per page, uses up to five paced page requests per second, checkpoints every completely decoded page, and accepts up to 1,000 pages within the remaining passive-phase budget and its 75-second connector ceiling. Empty pagination state completes the query; a repeated state, a state longer than 4,096 bytes, or a thousandth page that still advertises more work is reported as a bounded provider failure rather than allowing an endless loop.
 
 `netlas` uses the current two-request API workflow with Bearer authentication: it first queries `domains_count`, then submits the same exact-domain-excluding query to `domains/download` with a domain-only projection. Fellaga conservatively requests at most 200 records by default. Set `FELLAGA_NETLAS_DOWNLOAD_LIMIT` to an integer from 1 through 1,000,000 only when the configured Netlas plan permits the larger download. Its top-level JSON array is decoded directly from the response stream with 16 MiB total, 1 MiB per-record, and 50-record checkpoint limits; a malformed or oversized tail cannot discard earlier completed checkpoints. If the provider count or response shows that the selected limit truncated the result set, Fellaga retains completed records and reports a partial/error outcome instead of complete success.
 
@@ -169,7 +171,7 @@ The `github` and `gitlab` code-search connectors continue through remaining raw 
 
 ### Experimental and runtime-failing providers
 
-The registry marks `anubis`, `anubisdb`, `certificatedetails`, `digitorus`, `driftnet`, `hudsonrock`, `rapiddns`, `reconcloud`, `reconeer`, `riddler`, `sitedossier`, `subdomainapp`, `subdomaincenter`, `threatcrowd`, and `threatminer` as experimental. The default `deep` profile enables every locally accessible connector whose metadata permits automatic execution, including eligible experimental entries. Four duplicate compatibility names (`certificatedetails`, `otx`, `wayback`, and `whoisxml`) remain opt-in to prevent duplicate provider traffic; `--all-sources` exposes them to diagnostics too.
+The registry marks `anubis`, `anubisdb`, `certificatedetails`, `digitorus`, `driftnet`, `hudsonrock`, `rapiddns`, `reconcloud`, `reconeer`, `riddler`, `sitedossier`, `subdomainapp`, `subdomaincenter`, `threatcrowd`, and `threatminer` as experimental. The default `deep` profile enables every locally accessible connector whose metadata permits automatic execution, including eligible experimental entries. Four duplicate compatibility names (`certificatedetails`, `otx`, `wayback`, and `whoisxml`) remain opt-in to prevent duplicate provider traffic. `--all-sources` selects the corresponding unique implementations once; compatibility aliases remain explicitly selectable.
 
 BinaryEdge retired its service and is represented separately as an unavailable compatibility entry. Fellaga keeps the name so existing configuration and cached provenance remain understandable, but neither automatic selection, explicit selection, nor `--all-sources` sends a request to the retired endpoint.
 
@@ -226,7 +228,7 @@ Fellaga/<version> (+https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder)
 Set `FELLAGA_USER_AGENT` when an organization or provider needs a specific contact string:
 
 ```bash
-export FELLAGA_USER_AGENT='Fellaga/0.10.0 (security-team@example.org)'
+export FELLAGA_USER_AGENT='Fellaga/0.10.1 (security-team@example.org)'
 ```
 
 The override is optional. It must be non-empty ASCII, contain no control characters, and fit within 256 characters. It changes only the HTTP `User-Agent`; it does not alter source selection.
@@ -242,11 +244,11 @@ fellaga scan your-domain.example --passive-sources crtsh,certspotter,commoncrawl
 # Automatic selection except selected providers
 fellaga scan your-domain.example --exclude-sources hackertarget,urlscan
 
-# Diagnostic mode that selects every registered connector
+# Select every unique source implementation, including experimental entries
 fellaga scan your-domain.example --all-sources
 ```
 
-An explicitly selected source bypasses its adaptive pause. `--all-sources` selects every available connector name, including experimental and compatibility entries; unavailable registry entries remain visible in `fellaga sources` but are never scheduled. `fellaga sources --check` reports those entries as `skipped_unavailable`, with zero names, zero duration, and no network request. Providers without required credentials are skipped locally as `skipped_missing_key`; public or optional-key providers can still fail at runtime. Unknown connector identifiers are rejected before scheduling rather than receiving inferred capabilities. Because compatibility names share an endpoint with their canonical name, this mode favors registry diagnostics and comparative coverage over minimum provider traffic.
+An explicitly selected source bypasses its adaptive pause. `--all-sources` selects each available canonical or Fellaga-native implementation once, including experimental entries; it does not add a compatibility alias beside the corresponding implementation. Compatibility aliases remain valid in explicit allowlists for existing configurations. Unavailable registry entries remain visible in `fellaga sources` but are never scheduled. `fellaga sources --check` reports those entries as `skipped_unavailable`, with zero names, zero duration, and no network request. Providers without required credentials are skipped locally as `skipped_missing_key`; public or optional-key providers can still fail at runtime. Unknown connector identifiers are rejected before scheduling rather than receiving inferred capabilities.
 
 ## Caching, retries, and provider protection
 
@@ -255,6 +257,8 @@ Passive observations are merged permanently. A later empty or partial provider r
 The shared HTTP layer reuses connections, limits requests per provider, caps decompressed response bodies, validates sensitive pagination destinations, rejects redirects that change scheme, host, or port, and retries selected transient statuses with exponential backoff and jitter. Automatic request replay is restricted to safe read methods; credentialed state-changing requests are never replayed. Short `Retry-After` values are honored inline; longer waits are persisted as an adaptive pause instead of holding the scan open. Each connector receives only the time remaining in the passive phase, with a small handoff margin so a slow source cannot hold the next phase open. Common Crawl uses one field-restricted request for each 15-block page and advances its selected yearly indexes breadth-first.
 
 Each completely decoded provider page is committed immediately to permanent SQLite observations. The connector and scan working sets keep only a bounded candidate slice, so a large archive or passive-DNS response does not need to be duplicated across every active source before `--max-passive` is applied. A later timeout therefore preserves durable page data without turning the permanent inventory into an unbounded RAM requirement.
+
+Passive connector concurrency accepts values from 1 through 32 and the selected value controls both scheduling width and per-task working-set partitioning. Certificate wildcard patterns are rejected as host findings rather than being converted into a concrete apex or child name; concrete names found in the same response are retained. Cancelling or timing out the CT database connector aborts its pending connection task so it cannot continue detached from the scan.
 
 Passive refreshes use a generation number stored with each evidence row, making page replay idempotent without creating or deleting a second per-name marker set. An expiring SQLite lease allows only one process to refresh the same domain/source pair; a concurrent scan keeps the existing cache instead of duplicating provider traffic. Numeric connectors retain each completed lane across a crash and publish cache freshness only after every expected lane is complete and its advertised totals are satisfied. An unfinished generation older than 90 days restarts from page one, while all discovered names and provenance remain permanent.
 
