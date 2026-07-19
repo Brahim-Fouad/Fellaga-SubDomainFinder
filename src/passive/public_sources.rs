@@ -9,17 +9,28 @@ use super::{
     ApiKeyStore, client, commit_result_page, compact_external_error, response_bytes_limited_to,
     response_json, send_external, send_external_idempotent, send_external_streaming,
 };
-use crate::util::{extract_observed_names, normalize_domain, normalize_observed_name};
+use crate::util::{
+    extract_observed_names, normalize_domain, normalize_hostname, normalize_observed_name,
+};
 use anyhow::{Context, Result, bail};
+use reqwest::header::CONTENT_TYPE;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeSet;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use url::Url;
 
 const MAX_TEXT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_SUBMD_STREAM_BYTES: usize = 64 * 1024 * 1024;
 const MAX_SUBMD_LINE_BYTES: usize = 64 * 1024;
-const SUBMD_COMMIT_BATCH: usize = 1_000;
+const MAX_SHREWDEYE_STREAM_BYTES: usize = 64 * 1024 * 1024;
+const MAX_SHREWDEYE_LINE_BYTES: usize = 1_024;
+const MAX_SHREWDEYE_RECORDS: usize = 1_000_000;
+const MAX_ARQUIVO_STREAM_BYTES: usize = 32 * 1024 * 1024;
+const MAX_PUBLIC_STREAM_LINE_BYTES: usize = 64 * 1024;
+const PUBLIC_STREAM_COMMIT_BATCH: usize = 1_000;
+const PUBLIC_STREAM_CHECKPOINT_INTERVAL: Duration = Duration::from_millis(500);
+const ARQUIVO_RESULT_LIMIT: usize = 50_000;
 const MAX_RAPID_DNS_PAGES: usize = 1_000;
 const MAX_SITE_DOSSIER_PAGES: usize = 1_000;
 const MAX_THC_PAGES: usize = 1_000;
@@ -55,17 +66,163 @@ fn submd_line_names(line: &[u8], domain: &str) -> Result<BTreeSet<String>> {
     Ok(extract_names_from_text(line.trim(), domain))
 }
 
-fn commit_submd_line(
-    line: &[u8],
-    domain: &str,
-    accumulated: &mut BTreeSet<String>,
-    batch: &mut BTreeSet<String>,
-) -> Result<()> {
-    batch.extend(submd_line_names(line, domain)?);
-    if batch.len() >= SUBMD_COMMIT_BATCH {
-        commit_result_page(accumulated, std::mem::take(batch));
+#[derive(Debug, Deserialize)]
+struct ArquivoCdxRow {
+    url: String,
+}
+
+fn arquivo_cdx_line_names(line: &[u8], domain: &str) -> Result<BTreeSet<String>> {
+    let row: ArquivoCdxRow =
+        serde_json::from_slice(line).context("Arquivo.pt: invalid CDX JSON record")?;
+    let url = Url::parse(row.url.trim()).context("Arquivo.pt: invalid archived URL")?;
+    let host = url
+        .host_str()
+        .context("Arquivo.pt: archived URL has no hostname")?;
+    Ok(normalize_observed_name(host, domain).into_iter().collect())
+}
+
+fn public_stream_line_names(line: &[u8], domain: &str) -> Result<BTreeSet<String>> {
+    let line = std::str::from_utf8(line).context("ShrewdEye: non UTF-8 record")?;
+    let line = line.trim();
+    if line.starts_with("*.") {
+        return Ok(BTreeSet::new());
     }
-    Ok(())
+    let hostname = normalize_hostname(line).context("ShrewdEye: invalid hostname record")?;
+    Ok(normalize_observed_name(&hostname, domain)
+        .into_iter()
+        .collect())
+}
+
+async fn collect_streamed_lines<F>(
+    mut response: reqwest::Response,
+    source: &str,
+    domain: &str,
+    max_bytes: usize,
+    max_line_bytes: usize,
+    max_records: Option<usize>,
+    mut parse_line: F,
+) -> Result<BTreeSet<String>>
+where
+    F: FnMut(&[u8], &str) -> Result<BTreeSet<String>>,
+{
+    if !response.status().is_success() {
+        let status = response.status();
+        let text = bounded_text(response, source, MAX_TEXT_BYTES).await?;
+        bail!("{source}: HTTP {status}: {}", compact_external_error(&text));
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > max_bytes as u64)
+    {
+        bail!(
+            "{source}: response exceeds the {} MiB stream budget",
+            max_bytes / 1024 / 1024
+        );
+    }
+    if response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            let value = value.to_ascii_lowercase();
+            value.starts_with("text/html") || value.starts_with("application/xhtml+xml")
+        })
+    {
+        bail!("{source}: réponse HTML inattendue à la place du flux de données attendu");
+    }
+
+    let mut names = BTreeSet::new();
+    let mut batch = BTreeSet::new();
+    let mut carry = Vec::new();
+    let mut bytes_seen = 0_usize;
+    let mut records_seen = 0_usize;
+    let mut last_checkpoint = Instant::now();
+    loop {
+        let chunk = match response.chunk().await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
+            Err(error) => {
+                commit_result_page(&mut names, std::mem::take(&mut batch));
+                return Err(error).with_context(|| format!("{source}: interrupted stream"));
+            }
+        };
+        bytes_seen = bytes_seen
+            .checked_add(chunk.len())
+            .with_context(|| format!("{source}: response byte counter overflow"))?;
+        if bytes_seen > max_bytes {
+            commit_result_page(&mut names, std::mem::take(&mut batch));
+            bail!(
+                "{source}: stream exceeded the {} MiB budget after committed batches",
+                max_bytes / 1024 / 1024
+            );
+        }
+        let mut offset = 0_usize;
+        while offset < chunk.len() {
+            let remaining = &chunk[offset..];
+            let Some(newline) = remaining.iter().position(|byte| *byte == b'\n') else {
+                let pending = carry
+                    .len()
+                    .checked_add(remaining.len())
+                    .with_context(|| format!("{source}: record length overflow"))?;
+                if pending > max_line_bytes {
+                    commit_result_page(&mut names, std::mem::take(&mut batch));
+                    bail!("{source}: record exceeds {max_line_bytes} bytes");
+                }
+                carry.extend_from_slice(remaining);
+                break;
+            };
+            let segment = &remaining[..newline];
+            let line_length = carry
+                .len()
+                .checked_add(segment.len())
+                .with_context(|| format!("{source}: record length overflow"))?;
+            if line_length > max_line_bytes {
+                commit_result_page(&mut names, std::mem::take(&mut batch));
+                bail!("{source}: record exceeds {max_line_bytes} bytes");
+            }
+            carry.extend_from_slice(segment);
+            let line = carry.strip_suffix(b"\r").unwrap_or(&carry);
+            if !line.is_empty() {
+                records_seen = records_seen.saturating_add(1);
+                if max_records.is_some_and(|limit| records_seen > limit) {
+                    commit_result_page(&mut names, std::mem::take(&mut batch));
+                    bail!("{source}: local record cap reached; committed results are partial");
+                }
+                match parse_line(line, domain) {
+                    Ok(line_names) => batch.extend(line_names),
+                    Err(error) => {
+                        commit_result_page(&mut names, std::mem::take(&mut batch));
+                        return Err(error);
+                    }
+                }
+            }
+            if batch.len() >= PUBLIC_STREAM_COMMIT_BATCH {
+                commit_result_page(&mut names, std::mem::take(&mut batch));
+                last_checkpoint = Instant::now();
+            }
+            carry.clear();
+            offset = offset.saturating_add(newline).saturating_add(1);
+        }
+        // A short time checkpoint retains partial progress without turning
+        // arbitrary HTTP chunk boundaries into one SQLite transaction each.
+        if !batch.is_empty() && last_checkpoint.elapsed() >= PUBLIC_STREAM_CHECKPOINT_INTERVAL {
+            commit_result_page(&mut names, std::mem::take(&mut batch));
+            last_checkpoint = Instant::now();
+        }
+    }
+    if !carry.is_empty() {
+        let line = carry.strip_suffix(b"\r").unwrap_or(&carry);
+        if !line.is_empty() {
+            records_seen = records_seen.saturating_add(1);
+            if max_records.is_some_and(|limit| records_seen > limit) {
+                commit_result_page(&mut names, std::mem::take(&mut batch));
+                bail!("{source}: local record cap reached; committed results are partial");
+            }
+            batch.extend(parse_line(line, domain)?);
+        }
+    }
+    commit_result_page(&mut names, batch);
+    Ok(names)
 }
 
 async fn bounded_text(
@@ -305,6 +462,58 @@ pub(super) async fn shodanct(domain: &str, timeout: Duration) -> Result<BTreeSet
     ))
 }
 
+pub(super) async fn shrewdeye(domain: &str, timeout: Duration) -> Result<BTreeSet<String>> {
+    let domain = canonical_domain(domain)?;
+    let response = send_external_streaming(
+        "shrewdeye",
+        client(timeout)?.get(format!("https://shrewdeye.app/domains/{domain}.txt")),
+        &domain,
+    )
+    .await?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(BTreeSet::new());
+    }
+    collect_streamed_lines(
+        response,
+        "ShrewdEye",
+        &domain,
+        MAX_SHREWDEYE_STREAM_BYTES,
+        MAX_SHREWDEYE_LINE_BYTES,
+        Some(MAX_SHREWDEYE_RECORDS),
+        public_stream_line_names,
+    )
+    .await
+}
+
+pub(super) async fn arquivopt(domain: &str, timeout: Duration) -> Result<BTreeSet<String>> {
+    let domain = canonical_domain(domain)?;
+    let result_limit = ARQUIVO_RESULT_LIMIT.saturating_add(1).to_string();
+    let response = send_external_streaming(
+        "arquivopt",
+        client(timeout)?
+            .get("https://arquivo.pt/wayback/cdx")
+            .query(&[
+                ("url", domain.as_str()),
+                ("matchType", "domain"),
+                ("output", "json"),
+                ("fields", "url"),
+                ("limit", result_limit.as_str()),
+            ]),
+        &domain,
+    )
+    .await?;
+    collect_streamed_lines(
+        response,
+        "Arquivo.pt",
+        &domain,
+        MAX_ARQUIVO_STREAM_BYTES,
+        MAX_PUBLIC_STREAM_LINE_BYTES,
+        Some(ARQUIVO_RESULT_LIMIT),
+        arquivo_cdx_line_names,
+    )
+    .await
+}
+
 pub(super) async fn thc(domain: &str, timeout: Duration) -> Result<BTreeSet<String>> {
     let domain = canonical_domain(domain)?;
     let http = client(timeout)?;
@@ -354,90 +563,17 @@ pub(super) async fn submd(
     if let Some(token) = keys.optional("submd") {
         request = request.bearer_auth(token);
     }
-    let mut response = send_external_streaming("submd", request, &domain).await?;
-    if !response.status().is_success() {
-        let status = response.status();
-        let text = bounded_text(response, "sub.md", MAX_TEXT_BYTES).await?;
-        bail!("sub.md: HTTP {status}: {}", compact_external_error(&text));
-    }
-    if response
-        .content_length()
-        .is_some_and(|length| length > MAX_SUBMD_STREAM_BYTES as u64)
-    {
-        bail!(
-            "sub.md: response exceeds the {} MiB stream budget",
-            MAX_SUBMD_STREAM_BYTES / 1024 / 1024
-        );
-    }
-
-    let mut names = BTreeSet::new();
-    let mut batch = BTreeSet::new();
-    let mut carry = Vec::new();
-    let mut bytes_seen = 0_usize;
-    loop {
-        let chunk = match response.chunk().await {
-            Ok(Some(chunk)) => chunk,
-            Ok(None) => break,
-            Err(error) => {
-                commit_result_page(&mut names, std::mem::take(&mut batch));
-                return Err(error).context("sub.md: interrupted stream");
-            }
-        };
-        bytes_seen = bytes_seen
-            .checked_add(chunk.len())
-            .context("sub.md: response byte counter overflow")?;
-        if bytes_seen > MAX_SUBMD_STREAM_BYTES {
-            commit_result_page(&mut names, std::mem::take(&mut batch));
-            bail!(
-                "sub.md: stream exceeded the {} MiB budget after committed batches",
-                MAX_SUBMD_STREAM_BYTES / 1024 / 1024
-            );
-        }
-        let mut offset = 0_usize;
-        while offset < chunk.len() {
-            let remaining = &chunk[offset..];
-            let Some(newline) = remaining.iter().position(|byte| *byte == b'\n') else {
-                let pending = carry
-                    .len()
-                    .checked_add(remaining.len())
-                    .context("sub.md: record length overflow")?;
-                if pending > MAX_SUBMD_LINE_BYTES {
-                    commit_result_page(&mut names, std::mem::take(&mut batch));
-                    bail!("sub.md: record exceeds {MAX_SUBMD_LINE_BYTES} bytes");
-                }
-                carry.extend_from_slice(remaining);
-                break;
-            };
-            let segment = &remaining[..newline];
-            let line_length = carry
-                .len()
-                .checked_add(segment.len())
-                .context("sub.md: record length overflow")?;
-            if line_length > MAX_SUBMD_LINE_BYTES {
-                commit_result_page(&mut names, std::mem::take(&mut batch));
-                bail!("sub.md: record exceeds {MAX_SUBMD_LINE_BYTES} bytes");
-            }
-            carry.extend_from_slice(segment);
-            let line = carry.strip_suffix(b"\r").unwrap_or(&carry);
-            if let Err(error) = commit_submd_line(line, &domain, &mut names, &mut batch) {
-                commit_result_page(&mut names, std::mem::take(&mut batch));
-                return Err(error);
-            }
-            carry.clear();
-            offset = offset.saturating_add(newline).saturating_add(1);
-        }
-        // This synchronous checkpoint precedes the next network await, so an
-        // outer connector deadline cannot discard complete records.
-        commit_result_page(&mut names, std::mem::take(&mut batch));
-    }
-    if !carry.is_empty()
-        && let Err(error) = commit_submd_line(&carry, &domain, &mut names, &mut batch)
-    {
-        commit_result_page(&mut names, std::mem::take(&mut batch));
-        return Err(error);
-    }
-    commit_result_page(&mut names, batch);
-    Ok(names)
+    let response = send_external_streaming("submd", request, &domain).await?;
+    collect_streamed_lines(
+        response,
+        "sub.md",
+        &domain,
+        MAX_SUBMD_STREAM_BYTES,
+        MAX_SUBMD_LINE_BYTES,
+        None,
+        submd_line_names,
+    )
+    .await
 }
 
 pub(super) async fn rapiddns(domain: &str, timeout: Duration) -> Result<BTreeSet<String>> {
@@ -624,6 +760,49 @@ mod tests {
             normalize_many(values.iter().map(String::as_str), "example.com"),
             BTreeSet::from(["api.example.com".to_owned()])
         );
+    }
+
+    #[test]
+    fn shrewdeye_fixture_keeps_only_strict_subdomains() {
+        assert_eq!(
+            public_stream_line_names(b"api.example.com\r", "example.com").unwrap(),
+            BTreeSet::from(["api.example.com".to_owned()])
+        );
+        assert!(
+            public_stream_line_names(b"example.com", "example.com")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            public_stream_line_names(b"evil.test", "example.com")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            public_stream_line_names(b"*.wild.example.com", "example.com")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(public_stream_line_names(b"<html>", "example.com").is_err());
+        assert!(public_stream_line_names(&[0xff], "example.com").is_err());
+    }
+
+    #[test]
+    fn arquivo_cdx_fixture_extracts_only_the_archived_url_host() {
+        assert_eq!(
+            arquivo_cdx_line_names(
+                br#"{"url":"https://deep.api.example.com/a?next=evil.test"}"#,
+                "example.com"
+            )
+            .unwrap(),
+            BTreeSet::from(["deep.api.example.com".to_owned()])
+        );
+        assert!(
+            arquivo_cdx_line_names(br#"{"url":"https://evil.test/example.com"}"#, "example.com")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(arquivo_cdx_line_names(br#"{"original":"missing"}"#, "example.com").is_err());
     }
 
     #[test]

@@ -8,7 +8,7 @@ Fellaga separates discovery from validation. A provider response, certificate na
 2. Query selected passive providers and run strict AXFR checks while opportunistic direct Certificate Transparency indexing proceeds in the background, with a Static CT tile fallback for compatible logs.
 3. Detect wildcard behavior for the target and relevant child zones.
 4. Persist high-value discovery seeds and active generated candidates in separate SQLite queues, then validate them in interleaved bounded waves.
-5. Inspect the DNS graph, browse bounded DNS-SD and mail-policy relationships, and detect walkable NSEC zones.
+5. Inspect the DNS graph, browse bounded DNS-SD and mail-policy relationships, detect walkable NSEC zones, and run bounded PTR and public-IP hostname pivots.
 6. Extract in-scope names from standardized metadata, Web content, JavaScript semantics, source maps, archives, SNI/default TLS certificate differences, and STARTTLS endpoints.
 7. Feed new evidence back into the bounded event pipeline for recursive validation and enrichment.
 8. Store normalized evidence, validation events, graph edges, source health, and learning statistics locally.
@@ -34,7 +34,7 @@ Active generation is lazy: the one-million-name corpus is traversed with a durab
 
 | Method | Behavior |
 | --- | --- |
-| Passive connectors | Queries a typed registry of 67 names representing 57 canonical integrations, five Fellaga-native connectors, and five compatibility entries. Every registry entry explicitly classifies its continuation protocol as none, numeric page, fixed offset, opaque replay, streaming replay, or asynchronous polling, including unavailable and compatibility entries. Each active provider has rate limits, bounded responses, an explicit idempotent retry policy, validated SQLite page commits, bounded in-memory candidate sets, and permanent merged observations. Brave can read up to ten provider-signalled pages, while MerkleMap follows validated totals within its connector ceiling. The retired BinaryEdge compatibility entry is retained only for legacy configuration and provenance; it is unavailable and never selected automatically. |
+| Passive connectors | Queries a typed registry of 69 names representing 59 canonical integrations, five Fellaga-native connectors, and five compatibility entries. Every registry entry explicitly classifies its continuation protocol as none, numeric page, fixed offset, opaque replay, streaming replay, or asynchronous polling, including unavailable and compatibility entries. Each active provider has rate limits, bounded responses, an explicit idempotent retry policy, validated SQLite page commits, bounded in-memory candidate sets, and permanent merged observations. Arquivo.pt and ShrewdEye add bounded keyless streaming sources; Brave can read up to ten provider-signalled pages, while MerkleMap follows validated totals within its connector ceiling. The retired BinaryEdge compatibility entry is retained only for legacy configuration and provenance; it is unavailable and never selected automatically. |
 | Certificate Transparency | Combines provider results with direct incremental CT-log monitoring, automatically falls back to compatible Static CT data tiles, and extracts in-scope SAN/CN names. Checkpoints, immutable tiles, names, and cursors are persisted atomically. |
 | DNS brute force | Processes an embedded one-million-candidate corpus, user wordlists, mutations, and locally learned patterns in prioritized waves. A target-local grammar learns service, environment, region, cloud, separator, and numeric conventions under a hard candidate cap. |
 | Recursive discovery | Tests high-yield labels below validated parents up to the selected profile depth. |
@@ -44,6 +44,7 @@ Active generation is lazy: the one-million-name corpus is traversed with a durab
 | Web, metadata, and archives | Extracts in-scope hostnames from standardized `.well-known` documents, headers, redirects, HTML, JavaScript calls/configuration/string composition, JSON, manifests, source maps, bounded Common Crawl WARC records, Wayback, and urlscan data. Metadata DNS and HTTP work share one absolute deadline capped at 30 seconds, while retaining completed observations. Static content is parsed as data and never executed. |
 | TLS and STARTTLS | Extracts SAN/CN names from selected TLS endpoints, compares at most four prioritized SNI/no-SNI certificate pairs, and performs minimal STARTTLS negotiation for supported mail protocols. |
 | PTR | Queries only IP addresses already confirmed during the scan; it does not sweep address ranges. |
+| Public-IP hostname pivot | Sends one bounded wave of already-confirmed public IP addresses to Shodan InternetDB, admits at most 256 names per IP and 2,000 names overall, and sends every in-scope result through normal wildcard-aware DNS validation. Permanent local IP-to-hostname observations survive provider refreshes and failures. |
 
 ## DNS validation
 
@@ -109,13 +110,15 @@ Several independent limits prevent an intensive scan from running forever or exh
 - bounded response sizes and per-provider timeouts;
 - a profile-specific passive active-time budget shared across root and recursive passive phases: 45/25/60/15 seconds for `deep`/`balanced`/`passive`/`turbo`;
 - a global passive connector semaphore shared by root and child zones;
-- bounded AXFR, CT, NSEC, Web, TLS, graph, PTR, and pipeline work, including one cumulative Web/JavaScript deadline shared across all crawl rounds;
+- bounded AXFR, CT, NSEC, Web, TLS, graph, PTR, InternetDB, and pipeline work, including one cumulative Web/JavaScript deadline shared across all crawl rounds;
 - adaptive candidate waves that stop after insufficient yield;
 - a profile-specific active DNS budget shared by wildcard profiling, embedded and user wordlists, mutations, retries, resumed work, and recursive candidate generation;
 - persistent lazy SQLite-backed seed and active batches so millions of candidates do not need to remain in memory or be inserted before validation begins;
 - a persistent checkpoint every 30 seconds.
 
 The passive budget advances only while passive work is running; CT, AXFR, DNS validation, and later non-passive phases are not charged to it. A connector receives only the remaining phase time, preserving a small handoff margin for the scheduler. A connector that times out after returning one or more complete pages contributes those names as a partial result and is reported as degraded. The source order learns from marginal unique-name yield, reliability, and latency instead of rewarding duplicate-heavy raw response counts. Periodic heartbeats cover passive collection, CT, AXFR, DNS validation, and long enrichment phases. Final scan objects expose phase timings for performance diagnosis.
+
+PTR and InternetDB pivots are independent from the DNS graph. PTR shares the remaining active-DNS deadline and retains only reverse lookups completed before it; no PTR wave starts after that budget is exhausted. InternetDB runs at most once per scan. `deep`, `balanced`, and `turbo` query at most 16, 8, and 4 public IP addresses within cumulative budgets of 20, 10, and 5 seconds; the `passive` profile disables the pivot. Requests are paced at one per second and capped at five seconds each. A successful cache entry is refreshed after 24 hours by default, while all previously learned IP-to-hostname observations remain stored locally and can be revalidated later.
 
 Scan completion and learning are committed atomically. Prepared SQLite statements are reused for large word and pattern updates, and queue-selection indexes support bounded claims. Queue cleanup runs after the completion transaction on a best-effort basis and leaves the committed scan status unchanged.
 

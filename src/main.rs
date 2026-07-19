@@ -309,6 +309,8 @@ struct ProfileDefaults {
     tls_hosts: usize,
     graph_hosts: usize,
     ptr_ips: usize,
+    internetdb_ips: usize,
+    internetdb_max_runtime: u64,
     nsec_max_names: usize,
     nsec_max_runtime: u64,
     ct_logs: usize,
@@ -338,6 +340,8 @@ impl ScanProfile {
                 tls_hosts: 250,
                 graph_hosts: 1_000,
                 ptr_ips: 512,
+                internetdb_ips: 16,
+                internetdb_max_runtime: 20,
                 nsec_max_names: 10_000,
                 nsec_max_runtime: 180,
                 ct_logs: 8,
@@ -363,6 +367,8 @@ impl ScanProfile {
                 tls_hosts: 100,
                 graph_hosts: 250,
                 ptr_ips: 64,
+                internetdb_ips: 8,
+                internetdb_max_runtime: 10,
                 nsec_max_names: 10_000,
                 nsec_max_runtime: 90,
                 ct_logs: 2,
@@ -388,6 +394,8 @@ impl ScanProfile {
                 tls_hosts: 1,
                 graph_hosts: 1,
                 ptr_ips: 1,
+                internetdb_ips: 1,
+                internetdb_max_runtime: 1,
                 nsec_max_names: 1,
                 nsec_max_runtime: 1,
                 ct_logs: 8,
@@ -413,6 +421,8 @@ impl ScanProfile {
                 tls_hosts: 100,
                 graph_hosts: 500,
                 ptr_ips: 128,
+                internetdb_ips: 4,
+                internetdb_max_runtime: 5,
                 nsec_max_names: 10_000,
                 nsec_max_runtime: 60,
                 ct_logs: 2,
@@ -607,6 +617,27 @@ struct ScanArgs {
     no_ptr: bool,
     #[arg(long, help = "Maximum confirmed IP addresses queried with PTR")]
     ptr_ips: Option<usize>,
+    #[arg(
+        long,
+        help = "Disable the bounded Shodan InternetDB IP-to-hostname pivot"
+    )]
+    no_internetdb: bool,
+    #[arg(
+        long,
+        help = "Maximum public IP addresses queried through Shodan InternetDB (1-64)"
+    )]
+    internetdb_ips: Option<usize>,
+    #[arg(
+        long,
+        help = "Cumulative Shodan InternetDB phase budget in seconds (1-60)"
+    )]
+    internetdb_max_runtime: Option<u64>,
+    #[arg(
+        long,
+        default_value_t = 24,
+        help = "Shodan InternetDB successful-cache refresh interval in hours"
+    )]
+    internetdb_refresh_hours: u64,
     #[arg(long, help = "Disable DNSSEC NSEC detection and bounded walking")]
     no_nsec: bool,
     #[arg(
@@ -1671,6 +1702,10 @@ async fn main() -> Result<()> {
             let tls_hosts = args.tls_hosts.unwrap_or(defaults.tls_hosts);
             let graph_hosts = args.graph_hosts.unwrap_or(defaults.graph_hosts);
             let ptr_ips = args.ptr_ips.unwrap_or(defaults.ptr_ips);
+            let internetdb_ips = args.internetdb_ips.unwrap_or(defaults.internetdb_ips);
+            let internetdb_max_runtime = args
+                .internetdb_max_runtime
+                .unwrap_or(defaults.internetdb_max_runtime);
             let nsec_max_names = args.nsec_max_names.unwrap_or(defaults.nsec_max_names);
             let nsec_max_runtime = args.nsec_max_runtime.unwrap_or(defaults.nsec_max_runtime);
             let ct_logs = args.ct_logs.unwrap_or(defaults.ct_logs);
@@ -1761,6 +1796,15 @@ async fn main() -> Result<()> {
             }
             if ptr_ips == 0 {
                 bail!("--ptr-ips doit être supérieur à zéro");
+            }
+            if !(1..=64).contains(&internetdb_ips) {
+                bail!("--internetdb-ips doit être compris entre 1 et 64");
+            }
+            if !(1..=60).contains(&internetdb_max_runtime) {
+                bail!("--internetdb-max-runtime doit être compris entre 1 et 60");
+            }
+            if args.internetdb_refresh_hours == 0 {
+                bail!("--internetdb-refresh-hours doit être supérieur à zéro");
             }
             if nsec_max_names == 0 {
                 bail!("--nsec-max-names doit être supérieur à zéro");
@@ -1909,6 +1953,16 @@ async fn main() -> Result<()> {
                 service_discovery: !args.no_service_discovery && !profile_passive,
                 ptr_pivot: !args.no_ptr && !profile_passive,
                 ptr_max_ips: ptr_ips,
+                internetdb_pivot: !args.no_internetdb && !profile_passive,
+                internetdb_max_ips: internetdb_ips,
+                internetdb_phase_timeout: bounded_duration_seconds(
+                    internetdb_max_runtime,
+                    "--internetdb-max-runtime",
+                )?,
+                internetdb_refresh: bounded_duration_hours(
+                    args.internetdb_refresh_hours,
+                    "--internetdb-refresh-hours",
+                )?,
                 dnssec_nsec: !args.no_nsec && !profile_passive,
                 nsec_timeout: positive_duration_seconds(args.nsec_timeout, "--nsec-timeout")?,
                 nsec_refresh: bounded_duration_hours(

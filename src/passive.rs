@@ -28,8 +28,11 @@ use tokio::sync::{Mutex as TokioMutex, Semaphore};
 use url::Url;
 
 mod extra;
+mod ip_pivot;
 mod keyed_sources;
 mod public_sources;
+
+pub(crate) use ip_pivot::{is_public_internet_address, lookup_internetdb};
 
 #[derive(Clone, Default)]
 pub struct ApiKeyStore {
@@ -97,6 +100,7 @@ pub struct SourceMetadata {
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 enum SourceId {
     AnubisDb,
+    ArquivoPt,
     Bevigil,
     BinaryEdge,
     Brave,
@@ -120,6 +124,7 @@ enum SourceId {
     Otx,
     SecurityTrails,
     Shodan,
+    ShrewdEye,
     SubdomainCenter,
     SubdomainApp,
     Urlscan,
@@ -236,7 +241,7 @@ impl SourceId {
             | Self::VirusTotal
             | Self::WhoisXml
             | Self::WhoisXmlApi => EvidenceFamily::PassiveDns,
-            Self::Wayback | Self::WaybackArchive => EvidenceFamily::WebArchive,
+            Self::ArquivoPt | Self::Wayback | Self::WaybackArchive => EvidenceFamily::WebArchive,
             Self::Brave | Self::CommonCrawl | Self::Urlscan => EvidenceFamily::WebCrawl,
             Self::Github | Self::Gitlab | Self::Postman => EvidenceFamily::CodeSearch,
             Self::AnubisDb
@@ -260,6 +265,7 @@ impl SourceId {
             | Self::Reconeer
             | Self::RedHuntLabs
             | Self::Riddler
+            | Self::ShrewdEye
             | Self::SiteDossier
             | Self::SubMd
             | Self::ThreatCrowd
@@ -323,6 +329,7 @@ macro_rules! define_sources {
 
 define_sources! {
     AnubisDb { name: "anubisdb", pagination: PaginationCapability::None, requires_key: false, key_environment: None, environment_names: &[], key_aliases: &[], automatic: true },
+    ArquivoPt { name: "arquivopt", pagination: PaginationCapability::StreamingReplay, requires_key: false, key_environment: None, environment_names: &[], key_aliases: &[], automatic: true },
     Bevigil { name: "bevigil", pagination: PaginationCapability::None, requires_key: true, key_environment: Some("BEVIGIL_API_KEY"), environment_names: &["BEVIGIL_API_KEY"], key_aliases: &[], automatic: true },
     BinaryEdge { name: "binaryedge", pagination: PaginationCapability::None, requires_key: true, key_environment: Some("BINARYEDGE_API_KEY"), environment_names: &["BINARYEDGE_API_KEY"], key_aliases: &[], automatic: false },
     Brave { name: "brave", pagination: PaginationCapability::FixedOffset, requires_key: true, key_environment: Some("BRAVE_SEARCH_API_KEY"), environment_names: &["BRAVE_SEARCH_API_KEY"], key_aliases: &[], automatic: true },
@@ -346,6 +353,7 @@ define_sources! {
     Otx { name: "otx", pagination: PaginationCapability::Numeric, requires_key: true, key_environment: Some("OTX_API_KEY"), environment_names: &["OTX_API_KEY", "X_OTX_API_KEY"], key_aliases: &["alienvault"], automatic: false },
     SecurityTrails { name: "securitytrails", pagination: PaginationCapability::OpaqueReplay, requires_key: true, key_environment: Some("SECURITYTRAILS_API_KEY"), environment_names: &["SECURITYTRAILS_API_KEY"], key_aliases: &[], automatic: true },
     Shodan { name: "shodan", pagination: PaginationCapability::Numeric, requires_key: true, key_environment: Some("SHODAN_API_KEY"), environment_names: &["SHODAN_API_KEY"], key_aliases: &[], automatic: true },
+    ShrewdEye { name: "shrewdeye", pagination: PaginationCapability::StreamingReplay, requires_key: false, key_environment: None, environment_names: &[], key_aliases: &[], automatic: true },
     SubdomainCenter { name: "subdomaincenter", pagination: PaginationCapability::None, requires_key: false, key_environment: None, environment_names: &[], key_aliases: &[], automatic: true },
     SubdomainApp { name: "subdomainapp", pagination: PaginationCapability::None, requires_key: false, key_environment: None, environment_names: &[], key_aliases: &[], automatic: true },
     Urlscan { name: "urlscan", pagination: PaginationCapability::OpaqueReplay, requires_key: false, key_environment: Some("URLSCAN_API_KEY"), environment_names: &["URLSCAN_API_KEY"], key_aliases: &[], automatic: true },
@@ -909,6 +917,7 @@ fn source_metadata_from_definition(entry: SourceDefinition) -> SourceMetadata {
             | "reconcloud"
             | "reconeer"
             | "riddler"
+            | "shrewdeye"
             | "sitedossier"
             | "subdomainapp"
             | "subdomaincenter"
@@ -925,8 +934,10 @@ fn source_metadata_from_definition(entry: SourceDefinition) -> SourceMetadata {
         "none"
     };
     let cost = match name {
-        "commoncrawl" | "dnsdb" | "github" | "gitlab" | "netlas" | "postman" | "robtex"
-        | "submd" | "thc" | "urlscan" | "wayback" | "waybackarchive" => "high",
+        "arquivopt" | "commoncrawl" | "dnsdb" | "github" | "gitlab" | "netlas" | "postman"
+        | "robtex" | "shrewdeye" | "submd" | "thc" | "urlscan" | "wayback" | "waybackarchive" => {
+            "high"
+        }
         "crtsh" | "certspotter" | "virustotal" | "shodan" | "censys" | "whoisxml"
         | "whoisxmlapi" | "binaryedge" | "brave" | "merklemap" => "medium",
         _ => "low",
@@ -936,6 +947,7 @@ fn source_metadata_from_definition(entry: SourceDefinition) -> SourceMetadata {
         "certspotter" => 12,
         "hackertarget" => 5,
         "commoncrawl" | "wayback" | "waybackarchive" => 10,
+        "arquivopt" | "shrewdeye" => 5,
         "hudsonrock" | "rapiddns" | "reconcloud" | "riddler" | "sitedossier" | "threatcrowd"
         | "threatminer" => 5,
         "submd" => 60,
@@ -1512,7 +1524,7 @@ pub fn source_policy(source: &str) -> SourcePolicy {
             attempts: 3,
             base_backoff: Duration::from_millis(750),
         },
-        "commoncrawl" => SourcePolicy {
+        "commoncrawl" | "arquivopt" => SourcePolicy {
             timeout: Duration::from_secs(30),
             total_timeout: Duration::from_secs(45),
             attempts: 2,
@@ -1529,6 +1541,18 @@ pub fn source_policy(source: &str) -> SourcePolicy {
             total_timeout: Duration::from_secs(45),
             attempts: 2,
             base_backoff: Duration::from_millis(750),
+        },
+        "shrewdeye" => SourcePolicy {
+            timeout: Duration::from_secs(20),
+            total_timeout: Duration::from_secs(30),
+            attempts: 2,
+            base_backoff: Duration::from_secs(1),
+        },
+        "shodan-internetdb" => SourcePolicy {
+            timeout: Duration::from_secs(5),
+            total_timeout: Duration::from_secs(20),
+            attempts: 1,
+            base_backoff: Duration::from_secs(1),
         },
         "thc" => SourcePolicy {
             timeout: Duration::from_secs(30),
@@ -2293,6 +2317,7 @@ fn host_minimum_gap(host: &str) -> Duration {
         "urlscan.io" | "api.urlscan.io" => Duration::from_millis(500),
         "api.certspotter.com" => Duration::from_millis(250),
         "api.search.brave.com" | "api.merklemap.com" => Duration::from_secs(3),
+        "internetdb.shodan.io" => Duration::from_secs(1),
         _ => Duration::from_millis(100),
     }
 }
@@ -2356,8 +2381,11 @@ async fn throttle_external_source(source: &str) {
 /// internal content fetch from inheriting the conservative unknown-source
 /// fallback while avoiding fake public source metadata.
 fn internal_transport_rate_limit_per_minute(source: &str) -> Option<u32> {
-    const INTERNAL_TRANSPORT_RATES: &[(&str, u32)] =
-        &[("github-content", 600), ("gitlab-content", 600)];
+    const INTERNAL_TRANSPORT_RATES: &[(&str, u32)] = &[
+        ("github-content", 600),
+        ("gitlab-content", 600),
+        ("shodan-internetdb", 60),
+    ];
     INTERNAL_TRANSPORT_RATES
         .iter()
         .find_map(|(name, limit)| (*name == source).then_some(*limit))
@@ -2558,6 +2586,8 @@ async fn buffer_external_response(
 fn external_response_buffer_limit(source: Option<&str>) -> usize {
     if source == Some("commoncrawl") {
         COMMONCRAWL_MAX_BODY_BYTES
+    } else if source == Some("shodan-internetdb") {
+        256 * 1024
     } else {
         MAX_EXTERNAL_BODY_BYTES
     }
@@ -3094,6 +3124,7 @@ async fn fetch_detailed_with_total_budget(
             SourceId::Urlscan => urlscan(domain, timeout, keys).await,
             SourceId::Anubis => public_sources::anubis(domain, timeout).await,
             SourceId::AnubisDb => anubisdb(domain, timeout).await,
+            SourceId::ArquivoPt => public_sources::arquivopt(domain, timeout).await,
             SourceId::SubdomainApp => subdomainapp(domain, timeout).await,
             SourceId::VirusTotal => virustotal(domain, timeout, keys).await,
             SourceId::WhoisXml | SourceId::WhoisXmlApi => whoisxml(domain, timeout, keys).await,
@@ -3147,6 +3178,7 @@ async fn fetch_detailed_with_total_budget(
             SourceId::Robtex => keyed_sources::robtex(domain, timeout, keys).await,
             SourceId::RseCloud => keyed_sources::rsecloud(domain, timeout, keys).await,
             SourceId::ShodanCt => public_sources::shodanct(domain, timeout).await,
+            SourceId::ShrewdEye => public_sources::shrewdeye(domain, timeout).await,
             SourceId::SiteDossier => public_sources::sitedossier(domain, timeout).await,
             SourceId::SubMd => public_sources::submd(domain, timeout, keys).await,
             SourceId::Thc => public_sources::thc(domain, timeout).await,
@@ -4978,10 +5010,14 @@ mod tests {
         let deep = automatic_sources_for_profile(&keys, true);
         assert!(!balanced.contains(&"anubisdb".to_owned()));
         assert!(!balanced.contains(&"anubis".to_owned()));
+        assert!(balanced.contains(&"arquivopt".to_owned()));
+        assert!(!balanced.contains(&"shrewdeye".to_owned()));
         assert!(!balanced.contains(&"subdomainapp".to_owned()));
         assert!(!balanced.contains(&"driftnet".to_owned()));
         assert!(deep.contains(&"anubisdb".to_owned()));
         assert!(deep.contains(&"anubis".to_owned()));
+        assert!(deep.contains(&"arquivopt".to_owned()));
+        assert!(deep.contains(&"shrewdeye".to_owned()));
         assert!(deep.contains(&"subdomainapp".to_owned()));
         assert!(deep.contains(&"subdomaincenter".to_owned()));
         assert!(deep.contains(&"hudsonrock".to_owned()));
@@ -5008,7 +5044,7 @@ mod tests {
             assert!(sources.contains(canonical));
             assert!(!sources.contains(alias));
         }
-        assert_eq!(sources.len(), 62);
+        assert_eq!(sources.len(), 64);
     }
 
     #[test]
@@ -5076,6 +5112,7 @@ mod tests {
         let expected = BTreeSet::from([
             "alienvault",
             "anubis",
+            "arquivopt",
             "bevigil",
             "bufferover",
             "builtwith",
@@ -5118,6 +5155,7 @@ mod tests {
             "securitytrails",
             "shodan",
             "shodanct",
+            "shrewdeye",
             "sitedossier",
             "submd",
             "thc",
@@ -5164,10 +5202,10 @@ mod tests {
             .copied()
             .collect::<BTreeSet<_>>();
         assert_eq!(registered, expected_registry);
-        assert_eq!(expected.len(), 57);
+        assert_eq!(expected.len(), 59);
         assert_eq!(native.len(), 5);
         assert_eq!(compatibility.len(), 5);
-        assert_eq!(SOURCE_DEFINITIONS.len(), 67);
+        assert_eq!(SOURCE_DEFINITIONS.len(), 69);
     }
 
     #[test]
@@ -5331,7 +5369,16 @@ mod tests {
         );
         assert_eq!(
             names_for(PaginationCapability::StreamingReplay),
-            BTreeSet::from(["circl", "crtsh", "netlas", "profundis", "robtex", "submd"])
+            BTreeSet::from([
+                "arquivopt",
+                "circl",
+                "crtsh",
+                "netlas",
+                "profundis",
+                "robtex",
+                "shrewdeye",
+                "submd",
+            ])
         );
         assert_eq!(
             names_for(PaginationCapability::AsyncPolling),
