@@ -30,6 +30,12 @@ class ReleaseConsistencyTests(unittest.TestCase):
             ["README.md: missing 'v1.0.1'"],
         )
 
+    def test_unexpected_occurrence_count_is_reported(self):
+        self.assertEqual(
+            MODULE.require_occurrences("workflow", "upload upload", "upload", 1),
+            ["workflow: expected 1 occurrences of 'upload', found 2"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

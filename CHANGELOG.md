@@ -6,6 +6,10 @@ Published releases and downloadable artifacts are available on [GitHub Releases]
 
 ## [Unreleased]
 
+### Fixed
+
+- retry transient GitHub API failures throughout draft cleanup, asset upload, verification, and publication while keeping the seven-asset release set closed and published releases immutable.
+
 ## [0.12.2] - 2026-07-19
 
 ### Fixed
