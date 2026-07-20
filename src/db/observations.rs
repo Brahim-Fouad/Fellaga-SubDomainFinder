@@ -56,23 +56,70 @@ impl Database {
         source: &str,
         limit: usize,
     ) -> Result<Vec<String>> {
+        self.observation_names_bounded_before(root_domain, source, limit, None)
+    }
+
+    pub fn observation_names_bounded_until(
+        &self,
+        root_domain: &str,
+        source: &str,
+        limit: usize,
+        deadline: Instant,
+    ) -> Result<Vec<String>> {
+        self.observation_names_bounded_before(root_domain, source, limit, Some(deadline))
+    }
+
+    fn observation_names_bounded_before(
+        &self,
+        root_domain: &str,
+        source: &str,
+        limit: usize,
+        deadline: Option<Instant>,
+    ) -> Result<Vec<String>> {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let connection = self.lock()?;
+        ensure_passive_persistence_deadline(deadline)?;
+        let connection = self.lock_passive_until(deadline)?;
         let mut statement = connection.prepare(
-            r#"SELECT DISTINCT n.fqdn FROM observation_evidence e
+            r#"SELECT e.name_id, n.fqdn FROM observation_evidence e
                JOIN observed_names n ON n.id=e.name_id
-               WHERE e.root_domain=?1 AND e.source=?2
-               ORDER BY n.fqdn LIMIT ?3"#,
+               WHERE e.root_domain=?1 AND e.source=?2 AND e.name_id>?3
+               ORDER BY e.name_id LIMIT ?4"#,
         )?;
-        statement
-            .query_map(
-                params![root_domain, source, limit.min(i64::MAX as usize) as i64],
-                |row| row.get::<_, String>(0),
-            )?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(Into::into)
+        let mut names = BTreeSet::new();
+        let mut last_name_id = 0_i64;
+        while names.len() < limit {
+            ensure_passive_persistence_deadline(deadline)?;
+            let page_limit = limit
+                .saturating_sub(names.len())
+                .clamp(1, 4_096)
+                .min(i64::MAX as usize) as i64;
+            let mut rows =
+                statement.query(params![root_domain, source, last_name_id, page_limit])?;
+            let mut page_last_name_id = None;
+            let mut page_rows = 0_usize;
+            while let Some(row) = rows.next()? {
+                if page_rows.is_multiple_of(256) {
+                    ensure_passive_persistence_deadline(deadline)?;
+                }
+                let name_id = row.get::<_, i64>(0)?;
+                page_last_name_id = Some(name_id);
+                names.insert(row.get::<_, String>(1)?);
+                page_rows = page_rows.saturating_add(1);
+            }
+            drop(rows);
+            let Some(page_last_name_id) = page_last_name_id else {
+                break;
+            };
+            last_name_id = page_last_name_id;
+        }
+        ensure_passive_persistence_deadline(deadline)?;
+        // The observation index is ordered by (root_domain, source, name_id),
+        // so every page can stop without first sorting every matching FQDN.
+        // Moving the keyset cursor past the last name_id also skips any
+        // remaining evidence variants for an already collected name.
+        Ok(names.into_iter().collect())
     }
 
     pub fn wildcard_cache(&self, zone: &str) -> Result<Option<WildcardCacheEntry>> {

@@ -1,5 +1,32 @@
 use super::*;
 
+pub(super) struct PassiveConnectionGuard<'a> {
+    connection: std::sync::MutexGuard<'a, Connection>,
+    restore_busy_timeout: bool,
+}
+
+impl std::ops::Deref for PassiveConnectionGuard<'_> {
+    type Target = Connection;
+
+    fn deref(&self) -> &Self::Target {
+        &self.connection
+    }
+}
+
+impl std::ops::DerefMut for PassiveConnectionGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.connection
+    }
+}
+
+impl Drop for PassiveConnectionGuard<'_> {
+    fn drop(&mut self) {
+        if self.restore_busy_timeout {
+            let _ = self.connection.busy_timeout(Duration::from_secs(5));
+        }
+    }
+}
+
 impl Database {
     pub fn open(path: &Path) -> Result<Self> {
         prepare_private_database_storage(path)?;
@@ -1070,6 +1097,53 @@ impl Database {
         self.connection
             .lock()
             .map_err(|_| anyhow::anyhow!("verrou SQLite empoisonné"))
+    }
+
+    pub(super) fn lock_passive_until(
+        &self,
+        deadline: Option<Instant>,
+    ) -> Result<PassiveConnectionGuard<'_>> {
+        let Some(deadline) = deadline else {
+            return Ok(PassiveConnectionGuard {
+                connection: self.lock()?,
+                restore_busy_timeout: false,
+            });
+        };
+        loop {
+            if Instant::now() >= deadline {
+                return Err(passive_persistence_deadline_error());
+            }
+            match self.connection.try_lock() {
+                Ok(connection) => {
+                    if Instant::now() >= deadline {
+                        drop(connection);
+                        return Err(passive_persistence_deadline_error());
+                    }
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    connection.busy_timeout(
+                        remaining
+                            .min(Duration::from_millis(250))
+                            .max(Duration::from_millis(1)),
+                    )?;
+                    return Ok(PassiveConnectionGuard {
+                        connection,
+                        restore_busy_timeout: true,
+                    });
+                }
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    bail!("verrou SQLite empoisonné")
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    let retry = deadline
+                        .saturating_duration_since(Instant::now())
+                        .min(CT_MATERIALIZATION_LOCK_RETRY);
+                    if retry.is_zero() {
+                        return Err(passive_persistence_deadline_error());
+                    }
+                    std::thread::sleep(retry);
+                }
+            }
+        }
     }
 
     pub(super) fn lock_ct_materialization_until(

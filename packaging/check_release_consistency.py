@@ -55,6 +55,10 @@ def require_tokens(label: str, text: str, tokens: list[str]) -> list[str]:
     return [f"{label}: missing {token!r}" for token in tokens if token not in text]
 
 
+def forbid_tokens(label: str, text: str, tokens: list[str]) -> list[str]:
+    return [f"{label}: forbidden {token!r}" for token in tokens if token in text]
+
+
 def require_occurrences(
     label: str, text: str, token: str, expected: int
 ) -> list[str]:
@@ -176,6 +180,23 @@ def check_repository(root: Path) -> list[str]:
                 "expected-final-asset-sizes",
                 "for attempt in 1 2 3; do",
                 'patch_status="transport_error"',
+                '--output "$RUNNER_TEMP/releases-page.json.tmp"',
+                'mv "$RUNNER_TEMP/releases-page.json.tmp" "$RUNNER_TEMP/releases-page.json"',
+                '--output "$RUNNER_TEMP/draft-release.json.tmp"',
+                'mv "$RUNNER_TEMP/draft-release.json.tmp" "$RUNNER_TEMP/draft-release.json"',
+                '--output "$RUNNER_TEMP/published-release.json.tmp"',
+                'mv "$RUNNER_TEMP/published-release.json.tmp" "$RUNNER_TEMP/published-release.json"',
+            ],
+        )
+    )
+    errors.extend(
+        forbid_tokens(
+            ".github/workflows/release.yml",
+            workflow,
+            [
+                '> "$RUNNER_TEMP/releases-page.json"',
+                '> "$RUNNER_TEMP/draft-release.json"',
+                '> "$RUNNER_TEMP/published-release.json"',
             ],
         )
     )

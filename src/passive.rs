@@ -26,14 +26,16 @@ pub use config::{
     default_config_path, source_statuses,
 };
 pub use pagination::{
-    PassiveFetchResult, PassivePageSink, PassivePaginationContext, PassivePaginationContract,
-    PassivePaginationFinishSink, PassivePaginationPageSink, numeric_pagination_contract,
-    numeric_pagination_contracts,
+    ControlledPassivePageSink, PassiveFetchResult, PassivePageSink, PassivePaginationContext,
+    PassivePaginationContract, PassivePaginationFinishSink, PassivePaginationPageSink,
+    PassiveSinkControl, numeric_pagination_contract, numeric_pagination_contracts,
 };
 pub use providers::{current_commoncrawl_endpoint, seed_commoncrawl_endpoint};
 pub use runtime::{
-    fetch, fetch_detailed, fetch_detailed_bounded, fetch_detailed_bounded_with_limit,
-    fetch_detailed_bounded_with_pagination, fetch_detailed_bounded_with_sink,
+    fetch, fetch_detailed, fetch_detailed_bounded,
+    fetch_detailed_bounded_with_controlled_pagination, fetch_detailed_bounded_with_controlled_sink,
+    fetch_detailed_bounded_with_limit, fetch_detailed_bounded_with_pagination,
+    fetch_detailed_bounded_with_sink,
 };
 
 pub(crate) use config::sanitize_external_error;

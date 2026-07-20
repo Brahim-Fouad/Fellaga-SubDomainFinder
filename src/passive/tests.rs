@@ -1230,7 +1230,10 @@ async fn connector_wall_clock_budget_cancels_a_slow_tail() {
     })
     .await;
     assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("slow-test"));
+    let error = result.unwrap_err().to_string();
+    assert!(error.contains("slow-test"));
+    assert!(error.contains("10ms"));
+    assert!(!error.contains(".0s"));
     assert!(started.elapsed() < Duration::from_millis(250));
 }
 
@@ -1308,6 +1311,104 @@ async fn capped_checkpoint_persists_the_full_page_before_retaining_a_partial_set
 }
 
 #[tokio::test]
+async fn connector_budget_includes_non_paginated_persistence() {
+    let sink: ControlledPassivePageSink = Arc::new(|_, control| {
+        while !control.is_cancelled() {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        control.ensure_active()
+    });
+    let started = Instant::now();
+
+    let result = enforce_source_budget_preserving_partial_with_controlled_sink(
+        "persistence-test",
+        Duration::from_millis(25),
+        async { Ok(BTreeSet::from(["api.example.com".to_owned()])) },
+        10,
+        Some(sink),
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.names, BTreeSet::from(["api.example.com".to_owned()]));
+    assert!(
+        result
+            .partial_warning
+            .as_deref()
+            .is_some_and(|warning| warning.contains("persistance"))
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(150),
+        "la persistance a dépassé le délai du connecteur: {:?}",
+        started.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn aborting_connector_cancels_non_paginated_persistence_without_late_writes() {
+    let writes = Arc::new(AtomicUsize::new(0));
+    let writes_for_sink = Arc::clone(&writes);
+    let (started_sender, started_receiver) = tokio::sync::oneshot::channel();
+    let started_sender = Arc::new(StdMutex::new(Some(started_sender)));
+    let started_for_sink = Arc::clone(&started_sender);
+    let (finished_sender, finished_receiver) = tokio::sync::oneshot::channel();
+    let finished_sender = Arc::new(StdMutex::new(Some(finished_sender)));
+    let finished_for_sink = Arc::clone(&finished_sender);
+    let sink: ControlledPassivePageSink = Arc::new(move |_, control| {
+        if let Some(sender) = started_for_sink
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            let _ = sender.send(());
+        }
+        while !control.is_cancelled() {
+            std::thread::yield_now();
+        }
+        if control.ensure_active().is_ok() {
+            writes_for_sink.fetch_add(1, Ordering::SeqCst);
+        }
+        if let Some(sender) = finished_for_sink
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            let _ = sender.send(());
+        }
+        control.ensure_active()
+    });
+
+    let connector = tokio::spawn(async move {
+        enforce_source_budget_preserving_partial_with_controlled_sink(
+            "abort-persistence-test",
+            Duration::from_secs(30),
+            async { Ok(BTreeSet::from(["api.example.com".to_owned()])) },
+            10,
+            Some(sink),
+            None,
+        )
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(1), started_receiver)
+        .await
+        .expect("the persistence sink did not start")
+        .expect("the persistence sink dropped its start notification");
+
+    connector.abort();
+    let join_error = connector
+        .await
+        .expect_err("the connector unexpectedly completed before cancellation");
+    assert!(join_error.is_cancelled());
+    tokio::time::timeout(Duration::from_secs(1), finished_receiver)
+        .await
+        .expect("the cancelled persistence sink remained detached")
+        .expect("the persistence sink dropped its finish notification");
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    assert_eq!(writes.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn connector_returns_committed_pages_when_a_later_page_fails() {
     let result =
         enforce_source_budget_preserving_partial("paginated-test", Duration::from_secs(1), async {
@@ -1372,12 +1473,9 @@ async fn a_deadline_without_a_committed_page_is_deferred_not_failed() {
     .unwrap();
 
     assert!(result.names.is_empty());
-    assert!(
-        result
-            .partial_warning
-            .as_deref()
-            .is_some_and(|warning| warning.contains("empty-test") && warning.contains("limite"))
-    );
+    assert!(result.partial_warning.as_deref().is_some_and(|warning| {
+        warning.contains("empty-test") && warning.contains("délai de sécurité")
+    }));
 }
 
 #[test]

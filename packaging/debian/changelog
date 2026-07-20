@@ -1,3 +1,12 @@
+fellaga (0.12.3-1) unstable; urgency=medium
+
+  * Keep passive progress responsive during cache and lease contention.
+  * Show durable page, decoded-name, and new-name progress for active sources.
+  * Stop passive persistence cleanly on deadlines and task cancellation.
+  * Harden retry-safe GitHub release response handling.
+
+ -- Brahim-Fouad GUIA <170998597+Brahim-Fouad@users.noreply.github.com>  Mon, 20 Jul 2026 00:00:00 -0400
+
 fellaga (0.12.2-1) unstable; urgency=medium
 
   * Keep per-provider deadlines active in globally unlimited scans.

@@ -728,11 +728,79 @@ struct WriterMessage {
     root_domain: String,
     observations: Vec<ObservationInput>,
     passive_refresh_source: Option<String>,
-    reply: mpsc::Sender<std::result::Result<ObservationWriteStats, String>>,
+    deadline: Option<Instant>,
+    reply: mpsc::Sender<Result<ObservationWriteStats>>,
 }
 
 struct ObservationWriter {
     sender: mpsc::Sender<WriterMessage>,
+}
+
+#[derive(Debug)]
+struct PassivePersistenceDeadlineExceeded;
+
+impl std::fmt::Display for PassivePersistenceDeadlineExceeded {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("délai de persistance SQLite passive dépassé")
+    }
+}
+
+impl std::error::Error for PassivePersistenceDeadlineExceeded {}
+
+pub(crate) fn is_passive_persistence_deadline_error(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<PassivePersistenceDeadlineExceeded>()
+        .is_some()
+}
+
+fn is_sqlite_contention_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<rusqlite::Error>(),
+            Some(rusqlite::Error::SqliteFailure(inner, _))
+                if matches!(
+                    inner.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                )
+        )
+    })
+}
+
+pub(crate) fn is_passive_bookkeeping_deferred_error(error: &anyhow::Error) -> bool {
+    is_passive_persistence_deadline_error(error) || is_sqlite_contention_error(error)
+}
+
+fn passive_persistence_deadline_error() -> anyhow::Error {
+    anyhow::Error::new(PassivePersistenceDeadlineExceeded)
+}
+
+fn ensure_passive_persistence_deadline(deadline: Option<Instant>) -> Result<()> {
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return Err(passive_persistence_deadline_error());
+    }
+    Ok(())
+}
+
+fn receive_observation_writer_reply(
+    response: mpsc::Receiver<Result<ObservationWriteStats>>,
+    deadline: Option<Instant>,
+) -> Result<ObservationWriteStats> {
+    match deadline {
+        Some(deadline) => {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            ensure_passive_persistence_deadline(Some(deadline))?;
+            match response.recv_timeout(remaining) {
+                Ok(reply) => reply,
+                Err(mpsc::RecvTimeoutError::Timeout) => Err(passive_persistence_deadline_error()),
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    bail!("réponse du writer SQLite absente");
+                }
+            }
+        }
+        None => response
+            .recv()
+            .map_err(|_| anyhow::anyhow!("réponse du writer SQLite absente"))?,
+    }
 }
 
 impl ObservationWriter {
@@ -745,9 +813,9 @@ impl ObservationWriter {
                 let connection = Connection::open(&path);
                 let Ok(mut connection) = connection else {
                     for message in receiver {
-                        let _ = message
-                            .reply
-                            .send(Err("ouverture du writer SQLite impossible".to_owned()));
+                        let _ = message.reply.send(Err(anyhow::anyhow!(
+                            "ouverture du writer SQLite impossible"
+                        )));
                     }
                     return;
                 };
@@ -757,7 +825,7 @@ impl ObservationWriter {
                 let _ = connection.busy_timeout(std::time::Duration::from_secs(5));
                 if let Err(error) = secure_existing_sqlite_files(&path) {
                     for message in receiver {
-                        let _ = message.reply.send(Err(format!(
+                        let _ = message.reply.send(Err(anyhow::anyhow!(
                             "protection du writer SQLite impossible: {error:#}"
                         )));
                     }
@@ -770,14 +838,14 @@ impl ObservationWriter {
                             &message.root_domain,
                             source,
                             &message.observations,
+                            message.deadline,
                         ),
                         None => insert_observations_with_stats(
                             &mut connection,
                             &message.root_domain,
                             &message.observations,
                         ),
-                    }
-                    .map_err(|error| format!("{error:#}"));
+                    };
                     let _ = message.reply.send(result);
                 }
             })?;
@@ -798,13 +866,11 @@ impl ObservationWriter {
                 root_domain: root_domain.to_owned(),
                 observations,
                 passive_refresh_source: None,
+                deadline: None,
                 reply,
             })
             .map_err(|_| anyhow::anyhow!("writer SQLite arrêté"))?;
-        response
-            .recv()
-            .map_err(|_| anyhow::anyhow!("réponse du writer SQLite absente"))?
-            .map_err(anyhow::Error::msg)
+        receive_observation_writer_reply(response, None)
     }
 
     fn submit_passive_page_with_stats(
@@ -813,22 +879,48 @@ impl ObservationWriter {
         source: &str,
         observations: Vec<ObservationInput>,
     ) -> Result<ObservationWriteStats> {
+        self.submit_passive_page_with_stats_before(root_domain, source, observations, None)
+    }
+
+    fn submit_passive_page_with_stats_until(
+        &self,
+        root_domain: &str,
+        source: &str,
+        observations: Vec<ObservationInput>,
+        deadline: Instant,
+    ) -> Result<ObservationWriteStats> {
+        self.submit_passive_page_with_stats_before(
+            root_domain,
+            source,
+            observations,
+            Some(deadline),
+        )
+    }
+
+    fn submit_passive_page_with_stats_before(
+        &self,
+        root_domain: &str,
+        source: &str,
+        observations: Vec<ObservationInput>,
+        deadline: Option<Instant>,
+    ) -> Result<ObservationWriteStats> {
         // Even an empty provider page is durable progress: it starts or
         // refreshes the restart session and creates the incomplete cache
         // marker in one transaction, so it must still reach the writer.
+        if deadline.is_some_and(|deadline| deadline <= Instant::now()) {
+            return Err(passive_persistence_deadline_error());
+        }
         let (reply, response) = mpsc::channel();
         self.sender
             .send(WriterMessage {
                 root_domain: root_domain.to_owned(),
                 observations,
                 passive_refresh_source: Some(source.to_owned()),
+                deadline,
                 reply,
             })
             .map_err(|_| anyhow::anyhow!("writer SQLite arrêté"))?;
-        response
-            .recv()
-            .map_err(|_| anyhow::anyhow!("réponse du writer SQLite absente"))?
-            .map_err(anyhow::Error::msg)
+        receive_observation_writer_reply(response, deadline)
     }
 }
 
@@ -859,22 +951,47 @@ fn insert_passive_observations_with_stats(
     root_domain: &str,
     source: &str,
     observations: &[ObservationInput],
+    deadline: Option<Instant>,
 ) -> Result<ObservationWriteStats> {
-    let transaction = connection.transaction()?;
-    let stats = insert_passive_observation_rows_with_stats(
-        &transaction,
-        root_domain,
-        source,
-        observations,
-    )?;
-    transaction.execute(
-        r#"INSERT OR IGNORE INTO passive_cache(
-               root_domain, source, names_json, updated_at
-           ) VALUES (?1, ?2, '[]', 0)"#,
-        params![root_domain, source],
-    )?;
-    transaction.commit()?;
-    Ok(stats)
+    ensure_passive_persistence_deadline(deadline)?;
+    let busy_timeout = deadline
+        .map(|deadline| {
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(250))
+                .max(Duration::from_millis(1))
+        })
+        .unwrap_or(Duration::from_secs(5));
+    connection.busy_timeout(busy_timeout)?;
+    let result = (|| {
+        ensure_passive_persistence_deadline(deadline)?;
+        let transaction = connection.transaction()?;
+        let stats = insert_passive_observation_rows_with_stats_before(
+            &transaction,
+            root_domain,
+            source,
+            observations,
+            deadline,
+        )?;
+        ensure_passive_persistence_deadline(deadline)?;
+        transaction.execute(
+            r#"INSERT OR IGNORE INTO passive_cache(
+                   root_domain, source, names_json, updated_at
+               ) VALUES (?1, ?2, '[]', 0)"#,
+            params![root_domain, source],
+        )?;
+        ensure_passive_persistence_deadline(deadline)?;
+        transaction.commit()?;
+        Ok(stats)
+    })();
+    let restore = connection
+        .busy_timeout(Duration::from_secs(5))
+        .context("restauration du délai SQLite après persistance passive");
+    match (result, restore) {
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Ok(stats), Ok(())) => Ok(stats),
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1013,13 +1130,20 @@ fn clear_passive_refresh_session(
     Ok(())
 }
 
-fn insert_passive_observation_rows_with_stats(
+fn insert_passive_observation_rows_with_stats_before(
     connection: &Connection,
     root_domain: &str,
     source: &str,
     observations: &[ObservationInput],
+    deadline: Option<Instant>,
 ) -> Result<ObservationWriteStats> {
-    insert_observation_rows_with_refresh_stats(connection, root_domain, Some(source), observations)
+    insert_observation_rows_with_refresh_stats_before(
+        connection,
+        root_domain,
+        Some(source),
+        observations,
+        deadline,
+    )
 }
 
 fn insert_observation_rows_with_refresh_stats(
@@ -1028,12 +1152,32 @@ fn insert_observation_rows_with_refresh_stats(
     passive_refresh_source: Option<&str>,
     observations: &[ObservationInput],
 ) -> Result<ObservationWriteStats> {
+    insert_observation_rows_with_refresh_stats_before(
+        connection,
+        root_domain,
+        passive_refresh_source,
+        observations,
+        None,
+    )
+}
+
+fn insert_observation_rows_with_refresh_stats_before(
+    connection: &Connection,
+    root_domain: &str,
+    passive_refresh_source: Option<&str>,
+    observations: &[ObservationInput],
+    deadline: Option<Instant>,
+) -> Result<ObservationWriteStats> {
+    ensure_passive_persistence_deadline(deadline)?;
     let now = now_epoch();
     let refresh_generation = passive_refresh_source
         .map(|source| begin_passive_refresh_session(connection, root_domain, source, now))
         .transpose()?;
     let mut stats = ObservationWriteStats::default();
-    for observation in observations {
+    for (index, observation) in observations.iter().enumerate() {
+        if index % 32 == 0 {
+            ensure_passive_persistence_deadline(deadline)?;
+        }
         let inserted = connection.execute(
             r#"INSERT OR IGNORE INTO observed_names(
                    fqdn, reversed_name, first_seen, last_seen
@@ -1096,6 +1240,7 @@ fn insert_observation_rows_with_refresh_stats(
         }
         stats.written = stats.written.saturating_add(1);
     }
+    ensure_passive_persistence_deadline(deadline)?;
     Ok(stats)
 }
 

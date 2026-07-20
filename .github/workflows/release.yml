@@ -609,11 +609,12 @@ jobs:
             curl --retry 6 --retry-connrefused --retry-max-time 180 \
               --connect-timeout 15 --max-time 60 \
               --fail-with-body --silent --show-error \
+              --output "$RUNNER_TEMP/releases-page.json.tmp" \
               --header "Accept: application/vnd.github+json" \
               --header "Authorization: Bearer ${GH_TOKEN}" \
               --header "X-GitHub-Api-Version: 2022-11-28" \
-              "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/releases?per_page=100&page=${page}" \
-              > "$RUNNER_TEMP/releases-page.json"
+              "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/releases?per_page=100&page=${page}"
+            mv "$RUNNER_TEMP/releases-page.json.tmp" "$RUNNER_TEMP/releases-page.json"
             jq -e 'type == "array"' "$RUNNER_TEMP/releases-page.json" >/dev/null
             page_length="$(jq 'length' "$RUNNER_TEMP/releases-page.json")"
             jq -s '.[0] + .[1]' \
@@ -783,11 +784,12 @@ jobs:
           curl --retry 6 --retry-connrefused --retry-max-time 180 \
             --connect-timeout 15 --max-time 60 \
             --fail-with-body --silent --show-error \
+            --output "$RUNNER_TEMP/draft-release.json.tmp" \
             --header "Accept: application/vnd.github+json" \
             --header "Authorization: Bearer ${GH_TOKEN}" \
             --header "X-GitHub-Api-Version: 2022-11-28" \
-            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" \
-            > "$RUNNER_TEMP/draft-release.json"
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}"
+          mv "$RUNNER_TEMP/draft-release.json.tmp" "$RUNNER_TEMP/draft-release.json"
           jq -e --arg tag "$GITHUB_REF_NAME" \
             '.draft == true and .tag_name == $tag and (.assets | length == 7) and all(.assets[]; .state == "uploaded" and .size > 0)' \
             "$RUNNER_TEMP/draft-release.json" >/dev/null
@@ -815,11 +817,12 @@ jobs:
             curl --retry 6 --retry-connrefused --retry-max-time 180 \
               --connect-timeout 15 --max-time 60 \
               --fail-with-body --silent --show-error \
+              --output "$RUNNER_TEMP/published-release.json.tmp" \
               --header "Accept: application/vnd.github+json" \
               --header "Authorization: Bearer ${GH_TOKEN}" \
               --header "X-GitHub-Api-Version: 2022-11-28" \
-              "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" \
-              > "$RUNNER_TEMP/published-release.json"
+              "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}"
+            mv "$RUNNER_TEMP/published-release.json.tmp" "$RUNNER_TEMP/published-release.json"
           }
 
           for attempt in 1 2 3; do

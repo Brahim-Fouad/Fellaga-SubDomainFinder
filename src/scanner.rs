@@ -4,7 +4,10 @@ use crate::confidence::{assess_with_context as assess_confidence, evidence_famil
 use crate::ct_monitor::{
     CtProgressCallback, CtProgressEvent, monitor_ct_logs_bounded_with_progress_and_limit,
 };
-use crate::db::{CachedAnswer, Database, IpHostnameCacheEntry};
+use crate::db::{
+    CachedAnswer, Database, IpHostnameCacheEntry, is_passive_bookkeeping_deferred_error,
+    is_passive_persistence_deadline_error,
+};
 use crate::discovery::discover_dns_graph;
 use crate::dns::{DnsEngine, DnsResolutionOutcome, WildcardProbeOutcome};
 use crate::dnssec::discover_nsec_bounded;
@@ -17,12 +20,12 @@ use crate::model::{
     StopReason, WebObservation, WildcardVerdict,
 };
 use crate::passive::{
-    ApiKeyStore, PassiveFetchResult, PassivePageSink, PassivePaginationContext,
+    ApiKeyStore, ControlledPassivePageSink, PassiveFetchResult, PassivePaginationContext,
     PassivePaginationFinishSink, PassivePaginationPageSink, current_commoncrawl_endpoint,
-    fetch_detailed_bounded_with_pagination as fetch_passive_paginated,
-    fetch_detailed_bounded_with_sink as fetch_passive_bounded, numeric_pagination_contracts,
-    sanitize_external_error, seed_commoncrawl_endpoint, source_metadata, source_policy,
-    with_external_target_guard,
+    fetch_detailed_bounded_with_controlled_pagination as fetch_passive_paginated,
+    fetch_detailed_bounded_with_controlled_sink as fetch_passive_bounded,
+    numeric_pagination_contracts, sanitize_external_error, seed_commoncrawl_endpoint,
+    source_metadata, source_policy, with_external_target_guard,
 };
 use crate::pipeline::DiscoveryPipeline;
 use crate::tls::discover as discover_tls_certificates;
@@ -51,7 +54,12 @@ const DNSSEC_WILDCARD_SUSPECT_CAP: usize = 4;
 const METADATA_PHASE_BUDGET_CAP: Duration = Duration::from_secs(30);
 const METADATA_DNS_CONCURRENCY: usize = 4;
 const ENRICHMENT_VALIDATION_BATCH_SIZE: usize = 4_000;
-const PASSIVE_REFRESH_LEASE_GRACE: Duration = Duration::from_secs(60);
+const PASSIVE_REFRESH_LEASE_GRACE: Duration = Duration::from_secs(5);
+const PASSIVE_REFRESH_RENEWAL_GRACE: Duration = Duration::from_secs(5);
+const PASSIVE_REFRESH_RELEASE_BUDGET: Duration = Duration::from_millis(250);
+const PASSIVE_REFRESH_DROP_RELEASE_BUDGET: Duration = Duration::from_millis(1);
+const PASSIVE_REFRESH_RELEASE_RETRY_BUDGET: Duration = Duration::from_millis(250);
+const PASSIVE_BOOKKEEPING_BUDGET: Duration = Duration::from_secs(2);
 const INTERNETDB_PROVIDER: &str = "shodan-internetdb";
 const INTERNETDB_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const INTERNETDB_MAX_AGGREGATE_NAMES: usize = 2_000;

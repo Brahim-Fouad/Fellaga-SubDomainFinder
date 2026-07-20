@@ -111,15 +111,34 @@ impl Database {
     }
 
     pub fn prior_candidates(&self, limit: usize) -> Result<Vec<String>> {
-        let connection = self.lock()?;
+        self.prior_candidates_before(limit, None)
+    }
+
+    pub fn prior_candidates_until(&self, limit: usize, deadline: Instant) -> Result<Vec<String>> {
+        self.prior_candidates_before(limit, Some(deadline))
+    }
+
+    fn prior_candidates_before(
+        &self,
+        limit: usize,
+        deadline: Option<Instant>,
+    ) -> Result<Vec<String>> {
+        ensure_passive_persistence_deadline(deadline)?;
+        let connection = self.lock_passive_until(deadline)?;
         let mut statement = connection.prepare(
             r#"SELECT relative_name FROM candidate_priors
                ORDER BY priority DESC, relative_name ASC LIMIT ?1"#,
         )?;
-        statement
-            .query_map([limit as i64], |row| row.get::<_, String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(Into::into)
+        let mut rows = statement.query([limit.min(i64::MAX as usize) as i64])?;
+        let mut candidates = Vec::with_capacity(limit.min(4_096));
+        while let Some(row) = rows.next()? {
+            if candidates.len().is_multiple_of(256) {
+                ensure_passive_persistence_deadline(deadline)?;
+            }
+            candidates.push(row.get::<_, String>(0)?);
+        }
+        ensure_passive_persistence_deadline(deadline)?;
+        Ok(candidates)
     }
 
     pub fn enqueue_discovery_actions(

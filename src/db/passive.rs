@@ -11,13 +11,43 @@ impl Database {
         owner: &str,
         ttl: Duration,
     ) -> Result<bool> {
+        self.try_acquire_passive_refresh_lease_before(root_domain, source, owner, ttl, None)
+    }
+
+    pub fn try_acquire_passive_refresh_lease_until(
+        &self,
+        root_domain: &str,
+        source: &str,
+        owner: &str,
+        ttl: Duration,
+        deadline: Instant,
+    ) -> Result<bool> {
+        self.try_acquire_passive_refresh_lease_before(
+            root_domain,
+            source,
+            owner,
+            ttl,
+            Some(deadline),
+        )
+    }
+
+    fn try_acquire_passive_refresh_lease_before(
+        &self,
+        root_domain: &str,
+        source: &str,
+        owner: &str,
+        ttl: Duration,
+        deadline: Option<Instant>,
+    ) -> Result<bool> {
+        ensure_passive_persistence_deadline(deadline)?;
         if ttl.is_zero() {
             bail!("durée de lease passive nulle");
         }
         validate_passive_pagination_key(root_domain, source, "lease", 1, owner)?;
         let now = now_epoch();
         let expires_at = now.saturating_add(u64_to_i64_saturating(ttl.as_secs().max(1)));
-        let mut connection = self.lock()?;
+        let mut connection = self.lock_passive_until(deadline)?;
+        ensure_passive_persistence_deadline(deadline)?;
         let transaction = connection.transaction()?;
         cleanup_expired_passive_refresh_leases(&transaction, now)?;
         let acquired = transaction.execute(
@@ -32,6 +62,7 @@ impl Database {
                   OR passive_refresh_leases.owner=excluded.owner"#,
             params![root_domain, source, owner, expires_at, now],
         )? == 1;
+        ensure_passive_persistence_deadline(deadline)?;
         transaction.commit()?;
         Ok(acquired)
     }
@@ -46,13 +77,37 @@ impl Database {
         owner: &str,
         ttl: Duration,
     ) -> Result<bool> {
+        self.renew_passive_refresh_lease_before(root_domain, source, owner, ttl, None)
+    }
+
+    pub fn renew_passive_refresh_lease_until(
+        &self,
+        root_domain: &str,
+        source: &str,
+        owner: &str,
+        ttl: Duration,
+        deadline: Instant,
+    ) -> Result<bool> {
+        self.renew_passive_refresh_lease_before(root_domain, source, owner, ttl, Some(deadline))
+    }
+
+    fn renew_passive_refresh_lease_before(
+        &self,
+        root_domain: &str,
+        source: &str,
+        owner: &str,
+        ttl: Duration,
+        deadline: Option<Instant>,
+    ) -> Result<bool> {
+        ensure_passive_persistence_deadline(deadline)?;
         if ttl.is_zero() {
             bail!("durée de renouvellement passive nulle");
         }
         validate_passive_pagination_key(root_domain, source, "lease", 1, owner)?;
         let now = now_epoch();
         let expires_at = now.saturating_add(u64_to_i64_saturating(ttl.as_secs().max(1)));
-        let connection = self.lock()?;
+        let connection = self.lock_passive_until(deadline)?;
+        ensure_passive_persistence_deadline(deadline)?;
         Ok(connection.execute(
             r#"UPDATE passive_refresh_leases
                SET expires_at=?1, updated_at=?2
@@ -69,8 +124,30 @@ impl Database {
         source: &str,
         owner: &str,
     ) -> Result<bool> {
+        self.release_passive_refresh_lease_before(root_domain, source, owner, None)
+    }
+
+    pub fn release_passive_refresh_lease_until(
+        &self,
+        root_domain: &str,
+        source: &str,
+        owner: &str,
+        deadline: Instant,
+    ) -> Result<bool> {
+        self.release_passive_refresh_lease_before(root_domain, source, owner, Some(deadline))
+    }
+
+    fn release_passive_refresh_lease_before(
+        &self,
+        root_domain: &str,
+        source: &str,
+        owner: &str,
+        deadline: Option<Instant>,
+    ) -> Result<bool> {
+        ensure_passive_persistence_deadline(deadline)?;
         validate_passive_pagination_key(root_domain, source, "lease", 1, owner)?;
-        let connection = self.lock()?;
+        let connection = self.lock_passive_until(deadline)?;
+        ensure_passive_persistence_deadline(deadline)?;
         Ok(connection.execute(
             r#"DELETE FROM passive_refresh_leases
                WHERE root_domain=?1 AND source=?2 AND owner=?3"#,
@@ -85,6 +162,31 @@ impl Database {
         root_domain: &str,
         source: &str,
         expected_contracts: &[(&str, u32, &str)],
+    ) -> Result<()> {
+        self.prepare_passive_pagination_source_before(root_domain, source, expected_contracts, None)
+    }
+
+    pub fn prepare_passive_pagination_source_until(
+        &self,
+        root_domain: &str,
+        source: &str,
+        expected_contracts: &[(&str, u32, &str)],
+        deadline: Instant,
+    ) -> Result<()> {
+        self.prepare_passive_pagination_source_before(
+            root_domain,
+            source,
+            expected_contracts,
+            Some(deadline),
+        )
+    }
+
+    fn prepare_passive_pagination_source_before(
+        &self,
+        root_domain: &str,
+        source: &str,
+        expected_contracts: &[(&str, u32, &str)],
+        deadline: Option<Instant>,
     ) -> Result<()> {
         if expected_contracts.is_empty() {
             bail!("aucun contrat attendu pour la préparation passive");
@@ -106,7 +208,8 @@ impl Database {
             }
         }
 
-        let mut connection = self.lock()?;
+        let mut connection = self.lock_passive_until(deadline)?;
+        ensure_passive_persistence_deadline(deadline)?;
         let transaction = connection.transaction()?;
         cleanup_abandoned_passive_refresh_sessions(&transaction, now_epoch())?;
         let stored = {
@@ -126,6 +229,7 @@ impl Database {
                 .collect::<rusqlite::Result<Vec<_>>>()?
         };
         for (lane, contract_version, query_hash) in stored {
+            ensure_passive_persistence_deadline(deadline)?;
             let compatible =
                 expected
                     .get(&lane)
@@ -141,6 +245,7 @@ impl Database {
                 )?;
             }
         }
+        ensure_passive_persistence_deadline(deadline)?;
         transaction.commit()?;
         Ok(())
     }
@@ -156,8 +261,47 @@ impl Database {
         contract_version: u32,
         query_hash: &str,
     ) -> Result<Option<PassivePaginationState>> {
+        self.passive_pagination_resume_before(
+            root_domain,
+            source,
+            lane,
+            contract_version,
+            query_hash,
+            None,
+        )
+    }
+
+    pub fn passive_pagination_resume_until(
+        &self,
+        root_domain: &str,
+        source: &str,
+        lane: &str,
+        contract_version: u32,
+        query_hash: &str,
+        deadline: Instant,
+    ) -> Result<Option<PassivePaginationState>> {
+        self.passive_pagination_resume_before(
+            root_domain,
+            source,
+            lane,
+            contract_version,
+            query_hash,
+            Some(deadline),
+        )
+    }
+
+    fn passive_pagination_resume_before(
+        &self,
+        root_domain: &str,
+        source: &str,
+        lane: &str,
+        contract_version: u32,
+        query_hash: &str,
+        deadline: Option<Instant>,
+    ) -> Result<Option<PassivePaginationState>> {
         validate_passive_pagination_key(root_domain, source, lane, contract_version, query_hash)?;
-        let mut connection = self.lock()?;
+        let mut connection = self.lock_passive_until(deadline)?;
+        ensure_passive_persistence_deadline(deadline)?;
         let transaction = connection.transaction()?;
         let row = transaction
             .query_row(
@@ -196,6 +340,7 @@ impl Database {
             updated_at,
         )) = row
         else {
+            ensure_passive_persistence_deadline(deadline)?;
             transaction.commit()?;
             return Ok(None);
         };
@@ -205,6 +350,7 @@ impl Database {
                    WHERE root_domain=?1 AND source=?2 AND lane=?3"#,
                 params![root_domain, source, lane],
             )?;
+            ensure_passive_persistence_deadline(deadline)?;
             transaction.commit()?;
             return Ok(None);
         }
@@ -232,6 +378,7 @@ impl Database {
         if state.next_position == 0 || state.last_page_records > state.records_seen {
             bail!("état de pagination passive incohérent");
         }
+        ensure_passive_persistence_deadline(deadline)?;
         transaction.commit()?;
         Ok(Some(state))
     }
@@ -250,6 +397,55 @@ impl Database {
         page: &PassivePaginationPage,
         names: &BTreeSet<String>,
     ) -> Result<usize> {
+        self.commit_passive_pagination_page_before(
+            root_domain,
+            source,
+            lane,
+            contract_version,
+            query_hash,
+            page,
+            names,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_passive_pagination_page_until(
+        &self,
+        root_domain: &str,
+        source: &str,
+        lane: &str,
+        contract_version: u32,
+        query_hash: &str,
+        page: &PassivePaginationPage,
+        names: &BTreeSet<String>,
+        deadline: Instant,
+    ) -> Result<usize> {
+        self.commit_passive_pagination_page_before(
+            root_domain,
+            source,
+            lane,
+            contract_version,
+            query_hash,
+            page,
+            names,
+            Some(deadline),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn commit_passive_pagination_page_before(
+        &self,
+        root_domain: &str,
+        source: &str,
+        lane: &str,
+        contract_version: u32,
+        query_hash: &str,
+        page: &PassivePaginationPage,
+        names: &BTreeSet<String>,
+        deadline: Option<Instant>,
+    ) -> Result<usize> {
+        ensure_passive_persistence_deadline(deadline)?;
         validate_passive_pagination_key(root_domain, source, lane, contract_version, query_hash)?;
         validate_passive_pagination_hash(&page.page_hash, "hash de page")?;
         if page.position == 0
@@ -278,7 +474,8 @@ impl Database {
             .transpose()?;
         let page_records = passive_pagination_counter(page.page_records, "page_records")?;
 
-        let mut connection = self.lock()?;
+        let mut connection = self.lock_passive_until(deadline)?;
+        ensure_passive_persistence_deadline(deadline)?;
         let transaction = connection.transaction()?;
         let mut overlap_replay = false;
         let current = transaction
@@ -359,6 +556,7 @@ impl Database {
             // The previous transaction already made both evidence and progress
             // durable. Do not increment evidence counters for the deliberate
             // one-page overlap used to verify restart continuity.
+            ensure_passive_persistence_deadline(deadline)?;
             transaction.commit()?;
             return Ok(0);
         }
@@ -372,12 +570,15 @@ impl Database {
                 value: String::new(),
             })
             .collect::<Vec<_>>();
-        let stats = insert_passive_observation_rows_with_stats(
+        ensure_passive_persistence_deadline(deadline)?;
+        let stats = insert_passive_observation_rows_with_stats_before(
             &transaction,
             root_domain,
             source,
             &observations,
+            deadline,
         )?;
+        ensure_passive_persistence_deadline(deadline)?;
         transaction.execute(
             r#"INSERT OR IGNORE INTO passive_cache(
                    root_domain, source, names_json, updated_at
@@ -417,6 +618,7 @@ impl Database {
                 now,
             ],
         )?;
+        ensure_passive_persistence_deadline(deadline)?;
         transaction.commit()?;
         Ok(stats.novel_names)
     }
@@ -433,8 +635,48 @@ impl Database {
         contract_version: u32,
         query_hash: &str,
     ) -> Result<()> {
+        self.finish_passive_pagination_before(
+            root_domain,
+            source,
+            lane,
+            contract_version,
+            query_hash,
+            None,
+        )
+    }
+
+    pub fn finish_passive_pagination_until(
+        &self,
+        root_domain: &str,
+        source: &str,
+        lane: &str,
+        contract_version: u32,
+        query_hash: &str,
+        deadline: Instant,
+    ) -> Result<()> {
+        self.finish_passive_pagination_before(
+            root_domain,
+            source,
+            lane,
+            contract_version,
+            query_hash,
+            Some(deadline),
+        )
+    }
+
+    fn finish_passive_pagination_before(
+        &self,
+        root_domain: &str,
+        source: &str,
+        lane: &str,
+        contract_version: u32,
+        query_hash: &str,
+        deadline: Option<Instant>,
+    ) -> Result<()> {
+        ensure_passive_persistence_deadline(deadline)?;
         validate_passive_pagination_key(root_domain, source, lane, contract_version, query_hash)?;
-        let mut connection = self.lock()?;
+        let mut connection = self.lock_passive_until(deadline)?;
+        ensure_passive_persistence_deadline(deadline)?;
         let transaction = connection.transaction()?;
         let now = now_epoch();
         let (records_seen, expected_records, next_position, expected_pages, last_page_records): (
@@ -499,6 +741,7 @@ impl Database {
         if finished != 1 {
             bail!("état de pagination passive absent lors de la finalisation");
         }
+        ensure_passive_persistence_deadline(deadline)?;
         transaction.commit()?;
         Ok(())
     }
@@ -513,6 +756,37 @@ impl Database {
         source: &str,
         expected_contracts: &[(&str, u32, &str)],
     ) -> Result<()> {
+        self.complete_passive_pagination_source_before(
+            root_domain,
+            source,
+            expected_contracts,
+            None,
+        )
+    }
+
+    pub fn complete_passive_pagination_source_until(
+        &self,
+        root_domain: &str,
+        source: &str,
+        expected_contracts: &[(&str, u32, &str)],
+        deadline: Instant,
+    ) -> Result<()> {
+        self.complete_passive_pagination_source_before(
+            root_domain,
+            source,
+            expected_contracts,
+            Some(deadline),
+        )
+    }
+
+    fn complete_passive_pagination_source_before(
+        &self,
+        root_domain: &str,
+        source: &str,
+        expected_contracts: &[(&str, u32, &str)],
+        deadline: Option<Instant>,
+    ) -> Result<()> {
+        ensure_passive_persistence_deadline(deadline)?;
         if expected_contracts.is_empty() {
             bail!("aucun contrat attendu pour la finalisation passive");
         }
@@ -533,7 +807,8 @@ impl Database {
             }
         }
 
-        let mut connection = self.lock()?;
+        let mut connection = self.lock_passive_until(deadline)?;
+        ensure_passive_persistence_deadline(deadline)?;
         let transaction = connection.transaction()?;
         let actual = {
             let mut statement = transaction.prepare(
@@ -561,6 +836,7 @@ impl Database {
             );
         }
         for (lane, contract_version, query_hash, done) in &actual {
+            ensure_passive_persistence_deadline(deadline)?;
             let Some((expected_version, expected_hash)) = expected.get(lane) else {
                 bail!("voie de pagination passive inattendue: {lane}");
             };
@@ -588,6 +864,7 @@ impl Database {
             bail!("suppression incomplète des checkpoints de pagination passive");
         }
         clear_passive_refresh_session(&transaction, root_domain, source)?;
+        ensure_passive_persistence_deadline(deadline)?;
         transaction.commit()?;
         Ok(())
     }
@@ -602,7 +879,28 @@ impl Database {
         source: &str,
         limit: usize,
     ) -> Result<Option<PassiveCacheEntry>> {
-        let connection = self.lock()?;
+        self.passive_cache_bounded_before(domain, source, limit, None)
+    }
+
+    pub fn passive_cache_bounded_until(
+        &self,
+        domain: &str,
+        source: &str,
+        limit: usize,
+        deadline: Instant,
+    ) -> Result<Option<PassiveCacheEntry>> {
+        self.passive_cache_bounded_before(domain, source, limit, Some(deadline))
+    }
+
+    fn passive_cache_bounded_before(
+        &self,
+        domain: &str,
+        source: &str,
+        limit: usize,
+        deadline: Option<Instant>,
+    ) -> Result<Option<PassiveCacheEntry>> {
+        ensure_passive_persistence_deadline(deadline)?;
+        let connection = self.lock_passive_until(deadline)?;
         let row: Option<(String, i64)> = connection
             .query_row(
                 r#"SELECT names_json, updated_at FROM passive_cache
@@ -613,18 +911,23 @@ impl Database {
             .optional()?;
         drop(connection);
         row.map(|(names_json, updated_at)| {
-            let mut names = self
-                .observation_names_bounded(domain, &format!("passive:{source}"), limit)?
-                .into_iter()
-                .collect::<BTreeSet<_>>();
-            if names.len() < limit {
-                for name in serde_json::from_str::<Vec<String>>(&names_json)? {
-                    if names.len() >= limit {
-                        break;
-                    }
-                    names.insert(name);
+            ensure_passive_persistence_deadline(deadline)?;
+            let observed = match deadline {
+                Some(deadline) => self.observation_names_bounded_until(
+                    domain,
+                    &format!("passive:{source}"),
+                    limit,
+                    deadline,
+                )?,
+                None => {
+                    self.observation_names_bounded(domain, &format!("passive:{source}"), limit)?
                 }
+            };
+            let mut names = observed.into_iter().collect::<BTreeSet<_>>();
+            if names.len() < limit {
+                extend_legacy_passive_names_bounded(&names_json, &mut names, limit, deadline)?;
             }
+            ensure_passive_persistence_deadline(deadline)?;
             Ok(PassiveCacheEntry {
                 names: names.into_iter().collect(),
                 updated_at,
@@ -676,20 +979,61 @@ impl Database {
         source: &str,
         names: &BTreeSet<String>,
     ) -> Result<usize> {
-        let observations = names
-            .iter()
-            .map(|fqdn| ObservationInput {
+        self.store_passive_observation_page_before(domain, source, names, None)
+    }
+
+    pub fn store_passive_observation_page_until(
+        &self,
+        domain: &str,
+        source: &str,
+        names: &BTreeSet<String>,
+        deadline: Instant,
+    ) -> Result<usize> {
+        self.store_passive_observation_page_before(domain, source, names, Some(deadline))
+    }
+
+    fn store_passive_observation_page_before(
+        &self,
+        domain: &str,
+        source: &str,
+        names: &BTreeSet<String>,
+        deadline: Option<Instant>,
+    ) -> Result<usize> {
+        ensure_passive_persistence_deadline(deadline)?;
+        let evidence_source = format!("passive:{source}");
+        let mut observations = Vec::with_capacity(names.len());
+        for (index, fqdn) in names.iter().enumerate() {
+            if index.is_multiple_of(128) {
+                ensure_passive_persistence_deadline(deadline)?;
+            }
+            observations.push(ObservationInput {
                 fqdn: fqdn.clone(),
                 kind: "passive".to_owned(),
-                source: format!("passive:{source}"),
+                source: evidence_source.clone(),
                 value: String::new(),
-            })
-            .collect::<Vec<_>>();
+            });
+        }
+        ensure_passive_persistence_deadline(deadline)?;
         let stats = if let Some(writer) = &self.writer {
-            writer.submit_passive_page_with_stats(domain, source, observations)?
+            match deadline {
+                Some(deadline) => writer.submit_passive_page_with_stats_until(
+                    domain,
+                    source,
+                    observations,
+                    deadline,
+                )?,
+                None => writer.submit_passive_page_with_stats(domain, source, observations)?,
+            }
         } else {
-            let mut connection = self.lock()?;
-            insert_passive_observations_with_stats(&mut connection, domain, source, &observations)?
+            let mut connection = self.lock_passive_until(deadline)?;
+            ensure_passive_persistence_deadline(deadline)?;
+            insert_passive_observations_with_stats(
+                &mut connection,
+                domain,
+                source,
+                &observations,
+                deadline,
+            )?
         };
         Ok(stats.novel_names)
     }
@@ -792,7 +1136,29 @@ impl Database {
         source: &str,
         complete: bool,
     ) -> Result<()> {
-        let mut connection = self.lock()?;
+        self.mark_passive_cache_refresh_before(domain, source, complete, None)
+    }
+
+    pub fn mark_passive_cache_refresh_until(
+        &self,
+        domain: &str,
+        source: &str,
+        complete: bool,
+        deadline: Instant,
+    ) -> Result<()> {
+        self.mark_passive_cache_refresh_before(domain, source, complete, Some(deadline))
+    }
+
+    fn mark_passive_cache_refresh_before(
+        &self,
+        domain: &str,
+        source: &str,
+        complete: bool,
+        deadline: Option<Instant>,
+    ) -> Result<()> {
+        ensure_passive_persistence_deadline(deadline)?;
+        let mut connection = self.lock_passive_until(deadline)?;
+        ensure_passive_persistence_deadline(deadline)?;
         let transaction = connection.transaction()?;
         if complete {
             transaction.execute(
@@ -815,6 +1181,7 @@ impl Database {
                 params![domain, source],
             )?;
         }
+        ensure_passive_persistence_deadline(deadline)?;
         transaction.commit()?;
         Ok(())
     }
@@ -1018,7 +1385,25 @@ impl Database {
         duration_ms: u128,
         error: Option<&str>,
     ) -> Result<()> {
-        self.record_source_result_counts(source, None, novel_names, duration_ms, error)
+        self.record_source_result_counts(source, None, novel_names, duration_ms, error, None)
+    }
+
+    pub fn record_source_result_until(
+        &self,
+        source: &str,
+        novel_names: usize,
+        duration_ms: u128,
+        error: Option<&str>,
+        deadline: Instant,
+    ) -> Result<()> {
+        self.record_source_result_counts(
+            source,
+            None,
+            novel_names,
+            duration_ms,
+            error,
+            Some(deadline),
+        )
     }
 
     pub fn record_source_result_with_counts(
@@ -1029,7 +1414,26 @@ impl Database {
         duration_ms: u128,
         error: Option<&str>,
     ) -> Result<()> {
-        self.record_source_result_counts(source, Some(names), novel_names, duration_ms, error)
+        self.record_source_result_counts(source, Some(names), novel_names, duration_ms, error, None)
+    }
+
+    pub fn record_source_result_with_counts_until(
+        &self,
+        source: &str,
+        names: usize,
+        novel_names: usize,
+        duration_ms: u128,
+        error: Option<&str>,
+        deadline: Instant,
+    ) -> Result<()> {
+        self.record_source_result_counts(
+            source,
+            Some(names),
+            novel_names,
+            duration_ms,
+            error,
+            Some(deadline),
+        )
     }
 
     pub fn record_source_degraded(
@@ -1047,6 +1451,7 @@ impl Database {
             Some(warning),
             SourceResultStatus::Degraded,
             true,
+            None,
         )
     }
 
@@ -1066,6 +1471,28 @@ impl Database {
             Some(warning),
             SourceResultStatus::Degraded,
             true,
+            None,
+        )
+    }
+
+    pub fn record_source_degraded_with_counts_until(
+        &self,
+        source: &str,
+        names: usize,
+        novel_names: usize,
+        duration_ms: u128,
+        warning: &str,
+        deadline: Instant,
+    ) -> Result<()> {
+        self.record_source_outcome_counts(
+            source,
+            Some(names),
+            novel_names,
+            duration_ms,
+            Some(warning),
+            SourceResultStatus::Degraded,
+            true,
+            Some(deadline),
         )
     }
 
@@ -1083,6 +1510,26 @@ impl Database {
             Some(reason),
             SourceResultStatus::Deferred,
             false,
+            None,
+        )
+    }
+
+    pub fn record_source_deferred_until(
+        &self,
+        source: &str,
+        duration_ms: u128,
+        reason: &str,
+        deadline: Instant,
+    ) -> Result<()> {
+        self.record_source_outcome_counts(
+            source,
+            None,
+            0,
+            duration_ms,
+            Some(reason),
+            SourceResultStatus::Deferred,
+            false,
+            Some(deadline),
         )
     }
 
@@ -1093,6 +1540,7 @@ impl Database {
         novel_names: usize,
         duration_ms: u128,
         error: Option<&str>,
+        deadline: Option<Instant>,
     ) -> Result<()> {
         let status = if error.is_some() {
             SourceResultStatus::Failure
@@ -1107,6 +1555,7 @@ impl Database {
             error,
             status,
             true,
+            deadline,
         )
     }
 
@@ -1120,7 +1569,9 @@ impl Database {
         detail: Option<&str>,
         status: SourceResultStatus,
         record_yield_sample: bool,
+        deadline: Option<Instant>,
     ) -> Result<()> {
+        ensure_passive_persistence_deadline(deadline)?;
         let success = i64::from(status == SourceResultStatus::Success);
         let failure = i64::from(status == SourceResultStatus::Failure);
         let degraded = i64::from(status == SourceResultStatus::Degraded);
@@ -1128,7 +1579,8 @@ impl Database {
         let duration_ms = duration_ms.min(i64::MAX as u128) as i64;
         let novel_requests = i64::from(record_yield_sample);
         let novel_total_ms = if record_yield_sample { duration_ms } else { 0 };
-        let mut connection = self.lock()?;
+        let mut connection = self.lock_passive_until(deadline)?;
+        ensure_passive_persistence_deadline(deadline)?;
         let transaction = connection.transaction()?;
         transaction.execute(
             r#"INSERT INTO source_stats(
@@ -1210,6 +1662,7 @@ impl Database {
                 [format!("source.retry_until.{source}")],
             )?;
         }
+        ensure_passive_persistence_deadline(deadline)?;
         transaction.commit()?;
         Ok(())
     }
@@ -1219,19 +1672,60 @@ impl Database {
         key: &str,
         max_age: std::time::Duration,
     ) -> Result<Option<String>> {
+        self.source_metadata_before(key, max_age, None)
+    }
+
+    pub fn source_metadata_until(
+        &self,
+        key: &str,
+        max_age: std::time::Duration,
+        deadline: Instant,
+    ) -> Result<Option<String>> {
+        self.source_metadata_before(key, max_age, Some(deadline))
+    }
+
+    fn source_metadata_before(
+        &self,
+        key: &str,
+        max_age: std::time::Duration,
+        deadline: Option<Instant>,
+    ) -> Result<Option<String>> {
+        ensure_passive_persistence_deadline(deadline)?;
         let threshold = now_epoch().saturating_sub(max_age.as_secs().min(i64::MAX as u64) as i64);
-        self.lock()?
+        let value = self
+            .lock_passive_until(deadline)?
             .query_row(
                 "SELECT value FROM source_metadata_cache WHERE key=?1 AND updated_at>=?2",
                 params![key, threshold],
                 |row| row.get(0),
             )
             .optional()
-            .map_err(Into::into)
+            .map_err(anyhow::Error::from)?;
+        ensure_passive_persistence_deadline(deadline)?;
+        Ok(value)
     }
 
     pub fn store_source_metadata(&self, key: &str, value: &str) -> Result<()> {
-        self.lock()?.execute(
+        self.store_source_metadata_before(key, value, None)
+    }
+
+    pub fn store_source_metadata_until(
+        &self,
+        key: &str,
+        value: &str,
+        deadline: Instant,
+    ) -> Result<()> {
+        self.store_source_metadata_before(key, value, Some(deadline))
+    }
+
+    fn store_source_metadata_before(
+        &self,
+        key: &str,
+        value: &str,
+        deadline: Option<Instant>,
+    ) -> Result<()> {
+        ensure_passive_persistence_deadline(deadline)?;
+        self.lock_passive_until(deadline)?.execute(
             r#"INSERT INTO source_metadata_cache(key, value, updated_at)
                VALUES (?1, ?2, ?3)
                ON CONFLICT(key) DO UPDATE SET
@@ -1268,94 +1762,157 @@ impl Database {
         &self,
         cooldown: std::time::Duration,
     ) -> Result<BTreeMap<String, SourceDiagnostic>> {
+        self.source_diagnostics_before(cooldown, None)
+    }
+
+    pub fn source_diagnostics_until(
+        &self,
+        cooldown: std::time::Duration,
+        deadline: Instant,
+    ) -> Result<BTreeMap<String, SourceDiagnostic>> {
+        self.source_diagnostics_before(cooldown, Some(deadline))
+    }
+
+    fn source_diagnostics_before(
+        &self,
+        cooldown: std::time::Duration,
+        deadline: Option<Instant>,
+    ) -> Result<BTreeMap<String, SourceDiagnostic>> {
+        ensure_passive_persistence_deadline(deadline)?;
         let now = now_epoch();
         let cooldown_seconds = cooldown.as_secs().min(i64::MAX as u64) as i64;
-        let connection = self.lock()?;
-        let mut diagnostics = {
+        let connection = self.lock_passive_until(deadline)?;
+        let mut diagnostics = BTreeMap::new();
+        {
             let mut statement = connection.prepare(
                 r#"SELECT source, requests, successes, failures, degraded, deferred,
                    consecutive_failures, names, novel_names, novel_requests,
                    CASE WHEN requests=0 THEN 0 ELSE total_ms/requests END,
                    last_error, last_status, last_used FROM source_stats ORDER BY source"#,
             )?;
-            statement
-                .query_map([], |row| {
-                    let source = row.get::<_, String>(0)?;
-                    let consecutive_failures = row.get::<_, i64>(6)?;
-                    let last_status = row.get::<_, String>(12)?;
-                    let last_used = row.get::<_, i64>(13)?;
-                    let retry_at = last_used.saturating_add(cooldown_seconds);
-                    let next_retry =
-                        (consecutive_failures >= 3 && last_status == "failure" && retry_at > now)
-                            .then_some(retry_at);
-                    Ok((
-                        source,
-                        SourceDiagnostic {
-                            requests: row.get(1)?,
-                            successes: row.get(2)?,
-                            failures: row.get(3)?,
-                            degraded: row.get(4)?,
-                            deferred: row.get(5)?,
-                            consecutive_failures,
-                            names: row.get(7)?,
-                            novel_names: row.get(8)?,
-                            novel_requests: row.get(9)?,
-                            average_ms: row.get(10)?,
-                            last_error: row.get(11)?,
-                            last_status,
-                            last_used,
-                            next_retry,
-                            retry_in_seconds: next_retry.map(|retry| retry.saturating_sub(now)),
-                        },
-                    ))
-                })?
-                .collect::<rusqlite::Result<BTreeMap<_, _>>>()?
-        };
-        let mut statement = connection.prepare(
-            "SELECT key, value FROM source_metadata_cache WHERE key LIKE 'source.retry_until.%'",
-        )?;
-        let retries = statement
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        for (key, value) in retries {
-            let Some(source) = key.strip_prefix("source.retry_until.") else {
-                continue;
-            };
-            let Some(retry_until) = value.parse::<i64>().ok().filter(|retry| *retry > now) else {
-                continue;
-            };
-            if let Some(diagnostic) = diagnostics.get_mut(source) {
-                diagnostic.next_retry = Some(
-                    diagnostic
-                        .next_retry
-                        .map_or(retry_until, |current| current.max(retry_until)),
+            let mut rows = statement.query([])?;
+            let mut index = 0_usize;
+            while let Some(row) = rows.next()? {
+                if index.is_multiple_of(64) {
+                    ensure_passive_persistence_deadline(deadline)?;
+                }
+                let source = row.get::<_, String>(0)?;
+                let consecutive_failures = row.get::<_, i64>(6)?;
+                let last_status = row.get::<_, String>(12)?;
+                let last_used = row.get::<_, i64>(13)?;
+                let retry_at = last_used.saturating_add(cooldown_seconds);
+                let next_retry =
+                    (consecutive_failures >= 3 && last_status == "failure" && retry_at > now)
+                        .then_some(retry_at);
+                diagnostics.insert(
+                    source,
+                    SourceDiagnostic {
+                        requests: row.get(1)?,
+                        successes: row.get(2)?,
+                        failures: row.get(3)?,
+                        degraded: row.get(4)?,
+                        deferred: row.get(5)?,
+                        consecutive_failures,
+                        names: row.get(7)?,
+                        novel_names: row.get(8)?,
+                        novel_requests: row.get(9)?,
+                        average_ms: row.get(10)?,
+                        last_error: row.get(11)?,
+                        last_status,
+                        last_used,
+                        next_retry,
+                        retry_in_seconds: next_retry.map(|retry| retry.saturating_sub(now)),
+                    },
                 );
-                diagnostic.retry_in_seconds =
-                    diagnostic.next_retry.map(|retry| retry.saturating_sub(now));
+                index = index.saturating_add(1);
             }
         }
+        {
+            let mut statement = connection.prepare(
+                "SELECT key, value FROM source_metadata_cache WHERE key LIKE 'source.retry_until.%'",
+            )?;
+            let mut rows = statement.query([])?;
+            let mut index = 0_usize;
+            while let Some(row) = rows.next()? {
+                if index.is_multiple_of(64) {
+                    ensure_passive_persistence_deadline(deadline)?;
+                }
+                let key = row.get::<_, String>(0)?;
+                let value = row.get::<_, String>(1)?;
+                let Some(source) = key.strip_prefix("source.retry_until.") else {
+                    index = index.saturating_add(1);
+                    continue;
+                };
+                let Some(retry_until) = value.parse::<i64>().ok().filter(|retry| *retry > now)
+                else {
+                    index = index.saturating_add(1);
+                    continue;
+                };
+                if let Some(diagnostic) = diagnostics.get_mut(source) {
+                    diagnostic.next_retry = Some(
+                        diagnostic
+                            .next_retry
+                            .map_or(retry_until, |current| current.max(retry_until)),
+                    );
+                    diagnostic.retry_in_seconds =
+                        diagnostic.next_retry.map(|retry| retry.saturating_sub(now));
+                }
+                index = index.saturating_add(1);
+            }
+        }
+        ensure_passive_persistence_deadline(deadline)?;
         Ok(diagnostics)
     }
 
     pub fn source_cooldowns(&self, cooldown: std::time::Duration) -> Result<BTreeSet<String>> {
+        self.source_cooldowns_before(cooldown, None)
+    }
+
+    pub fn source_cooldowns_until(
+        &self,
+        cooldown: std::time::Duration,
+        deadline: Instant,
+    ) -> Result<BTreeSet<String>> {
+        self.source_cooldowns_before(cooldown, Some(deadline))
+    }
+
+    fn source_cooldowns_before(
+        &self,
+        cooldown: std::time::Duration,
+        deadline: Option<Instant>,
+    ) -> Result<BTreeSet<String>> {
+        ensure_passive_persistence_deadline(deadline)?;
         let threshold = now_epoch().saturating_sub(cooldown.as_secs().min(i64::MAX as u64) as i64);
-        let connection = self.lock()?;
+        let connection = self.lock_passive_until(deadline)?;
         let mut statement = connection.prepare(
             r#"SELECT source FROM source_stats
                WHERE consecutive_failures>=3
                  AND last_status='failure'
-                 AND last_used>=?1"#,
+                  AND last_used>=?1"#,
         )?;
-        statement
-            .query_map([threshold], |row| row.get::<_, String>(0))?
-            .collect::<rusqlite::Result<BTreeSet<_>>>()
-            .map_err(Into::into)
+        let mut rows = statement.query([threshold])?;
+        let mut sources = BTreeSet::new();
+        while let Some(row) = rows.next()? {
+            if sources.len().is_multiple_of(64) {
+                ensure_passive_persistence_deadline(deadline)?;
+            }
+            sources.insert(row.get::<_, String>(0)?);
+        }
+        ensure_passive_persistence_deadline(deadline)?;
+        Ok(sources)
     }
 
     pub fn source_scores(&self) -> Result<HashMap<String, i64>> {
-        let connection = self.lock()?;
+        self.source_scores_before(None)
+    }
+
+    pub fn source_scores_until(&self, deadline: Instant) -> Result<HashMap<String, i64>> {
+        self.source_scores_before(Some(deadline))
+    }
+
+    fn source_scores_before(&self, deadline: Option<Instant>) -> Result<HashMap<String, i64>> {
+        ensure_passive_persistence_deadline(deadline)?;
+        let connection = self.lock_passive_until(deadline)?;
         let mut statement = connection.prepare(
             r#"SELECT source,
                CASE WHEN successes+failures+degraded=0 THEN 0 ELSE
@@ -1371,11 +1928,80 @@ impl Database {
                AS score
                FROM source_stats"#,
         )?;
-        statement
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-            })?
-            .collect::<rusqlite::Result<HashMap<_, _>>>()
-            .map_err(Into::into)
+        let mut rows = statement.query([])?;
+        let mut scores = HashMap::new();
+        while let Some(row) = rows.next()? {
+            if scores.len().is_multiple_of(64) {
+                ensure_passive_persistence_deadline(deadline)?;
+            }
+            scores.insert(row.get::<_, String>(0)?, row.get::<_, i64>(1)?);
+        }
+        ensure_passive_persistence_deadline(deadline)?;
+        Ok(scores)
+    }
+}
+
+fn extend_legacy_passive_names_bounded(
+    names_json: &str,
+    names: &mut BTreeSet<String>,
+    limit: usize,
+    deadline: Option<Instant>,
+) -> Result<()> {
+    if names.len() >= limit {
+        return Ok(());
+    }
+    let bytes = names_json.as_bytes();
+    let mut cursor = 0_usize;
+    while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+        cursor = cursor.saturating_add(1);
+    }
+    if bytes.get(cursor) != Some(&b'[') {
+        bail!("cache passif legacy invalide: tableau JSON attendu");
+    }
+    cursor = cursor.saturating_add(1);
+    loop {
+        ensure_passive_persistence_deadline(deadline)?;
+        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+            cursor = cursor.saturating_add(1);
+        }
+        if bytes.get(cursor) == Some(&b']') {
+            return Ok(());
+        }
+        if bytes.get(cursor) != Some(&b'\"') {
+            bail!("cache passif legacy invalide: chaîne JSON attendue");
+        }
+        let string_start = cursor;
+        cursor = cursor.saturating_add(1);
+        let mut escaped = false;
+        loop {
+            if cursor.is_multiple_of(4_096) {
+                ensure_passive_persistence_deadline(deadline)?;
+            }
+            let Some(byte) = bytes.get(cursor).copied() else {
+                bail!("cache passif legacy invalide: chaîne JSON incomplète");
+            };
+            cursor = cursor.saturating_add(1);
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'\"' {
+                break;
+            }
+        }
+        names.insert(serde_json::from_str::<String>(
+            &names_json[string_start..cursor],
+        )?);
+        if names.len() >= limit {
+            return Ok(());
+        }
+        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+            cursor = cursor.saturating_add(1);
+        }
+        match bytes.get(cursor) {
+            Some(b',') => cursor = cursor.saturating_add(1),
+            Some(b']') => return Ok(()),
+            _ => bail!("cache passif legacy invalide: séparateur JSON attendu"),
+        }
     }
 }

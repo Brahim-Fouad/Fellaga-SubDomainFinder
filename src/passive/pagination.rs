@@ -4,7 +4,11 @@ use crate::source_contract::{PassivePaginationPage, PassivePaginationState};
 use crate::util::domain_hash;
 use anyhow::{Context, Result, bail};
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{
+    Arc, Mutex as StdMutex,
+    atomic::{AtomicBool, Ordering},
+};
+use std::time::Instant;
 #[derive(Debug)]
 pub struct PassiveFetchResult {
     pub names: BTreeSet<String>,
@@ -20,6 +24,49 @@ pub struct PassiveFetchResult {
 }
 
 pub type PassivePageSink = Arc<dyn Fn(&BTreeSet<String>) -> Result<()> + Send + Sync>;
+
+/// Deadline-aware durable page callback. Implementations must call
+/// `control.ensure_active()` before expensive work and stop promptly once
+/// `control.is_cancelled()` is true.
+pub type ControlledPassivePageSink =
+    Arc<dyn Fn(&BTreeSet<String>, &PassiveSinkControl) -> Result<()> + Send + Sync>;
+
+#[derive(Clone)]
+pub struct PassiveSinkControl {
+    deadline: Option<Instant>,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl PassiveSinkControl {
+    pub(super) fn new(deadline: Option<Instant>) -> Self {
+        Self {
+            deadline,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub fn deadline(&self) -> Option<Instant> {
+        self.deadline
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+            || self
+                .deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
+    }
+
+    pub fn ensure_active(&self) -> Result<()> {
+        if self.is_cancelled() {
+            bail!("persistance passive annulée à son échéance");
+        }
+        Ok(())
+    }
+
+    pub(super) fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PassivePaginationContract {
@@ -145,15 +192,21 @@ pub(super) struct PartialResultState {
 pub(super) struct PartialResultCheckpoint {
     state: Arc<StdMutex<PartialResultState>>,
     working_set_limit: usize,
-    page_sink: Option<PassivePageSink>,
+    page_sink: Option<ControlledPassivePageSink>,
+    sink_control: PassiveSinkControl,
 }
 
 impl PartialResultCheckpoint {
-    pub(super) fn new(working_set_limit: usize, page_sink: Option<PassivePageSink>) -> Self {
+    pub(super) fn new(
+        working_set_limit: usize,
+        page_sink: Option<ControlledPassivePageSink>,
+        sink_control: PassiveSinkControl,
+    ) -> Self {
         Self {
             state: Arc::new(StdMutex::new(PartialResultState::default())),
             working_set_limit,
             page_sink,
+            sink_control,
         }
     }
 
@@ -178,35 +231,48 @@ impl PartialResultCheckpoint {
         let persistence_error = self
             .page_sink
             .as_ref()
-            .and_then(|sink| sink(names).err())
+            .and_then(|sink| sink(names, &self.sink_control).err())
             .map(|error| format!("persistance SQLite de page passive: {error:#}"));
         self.record_page(names, persistence_error);
     }
 
     pub(super) fn persist_non_paginated_result(&self, names: &BTreeSet<String>) {
-        let should_persist = self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .committed_pages
-            == 0;
-        if !should_persist || names.is_empty() {
+        if !self.should_persist_non_paginated_result(names) {
             return;
         }
         let persistence_error = self
             .page_sink
             .as_ref()
-            .and_then(|sink| sink(names).err())
+            .and_then(|sink| sink(names, &self.sink_control).err())
             .map(|error| format!("persistance SQLite du résultat passif: {error:#}"));
         if let Some(persistence_error) = persistence_error {
-            let mut state = self
+            self.record_persistence_error(persistence_error);
+        }
+    }
+
+    pub(super) fn should_persist_non_paginated_result(&self, names: &BTreeSet<String>) -> bool {
+        self.page_sink.is_some()
+            && !names.is_empty()
+            && self
                 .state
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if state.persistence_error.is_none() {
-                state.persistence_error = Some(persistence_error);
-            }
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .committed_pages
+                == 0
+    }
+
+    pub(super) fn record_persistence_error(&self, persistence_error: String) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.persistence_error.is_none() {
+            state.persistence_error = Some(persistence_error);
         }
+    }
+
+    pub(super) fn cancel_persistence(&self) {
+        self.sink_control.cancel();
     }
 
     pub(super) fn snapshot(&self) -> PartialResultState {
