@@ -1473,14 +1473,9 @@ async fn a_deadline_without_a_committed_page_is_deferred_not_failed() {
     .unwrap();
 
     assert!(result.names.is_empty());
-    assert!(
-        result
-            .partial_warning
-            .as_deref()
-            .is_some_and(|warning| {
-                warning.contains("empty-test") && warning.contains("délai de sécurité")
-            })
-    );
+    assert!(result.partial_warning.as_deref().is_some_and(|warning| {
+        warning.contains("empty-test") && warning.contains("délai de sécurité")
+    }));
 }
 
 #[test]
