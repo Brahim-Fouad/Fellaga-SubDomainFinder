@@ -9,6 +9,19 @@ pub(super) const fn passive_completion_snapshot_required(
     !phase_timed_out && refresh_total > 0 && refresh_finished == refresh_total && is_root_zone
 }
 
+pub(super) fn passive_active_source_status(active_sources: &BTreeMap<String, Instant>) -> String {
+    let active = active_sources.len();
+    let Some((source, _)) = active_sources.iter().min_by_key(|(_, started)| **started) else {
+        return "0 active(s)".to_owned();
+    };
+    let source_timeout = source_policy(source).total_timeout.as_secs();
+    if active == 1 {
+        format!("1 active(s): {source} (délai source {source_timeout}s)")
+    } else {
+        format!("{active} active(s), plus ancienne: {source} (délai source {source_timeout}s)")
+    }
+}
+
 impl Scanner {
     pub(super) async fn collect_passive(
         &self,
@@ -459,15 +472,15 @@ impl Scanner {
                 _ = heartbeat.tick() => {
                     let active = active_sources
                         .lock()
-                        .map(|sources| sources.len())
-                        .unwrap_or_default();
+                        .map(|sources| passive_active_source_status(&sources))
+                        .unwrap_or_else(|_| "état des sources indisponible".to_owned());
                     let remaining = passive_deadline
                         .map(|deadline| format!("limite cumulative dans {}s", deadline.saturating_duration_since(tokio::time::Instant::now()).as_secs()))
-                        .unwrap_or_else(|| "sans limite cumulative".to_owned());
+                        .unwrap_or_else(|| "aucune limite globale".to_owned());
                     self.emit(ProgressEvent::Phase {
                         name: "passif".to_owned(),
                         detail: format!(
-                            "{refresh_finished}/{refresh_total} source(s), {active} active(s), en cours depuis {}s, {remaining}",
+                            "{refresh_finished}/{refresh_total} source(s), {active}, en cours depuis {}s, {remaining}",
                             refresh_started.elapsed().as_secs()
                         ),
                     });

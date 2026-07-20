@@ -159,6 +159,14 @@ fn passive_heartbeat_tracks_elapsed_time_without_changing_its_progress_signature
         )
     );
     assert_eq!(
+        transient_progress_signature(
+            "0/1 source(s), 1 active(s): waybackarchive (délai source 45s), en cours depuis 10s, aucune limite globale"
+        ),
+        transient_progress_signature(
+            "0/1 source(s), 1 active(s): waybackarchive (délai source 45s), en cours depuis 11s, aucune limite globale"
+        )
+    );
+    assert_eq!(
         transient_phase_detail(
             "8/9 source(s), 1 active(s), sans limite cumulative",
             Duration::from_secs(85)

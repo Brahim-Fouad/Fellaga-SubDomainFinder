@@ -4,7 +4,7 @@ Published artifacts appear on the GitHub release page after the release workflow
 
 ## Release contents
 
-Fellaga v0.12.1 contains seven assets:
+Fellaga v0.12.2 contains seven assets:
 
 - x86-64 and ARM64 GNU/Linux archives;
 - an amd64 Debian package;
@@ -51,7 +51,7 @@ jq -e '
   any(.metadata.component.properties[];
       .name == "fellaga:binary-target" and
       .value == "x86_64-unknown-linux-gnu")
-' fellaga-v0.12.1-x86_64-unknown-linux-gnu.cdx.json
+' fellaga-v0.12.2-x86_64-unknown-linux-gnu.cdx.json
 ```
 
 `THIRD_PARTY_LICENSES.txt` maps the same locked Rust packages to their declared
@@ -64,7 +64,7 @@ Install the GitHub CLI, authenticate if required, and verify the downloaded arti
 
 ```bash
 gh attestation verify \
-  fellaga-v0.12.1-x86_64-unknown-linux-gnu.tar.gz \
+  fellaga-v0.12.2-x86_64-unknown-linux-gnu.tar.gz \
   --repo Brahim-Fouad/Fellaga-SubDomainFinder
 ```
 
@@ -77,12 +77,12 @@ Install Cosign and run:
 ```bash
 cosign verify-blob \
   --bundle SHA256SUMS.sigstore.json \
-  --certificate-identity "https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/.github/workflows/release.yml@refs/tags/v0.12.1" \
+  --certificate-identity "https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/.github/workflows/release.yml@refs/tags/v0.12.2" \
   --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
   SHA256SUMS
 ```
 
-The certificate identity binds the keyless signature to the release workflow at the exact `v0.12.1` tag.
+The certificate identity binds the keyless signature to the release workflow at the exact `v0.12.2` tag.
 
 ## Verify the source identity
 
@@ -90,8 +90,8 @@ For a source checkout:
 
 ```bash
 git fetch --tags origin
-git rev-parse 'v0.12.1^{commit}'
-git show --no-patch --format=fuller v0.12.1
+git rev-parse 'v0.12.2^{commit}'
+git show --no-patch --format=fuller v0.12.2
 ```
 
 The release pipeline also verifies that the tag version matches `Cargo.toml`, that the tagged commit is reachable from `main`, and that it will not overwrite an existing published release.

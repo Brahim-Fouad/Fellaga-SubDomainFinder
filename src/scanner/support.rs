@@ -147,9 +147,10 @@ pub(super) fn passive_connector_timing(
                 .saturating_sub(Duration::from_millis(250))
                 .min(policy_total_timeout)
         })
-        // Passive connectors use zero as the explicit "no cumulative
-        // deadline" sentinel; per-request timeouts and pagination caps remain.
-        .unwrap_or(Duration::ZERO);
+        // An unlimited passive phase removes only the shared phase deadline.
+        // Each provider must still respect its own wall-clock policy so one
+        // degraded paginated endpoint cannot hold the entire scan forever.
+        .unwrap_or(policy_total_timeout);
     let lease_window = if phase_deadline.is_some() {
         connector_budget
     } else {
