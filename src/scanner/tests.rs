@@ -1,4 +1,4 @@
-use super::passive_phase::passive_completion_snapshot_required;
+use super::passive_phase::{passive_active_source_status, passive_completion_snapshot_required};
 use super::refresh::*;
 use super::{
     BatchDnsMode, RefreshOptions, ScanOptions, ScanRunGuard, Scanner,
@@ -907,13 +907,13 @@ fn metadata_is_unlimited_with_the_web_phase_and_caps_explicit_budgets() {
 }
 
 #[test]
-fn unlimited_passive_phase_disables_only_the_connector_cumulative_deadline() {
+fn unlimited_passive_phase_keeps_each_connector_wall_clock_deadline() {
     let request_timeout = Duration::from_secs(10);
     let policy_total_timeout = Duration::from_secs(45);
     let (connector_budget, lease_ttl) =
         passive_connector_timing(None, request_timeout, policy_total_timeout);
 
-    assert_eq!(connector_budget, Duration::ZERO);
+    assert_eq!(connector_budget, policy_total_timeout);
     assert_eq!(
         lease_ttl,
         policy_total_timeout + super::PASSIVE_REFRESH_LEASE_GRACE
@@ -925,6 +925,25 @@ fn unlimited_passive_phase_disables_only_the_connector_cumulative_deadline() {
         policy_total_timeout,
     );
     assert_eq!(expired_budget, Duration::ZERO);
+}
+
+#[test]
+fn passive_heartbeat_identifies_the_oldest_active_source() {
+    let now = Instant::now();
+    let mut sources = BTreeMap::new();
+    assert_eq!(passive_active_source_status(&sources), "0 active(s)");
+
+    sources.insert("commoncrawl".to_owned(), now - Duration::from_secs(7));
+    assert_eq!(
+        passive_active_source_status(&sources),
+        "1 active(s): commoncrawl (délai source 45s)"
+    );
+
+    sources.insert("waybackarchive".to_owned(), now - Duration::from_secs(19));
+    assert_eq!(
+        passive_active_source_status(&sources),
+        "2 active(s), plus ancienne: waybackarchive (délai source 45s)"
+    );
 }
 
 #[test]

@@ -6,6 +6,13 @@ Published releases and downloadable artifacts are available on [GitHub Releases]
 
 ## [Unreleased]
 
+## [0.12.2] - 2026-07-19
+
+### Fixed
+
+- keep provider-specific wall-clock deadlines active when the passive phase has no global deadline, preventing a paginated source such as Wayback from holding a scan for hours while retaining completed pages;
+- identify the oldest active passive connector and its source deadline in progress output without reintroducing repeated redirected heartbeats.
+
 ## [0.12.1] - 2026-07-19
 
 ### Fixed
@@ -337,7 +344,8 @@ Initial public release of Fellaga.
 - public MIT repository with security policy, contribution guide, third-party notices, and verifiable corpus provenance;
 - verifiable v0.8.0 release with x86-64 and ARM64 GNU/Linux archives, an amd64 Debian package, architecture SBOMs, checksums, a keyless Sigstore signature over the checksum manifest, and GitHub attestations.
 
-[Unreleased]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/compare/v0.12.1...HEAD
+[Unreleased]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/compare/v0.12.2...HEAD
+[0.12.2]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/tag/v0.12.2
 [0.12.1]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/tag/v0.12.1
 [0.12.0]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/tag/v0.12.0
 [0.11.1]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/tag/v0.11.1

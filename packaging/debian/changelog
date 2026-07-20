@@ -1,3 +1,11 @@
+fellaga (0.12.2-1) unstable; urgency=medium
+
+  * Keep per-provider deadlines active in globally unlimited scans.
+  * Prevent long Wayback pagination from holding the passive phase.
+  * Show the active passive source and its deadline in progress output.
+
+ -- Brahim-Fouad GUIA <170998597+Brahim-Fouad@users.noreply.github.com>  Sun, 19 Jul 2026 00:00:00 -0400
+
 fellaga (0.12.1-1) unstable; urgency=medium
 
   * Keep passive progress on one live terminal line.
