@@ -292,7 +292,15 @@ pub(super) fn render_scan_summary(
     }
 
     if let Some(reason) = result.scheduler_metrics.stop_reason {
-        lines.push(summary_row(style, "Stopped", friendly_stop_reason(reason)));
+        // This reason belongs to the active candidate scheduler, not to every
+        // discovery phase. Calling it the scan stop reason is misleading when
+        // an explicitly bounded passive source finishes partial while the
+        // candidate queue itself is empty.
+        lines.push(summary_row(
+            style,
+            "Scheduler",
+            friendly_stop_reason(reason),
+        ));
     }
 
     if !result.warnings.is_empty() {

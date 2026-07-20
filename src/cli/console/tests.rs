@@ -129,6 +129,14 @@ fn repeated_long_running_phases_are_recognized_as_transient() {
         "passif",
         "8/9 source(s), 1 active(s), sans limite cumulative"
     ));
+    assert!(is_transient_phase(
+        "passif api.example.com",
+        "0/1 · waybackarchive ≤45s · 3p · 824 lus · +15"
+    ));
+    assert!(!is_transient_phase(
+        "passif api.example.com",
+        "1/1 · 3p · 824 lus · +15 · terminé en 12s"
+    ));
     assert!(!is_transient_phase(
         "passif",
         "9/9 source(s), terminé en 42s"
@@ -167,11 +175,27 @@ fn passive_heartbeat_tracks_elapsed_time_without_changing_its_progress_signature
         )
     );
     assert_eq!(
+        transient_progress_signature("0/1 · waybackarchive ≤45s · 3p · 824 lus · +15"),
+        transient_progress_signature("0/1 · waybackarchive ≤45s · 3p · 824 lus · +15")
+    );
+    assert_eq!(
+        transient_progress_signature("0/1 · waybackarchive ≤45s · 3p · 824 lus · +15 · g≤20s"),
+        transient_progress_signature("0/1 · waybackarchive ≤45s · 3p · 824 lus · +15 · g≤19s")
+    );
+    assert_eq!(
+        transient_progress_signature("0/1 · waybackarchive a=12s/45s · 3p · 824 lus · +15"),
+        transient_progress_signature("0/1 · waybackarchive a=13s/45s · 3p · 824 lus · +15")
+    );
+    assert_eq!(
+        transient_progress_signature("cache local 0/25 · préparation"),
+        transient_progress_signature("cache local 17/25 · waybackarchive")
+    );
+    assert_eq!(
         transient_phase_detail(
             "8/9 source(s), 1 active(s), sans limite cumulative",
             Duration::from_secs(85)
         ),
-        "8/9 source(s), 1 active(s), sans limite cumulative · écoulé 1m25s"
+        "8/9 source(s), 1 active(s), sans limite cumulative · t=1m25s"
     );
 }
 

@@ -685,19 +685,21 @@ pub(super) fn merge_passive_source_names_bounded(
     omitted
 }
 
-pub(super) fn refill_passive_union_from_cache(
+pub(super) fn refill_passive_union_from_cache_until(
     database: &Database,
     domain: &str,
     ordered_sources: &[String],
     sources: &mut BTreeMap<String, BTreeSet<String>>,
     limit: usize,
+    deadline: Instant,
 ) -> Result<usize> {
     let before = sources.len();
     for source in ordered_sources {
         if sources.len() >= limit {
             break;
         }
-        let Some(entry) = database.passive_cache_bounded(domain, source, limit)? else {
+        let entry = database.passive_cache_bounded_until(domain, source, limit, deadline)?;
+        let Some(entry) = entry else {
             continue;
         };
         merge_passive_source_names_bounded(sources, entry.names, source, Some("cache"), limit);

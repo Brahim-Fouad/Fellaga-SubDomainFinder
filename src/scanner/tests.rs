@@ -1,7 +1,11 @@
-use super::passive_phase::{passive_active_source_status, passive_completion_snapshot_required};
+use super::passive_phase::{
+    passive_active_source_status, passive_bookkeeping_result, passive_completion_phase_required,
+    passive_local_deadline, passive_persistence_status, passive_source_warning,
+    passive_sqlite_callback, passive_sqlite_operation,
+};
 use super::refresh::*;
 use super::{
-    BatchDnsMode, RefreshOptions, ScanOptions, ScanRunGuard, Scanner,
+    BatchDnsMode, PassiveRefreshLeaseGuard, RefreshOptions, ScanOptions, ScanRunGuard, Scanner,
     active_candidate_budget_exhausted, active_candidate_work_allowed, active_resume_required,
     assess_dnssec_suspects_bounded, automatic_bulk_source_limit, cache_requires_revalidation,
     candidate_refill_capacity, candidate_uses_active_budget, candidate_uses_discovery_fast_path,
@@ -14,9 +18,9 @@ use super::{
     is_missing_api_key_error, is_preflight_auth_error, late_ct_seed_reserve,
     materialize_ct_fallback_bounded, merge_ct_fallback_names, merge_passive_names_bounded,
     merge_resolver_metrics, metadata_phase_budget, passive_connector_timing,
-    passive_connector_working_set_limit, persist_routed_dns_outcomes, phase_deadline,
-    prioritized_answer_addresses, refill_passive_union_from_cache, route_dns_outcomes,
-    select_bounded_mutation_observations, should_expand_adaptive_wave,
+    passive_connector_working_set_limit, passive_lease_renewal_ttl, persist_routed_dns_outcomes,
+    phase_deadline, prioritized_answer_addresses, refill_passive_union_from_cache_until,
+    route_dns_outcomes, select_bounded_mutation_observations, should_expand_adaptive_wave,
     should_retry_source_after_key_added, source_bootstrap_score, source_error_is_deferred,
     source_requires_api_key, unprofiled_deepest_parents, was_recently_verified,
     wildcard_cache_algorithm_is_current, wildcard_profile_after_probe, wildcard_profile_observed,
@@ -197,12 +201,26 @@ async fn scanner_scopes_no_target_contact_to_each_passive_fetch() {
 }
 
 #[test]
-fn passive_completion_snapshot_is_only_global_and_complete() {
-    assert!(passive_completion_snapshot_required(false, 9, 9, true));
-    assert!(!passive_completion_snapshot_required(true, 9, 9, true));
-    assert!(!passive_completion_snapshot_required(false, 9, 8, true));
-    assert!(!passive_completion_snapshot_required(false, 0, 0, true));
-    assert!(!passive_completion_snapshot_required(false, 3, 3, false));
+fn passive_completion_phase_is_emitted_for_every_completed_zone() {
+    assert!(passive_completion_phase_required(false, 9, 9));
+    assert!(passive_completion_phase_required(false, 3, 3));
+    assert!(!passive_completion_phase_required(true, 9, 9));
+    assert!(!passive_completion_phase_required(false, 9, 8));
+    assert!(!passive_completion_phase_required(false, 0, 0));
+}
+
+#[test]
+fn passive_local_work_never_extends_the_global_deadline() {
+    let global = Instant::now() + Duration::from_millis(25);
+    assert_eq!(
+        passive_local_deadline(Some(global), Duration::from_secs(2)),
+        global
+    );
+
+    let local_started = Instant::now();
+    let local = passive_local_deadline(None, Duration::from_millis(25));
+    assert!(local >= local_started + Duration::from_millis(25));
+    assert!(local <= Instant::now() + Duration::from_millis(30));
 }
 
 #[tokio::test]
@@ -403,6 +421,28 @@ async fn unavailable_library_source_uses_cache_without_health_or_network_attempt
                 && !status.contains("clé API")
                 && *names == 1
     )));
+    let events = events.lock().unwrap();
+    let finalizing = events.iter().position(|event| {
+        matches!(
+            event,
+            super::ProgressEvent::Phase { name, detail }
+                if name == "passif" && detail.contains("finalisation cache")
+        )
+    });
+    let completed = events.iter().rposition(|event| {
+        matches!(
+            event,
+            super::ProgressEvent::Phase { name, detail }
+                if name == "passif" && detail.contains("terminé")
+        )
+    });
+    assert!(
+        finalizing
+            .zip(completed)
+            .is_some_and(|(finalizing, completed)| finalizing < completed),
+        "la phase passive ne doit être terminée qu'après la finalisation du cache"
+    );
+    drop(events);
     resolver_task.abort();
 }
 
@@ -928,21 +968,267 @@ fn unlimited_passive_phase_keeps_each_connector_wall_clock_deadline() {
 }
 
 #[test]
+fn passive_lease_renewal_does_not_outlive_the_connector_by_a_minute() {
+    let acquired_ttl = Duration::from_secs(105);
+
+    assert_eq!(
+        passive_lease_renewal_ttl(Duration::from_secs(40), acquired_ttl),
+        Duration::from_secs(45)
+    );
+    assert_eq!(
+        passive_lease_renewal_ttl(Duration::from_secs(1), acquired_ttl),
+        Duration::from_secs(6)
+    );
+    assert_eq!(
+        passive_lease_renewal_ttl(Duration::from_secs(200), acquired_ttl),
+        acquired_ttl
+    );
+}
+
+#[test]
+fn passive_refresh_lease_is_released_before_the_guard_is_dropped() {
+    let db = Database::in_memory().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let guard = PassiveRefreshLeaseGuard::try_acquire(
+        db.clone(),
+        "example.com",
+        "fixture",
+        Duration::from_secs(5),
+        deadline,
+    )
+    .unwrap()
+    .unwrap();
+
+    guard.release_bounded().unwrap();
+    let replacement = PassiveRefreshLeaseGuard::try_acquire(
+        db,
+        "example.com",
+        "fixture",
+        Duration::from_secs(5),
+        deadline,
+    )
+    .unwrap();
+
+    assert!(replacement.is_some());
+}
+
+#[test]
+fn passive_refresh_lease_retries_cleanup_after_repeated_sqlite_contention() {
+    let temporary = tempfile::NamedTempFile::new().unwrap();
+    let db = Database::open(temporary.path()).unwrap();
+    let guard = PassiveRefreshLeaseGuard::try_acquire(
+        db.clone(),
+        "example.com",
+        "fixture",
+        Duration::from_secs(30),
+        Instant::now() + Duration::from_secs(2),
+    )
+    .unwrap()
+    .unwrap();
+    let locker = rusqlite::Connection::open(temporary.path()).unwrap();
+    locker.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+    let started = Instant::now();
+    let completion = guard.release_or_schedule_tracked();
+    assert!(started.elapsed() < Duration::from_secs(1));
+    // The synchronous release and at least the first deferred attempt must both
+    // encounter SQLITE_BUSY. A single fire-and-forget retry would lose the
+    // cleanup here.
+    std::thread::sleep(Duration::from_millis(650));
+    locker.execute_batch("ROLLBACK").unwrap();
+    let outcome = completion
+        .recv_timeout(Duration::from_secs(3))
+        .expect("le worker de nettoyage doit produire un résultat borné");
+    assert!(outcome.released);
+    assert!(
+        outcome.attempts >= 2,
+        "au moins deux retries sont requis après une contention répétée"
+    );
+
+    let replacement = PassiveRefreshLeaseGuard::try_acquire(
+        db,
+        "example.com",
+        "fixture",
+        Duration::from_secs(5),
+        Instant::now() + Duration::from_secs(1),
+    )
+    .unwrap();
+    assert!(
+        replacement.is_some(),
+        "le retry de nettoyage doit libérer le lease dès que SQLite redevient disponible"
+    );
+}
+
+#[test]
+fn passive_refresh_lease_cleanup_survives_tokio_runtime_shutdown() {
+    let temporary = tempfile::NamedTempFile::new().unwrap();
+    let db = Database::open(temporary.path()).unwrap();
+    let guard = PassiveRefreshLeaseGuard::try_acquire(
+        db.clone(),
+        "runtime.example.com",
+        "fixture",
+        Duration::from_secs(30),
+        Instant::now() + Duration::from_secs(2),
+    )
+    .unwrap()
+    .unwrap();
+    let locker = rusqlite::Connection::open(temporary.path()).unwrap();
+    locker.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    let completion = runtime.block_on(async { guard.release_or_schedule_tracked() });
+    drop(runtime);
+    std::thread::sleep(Duration::from_millis(650));
+    locker.execute_batch("ROLLBACK").unwrap();
+
+    let outcome = completion
+        .recv_timeout(Duration::from_secs(3))
+        .expect("le nettoyage ne doit pas dépendre de la durée de vie du runtime Tokio");
+    assert!(outcome.released);
+    let replacement = PassiveRefreshLeaseGuard::try_acquire(
+        db,
+        "runtime.example.com",
+        "fixture",
+        Duration::from_secs(5),
+        Instant::now() + Duration::from_secs(1),
+    )
+    .unwrap();
+    assert!(replacement.is_some());
+}
+
+#[test]
 fn passive_heartbeat_identifies_the_oldest_active_source() {
     let now = Instant::now();
     let mut sources = BTreeMap::new();
-    assert_eq!(passive_active_source_status(&sources), "0 active(s)");
+    assert_eq!(passive_active_source_status(&sources, 0, 1), "1 en attente");
+    assert_eq!(passive_active_source_status(&sources, 1, 1), "0 active");
 
     sources.insert("commoncrawl".to_owned(), now - Duration::from_secs(7));
     assert_eq!(
-        passive_active_source_status(&sources),
-        "1 active(s): commoncrawl (délai source 45s)"
+        passive_active_source_status(&sources, 0, 2),
+        "commoncrawl a=7s/45s · 1 file"
     );
 
     sources.insert("waybackarchive".to_owned(), now - Duration::from_secs(19));
     assert_eq!(
-        passive_active_source_status(&sources),
-        "2 active(s), plus ancienne: waybackarchive (délai source 45s)"
+        passive_active_source_status(&sources, 0, 3),
+        "2 act · waybackarchive a=19s/45s · 1 file"
+    );
+}
+
+#[test]
+fn passive_heartbeat_reports_only_successfully_persisted_work() {
+    assert_eq!(passive_persistence_status(0, 0, 0), "0p · 0 lus · +0");
+    assert_eq!(passive_persistence_status(1, 1, 1), "1p · 1 lus · +1");
+    assert_eq!(passive_persistence_status(3, 824, 15), "3p · 824 lus · +15");
+}
+
+#[tokio::test]
+async fn passive_sqlite_operation_does_not_block_the_heartbeat_runtime() {
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let operation = tokio::spawn(async move {
+        passive_sqlite_operation("fixture SQLite", move || {
+            let _ = entered_tx.send(());
+            std::thread::sleep(Duration::from_millis(150));
+            Ok(())
+        })
+        .await
+    });
+
+    entered_rx.await.unwrap();
+    tokio::time::timeout(
+        Duration::from_millis(75),
+        tokio::time::sleep(Duration::from_millis(5)),
+    )
+    .await
+    .expect("le heartbeat doit rester planifiable pendant une opération SQLite");
+    operation.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn passive_sqlite_callback_releases_its_runtime_worker() {
+    let entered = Arc::new(AtomicBool::new(false));
+    let finished = Arc::new(AtomicBool::new(false));
+    let callback_entered = Arc::clone(&entered);
+    let callback_finished = Arc::clone(&finished);
+    let callback = tokio::spawn(async move {
+        passive_sqlite_callback(|| {
+            callback_entered.store(true, Ordering::Release);
+            std::thread::sleep(Duration::from_millis(200));
+            callback_finished.store(true, Ordering::Release);
+        });
+    });
+
+    while !entered.load(Ordering::Acquire) {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::timeout(
+        Duration::from_millis(75),
+        tokio::time::sleep(Duration::from_millis(5)),
+    )
+    .await
+    .expect("le callback SQLite ne doit pas figer le heartbeat");
+    assert!(
+        !finished.load(Ordering::Acquire),
+        "le test doit observer le heartbeat avant la fin du callback bloquant"
+    );
+    callback.await.unwrap();
+}
+
+#[test]
+fn passive_warning_prefixes_a_source_exactly_once() {
+    assert_eq!(
+        passive_source_warning("waybackarchive", "deadline reached"),
+        "waybackarchive: deadline reached"
+    );
+    assert_eq!(
+        passive_source_warning("waybackarchive", "waybackarchive: deadline reached"),
+        "waybackarchive: deadline reached"
+    );
+}
+
+#[test]
+fn passive_bookkeeping_defers_external_sqlite_write_contention() {
+    let temporary = tempfile::NamedTempFile::new().unwrap();
+    let db = Database::open(temporary.path()).unwrap();
+    let locker = rusqlite::Connection::open(temporary.path()).unwrap();
+    locker.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+    let started = Instant::now();
+    let result = passive_bookkeeping_result(db.record_source_result_until(
+        "locked-fixture",
+        0,
+        1,
+        None,
+        started + Duration::from_millis(750),
+    ));
+
+    assert!(matches!(result, Ok(None)));
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "la contention SQLite a dépassé sa borne: {:?}",
+        started.elapsed()
+    );
+    locker.execute_batch("ROLLBACK").unwrap();
+    assert!(
+        !db.source_diagnostics(Duration::from_secs(60))
+            .unwrap()
+            .contains_key("locked-fixture"),
+        "un bookkeeping différé ne doit pas laisser une statistique partielle"
+    );
+}
+
+#[test]
+fn passive_bookkeeping_keeps_non_transient_sqlite_errors_fatal() {
+    let result =
+        passive_bookkeeping_result::<()>(Err(anyhow::anyhow!("fixture de schéma SQLite invalide")));
+
+    assert_eq!(
+        result.unwrap_err().to_string(),
+        "fixture de schéma SQLite invalide"
     );
 }
 
@@ -1437,12 +1723,13 @@ fn durable_passive_refill_recovers_coverage_beyond_the_connector_cap() {
         .map(|name| (name, BTreeSet::from(["passive:fixture".to_owned()])))
         .collect::<BTreeMap<_, _>>();
 
-    let added = refill_passive_union_from_cache(
+    let added = refill_passive_union_from_cache_until(
         &db,
         "example.com",
         &["fixture".to_owned()],
         &mut sources,
         10,
+        Instant::now() + Duration::from_secs(2),
     )
     .unwrap();
 

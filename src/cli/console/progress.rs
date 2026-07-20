@@ -443,7 +443,10 @@ impl ConsoleProgress {
 
 pub(super) fn transient_progress_signature(detail: &str) -> String {
     let mut signature = sanitize_terminal_text(detail);
-    for marker in ["en cours depuis", "limite cumulative dans"] {
+    if signature.starts_with("cache local ") {
+        return "cache local".to_owned();
+    }
+    for marker in ["en cours depuis", "limite cumulative dans", "g≤", "a="] {
         signature = normalize_duration_after(&signature, marker);
     }
     signature
@@ -486,7 +489,7 @@ pub(super) fn transient_phase_detail(detail: &str, elapsed: Duration) -> String 
     } else {
         format_duration(elapsed.as_millis())
     };
-    format!("{detail} · écoulé {elapsed}")
+    format!("{detail} · t={elapsed}")
 }
 
 impl Drop for ConsoleProgress {

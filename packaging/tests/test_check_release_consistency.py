@@ -30,6 +30,12 @@ class ReleaseConsistencyTests(unittest.TestCase):
             ["README.md: missing 'v1.0.1'"],
         )
 
+    def test_forbidden_token_is_reported(self):
+        self.assertEqual(
+            MODULE.forbid_tokens("workflow", 'curl > "response.json"', ['> "response.json"']),
+            ['workflow: forbidden \'> "response.json"\''],
+        )
+
     def test_unexpected_occurrence_count_is_reported(self):
         self.assertEqual(
             MODULE.require_occurrences("workflow", "upload upload", "upload", 1),

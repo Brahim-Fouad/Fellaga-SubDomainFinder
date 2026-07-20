@@ -1,6 +1,307 @@
 use super::*;
 use crate::model::DnsRecord;
 
+fn assert_passive_deadline<T: std::fmt::Debug>(result: Result<T>) {
+    let error = result.unwrap_err();
+    assert!(
+        is_passive_persistence_deadline_error(&error),
+        "erreur inattendue: {error:#}"
+    );
+}
+
+#[test]
+fn passive_source_preflight_reads_do_not_wait_past_the_shared_deadline() {
+    let db = Database::in_memory().unwrap();
+    let shared_lock = db.lock().unwrap();
+    let started = Instant::now();
+
+    assert_passive_deadline(db.source_metadata_until(
+        "fixture",
+        Duration::from_secs(60),
+        Instant::now() + Duration::from_millis(20),
+    ));
+    assert_passive_deadline(db.source_diagnostics_until(
+        Duration::from_secs(60),
+        Instant::now() + Duration::from_millis(20),
+    ));
+    assert_passive_deadline(db.source_cooldowns_until(
+        Duration::from_secs(60),
+        Instant::now() + Duration::from_millis(20),
+    ));
+    assert_passive_deadline(db.source_scores_until(Instant::now() + Duration::from_millis(20)));
+    assert_passive_deadline(
+        db.prior_candidates_until(10, Instant::now() + Duration::from_millis(20)),
+    );
+
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "les lectures de préparation ont dépassé leur échéance: {:?}",
+        started.elapsed()
+    );
+    drop(shared_lock);
+}
+
+#[test]
+fn bounded_observation_names_are_sorted_and_deduplicated_after_indexed_read() {
+    let db = Database::in_memory().unwrap();
+    db.store_observations(
+        "example.com",
+        vec![
+            ObservationInput {
+                fqdn: "z.example.com".to_owned(),
+                kind: "passive".to_owned(),
+                source: "passive:fixture".to_owned(),
+                value: "first".to_owned(),
+            },
+            ObservationInput {
+                fqdn: "a.example.com".to_owned(),
+                kind: "passive".to_owned(),
+                source: "passive:fixture".to_owned(),
+                value: String::new(),
+            },
+            ObservationInput {
+                fqdn: "z.example.com".to_owned(),
+                kind: "passive".to_owned(),
+                source: "passive:fixture".to_owned(),
+                value: "second".to_owned(),
+            },
+        ],
+    )
+    .unwrap();
+
+    assert_eq!(
+        db.observation_names_bounded_until(
+            "example.com",
+            "passive:fixture",
+            2,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .unwrap(),
+        vec!["a.example.com", "z.example.com"]
+    );
+
+    let connection = db.lock().unwrap();
+    let mut statement = connection
+        .prepare(
+            r#"EXPLAIN QUERY PLAN
+               SELECT e.name_id, n.fqdn FROM observation_evidence e
+               JOIN observed_names n ON n.id=e.name_id
+               WHERE e.root_domain=?1 AND e.source=?2 AND e.name_id>?3
+               ORDER BY e.name_id LIMIT ?4"#,
+        )
+        .unwrap();
+    let plan = statement
+        .query_map(
+            params!["example.com", "passive:fixture", 0_i64, 2_i64],
+            |row| row.get::<_, String>(3),
+        )
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert!(
+        plan.iter()
+            .any(|detail| detail.contains("idx_observation_root_source")),
+        "le plan doit parcourir l'index root/source/name_id: {plan:?}"
+    );
+    assert!(
+        plan.iter()
+            .all(|detail| !detail.contains("TEMP B-TREE FOR ORDER BY")),
+        "le plan ne doit pas trier toutes les observations: {plan:?}"
+    );
+}
+
+#[test]
+fn bounded_legacy_passive_cache_reads_until_the_unique_name_limit() {
+    let db = Database::in_memory().unwrap();
+    db.lock()
+        .unwrap()
+        .execute(
+            r#"INSERT INTO passive_cache(root_domain, source, names_json, updated_at)
+               VALUES (?1, ?2, ?3, ?4)"#,
+            params![
+                "example.com",
+                "legacy",
+                r#"["dup.example.com","dup.example.com","api.example.com","z.example.com"]"#,
+                now_epoch()
+            ],
+        )
+        .unwrap();
+
+    let cached = db
+        .passive_cache_bounded_until(
+            "example.com",
+            "legacy",
+            2,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(
+        cached.names,
+        vec!["api.example.com".to_owned(), "dup.example.com".to_owned()]
+    );
+}
+
+#[test]
+fn observation_writer_reply_received_before_deadline_succeeds() {
+    let (reply, response) = mpsc::channel();
+    let expected = ObservationWriteStats {
+        written: 7,
+        novel_names: 3,
+    };
+    reply.send(Ok(expected)).unwrap();
+
+    let actual =
+        receive_observation_writer_reply(response, Some(Instant::now() + Duration::from_secs(1)))
+            .unwrap();
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn observation_writer_reply_respects_deadline_when_reply_is_withheld() {
+    let (_reply, response) = mpsc::channel::<Result<ObservationWriteStats>>();
+    let started = Instant::now();
+
+    let error =
+        receive_observation_writer_reply(response, Some(started + Duration::from_millis(25)))
+            .unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "délai de persistance SQLite passive dépassé"
+    );
+    assert!(is_passive_persistence_deadline_error(&error));
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "le timeout du writer a pris {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn observation_writer_reply_reports_disconnected_channel() {
+    let (reply, response) = mpsc::channel::<Result<ObservationWriteStats>>();
+    drop(reply);
+
+    let error =
+        receive_observation_writer_reply(response, Some(Instant::now() + Duration::from_secs(1)))
+            .unwrap_err();
+
+    assert_eq!(error.to_string(), "réponse du writer SQLite absente");
+    assert!(!is_passive_persistence_deadline_error(&error));
+}
+
+#[test]
+fn passive_observation_page_rejects_an_expired_persistence_deadline() {
+    let db = Database::in_memory().unwrap();
+    let names = BTreeSet::from(["api.example.com".to_owned()]);
+    let deadline = Instant::now()
+        .checked_sub(Duration::from_millis(1))
+        .unwrap();
+
+    let error = db
+        .store_passive_observation_page_until("example.com", "fixture", &names, deadline)
+        .unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "délai de persistance SQLite passive dépassé"
+    );
+    assert!(is_passive_persistence_deadline_error(&error));
+    assert!(
+        db.observation_names("example.com", "passive:fixture")
+            .unwrap()
+            .is_empty(),
+        "une page arrivée après l'échéance ne doit rien persister"
+    );
+}
+
+#[test]
+fn passive_observation_page_does_not_wait_past_deadline_for_shared_lock() {
+    let db = Database::in_memory().unwrap();
+    let shared_lock = db.lock().unwrap();
+    let worker_db = db.clone();
+    let started = Instant::now();
+
+    let worker = std::thread::spawn(move || {
+        worker_db.store_passive_observation_page_until(
+            "example.com",
+            "fixture",
+            &BTreeSet::from(["api.example.com".to_owned()]),
+            Instant::now() + Duration::from_millis(50),
+        )
+    });
+    let error = worker.join().unwrap().unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "délai de persistance SQLite passive dépassé"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "l'attente du verrou a dépassé la borne: {:?}",
+        started.elapsed()
+    );
+    drop(shared_lock);
+    assert!(
+        db.observation_names("example.com", "passive:fixture")
+            .unwrap()
+            .is_empty(),
+        "un timeout de verrou ne doit laisser aucune observation partielle"
+    );
+}
+
+#[test]
+fn deadline_aware_numeric_passive_page_commits_atomically() {
+    let db = Database::in_memory().unwrap();
+    let query_hash = domain_hash("fixture:pages:v1:example.com");
+    let names = BTreeSet::from(["api.example.com".to_owned()]);
+    let page = PassivePaginationPage {
+        position: 1,
+        next_position: 2,
+        records_seen: 1,
+        expected_records: Some(1),
+        expected_pages: Some(1),
+        page_hash: domain_hash("api.example.com"),
+        page_records: 1,
+    };
+
+    let novel = db
+        .commit_passive_pagination_page_until(
+            "example.com",
+            "fixture",
+            "pages",
+            1,
+            &query_hash,
+            &page,
+            &names,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .unwrap();
+
+    assert_eq!(novel, 1);
+    let state = db
+        .passive_pagination_resume_until(
+            "example.com",
+            "fixture",
+            "pages",
+            1,
+            &query_hash,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(state.next_position, 2);
+    assert_eq!(state.records_seen, 1);
+    assert_eq!(
+        db.observation_names("example.com", "passive:fixture")
+            .unwrap(),
+        vec!["api.example.com"]
+    );
+}
+
 #[cfg(unix)]
 fn unix_mode(path: &Path) -> u32 {
     use std::os::unix::fs::PermissionsExt;

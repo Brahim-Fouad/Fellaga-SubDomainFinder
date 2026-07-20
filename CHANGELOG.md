@@ -6,9 +6,20 @@ Published releases and downloadable artifacts are available on [GitHub Releases]
 
 ## [Unreleased]
 
+## [0.12.3] - 2026-07-20
+
+### Changed
+
+- show the active passive connector, elapsed time, safety deadline, completed pages, decoded names, and newly persisted names on one in-place progress line;
+- defer provisional passive names until final output so progress never bypasses wildcard and live-state classification.
+
 ### Fixed
 
-- retry transient GitHub API failures throughout draft cleanup, asset upload, verification, and publication while keeping the seven-asset release set closed and published releases immutable.
+- keep cache preparation, observation reads, pagination checkpoints, persistence, finalization, and refresh leases inside the passive connector or phase deadline while retaining every committed partial page for later reuse;
+- cancel cooperative persistence when a connector task is aborted, clean refresh leases without extending the critical path, emit the terminal passive phase only after bounded finalization completes, and label the candidate scheduler separately from the overall scan status;
+- stream legacy cache entries and use an index-friendly evidence cursor so large permanent databases do not require an unbounded in-memory intermediate set;
+- retry transient GitHub API failures throughout draft cleanup, asset upload, verification, and publication while keeping the seven-asset release set closed and published releases immutable;
+- capture every retried GitHub API response atomically so a transient error body cannot be concatenated with the successful JSON response.
 
 ## [0.12.2] - 2026-07-19
 
@@ -348,7 +359,8 @@ Initial public release of Fellaga.
 - public MIT repository with security policy, contribution guide, third-party notices, and verifiable corpus provenance;
 - verifiable v0.8.0 release with x86-64 and ARM64 GNU/Linux archives, an amd64 Debian package, architecture SBOMs, checksums, a keyless Sigstore signature over the checksum manifest, and GitHub attestations.
 
-[Unreleased]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/compare/v0.12.2...HEAD
+[Unreleased]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/compare/v0.12.3...HEAD
+[0.12.3]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/tag/v0.12.3
 [0.12.2]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/tag/v0.12.2
 [0.12.1]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/tag/v0.12.1
 [0.12.0]: https://github.com/Brahim-Fouad/Fellaga-SubDomainFinder/releases/tag/v0.12.0
