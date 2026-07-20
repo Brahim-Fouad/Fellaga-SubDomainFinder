@@ -577,7 +577,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          status="$(curl --silent --show-error --output "$RUNNER_TEMP/existing-release.json" \
+          status="$(curl --retry 6 --retry-connrefused --retry-max-time 180 \
+            --connect-timeout 15 --max-time 60 \
+            --silent --show-error --output "$RUNNER_TEMP/existing-release.json" \
             --write-out '%{http_code}' \
             --header "Accept: application/vnd.github+json" \
             --header "Authorization: Bearer ${GH_TOKEN}" \
@@ -589,15 +591,7 @@ jobs:
             200)
               jq -e 'type == "object" and (.id | type == "number") and (.draft | type == "boolean")' \
                 "$RUNNER_TEMP/existing-release.json" >/dev/null
-              if jq -e '.draft == true' "$RUNNER_TEMP/existing-release.json" >/dev/null; then
-                stale_release_id="$(jq -r '.id' "$RUNNER_TEMP/existing-release.json")"
-                curl --fail-with-body --silent --show-error \
-                  --request DELETE \
-                  --header "Accept: application/vnd.github+json" \
-                  --header "Authorization: Bearer ${GH_TOKEN}" \
-                  --header "X-GitHub-Api-Version: 2022-11-28" \
-                  "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/releases/${stale_release_id}"
-              else
+              if jq -e '.draft == false' "$RUNNER_TEMP/existing-release.json" >/dev/null; then
                 echo "Refusing to overwrite the published release for ${GITHUB_REF_NAME}" >&2
                 exit 1
               fi
@@ -612,7 +606,9 @@ jobs:
           printf '[]\n' > "$RUNNER_TEMP/releases.json"
           page=1
           while :; do
-            curl --fail-with-body --silent --show-error \
+            curl --retry 6 --retry-connrefused --retry-max-time 180 \
+              --connect-timeout 15 --max-time 60 \
+              --fail-with-body --silent --show-error \
               --header "Accept: application/vnd.github+json" \
               --header "Authorization: Bearer ${GH_TOKEN}" \
               --header "X-GitHub-Api-Version: 2022-11-28" \
@@ -637,12 +633,25 @@ jobs:
           fi
           while IFS= read -r stale_release_id; do
             [[ "$stale_release_id" =~ ^[0-9]+$ ]]
-            curl --fail-with-body --silent --show-error \
+            delete_status="$(curl --retry 6 --retry-connrefused \
+              --retry-max-time 180 --connect-timeout 15 --max-time 60 \
+              --silent --show-error \
               --request DELETE \
+              --output "$RUNNER_TEMP/delete-release-${stale_release_id}.json" \
+              --write-out '%{http_code}' \
               --header "Accept: application/vnd.github+json" \
               --header "Authorization: Bearer ${GH_TOKEN}" \
               --header "X-GitHub-Api-Version: 2022-11-28" \
-              "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/releases/${stale_release_id}"
+              "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/releases/${stale_release_id}")"
+            case "$delete_status" in
+              204|404)
+                ;;
+              *)
+                echo "Unable to remove interrupted draft ${stale_release_id}; GitHub returned HTTP ${delete_status}" >&2
+                cat "$RUNNER_TEMP/delete-release-${stale_release_id}.json" >&2
+                exit 1
+                ;;
+            esac
           done < <(jq -r --arg tag "$GITHUB_REF_NAME" \
             '.[] | select(.tag_name == $tag and .draft == true) | .id' \
             "$RUNNER_TEMP/releases.json")
@@ -690,8 +699,9 @@ jobs:
             dist/SHA256SUMS
             dist/SHA256SUMS.sigstore.json
 
-      - name: Create a draft release and upload the closed payload
-        id: draft_release
+      - name: Create the draft release and upload the closed payload
+        id: draft_release_primary
+        continue-on-error: true
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           tag_name: ${{ github.ref_name }}
@@ -711,6 +721,55 @@ jobs:
             dist/SHA256SUMS
             dist/SHA256SUMS.sigstore.json
 
+      - name: Back off after a transient draft upload failure
+        if: steps.draft_release_primary.outcome == 'failure'
+        run: sleep 20
+
+      - name: Resume the draft release after a transient failure
+        id: draft_release_retry
+        if: steps.draft_release_primary.outcome == 'failure'
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Fellaga v${{ needs.gate.outputs.version }}
+          draft: true
+          prerelease: false
+          generate_release_notes: true
+          overwrite_files: false
+          preserve_order: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/fellaga-v${{ needs.gate.outputs.version }}-aarch64-unknown-linux-gnu.cdx.json
+            dist/fellaga-v${{ needs.gate.outputs.version }}-aarch64-unknown-linux-gnu.tar.gz
+            dist/fellaga-v${{ needs.gate.outputs.version }}-x86_64-unknown-linux-gnu.cdx.json
+            dist/fellaga-v${{ needs.gate.outputs.version }}-x86_64-unknown-linux-gnu.tar.gz
+            dist/fellaga_${{ needs.gate.outputs.version }}-1_amd64.deb
+            dist/SHA256SUMS
+            dist/SHA256SUMS.sigstore.json
+
+      - name: Resolve the verified draft release id
+        id: draft_release
+        env:
+          PRIMARY_ID: ${{ steps.draft_release_primary.outputs.id }}
+          PRIMARY_OUTCOME: ${{ steps.draft_release_primary.outcome }}
+          RETRY_ID: ${{ steps.draft_release_retry.outputs.id }}
+          RETRY_OUTCOME: ${{ steps.draft_release_retry.outcome }}
+        run: |
+          set -euo pipefail
+          if [[ "$PRIMARY_OUTCOME" == "success" ]]; then
+            release_id="$PRIMARY_ID"
+          elif [[ "$RETRY_OUTCOME" == "success" ]]; then
+            release_id="$RETRY_ID"
+          else
+            echo "Draft upload failed after the bounded retry" >&2
+            exit 1
+          fi
+          if [[ ! "$release_id" =~ ^[0-9]+$ ]]; then
+            echo "Invalid draft release id: $release_id" >&2
+            exit 1
+          fi
+          echo "id=${release_id}" >> "$GITHUB_OUTPUT"
+
       - name: Verify the uploaded draft before publication
         env:
           GH_TOKEN: ${{ github.token }}
@@ -721,18 +780,26 @@ jobs:
             echo "Invalid draft release id: $RELEASE_ID" >&2
             exit 1
           fi
-          curl --fail-with-body --silent --show-error \
+          curl --retry 6 --retry-connrefused --retry-max-time 180 \
+            --connect-timeout 15 --max-time 60 \
+            --fail-with-body --silent --show-error \
             --header "Accept: application/vnd.github+json" \
             --header "Authorization: Bearer ${GH_TOKEN}" \
             --header "X-GitHub-Api-Version: 2022-11-28" \
             "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" \
             > "$RUNNER_TEMP/draft-release.json"
           jq -e --arg tag "$GITHUB_REF_NAME" \
-            '.draft == true and .tag_name == $tag and all(.assets[]; .state == "uploaded" and .size > 0)' \
+            '.draft == true and .tag_name == $tag and (.assets | length == 7) and all(.assets[]; .state == "uploaded" and .size > 0)' \
             "$RUNNER_TEMP/draft-release.json" >/dev/null
           jq -r '.assets[].name' "$RUNNER_TEMP/draft-release.json" | sort \
             > "$RUNNER_TEMP/uploaded-assets"
           diff -u "$RUNNER_TEMP/expected-final-assets" "$RUNNER_TEMP/uploaded-assets"
+          find dist -mindepth 1 -maxdepth 1 -type f -printf '%f\t%s\n' | sort \
+            > "$RUNNER_TEMP/expected-final-asset-sizes"
+          jq -r '.assets[] | [.name, (.size | tostring)] | @tsv' \
+            "$RUNNER_TEMP/draft-release.json" | sort \
+            > "$RUNNER_TEMP/uploaded-asset-sizes"
+          diff -u "$RUNNER_TEMP/expected-final-asset-sizes" "$RUNNER_TEMP/uploaded-asset-sizes"
 
       - name: Publish the fully populated draft
         env:
@@ -744,14 +811,55 @@ jobs:
             echo "Invalid draft release id: $RELEASE_ID" >&2
             exit 1
           fi
-          curl --fail-with-body --silent --show-error \
-            --request PATCH \
-            --header "Accept: application/vnd.github+json" \
-            --header "Authorization: Bearer ${GH_TOKEN}" \
-            --header "X-GitHub-Api-Version: 2022-11-28" \
-            --data '{"draft":false}' \
-            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" \
-            > "$RUNNER_TEMP/published-release.json"
+          fetch_release() {
+            curl --retry 6 --retry-connrefused --retry-max-time 180 \
+              --connect-timeout 15 --max-time 60 \
+              --fail-with-body --silent --show-error \
+              --header "Accept: application/vnd.github+json" \
+              --header "Authorization: Bearer ${GH_TOKEN}" \
+              --header "X-GitHub-Api-Version: 2022-11-28" \
+              "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" \
+              > "$RUNNER_TEMP/published-release.json"
+          }
+
+          for attempt in 1 2 3; do
+            fetch_release
+            jq -e --arg tag "$GITHUB_REF_NAME" \
+              '.tag_name == $tag and (.assets | length == 7) and all(.assets[]; .state == "uploaded" and .size > 0)' \
+              "$RUNNER_TEMP/published-release.json" >/dev/null
+            jq -r '.assets[] | [.name, (.size | tostring)] | @tsv' \
+              "$RUNNER_TEMP/published-release.json" | sort \
+              > "$RUNNER_TEMP/published-asset-sizes"
+            diff -u "$RUNNER_TEMP/expected-final-asset-sizes" "$RUNNER_TEMP/published-asset-sizes"
+            if jq -e '.draft == false' "$RUNNER_TEMP/published-release.json" >/dev/null; then
+              break
+            fi
+
+            patch_status=""
+            if ! patch_status="$(curl --retry 6 --retry-connrefused \
+                --retry-max-time 180 --connect-timeout 15 --max-time 60 \
+                --silent --show-error \
+                --request PATCH \
+                --output "$RUNNER_TEMP/publish-response.json" \
+                --write-out '%{http_code}' \
+                --header "Accept: application/vnd.github+json" \
+                --header "Authorization: Bearer ${GH_TOKEN}" \
+                --header "X-GitHub-Api-Version: 2022-11-28" \
+                --data '{"draft":false}' \
+                "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}")"; then
+              patch_status="transport_error"
+            fi
+            if [[ "$patch_status" != "200" ]]; then
+              echo "Publish attempt ${attempt}/3 returned HTTP ${patch_status}; reconciling the release state" >&2
+            fi
+            sleep "$((attempt * 2))"
+          done
+
+          fetch_release
           jq -e --arg tag "$GITHUB_REF_NAME" \
-            '.draft == false and .tag_name == $tag' \
+            '.draft == false and .tag_name == $tag and (.assets | length == 7) and all(.assets[]; .state == "uploaded" and .size > 0)' \
             "$RUNNER_TEMP/published-release.json" >/dev/null
+          jq -r '.assets[] | [.name, (.size | tostring)] | @tsv' \
+            "$RUNNER_TEMP/published-release.json" | sort \
+            > "$RUNNER_TEMP/published-asset-sizes"
+          diff -u "$RUNNER_TEMP/expected-final-asset-sizes" "$RUNNER_TEMP/published-asset-sizes"

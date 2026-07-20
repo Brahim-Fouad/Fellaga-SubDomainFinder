@@ -55,6 +55,15 @@ def require_tokens(label: str, text: str, tokens: list[str]) -> list[str]:
     return [f"{label}: missing {token!r}" for token in tokens if token not in text]
 
 
+def require_occurrences(
+    label: str, text: str, token: str, expected: int
+) -> list[str]:
+    actual = text.count(token)
+    if actual == expected:
+        return []
+    return [f"{label}: expected {expected} occurrences of {token!r}, found {actual}"]
+
+
 def check_repository(root: Path) -> list[str]:
     errors: list[str] = []
     cargo = read(root / "Cargo.toml")
@@ -145,6 +154,34 @@ def check_repository(root: Path) -> list[str]:
         errors.append(
             ".github/workflows/release.yml: final asset set differs; "
             f"missing={missing}, unexpected={unexpected}"
+        )
+
+    errors.extend(
+        require_occurrences(
+            ".github/workflows/release.yml",
+            workflow,
+            "uses: softprops/action-gh-release@",
+            2,
+        )
+    )
+    errors.extend(
+        require_tokens(
+            ".github/workflows/release.yml",
+            workflow,
+            [
+                "continue-on-error: true",
+                "steps.draft_release_primary.outcome == 'failure'",
+                "--retry-connrefused",
+                "(.assets | length == 7)",
+                "expected-final-asset-sizes",
+                "for attempt in 1 2 3; do",
+                'patch_status="transport_error"',
+            ],
+        )
+    )
+    if "--retry-all-errors" in workflow:
+        errors.append(
+            ".github/workflows/release.yml: permanent HTTP failures must not be retried"
         )
 
     return errors
