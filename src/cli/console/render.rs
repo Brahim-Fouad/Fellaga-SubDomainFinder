@@ -1,4 +1,4 @@
-use fellaga_core::model::{Finding, ObservationState, ScanResult, StopReason};
+use fellaga_core::model::{AxfrStatus, Finding, ObservationState, ScanResult, StopReason};
 use fellaga_core::output::FindingSelection;
 use std::collections::BTreeSet;
 use std::io::{IsTerminal, Write};
@@ -399,9 +399,248 @@ pub(crate) fn print_scan_findings(
     let _ = std::io::stdout().flush();
 }
 
-pub(crate) fn print_scan_summary(result: &ScanResult, verbosity: u8) {
+#[allow(clippy::vec_init_then_push)]
+pub(super) fn render_ludique_dashboard(result: &ScanResult, style: TerminalStyle) -> Vec<String> {
+    let mut lines = Vec::new();
+    lines.push(String::new());
+
+    // ASCII Banner
+    lines.push(style.paint(Tone::Accent, r#"  ______   _   _                      "#));
+    lines.push(style.paint(Tone::Accent, r#" |  ____| | | | |                     "#));
+    lines.push(style.paint(Tone::Accent, r#" | |__    | | | |  __ _   __ _   __ _ "#));
+    lines.push(style.paint(Tone::Accent, r#" |  __|   | | | | / _` | / _` | / _` |"#));
+    lines.push(style.paint(Tone::Accent, r#" | |      | | | || (_| || (_| || (_| |"#));
+    lines.push(style.paint(Tone::Accent, r#" |_|      |_| |_| \__,_| \__, | \__, |"#));
+    lines.push(style.paint(Tone::Accent, r#"                          __/ |  __/ |"#));
+    lines.push(style.paint(Tone::Accent, r#"                         |___/  |___/ "#));
+    lines.push(String::new());
+    lines.push(style.paint(
+        Tone::Bold,
+        "🎮 TABLEAU DE BORD DE RECONNAISSANCE GAMIFIÉ 🎮",
+    ));
+    lines.push(style.paint(Tone::Dim, "─".repeat(style.width.clamp(40, SUMMARY_WIDTH))));
+
+    // Calculate Recon Score (0-100)
+    let live_count = result
+        .findings
+        .iter()
+        .filter(|finding| finding.state == ObservationState::Live && !finding.wildcard)
+        .count();
+
+    let historical_count = result
+        .findings
+        .iter()
+        .filter(|finding| finding.state == ObservationState::Historical)
+        .count();
+
+    let mut score = 0u32;
+
+    // 1. Live finding points
+    score += (live_count as u32 * 3).min(30);
+
+    // 2. Cache / scan efficiency points
+    let total_candidates = result.candidates;
+    let cache_hits = result.cache_hits;
+    let cache_efficiency = cache_hits
+        .checked_mul(100)
+        .and_then(|val| val.checked_div(total_candidates))
+        .unwrap_or(100);
+    score += (cache_efficiency as u32 / 5).min(20);
+
+    // 3. DNSSEC walkthrough points
+    let has_dnssec = !result.dnssec_walks.is_empty();
+    if has_dnssec {
+        score += 15;
+    }
+
+    // 4. AXFR success points
+    let mut axfr_success = false;
+    for attempt in &result.axfr_attempts {
+        if attempt.status == AxfrStatus::Success {
+            axfr_success = true;
+            break;
+        }
+    }
+    if axfr_success {
+        score += 25;
+    } else if !result.axfr_attempts.is_empty() {
+        score += 5; // points for attempting AXFR
+    }
+
+    // 5. Rich information / pipeline points
+    if !result.web_observations.is_empty() {
+        score += 5;
+    }
+    if !result.tls_certificates.is_empty() {
+        score += 5;
+    }
+
+    let final_score = score.min(100);
+
+    // Score Badge / Level
+    let rank = if final_score >= 80 {
+        "🥇 Expert Légendaire"
+    } else if final_score >= 50 {
+        "🥈 Éclaireur Chevronné"
+    } else if final_score >= 20 {
+        "🥉 Apprenti Pirate"
+    } else {
+        "🌱 Curieux Débutant"
+    };
+
+    let score_color = if final_score >= 80 {
+        Tone::Good
+    } else if final_score >= 50 {
+        Tone::Accent
+    } else if final_score >= 20 {
+        Tone::Warn
+    } else {
+        Tone::Bad
+    };
+
+    lines.push(format!(
+        "  🎯 Score de Recon : {}/100 · {}",
+        style.paint(score_color, final_score.to_string()),
+        style.paint(Tone::Bold, rank)
+    ));
+    lines.push(String::new());
+
+    // Achievements
+    lines.push(style.paint(Tone::Bold, "🏆 SUCCÈS DÉVERROUILLÉS :"));
+    let mut achievements = Vec::new();
+
+    // 1. Invisible Shadow
+    if result.resolved_from_network == 0 && live_count == 0 && !result.findings.is_empty() {
+        achievements.push((
+            "🕵️‍♂️ L'Ombre Invisible",
+            "A collecté des indices précieux sans jamais toucher directement la cible.",
+            Tone::Accent,
+        ));
+    }
+
+    // 2. Imperial Seal
+    if has_dnssec {
+        achievements.push((
+            "🔐 Le Sceau Impérial",
+            "A validé la signature de la cible via des preuves DNSSEC irréprochables.",
+            Tone::Good,
+        ));
+    }
+
+    // 3. Door Breaker
+    if axfr_success {
+        achievements.push((
+            "🔓 Le Casseur de Portes",
+            "A réussi un transfert de zone AXFR complet ! La cible a laissé ses portes ouvertes.",
+            Tone::Bad,
+        ));
+    }
+
+    // 4. Web Archaeologist
+    if !result.web_observations.is_empty() {
+        achievements.push((
+            "📦 L'Archéologue du Web",
+            "A fouillé les tréfonds du code JS et des pages HTML pour en extraire des sous-domaines.",
+            Tone::Warn,
+        ));
+    }
+
+    // 5. Light Speed
+    if result.duration_ms < 5000 && live_count > 0 {
+        achievements.push((
+            "⚡ Vitesse Lumière",
+            "A scanné et résolu la cible plus vite que son ombre (moins de 5 secondes) !",
+            Tone::Accent,
+        ));
+    }
+
+    // 6. Sniper
+    let total_verified = live_count + historical_count;
+    if total_verified >= 3 && live_count * 100 / total_verified.max(1) >= 90 {
+        achievements.push((
+            "🎯 Le Sniper",
+            "Précision chirurgicale : plus de 90% des domaines trouvés sont actifs et vérifiés.",
+            Tone::Good,
+        ));
+    }
+
+    // 7. Grand Explorer
+    if result.findings.len() >= 10 {
+        achievements.push((
+            "🏆 Grand Explorateur",
+            "A révélé une grande partie cachée de l'iceberg avec plus de 10 sous-domaines identifiés.",
+            Tone::Bold
+        ));
+    }
+
+    // 8. The Alchemist
+    if result.candidates > 1000 {
+        achievements.push((
+            "🧪 L'Alchimiste",
+            "A généré et analysé plus de 1 000 variations de candidats.",
+            Tone::Dim,
+        ));
+    }
+
+    if achievements.is_empty() {
+        lines.push(style.paint(
+            Tone::Dim,
+            "    Aucun succès déverrouillé pour ce scan. Tentez une cible plus complexe !",
+        ));
+    } else {
+        for (name, desc, tone) in achievements {
+            lines.push(format!("  • {}", style.paint(tone, name)));
+            lines.push(format!("    {}", style.paint(Tone::Dim, desc)));
+        }
+    }
+    lines.push(String::new());
+
+    // Performance & Stability Report
+    lines.push(style.paint(Tone::Bold, "📈 RAPPORT DE STABILITÉ ET EFFICACITÉ :"));
+
+    // Scan efficiency
+    let efficiency_desc = if cache_efficiency >= 80 {
+        "Excellent (Utilisation optimale du cache local)"
+    } else if cache_efficiency >= 50 {
+        "Correct (Bon équilibre réseau/cache)"
+    } else {
+        "Intensif (Scan frais, forte sollicitation réseau)"
+    };
+    lines.push(format!(
+        "  ⚡ Efficacité du Scan : {}% · {}",
+        style.paint(Tone::Good, format!("{cache_efficiency}")),
+        style.paint(Tone::Dim, efficiency_desc)
+    ));
+
+    // Target posture
+    let target_status = if axfr_success {
+        ("VULNÉRABLE (AXFR ouvert !)", Tone::Bad)
+    } else if has_dnssec {
+        ("SÉCURISÉE (DNSSEC actif)", Tone::Good)
+    } else if result.wildcard_detected {
+        ("INSTABLE (Profil Wildcard bruyant)", Tone::Warn)
+    } else {
+        ("CLASSIQUE (Configuration standard)", Tone::Accent)
+    };
+    lines.push(format!(
+        "  🛡️ Posture de la Cible : {}",
+        style.paint(target_status.1, target_status.0)
+    ));
+
+    lines.push(style.paint(Tone::Dim, "─".repeat(style.width.clamp(40, SUMMARY_WIDTH))));
+    lines.push(String::new());
+
+    lines
+}
+
+pub(crate) fn print_scan_summary(result: &ScanResult, verbosity: u8, ludique: bool) {
     let style = TerminalStyle::auto(std::io::stdout().is_terminal());
     for line in render_scan_summary(result, style, verbosity) {
         println!("{line}");
+    }
+    if ludique {
+        for line in render_ludique_dashboard(result, style) {
+            println!("{line}");
+        }
     }
 }

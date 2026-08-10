@@ -519,7 +519,7 @@ pub(crate) async fn run(args: Box<ScanArgs>, context: &AppContext) -> Result<()>
     } else if !args.quiet {
         for result in &results {
             print_scan_findings(result, args.include_non_live, args.include_wildcard);
-            print_scan_summary(result, args.verbose);
+            print_scan_summary(result, args.verbose, args.ludique);
         }
     }
     if let Some(path) = &args.output {

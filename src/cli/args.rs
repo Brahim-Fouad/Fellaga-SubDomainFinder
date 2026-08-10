@@ -483,6 +483,12 @@ pub(crate) struct ScanArgs {
         help = "Suppress all human findings, progress, and summary output"
     )]
     pub(crate) quiet: bool,
+    #[arg(
+        long,
+        alias = "fun",
+        help = "Enable a highly engaging, gamified, and colorful Recon dashboard with achievements"
+    )]
+    pub(crate) ludique: bool,
 }
 
 #[derive(Debug, Args)]

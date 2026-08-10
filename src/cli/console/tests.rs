@@ -1,7 +1,9 @@
 use super::progress::{
     ConsoleProgress, TransientPhaseState, transient_phase_detail, transient_progress_signature,
 };
-use super::render::{finding_line, render_scan_findings, render_scan_summary};
+use super::render::{
+    finding_line, render_ludique_dashboard, render_scan_findings, render_scan_summary,
+};
 use super::text::{
     NoticeKind, TerminalStyle, animation_enabled, classify_notice, format_duration, format_number,
     is_transient_phase, sanitize_terminal_text, should_render_axfr, should_render_passive_source,
@@ -411,4 +413,52 @@ fn finalized_findings_default_to_live_non_wildcard_results() {
     assert!(wildcard_only.contains("www.example.com"));
     assert!(!wildcard_only.contains("old.example.com"));
     assert!(wildcard_only.contains("wild.example.com"));
+}
+
+#[test]
+fn test_ludique_dashboard_score_and_achievements() {
+    let mut scan = result();
+    // Initially: 1 live finding, 1234 candidates, 2 cache hits, 0 axfr, 0 dnssec, 0 web
+    let output = render_ludique_dashboard(&scan, TerminalStyle::plain()).join("\n");
+    assert!(output.contains("🎮 TABLEAU DE BORD DE RECONNAISSANCE GAMIFIÉ 🎮"));
+    assert!(output.contains("Score de Recon :"));
+    assert!(output.contains("Efficacité du Scan"));
+    assert!(output.contains("🌱 Curieux Débutant") || output.contains("🥉 Apprenti Pirate"));
+
+    // Unlock Imperial Seal (DNSSEC)
+    scan.dnssec_walks = vec![fellaga_core::model::DnssecWalkResult {
+        zone: "example.com".to_owned(),
+        nameserver: "ns1.example.com".to_owned(),
+        status: "success".to_owned(),
+        queries: 5,
+        names: BTreeSet::new(),
+        from_cache: false,
+        error: None,
+    }];
+    let output_dnssec = render_ludique_dashboard(&scan, TerminalStyle::plain()).join("\n");
+    assert!(output_dnssec.contains("Le Sceau Impérial"));
+    assert!(output_dnssec.contains("SÉCURISÉE (DNSSEC actif)"));
+
+    // Unlock Door Breaker (AXFR Success)
+    scan.axfr_attempts = vec![fellaga_core::model::AxfrAttempt {
+        nameserver: "ns1.example.com".to_owned(),
+        address: "192.0.2.1".to_owned(),
+        status: fellaga_core::model::AxfrStatus::Success,
+        error: None,
+        records: Vec::new(),
+        names: BTreeSet::new(),
+    }];
+    let output_axfr = render_ludique_dashboard(&scan, TerminalStyle::plain()).join("\n");
+    assert!(output_axfr.contains("Le Casseur de Portes"));
+    assert!(output_axfr.contains("VULNÉRABLE (AXFR ouvert !)"));
+
+    // Unlock Web Archaeologist
+    scan.web_observations = vec![fellaga_core::model::WebObservation {
+        url: "https://www.example.com/".to_owned(),
+        status: 200,
+        names: BTreeSet::new(),
+        from_cache: false,
+    }];
+    let output_web = render_ludique_dashboard(&scan, TerminalStyle::plain()).join("\n");
+    assert!(output_web.contains("L'Archéologue du Web"));
 }
