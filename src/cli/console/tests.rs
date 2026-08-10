@@ -1,7 +1,9 @@
 use super::progress::{
     ConsoleProgress, TransientPhaseState, transient_phase_detail, transient_progress_signature,
 };
-use super::render::{finding_line, render_scan_findings, render_scan_summary, render_ludique_dashboard};
+use super::render::{
+    finding_line, render_ludique_dashboard, render_scan_findings, render_scan_summary,
+};
 use super::text::{
     NoticeKind, TerminalStyle, animation_enabled, classify_notice, format_duration, format_number,
     is_transient_phase, sanitize_terminal_text, should_render_axfr, should_render_passive_source,

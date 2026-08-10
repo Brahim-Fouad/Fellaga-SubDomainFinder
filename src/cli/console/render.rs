@@ -1,4 +1,4 @@
-use fellaga_core::model::{Finding, ObservationState, ScanResult, StopReason, AxfrStatus};
+use fellaga_core::model::{AxfrStatus, Finding, ObservationState, ScanResult, StopReason};
 use fellaga_core::output::FindingSelection;
 use std::collections::BTreeSet;
 use std::io::{IsTerminal, Write};
@@ -399,6 +399,7 @@ pub(crate) fn print_scan_findings(
     let _ = std::io::stdout().flush();
 }
 
+#[allow(clippy::vec_init_then_push)]
 pub(super) fn render_ludique_dashboard(result: &ScanResult, style: TerminalStyle) -> Vec<String> {
     let mut lines = Vec::new();
     lines.push(String::new());
@@ -413,7 +414,10 @@ pub(super) fn render_ludique_dashboard(result: &ScanResult, style: TerminalStyle
     lines.push(style.paint(Tone::Accent, r#"                          __/ |  __/ |"#));
     lines.push(style.paint(Tone::Accent, r#"                         |___/  |___/ "#));
     lines.push(String::new());
-    lines.push(style.paint(Tone::Bold, "🎮 TABLEAU DE BORD DE RECONNAISSANCE GAMIFIÉ 🎮"));
+    lines.push(style.paint(
+        Tone::Bold,
+        "🎮 TABLEAU DE BORD DE RECONNAISSANCE GAMIFIÉ 🎮",
+    ));
     lines.push(style.paint(Tone::Dim, "─".repeat(style.width.clamp(40, SUMMARY_WIDTH))));
 
     // Calculate Recon Score (0-100)
@@ -437,11 +441,10 @@ pub(super) fn render_ludique_dashboard(result: &ScanResult, style: TerminalStyle
     // 2. Cache / scan efficiency points
     let total_candidates = result.candidates;
     let cache_hits = result.cache_hits;
-    let cache_efficiency = if total_candidates > 0 {
-        (cache_hits * 100) / total_candidates
-    } else {
-        100
-    };
+    let cache_efficiency = cache_hits
+        .checked_mul(100)
+        .and_then(|val| val.checked_div(total_candidates))
+        .unwrap_or(100);
     score += (cache_efficiency as u32 / 5).min(20);
 
     // 3. DNSSEC walkthrough points
@@ -511,7 +514,7 @@ pub(super) fn render_ludique_dashboard(result: &ScanResult, style: TerminalStyle
         achievements.push((
             "🕵️‍♂️ L'Ombre Invisible",
             "A collecté des indices précieux sans jamais toucher directement la cible.",
-            Tone::Accent
+            Tone::Accent,
         ));
     }
 
@@ -520,7 +523,7 @@ pub(super) fn render_ludique_dashboard(result: &ScanResult, style: TerminalStyle
         achievements.push((
             "🔐 Le Sceau Impérial",
             "A validé la signature de la cible via des preuves DNSSEC irréprochables.",
-            Tone::Good
+            Tone::Good,
         ));
     }
 
@@ -529,7 +532,7 @@ pub(super) fn render_ludique_dashboard(result: &ScanResult, style: TerminalStyle
         achievements.push((
             "🔓 Le Casseur de Portes",
             "A réussi un transfert de zone AXFR complet ! La cible a laissé ses portes ouvertes.",
-            Tone::Bad
+            Tone::Bad,
         ));
     }
 
@@ -538,7 +541,7 @@ pub(super) fn render_ludique_dashboard(result: &ScanResult, style: TerminalStyle
         achievements.push((
             "📦 L'Archéologue du Web",
             "A fouillé les tréfonds du code JS et des pages HTML pour en extraire des sous-domaines.",
-            Tone::Warn
+            Tone::Warn,
         ));
     }
 
@@ -547,7 +550,7 @@ pub(super) fn render_ludique_dashboard(result: &ScanResult, style: TerminalStyle
         achievements.push((
             "⚡ Vitesse Lumière",
             "A scanné et résolu la cible plus vite que son ombre (moins de 5 secondes) !",
-            Tone::Accent
+            Tone::Accent,
         ));
     }
 
@@ -557,7 +560,7 @@ pub(super) fn render_ludique_dashboard(result: &ScanResult, style: TerminalStyle
         achievements.push((
             "🎯 Le Sniper",
             "Précision chirurgicale : plus de 90% des domaines trouvés sont actifs et vérifiés.",
-            Tone::Good
+            Tone::Good,
         ));
     }
 
@@ -575,12 +578,15 @@ pub(super) fn render_ludique_dashboard(result: &ScanResult, style: TerminalStyle
         achievements.push((
             "🧪 L'Alchimiste",
             "A généré et analysé plus de 1 000 variations de candidats.",
-            Tone::Dim
+            Tone::Dim,
         ));
     }
 
     if achievements.is_empty() {
-        lines.push(style.paint(Tone::Dim, "    Aucun succès déverrouillé pour ce scan. Tentez une cible plus complexe !"));
+        lines.push(style.paint(
+            Tone::Dim,
+            "    Aucun succès déverrouillé pour ce scan. Tentez une cible plus complexe !",
+        ));
     } else {
         for (name, desc, tone) in achievements {
             lines.push(format!("  • {}", style.paint(tone, name)));
